@@ -29,6 +29,10 @@ def compute_pt_eta_phi(px: ak.Array, py: ak.Array, pz: ak.Array) -> tuple[ak.Arr
 
 
 def p4_to_features(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.ndarray) -> np.ndarray:
+    px = np.asarray(px, dtype=np.float32)
+    py = np.asarray(py, dtype=np.float32)
+    pz = np.asarray(pz, dtype=np.float32)
+    energy = np.asarray(energy, dtype=np.float32)
     p4 = vector.zip(
         {
             "px": px,
@@ -37,8 +41,12 @@ def p4_to_features(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.nd
             "E": energy,
         }
     )
-    eta = np.where(np.isfinite(p4.eta), p4.eta, 0.0)
-    return np.stack([p4.E, p4.pt, eta, p4.phi], axis=1).astype(np.float32)
+    energy_values = np.asarray(p4.E, dtype=np.float32)
+    pt_values = np.asarray(p4.pt, dtype=np.float32)
+    eta_values = np.asarray(p4.eta, dtype=np.float32)
+    phi_values = np.asarray(p4.phi, dtype=np.float32)
+    eta_values = np.where(np.isfinite(eta_values), eta_values, 0.0)
+    return np.stack([energy_values, pt_values, eta_values, phi_values], axis=1).astype(np.float32)
 
 
 def sum_masked_p4(events: ak.Array, mask: ak.Array):
