@@ -7,6 +7,8 @@ This directory contains the local ML-side utilities and configs used with the LE
 - `EveNet-Full/`: upstream EveNet codebase and docs.
 - `config/analysis.yaml`: sample list for plotting DataLoader parquet outputs.
 - `util/plot_control_parquets.py`: simple data-vs-MC control plotting script for parquet files produced by `processor/DataLoader.py`.
+- `util/build_evenet_input_from_parquet.py`: convert DataLoader parquet outputs into a simple EveNet-style `.npz` bundle plus metadata and an `event_info.yaml` skeleton.
+- `util/evenet_parquet_common.py`: shared visible-tau and invisible-target helpers used by both scripts.
 
 ## Parquet Plotting
 
@@ -42,6 +44,8 @@ python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/util/plot_control_
 - `nprong`
 - `n_neutral`
 - `thrust_neglog1m`
+- `tau_vis_prong_pt`
+- `tau_vis_rho_pt`
 
 If the parquet contains the truth branches written by `processor/DataLoader.py`, the script also writes MC-only truth plots:
 
@@ -50,6 +54,7 @@ If the parquet contains the truth branches written by `processor/DataLoader.py`,
 - `truth_tau_pair_pt`
 - `truth_tau_pair_mass`
 - `truth_nunu_pt`
+- `target_invisible_pt`
 
 ## Config Format
 
@@ -80,3 +85,38 @@ Subcategories:
 ```
 
 The key under `Subcategories` should match the sample key or sample `name` from `Samples`.
+
+## Parquet -> EveNet Input
+
+`util/build_evenet_input_from_parquet.py` converts the awkward parquet files from `processor/DataLoader.py` into one combined EveNet-style `.npz` bundle.
+
+It currently:
+
+- converts `Part_*` into the point-cloud tensor `x`
+- replaces Cartesian four-momentum with `energy`, `pt`, `eta`, `phi`
+- builds event-level `conditions`
+- applies the preselection `nprong == 2`
+- assigns `classification` labels from sample name plus optional subcategory split
+- builds two visible-tau assumptions for every event:
+  - `tau_vis_prong`: all charged prong legs in each tau hemisphere
+  - `tau_vis_rho`: prong legs plus nearby photons within `dR < 0.3`
+- fills `x_invisible` from `truth_tau - tau_vis_target`, where `tau_vis_target` is chosen per tau from `event_category`
+  - `Pi` and `Lepton` use the prong-only visible tau
+  - `Rho` uses the prong-plus-photon visible tau
+- writes monitoring plots under `<output-dir>/monitoring/`, including:
+  - `nprong` before/after the preselection for each input sample
+  - one histogram per global input field
+  - `tau_vis_prong_pt`
+  - `tau_vis_rho_pt`
+  - `target_invisible_pt`
+- writes `evenet_input.npz`, `evenet_input_metadata.json`, and `event_info.yaml`
+
+The visible-tau and target-invisible definitions are shared with `util/plot_control_parquets.py`, so the monitor plots and the standalone plotting script use the same reconstruction assumptions.
+
+Run:
+
+```bash
+python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/util/build_evenet_input_from_parquet.py \
+  --config /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/config/analysis.yaml \
+  --output-dir /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/evenet_inputs
+```

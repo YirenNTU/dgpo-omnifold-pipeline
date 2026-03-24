@@ -11,6 +11,7 @@ import awkward as ak
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
+from evenet_parquet_common import build_tau_targets, build_visible_tau_assumptions
 from rich.console import Console
 from rich.table import Table
 
@@ -391,6 +392,16 @@ def extract_thrust_neglog1m(events: ak.Array) -> np.ndarray:
     return ak.to_numpy(-np.log10(1 - thrust + 1e-10), allow_missing=False)
 
 
+def extract_tau_vis_prong_pt(events: ak.Array) -> np.ndarray:
+    tau_vis_prong, tau_vis_prong_mask, _, _ = build_visible_tau_assumptions(events)
+    return tau_vis_prong[..., 1][tau_vis_prong_mask]
+
+
+def extract_tau_vis_rho_pt(events: ak.Array) -> np.ndarray:
+    _, _, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
+    return tau_vis_rho[..., 1][tau_vis_rho_mask]
+
+
 def truth_array(events: ak.Array, field_name: str) -> np.ndarray:
     if field_name not in events.fields:
         return np.array([], dtype=float)
@@ -432,6 +443,18 @@ def extract_truth_nunu_pt(events: ak.Array) -> np.ndarray:
     px = truth_array(events, "truth_nu_tau_px") + truth_array(events, "truth_anti_nu_tau_px")
     py = truth_array(events, "truth_nu_tau_py") + truth_array(events, "truth_anti_nu_tau_py")
     return np.sqrt(px ** 2 + py ** 2)
+
+
+def extract_target_invisible_pt(events: ak.Array) -> np.ndarray:
+    tau_vis_prong, tau_vis_prong_mask, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
+    x_invisible, x_invisible_mask, _, _, _, _ = build_tau_targets(
+        events,
+        tau_vis_prong,
+        tau_vis_prong_mask,
+        tau_vis_rho,
+        tau_vis_rho_mask,
+    )
+    return x_invisible[..., 1][x_invisible_mask]
 
 
 def default_plot_specs() -> list[PlotSpec]:
@@ -494,6 +517,20 @@ def default_plot_specs() -> list[PlotSpec]:
             bins=np.linspace(0, 10, 81),
             extractor=extract_thrust_neglog1m,
         ),
+        PlotSpec(
+            name="tau_vis_prong_pt",
+            x_label="Visible tau pT from prongs [GeV]",
+            title="Visible tau pT from prongs",
+            bins=np.linspace(0, 60, 81),
+            extractor=extract_tau_vis_prong_pt,
+        ),
+        PlotSpec(
+            name="tau_vis_rho_pt",
+            x_label="Visible tau pT from prongs + nearby photons [GeV]",
+            title="Visible tau pT from prongs + nearby photons",
+            bins=np.linspace(0, 60, 81),
+            extractor=extract_tau_vis_rho_pt,
+        ),
     ]
 
 
@@ -534,6 +571,14 @@ def default_truth_plot_specs() -> list[PlotSpec]:
             title="Truth neutrino-pair pT",
             bins=np.linspace(0, 30, 81),
             extractor=extract_truth_nunu_pt,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="target_invisible_pt",
+            x_label="Target invisible pT [GeV]",
+            title="Target invisible pT",
+            bins=np.linspace(0, 30, 81),
+            extractor=extract_target_invisible_pt,
             log_scale=False,
         ),
     ]
