@@ -6,7 +6,7 @@ This directory contains the local ML-side utilities and configs used with the LE
 
 - `EveNet-Full/`: upstream EveNet codebase and docs.
 - `config/analysis.yaml`: sample list for plotting DataLoader parquet outputs.
-- `uitl/plot_control_parquets.py`: simple data-vs-MC control plotting script for parquet files produced by `processor/DataLoader.py`.
+- `util/plot_control_parquets.py`: simple data-vs-MC control plotting script for parquet files produced by `processor/DataLoader.py`.
 
 ## Parquet Plotting
 
@@ -22,10 +22,12 @@ It reads the `Samples` block from `config/analysis.yaml`, loads each parquet wit
 
 If no luminosity is available, it falls back to shape-only normalization.
 
+If `Subcategories` is present in the config, the script further splits a sample by `event_category` before plotting. This is useful for breaking `Ztautau` into stacked subchannels while keeping the same overall normalization scheme. Any uncategorized remainder is added automatically as `<sample>_others`.
+
 ### Run
 
 ```bash
-python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/uitl/plot_control_parquets.py \
+python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/util/plot_control_parquets.py \
   --config /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/config/analysis.yaml \
   --output-dir /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/plots
 ```
@@ -58,3 +60,15 @@ Samples:
 ```
 
 `input_files` may also use glob patterns.
+
+Optional `Subcategories` format:
+
+```yaml
+Subcategories:
+  Ztautau:
+    Ztautau_pipi: [11]
+    Ztautau_pirho: [12, 21]
+    Ztautau_pilep: [13, 31, 14, 41]
+```
+
+The key under `Subcategories` should match the sample key or sample `name` from `Samples`.

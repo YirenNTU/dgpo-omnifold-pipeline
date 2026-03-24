@@ -30,3 +30,12 @@ Samples:
     norm_factor: 30511.2 # pb
     input_files:
       - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Zqq/filtered___tautau.parquet"
+
+Subcategories:
+  Ztautau:
+    Ztautau_pipi: [11]
+    Ztautau_pirho: [12, 21]
+    Ztautau_pilep: [13, 31, 14, 41]
+    Ztautau_rhorho: [22]
+    Ztautau_leplep: [33, 34, 43, 44]
+    Ztautau_piother: [15, 51]

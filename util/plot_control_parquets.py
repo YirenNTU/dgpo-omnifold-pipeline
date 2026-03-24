@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import glob
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -31,6 +31,12 @@ class PlotSpec:
     bins: np.ndarray
     extractor: Callable[[ak.Array], np.ndarray]
     log_scale: bool = True
+
+
+@dataclass(frozen=True)
+class CategorySplit:
+    name: str
+    categories: tuple[int, ...]
 
 
 def read_yaml(path: Path) -> dict:
@@ -88,6 +94,103 @@ def sample_scale(sample: Sample, events: ak.Array, luminosity: float | None) -> 
     if initial_total_num_events <= 0:
         raise ValueError(f"Sample '{sample.name}' has non-positive initial_total_num_events.")
     return sample.norm_factor / initial_total_num_events * luminosity
+
+
+def _parse_category_values(raw_values) -> tuple[int, ...]:
+    if isinstance(raw_values, (list, tuple)):
+        return tuple(int(value) for value in raw_values)
+    return (int(raw_values),)
+
+
+def parse_plot_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]]]:
+    config = read_yaml(config_path)
+
+    raw_samples = config.get("Samples", {})
+    if not raw_samples:
+        raise ValueError(f"No 'Samples' section found in {config_path}.")
+
+    samples = {}
+    for sample_key, sample_cfg in raw_samples.items():
+        samples[sample_key] = Sample(
+            name=sample_cfg.get("name", sample_key),
+            is_data=bool(sample_cfg.get("is_data", False)),
+            is_signal=bool(sample_cfg.get("is_signal", False)),
+            input_files=tuple(sample_cfg.get("input_files", [])),
+            norm_factor=float(sample_cfg.get("norm_factor", 1.0)),
+            lumi=sample_cfg.get("lumi"),
+        )
+
+    raw_subcategories = config.get("Subcategories", {})
+    legacy_signal_categories = config.get("signal_categories")
+    if legacy_signal_categories is not None and "Ztautau" not in raw_subcategories:
+        raw_subcategories = dict(raw_subcategories)
+        raw_subcategories["Ztautau"] = legacy_signal_categories
+
+    subcategories: dict[str, list[CategorySplit]] = {}
+    for sample_key, split_cfg in raw_subcategories.items():
+        subcategories[sample_key] = [
+            CategorySplit(name=split_name, categories=_parse_category_values(category_values))
+            for split_name, category_values in split_cfg.items()
+        ]
+
+    return samples, subcategories
+
+
+def split_sample_by_event_category(
+    sample: Sample,
+    events: ak.Array,
+    category_splits: list[CategorySplit],
+) -> list[tuple[Sample, ak.Array]]:
+    if "event_category" not in events.fields:
+        raise ValueError(
+            f"Sample '{sample.name}' cannot be split into subcategories because 'event_category' is missing."
+        )
+
+    available_mask = ak.ones_like(events["event_category"], dtype=bool)
+    split_samples: list[tuple[Sample, ak.Array]] = []
+
+    for category_split in category_splits:
+        category_mask = ak.zeros_like(events["event_category"], dtype=bool)
+        for category in category_split.categories:
+            category_mask = category_mask | (events["event_category"] == category)
+        category_mask = available_mask & category_mask
+
+        split_events = events[category_mask]
+        if len(split_events) == 0:
+            continue
+
+        split_samples.append((replace(sample, name=category_split.name), split_events))
+        available_mask = available_mask & ~category_mask
+
+    remainder_events = events[available_mask]
+    if len(remainder_events) > 0:
+        split_samples.append((replace(sample, name=f"{sample.name}_others"), remainder_events))
+
+    return split_samples
+
+
+def expand_samples(
+    samples: dict[str, Sample],
+    loaded_events: dict[str, ak.Array],
+    subcategories: dict[str, list[CategorySplit]],
+) -> list[tuple[Sample, ak.Array]]:
+    expanded_samples: list[tuple[Sample, ak.Array]] = []
+    seen_names: set[str] = set()
+
+    for sample_key, sample in samples.items():
+        split_cfg = subcategories.get(sample_key) or subcategories.get(sample.name)
+        if split_cfg:
+            split_entries = split_sample_by_event_category(sample, loaded_events[sample_key], split_cfg)
+        else:
+            split_entries = [(sample, loaded_events[sample_key])]
+
+        for split_sample, split_events in split_entries:
+            if split_sample.name in seen_names:
+                raise ValueError(f"Duplicate sample name '{split_sample.name}' after subcategory expansion.")
+            seen_names.add(split_sample.name)
+            expanded_samples.append((split_sample, split_events))
+
+    return expanded_samples
 
 
 def make_ratio_axes():
@@ -305,33 +408,15 @@ def default_plot_specs() -> list[PlotSpec]:
     ]
 
 
-def parse_samples(config_path: Path) -> dict[str, Sample]:
-    config = read_yaml(config_path)
-    raw_samples = config.get("Samples", {})
-    if not raw_samples:
-        raise ValueError(f"No 'Samples' section found in {config_path}.")
-
-    samples = {}
-    for sample_key, sample_cfg in raw_samples.items():
-        samples[sample_key] = Sample(
-            name=sample_cfg.get("name", sample_key),
-            is_data=bool(sample_cfg.get("is_data", False)),
-            is_signal=bool(sample_cfg.get("is_signal", False)),
-            input_files=tuple(sample_cfg.get("input_files", [])),
-            norm_factor=float(sample_cfg.get("norm_factor", 1.0)),
-            lumi=sample_cfg.get("lumi"),
-        )
-    return samples
-
-
 def make_control_plots(
     config_path: Path,
     output_dir: Path,
     luminosity: float | None = None,
     normalize: bool | None = None,
 ):
-    samples = parse_samples(config_path)
+    samples, subcategories = parse_plot_config(config_path)
     loaded_events = {sample_key: load_sample_events(sample) for sample_key, sample in samples.items()}
+    expanded_samples = expand_samples(samples, loaded_events, subcategories)
 
     resolved_luminosity = infer_luminosity(samples, luminosity)
     if normalize is None:
@@ -344,15 +429,15 @@ def make_control_plots(
         hist_mc: dict[str, np.ndarray] = {}
         hist_mc_err2: dict[str, np.ndarray] = {}
 
-        for sample_key, sample in samples.items():
-            values = plot_spec.extractor(loaded_events[sample_key])
+        for sample, sample_events in expanded_samples:
+            values = plot_spec.extractor(sample_events)
             hist, _ = np.histogram(values, bins=plot_spec.bins)
 
             if sample.is_data:
                 hist_data += hist
                 continue
 
-            scale = sample_scale(sample, loaded_events[sample_key], resolved_luminosity)
+            scale = sample_scale(sample, sample_events, resolved_luminosity)
             hist_mc[sample.name] = hist.astype(float) * scale
             hist_mc_err2[sample.name] = hist.astype(float) * (scale ** 2)
 
