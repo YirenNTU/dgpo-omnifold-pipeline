@@ -11,6 +11,8 @@ import awkward as ak
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
+from rich.console import Console
+from rich.table import Table
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,9 @@ class CategorySplit:
     categories: tuple[int, ...]
 
 
+console = Console()
+
+
 def read_yaml(path: Path) -> dict:
     with path.open("r") as handle:
         return yaml.safe_load(handle) or {}
@@ -57,14 +62,27 @@ def expand_input_files(patterns: tuple[str, ...]) -> list[str]:
 
 def load_sample_events(sample: Sample) -> ak.Array:
     arrays = []
-    for parquet_path in expand_input_files(sample.input_files):
+    parquet_files = expand_input_files(sample.input_files)
+    console.print(
+        f"[bold cyan]Loading sample[/bold cyan] [white]{sample.name}[/white] "
+        f"from [white]{len(parquet_files)}[/white] parquet file(s)"
+    )
+    for parquet_path in parquet_files:
+        console.print(f"  [dim]- {parquet_path}[/dim]")
         arrays.append(ak.from_parquet(parquet_path))
 
     if not arrays:
         raise ValueError(f"No parquet inputs found for sample '{sample.name}'.")
     if len(arrays) == 1:
-        return arrays[0]
-    return ak.concatenate(arrays, axis=0)
+        events = arrays[0]
+    else:
+        events = ak.concatenate(arrays, axis=0)
+
+    console.print(
+        f"  [green]Loaded[/green] [white]{len(events)}[/white] selected event(s), "
+        f"initial_total_num_events=[white]{get_initial_total_num_events(events)}[/white]"
+    )
+    return events
 
 
 def get_initial_total_num_events(events: ak.Array) -> int:
@@ -149,6 +167,8 @@ def split_sample_by_event_category(
     available_mask = ak.ones_like(events["event_category"], dtype=bool)
     split_samples: list[tuple[Sample, ak.Array]] = []
 
+    console.print(f"[bold cyan]Splitting sample[/bold cyan] [white]{sample.name}[/white] by event_category")
+
     for category_split in category_splits:
         category_mask = ak.zeros_like(events["event_category"], dtype=bool)
         for category in category_split.categories:
@@ -157,13 +177,25 @@ def split_sample_by_event_category(
 
         split_events = events[category_mask]
         if len(split_events) == 0:
+            console.print(
+                f"  [yellow]Skipping empty split[/yellow] [white]{category_split.name}[/white] "
+                f"categories={list(category_split.categories)}"
+            )
             continue
 
+        console.print(
+            f"  [green]Created[/green] [white]{category_split.name}[/white] "
+            f"categories={list(category_split.categories)} events=[white]{len(split_events)}[/white]"
+        )
         split_samples.append((replace(sample, name=category_split.name), split_events))
         available_mask = available_mask & ~category_mask
 
     remainder_events = events[available_mask]
     if len(remainder_events) > 0:
+        console.print(
+            f"  [green]Created[/green] [white]{sample.name}_others[/white] "
+            f"events=[white]{len(remainder_events)}[/white]"
+        )
         split_samples.append((replace(sample, name=f"{sample.name}_others"), remainder_events))
 
     return split_samples
@@ -204,8 +236,13 @@ def make_ratio_axes():
     )
 
 
+def sanitize_hist_values(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    return values[np.isfinite(values)]
+
+
 def plot_from_histograms(
-    hist_data: np.ndarray,
+    hist_data: np.ndarray | None,
     hist_mc: dict[str, np.ndarray],
     hist_mc_err2: dict[str, np.ndarray],
     bin_edges: np.ndarray,
@@ -215,7 +252,12 @@ def plot_from_histograms(
     normalize: bool,
     log_scale: bool,
 ):
-    fig, (ax, ax_ratio) = make_ratio_axes()
+    has_data = hist_data is not None
+    if has_data:
+        fig, (ax, ax_ratio) = make_ratio_axes()
+    else:
+        fig, ax = plt.subplots(1, 1, dpi=220, figsize=(8, 5))
+        ax_ratio = None
 
     num_bins = len(bin_edges) - 1
     total_mc = np.zeros(num_bins, dtype=float)
@@ -259,46 +301,50 @@ def plot_from_histograms(
         label="MC unc.",
     )
 
-    data_hist = hist_data.astype(float)
-    data_total = float(np.sum(data_hist))
-    if normalize and data_total > 0:
-        data_plot = data_hist / data_total
-        data_err = np.sqrt(data_hist) / data_total
-    else:
-        data_plot = data_hist
-        data_err = np.sqrt(data_hist)
-
-    ax.errorbar(
-        bin_centers,
-        data_plot,
-        yerr=data_err,
-        fmt="o",
-        color="black",
-        label="Data",
-    )
     ax.set_ylabel("Normalized events" if normalize else "Events")
     ax.set_title(title)
-    ax.legend(loc="best")
+    ax.set_xlabel(x_label if not has_data else "")
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = np.divide(
+    if has_data:
+        data_hist = hist_data.astype(float)
+        data_total = float(np.sum(data_hist))
+        if normalize and data_total > 0:
+            data_plot = data_hist / data_total
+            data_err = np.sqrt(data_hist) / data_total
+        else:
+            data_plot = data_hist
+            data_err = np.sqrt(data_hist)
+
+        ax.errorbar(
+            bin_centers,
             data_plot,
-            total_mc,
-            out=np.full_like(data_plot, np.nan, dtype=float),
-            where=total_mc > 0,
-        )
-        ratio_err = np.divide(
-            data_err,
-            total_mc,
-            out=np.full_like(data_err, np.nan, dtype=float),
-            where=total_mc > 0,
+            yerr=data_err,
+            fmt="o",
+            color="black",
+            label="Data",
         )
 
-    ax_ratio.errorbar(bin_centers, ratio, yerr=ratio_err, fmt="o", color="black")
-    ax_ratio.axhline(1.0, color="gray", linestyle=":")
-    ax_ratio.set_ylabel("Data/MC")
-    ax_ratio.set_xlabel(x_label)
-    ax_ratio.set_ylim(0.5, 1.5)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.divide(
+                data_plot,
+                total_mc,
+                out=np.full_like(data_plot, np.nan, dtype=float),
+                where=total_mc > 0,
+            )
+            ratio_err = np.divide(
+                data_err,
+                total_mc,
+                out=np.full_like(data_err, np.nan, dtype=float),
+                where=total_mc > 0,
+            )
+
+        ax_ratio.errorbar(bin_centers, ratio, yerr=ratio_err, fmt="o", color="black")
+        ax_ratio.axhline(1.0, color="gray", linestyle=":")
+        ax_ratio.set_ylabel("Data/MC")
+        ax_ratio.set_xlabel(x_label)
+        ax_ratio.set_ylim(0.5, 1.5)
+
+    ax.legend(loc="best")
 
     if log_scale:
         ax.set_yscale("log")
@@ -343,6 +389,49 @@ def extract_n_neutral(events: ak.Array) -> np.ndarray:
 def extract_thrust_neglog1m(events: ak.Array) -> np.ndarray:
     thrust = events["thrust_Mag"]
     return ak.to_numpy(-np.log10(1 - thrust + 1e-10), allow_missing=False)
+
+
+def truth_array(events: ak.Array, field_name: str) -> np.ndarray:
+    if field_name not in events.fields:
+        return np.array([], dtype=float)
+    return ak.to_numpy(ak.fill_none(events[field_name], np.nan), allow_missing=False)
+
+
+def invariant_mass(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.ndarray) -> np.ndarray:
+    mass2 = energy ** 2 - px ** 2 - py ** 2 - pz ** 2
+    return np.sqrt(np.clip(mass2, a_min=0.0, a_max=None))
+
+
+def extract_truth_tau_pt(events: ak.Array) -> np.ndarray:
+    px = truth_array(events, "truth_tau_px")
+    py = truth_array(events, "truth_tau_py")
+    return np.sqrt(px ** 2 + py ** 2)
+
+
+def extract_truth_anti_tau_pt(events: ak.Array) -> np.ndarray:
+    px = truth_array(events, "truth_anti_tau_px")
+    py = truth_array(events, "truth_anti_tau_py")
+    return np.sqrt(px ** 2 + py ** 2)
+
+
+def extract_truth_tau_pair_pt(events: ak.Array) -> np.ndarray:
+    px = truth_array(events, "truth_tau_px") + truth_array(events, "truth_anti_tau_px")
+    py = truth_array(events, "truth_tau_py") + truth_array(events, "truth_anti_tau_py")
+    return np.sqrt(px ** 2 + py ** 2)
+
+
+def extract_truth_tau_pair_mass(events: ak.Array) -> np.ndarray:
+    px = truth_array(events, "truth_tau_px") + truth_array(events, "truth_anti_tau_px")
+    py = truth_array(events, "truth_tau_py") + truth_array(events, "truth_anti_tau_py")
+    pz = truth_array(events, "truth_tau_pz") + truth_array(events, "truth_anti_tau_pz")
+    energy = truth_array(events, "truth_tau_E") + truth_array(events, "truth_anti_tau_E")
+    return invariant_mass(px, py, pz, energy)
+
+
+def extract_truth_nunu_pt(events: ak.Array) -> np.ndarray:
+    px = truth_array(events, "truth_nu_tau_px") + truth_array(events, "truth_anti_nu_tau_px")
+    py = truth_array(events, "truth_nu_tau_py") + truth_array(events, "truth_anti_nu_tau_py")
+    return np.sqrt(px ** 2 + py ** 2)
 
 
 def default_plot_specs() -> list[PlotSpec]:
@@ -408,6 +497,48 @@ def default_plot_specs() -> list[PlotSpec]:
     ]
 
 
+def default_truth_plot_specs() -> list[PlotSpec]:
+    return [
+        PlotSpec(
+            name="truth_tau_pt",
+            x_label="Truth tau pT [GeV]",
+            title="Truth tau pT",
+            bins=np.linspace(0, 60, 81),
+            extractor=extract_truth_tau_pt,
+        ),
+        PlotSpec(
+            name="truth_anti_tau_pt",
+            x_label="Truth anti-tau pT [GeV]",
+            title="Truth anti-tau pT",
+            bins=np.linspace(0, 60, 81),
+            extractor=extract_truth_anti_tau_pt,
+        ),
+        PlotSpec(
+            name="truth_tau_pair_pt",
+            x_label="Truth tau-pair pT [GeV]",
+            title="Truth tau-pair pT",
+            bins=np.linspace(0, 30, 81),
+            extractor=extract_truth_tau_pair_pt,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="truth_tau_pair_mass",
+            x_label="Truth tau-pair mass [GeV]",
+            title="Truth tau-pair mass",
+            bins=np.linspace(0, 120, 81),
+            extractor=extract_truth_tau_pair_mass,
+        ),
+        PlotSpec(
+            name="truth_nunu_pt",
+            x_label="Truth neutrino-pair pT [GeV]",
+            title="Truth neutrino-pair pT",
+            bins=np.linspace(0, 30, 81),
+            extractor=extract_truth_nunu_pt,
+            log_scale=False,
+        ),
+    ]
+
+
 def make_control_plots(
     config_path: Path,
     output_dir: Path,
@@ -415,6 +546,7 @@ def make_control_plots(
     normalize: bool | None = None,
 ):
     samples, subcategories = parse_plot_config(config_path)
+    console.print(f"[bold]Using config[/bold] [white]{config_path}[/white]")
     loaded_events = {sample_key: load_sample_events(sample) for sample_key, sample in samples.items()}
     expanded_samples = expand_samples(samples, loaded_events, subcategories)
 
@@ -423,14 +555,39 @@ def make_control_plots(
         normalize = resolved_luminosity is None
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    console.print(f"[bold]Output directory[/bold] [white]{output_dir}[/white]")
+    console.print(
+        f"[bold]Normalization mode[/bold] "
+        f"{'shape-only' if normalize else 'absolute-yield'}"
+        + (
+            f" (luminosity={resolved_luminosity} pb^-1)"
+            if resolved_luminosity is not None
+            else ""
+        )
+    )
+
+    sample_table = Table(title="Expanded Samples")
+    sample_table.add_column("Sample")
+    sample_table.add_column("Type")
+    sample_table.add_column("Selected events", justify="right")
+    sample_table.add_column("Initial events", justify="right")
+    for sample, sample_events in expanded_samples:
+        sample_table.add_row(
+            sample.name,
+            "data" if sample.is_data else ("signal" if sample.is_signal else "background"),
+            str(len(sample_events)),
+            str(get_initial_total_num_events(sample_events)),
+        )
+    console.print(sample_table)
 
     for plot_spec in default_plot_specs():
+        console.print(f"[bold cyan]Processing plot[/bold cyan] [white]{plot_spec.name}[/white]")
         hist_data = np.zeros(len(plot_spec.bins) - 1, dtype=float)
         hist_mc: dict[str, np.ndarray] = {}
         hist_mc_err2: dict[str, np.ndarray] = {}
 
         for sample, sample_events in expanded_samples:
-            values = plot_spec.extractor(sample_events)
+            values = sanitize_hist_values(plot_spec.extractor(sample_events))
             hist, _ = np.histogram(values, bins=plot_spec.bins)
 
             if sample.is_data:
@@ -451,6 +608,46 @@ def make_control_plots(
             output_path=output_dir / f"{plot_spec.name}.png",
             normalize=normalize,
             log_scale=plot_spec.log_scale,
+        )
+        console.print(
+            f"  [green]Wrote[/green] [white]{output_dir / f'{plot_spec.name}.png'}[/white]"
+        )
+
+    for plot_spec in default_truth_plot_specs():
+        console.print(f"[bold magenta]Processing truth plot[/bold magenta] [white]{plot_spec.name}[/white]")
+        hist_mc: dict[str, np.ndarray] = {}
+        hist_mc_err2: dict[str, np.ndarray] = {}
+
+        for sample, sample_events in expanded_samples:
+            if sample.is_data:
+                continue
+
+            values = sanitize_hist_values(plot_spec.extractor(sample_events))
+            if values.size == 0:
+                continue
+
+            hist, _ = np.histogram(values, bins=plot_spec.bins)
+            scale = sample_scale(sample, sample_events, resolved_luminosity)
+            hist_mc[sample.name] = hist.astype(float) * scale
+            hist_mc_err2[sample.name] = hist.astype(float) * (scale ** 2)
+
+        if not hist_mc:
+            console.print("  [yellow]Skipped[/yellow] no valid truth branches found")
+            continue
+
+        plot_from_histograms(
+            hist_data=None,
+            hist_mc=hist_mc,
+            hist_mc_err2=hist_mc_err2,
+            bin_edges=plot_spec.bins,
+            x_label=plot_spec.x_label,
+            title=plot_spec.title,
+            output_path=output_dir / f"{plot_spec.name}.png",
+            normalize=normalize,
+            log_scale=plot_spec.log_scale,
+        )
+        console.print(
+            f"  [green]Wrote[/green] [white]{output_dir / f'{plot_spec.name}.png'}[/white]"
         )
 
 

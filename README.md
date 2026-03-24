@@ -43,6 +43,14 @@ python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/util/plot_control_
 - `n_neutral`
 - `thrust_neglog1m`
 
+If the parquet contains the truth branches written by `processor/DataLoader.py`, the script also writes MC-only truth plots:
+
+- `truth_tau_pt`
+- `truth_anti_tau_pt`
+- `truth_tau_pair_pt`
+- `truth_tau_pair_mass`
+- `truth_nunu_pt`
+
 ## Config Format
 
 `config/analysis.yaml` expects:
