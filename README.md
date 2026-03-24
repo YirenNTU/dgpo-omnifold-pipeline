@@ -46,8 +46,18 @@ python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/util/plot_control_
 - `nprong`
 - `n_neutral`
 - `thrust_neglog1m`
+- one plot for each particle momentum feature: `Part_energy`, `Part_pt`, `Part_eta`, `Part_phi`
+- one plot for each auxiliary particle feature under `Part_*`
+- `tau_vis_prong_energy`
 - `tau_vis_prong_pt`
+- `tau_vis_prong_eta`
+- `tau_vis_prong_phi`
+- `tau_vis_prong_mass`
+- `tau_vis_rho_energy`
 - `tau_vis_rho_pt`
+- `tau_vis_rho_eta`
+- `tau_vis_rho_phi`
+- `tau_vis_rho_mass`
 
 If the parquet contains the truth branches written by `processor/DataLoader.py`, the script also writes MC-only truth plots:
 
@@ -56,7 +66,11 @@ If the parquet contains the truth branches written by `processor/DataLoader.py`,
 - `truth_tau_pair_pt`
 - `truth_tau_pair_mass`
 - `truth_nunu_pt`
+- `target_invisible_energy`
 - `target_invisible_pt`
+- `target_invisible_eta`
+- `target_invisible_phi`
+- `target_invisible_mass`
 
 ## Config Format
 
@@ -108,9 +122,24 @@ It currently:
 - writes monitoring plots under `<output-dir>/monitoring/`, including:
   - `nprong` before/after the preselection for each input sample
   - one histogram per global input field
+  - one histogram per particle momentum feature: `Part_energy`, `Part_pt`, `Part_eta`, `Part_phi`
+  - one histogram per auxiliary `Part_*` feature
+  - `tau_vis_prong_energy`
   - `tau_vis_prong_pt`
+  - `tau_vis_prong_eta`
+  - `tau_vis_prong_phi`
+  - `tau_vis_prong_mass`
+  - `tau_vis_rho_energy`
   - `tau_vis_rho_pt`
+  - `tau_vis_rho_eta`
+  - `tau_vis_rho_phi`
+  - `tau_vis_rho_mass`
+  - `target_invisible_energy`
   - `target_invisible_pt`
+  - `target_invisible_eta`
+  - `target_invisible_phi`
+  - `target_invisible_mass`
+- uses the same data-vs-stacked-MC plotting style and normalization logic as `util/plot_control_parquets.py`
 - writes `evenet_input.npz`, `evenet_input_metadata.json`, and `event_info.yaml`
 
 The visible-tau and target-invisible definitions are shared with `util/plot_control_parquets.py`, so the monitor plots and the standalone plotting script use the same reconstruction assumptions.

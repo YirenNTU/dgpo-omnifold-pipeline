@@ -8,10 +8,24 @@ from pathlib import Path
 from typing import Callable
 
 import awkward as ak
-import matplotlib.pyplot as plt
 import numpy as np
 import yaml
-from evenet_parquet_common import build_tau_targets, build_visible_tau_assumptions
+from evenet_parquet_common import (
+    FOUR_VECTOR_FEATURES,
+    PART_AUX_FIELDS,
+    extract_target_invisible_observable,
+    extract_part_feature,
+    extract_part_momentum_observable,
+    extract_visible_tau_observable,
+)
+from parquet_plot_common import (
+    choose_bins,
+    get_initial_total_num_events,
+    infer_luminosity,
+    plot_from_histograms,
+    sanitize_hist_values,
+    sample_scale,
+)
 from rich.console import Console
 from rich.table import Table
 
@@ -31,7 +45,7 @@ class PlotSpec:
     name: str
     x_label: str
     title: str
-    bins: np.ndarray
+    bins: np.ndarray | None
     extractor: Callable[[ak.Array], np.ndarray]
     log_scale: bool = True
 
@@ -84,35 +98,6 @@ def load_sample_events(sample: Sample) -> ak.Array:
         f"initial_total_num_events=[white]{get_initial_total_num_events(events)}[/white]"
     )
     return events
-
-
-def get_initial_total_num_events(events: ak.Array) -> int:
-    if "initial_total_num_events" in events.fields and len(events) > 0:
-        return int(ak.to_numpy(events["initial_total_num_events"][:1])[0])
-    return int(len(events))
-
-
-def infer_luminosity(samples: dict[str, Sample], fallback: float | None) -> float | None:
-    if fallback is not None:
-        return fallback
-
-    for sample in samples.values():
-        if sample.is_data and sample.lumi is not None:
-            return float(sample.lumi)
-    return None
-
-
-def sample_scale(sample: Sample, events: ak.Array, luminosity: float | None) -> float:
-    if sample.is_data:
-        return 1.0
-
-    if luminosity is None:
-        return 1.0
-
-    initial_total_num_events = get_initial_total_num_events(events)
-    if initial_total_num_events <= 0:
-        raise ValueError(f"Sample '{sample.name}' has non-positive initial_total_num_events.")
-    return sample.norm_factor / initial_total_num_events * luminosity
 
 
 def _parse_category_values(raw_values) -> tuple[int, ...]:
@@ -226,138 +211,6 @@ def expand_samples(
     return expanded_samples
 
 
-def make_ratio_axes():
-    return plt.subplots(
-        2,
-        1,
-        dpi=220,
-        figsize=(8, 6),
-        sharex=True,
-        gridspec_kw={"height_ratios": [4, 1]},
-    )
-
-
-def sanitize_hist_values(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=float)
-    return values[np.isfinite(values)]
-
-
-def plot_from_histograms(
-    hist_data: np.ndarray | None,
-    hist_mc: dict[str, np.ndarray],
-    hist_mc_err2: dict[str, np.ndarray],
-    bin_edges: np.ndarray,
-    x_label: str,
-    title: str,
-    output_path: Path,
-    normalize: bool,
-    log_scale: bool,
-):
-    has_data = hist_data is not None
-    if has_data:
-        fig, (ax, ax_ratio) = make_ratio_axes()
-    else:
-        fig, ax = plt.subplots(1, 1, dpi=220, figsize=(8, 5))
-        ax_ratio = None
-
-    num_bins = len(bin_edges) - 1
-    total_mc = np.zeros(num_bins, dtype=float)
-    total_mc_err2 = np.zeros(num_bins, dtype=float)
-
-    sum_mc_yields = sum(float(np.sum(hist)) for hist in hist_mc.values())
-    if normalize and sum_mc_yields <= 0:
-        normalize = False
-
-    colors = plt.cm.tab10.colors
-    for index, sample_name in enumerate(hist_mc):
-        hist = hist_mc[sample_name].astype(float)
-        err2 = hist_mc_err2[sample_name].astype(float)
-        if normalize:
-            hist = hist / sum_mc_yields
-            err2 = err2 / (sum_mc_yields ** 2)
-
-        ax.bar(
-            bin_edges[:-1],
-            hist,
-            bottom=total_mc,
-            width=np.diff(bin_edges),
-            align="edge",
-            label=sample_name,
-            color=colors[index % len(colors)],
-            alpha=0.75,
-            edgecolor="black",
-        )
-        total_mc += hist
-        total_mc_err2 += err2
-
-    total_mc_err = np.sqrt(total_mc_err2)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    ax.fill_between(
-        bin_centers,
-        total_mc - total_mc_err,
-        total_mc + total_mc_err,
-        step="mid",
-        color="gray",
-        alpha=0.35,
-        label="MC unc.",
-    )
-
-    ax.set_ylabel("Normalized events" if normalize else "Events")
-    ax.set_title(title)
-    ax.set_xlabel(x_label if not has_data else "")
-
-    if has_data:
-        data_hist = hist_data.astype(float)
-        data_total = float(np.sum(data_hist))
-        if normalize and data_total > 0:
-            data_plot = data_hist / data_total
-            data_err = np.sqrt(data_hist) / data_total
-        else:
-            data_plot = data_hist
-            data_err = np.sqrt(data_hist)
-
-        ax.errorbar(
-            bin_centers,
-            data_plot,
-            yerr=data_err,
-            fmt="o",
-            color="black",
-            label="Data",
-        )
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = np.divide(
-                data_plot,
-                total_mc,
-                out=np.full_like(data_plot, np.nan, dtype=float),
-                where=total_mc > 0,
-            )
-            ratio_err = np.divide(
-                data_err,
-                total_mc,
-                out=np.full_like(data_err, np.nan, dtype=float),
-                where=total_mc > 0,
-            )
-
-        ax_ratio.errorbar(bin_centers, ratio, yerr=ratio_err, fmt="o", color="black")
-        ax_ratio.axhline(1.0, color="gray", linestyle=":")
-        ax_ratio.set_ylabel("Data/MC")
-        ax_ratio.set_xlabel(x_label)
-        ax_ratio.set_ylim(0.5, 1.5)
-
-    ax.legend(loc="best")
-
-    if log_scale:
-        ax.set_yscale("log")
-        ax.set_ylim(bottom=1e-1 if normalize else 1)
-    else:
-        ax.set_ylim(bottom=0)
-
-    fig.tight_layout()
-    fig.savefig(output_path)
-    plt.close(fig)
-
-
 def extract_isolation_angle(events: ak.Array) -> np.ndarray:
     return ak.to_numpy(events["isolation_angle"], allow_missing=False)
 
@@ -393,13 +246,43 @@ def extract_thrust_neglog1m(events: ak.Array) -> np.ndarray:
 
 
 def extract_tau_vis_prong_pt(events: ak.Array) -> np.ndarray:
-    tau_vis_prong, tau_vis_prong_mask, _, _ = build_visible_tau_assumptions(events)
-    return tau_vis_prong[..., 1][tau_vis_prong_mask]
+    return extract_visible_tau_observable(events, "prong", "pt")
+
+
+def extract_tau_vis_prong_energy(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong", "energy")
 
 
 def extract_tau_vis_rho_pt(events: ak.Array) -> np.ndarray:
-    _, _, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
-    return tau_vis_rho[..., 1][tau_vis_rho_mask]
+    return extract_visible_tau_observable(events, "rho", "pt")
+
+
+def extract_tau_vis_rho_energy(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "rho", "energy")
+
+
+def extract_tau_vis_prong_eta(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong", "eta")
+
+
+def extract_tau_vis_prong_phi(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong", "phi")
+
+
+def extract_tau_vis_prong_mass(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong", "mass")
+
+
+def extract_tau_vis_rho_eta(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "rho", "eta")
+
+
+def extract_tau_vis_rho_phi(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "rho", "phi")
+
+
+def extract_tau_vis_rho_mass(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "rho", "mass")
 
 
 def truth_array(events: ak.Array, field_name: str) -> np.ndarray:
@@ -446,19 +329,27 @@ def extract_truth_nunu_pt(events: ak.Array) -> np.ndarray:
 
 
 def extract_target_invisible_pt(events: ak.Array) -> np.ndarray:
-    tau_vis_prong, tau_vis_prong_mask, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
-    x_invisible, x_invisible_mask, _, _, _, _ = build_tau_targets(
-        events,
-        tau_vis_prong,
-        tau_vis_prong_mask,
-        tau_vis_rho,
-        tau_vis_rho_mask,
-    )
-    return x_invisible[..., 1][x_invisible_mask]
+    return extract_target_invisible_observable(events, "pt")
+
+
+def extract_target_invisible_energy(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "energy")
+
+
+def extract_target_invisible_eta(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "eta")
+
+
+def extract_target_invisible_phi(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "phi")
+
+
+def extract_target_invisible_mass(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "mass")
 
 
 def default_plot_specs() -> list[PlotSpec]:
-    return [
+    specs = [
         PlotSpec(
             name="isolation_angle",
             x_label="Isolation angle [deg]",
@@ -518,20 +409,106 @@ def default_plot_specs() -> list[PlotSpec]:
             extractor=extract_thrust_neglog1m,
         ),
         PlotSpec(
+            name="tau_vis_prong_energy",
+            x_label="Visible tau energy from prongs [GeV]",
+            title="Visible tau energy from prongs",
+            bins=None,
+            extractor=extract_tau_vis_prong_energy,
+        ),
+        PlotSpec(
             name="tau_vis_prong_pt",
             x_label="Visible tau pT from prongs [GeV]",
             title="Visible tau pT from prongs",
-            bins=np.linspace(0, 60, 81),
+            bins=None,
             extractor=extract_tau_vis_prong_pt,
+        ),
+        PlotSpec(
+            name="tau_vis_prong_eta",
+            x_label="Visible tau eta from prongs",
+            title="Visible tau eta from prongs",
+            bins=np.linspace(-5, 5, 81),
+            extractor=extract_tau_vis_prong_eta,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="tau_vis_prong_phi",
+            x_label="Visible tau phi from prongs",
+            title="Visible tau phi from prongs",
+            bins=np.linspace(-np.pi, np.pi, 81),
+            extractor=extract_tau_vis_prong_phi,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="tau_vis_prong_mass",
+            x_label="Visible tau mass from prongs [GeV]",
+            title="Visible tau mass from prongs",
+            bins=np.linspace(0, 3, 81),
+            extractor=extract_tau_vis_prong_mass,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="tau_vis_rho_energy",
+            x_label="Visible tau energy from prongs + nearby photons [GeV]",
+            title="Visible tau energy from prongs + nearby photons",
+            bins=None,
+            extractor=extract_tau_vis_rho_energy,
         ),
         PlotSpec(
             name="tau_vis_rho_pt",
             x_label="Visible tau pT from prongs + nearby photons [GeV]",
             title="Visible tau pT from prongs + nearby photons",
-            bins=np.linspace(0, 60, 81),
+            bins=None,
             extractor=extract_tau_vis_rho_pt,
         ),
+        PlotSpec(
+            name="tau_vis_rho_eta",
+            x_label="Visible tau eta from prongs + nearby photons",
+            title="Visible tau eta from prongs + nearby photons",
+            bins=np.linspace(-5, 5, 81),
+            extractor=extract_tau_vis_rho_eta,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="tau_vis_rho_phi",
+            x_label="Visible tau phi from prongs + nearby photons",
+            title="Visible tau phi from prongs + nearby photons",
+            bins=np.linspace(-np.pi, np.pi, 81),
+            extractor=extract_tau_vis_rho_phi,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="tau_vis_rho_mass",
+            x_label="Visible tau mass from prongs + nearby photons [GeV]",
+            title="Visible tau mass from prongs + nearby photons",
+            bins=np.linspace(0, 3, 81),
+            extractor=extract_tau_vis_rho_mass,
+            log_scale=False,
+        ),
     ]
+
+    for observable in FOUR_VECTOR_FEATURES:
+        specs.append(
+            PlotSpec(
+                name=f"Part_{observable}",
+                x_label=f"Part_{observable}",
+                title=f"Part_{observable}",
+                bins=None,
+                extractor=lambda events, observable=observable: extract_part_momentum_observable(events, observable),
+                log_scale=observable not in {"eta", "phi"},
+            )
+        )
+    for field_name in PART_AUX_FIELDS:
+        specs.append(
+            PlotSpec(
+                name=field_name,
+                x_label=field_name,
+                title=field_name,
+                bins=None,
+                extractor=lambda events, field_name=field_name: extract_part_feature(events, field_name),
+                log_scale=False,
+            )
+        )
+    return specs
 
 
 def default_truth_plot_specs() -> list[PlotSpec]:
@@ -574,11 +551,43 @@ def default_truth_plot_specs() -> list[PlotSpec]:
             log_scale=False,
         ),
         PlotSpec(
+            name="target_invisible_energy",
+            x_label="Target invisible energy [GeV]",
+            title="Target invisible energy",
+            bins=None,
+            extractor=extract_target_invisible_energy,
+            log_scale=False,
+        ),
+        PlotSpec(
             name="target_invisible_pt",
             x_label="Target invisible pT [GeV]",
             title="Target invisible pT",
-            bins=np.linspace(0, 30, 81),
+            bins=None,
             extractor=extract_target_invisible_pt,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="target_invisible_eta",
+            x_label="Target invisible eta",
+            title="Target invisible eta",
+            bins=np.linspace(-5, 5, 81),
+            extractor=extract_target_invisible_eta,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="target_invisible_phi",
+            x_label="Target invisible phi",
+            title="Target invisible phi",
+            bins=np.linspace(-np.pi, np.pi, 81),
+            extractor=extract_target_invisible_phi,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="target_invisible_mass",
+            x_label="Target invisible mass [GeV]",
+            title="Target invisible mass",
+            bins=np.linspace(0, 3, 81),
+            extractor=extract_target_invisible_mass,
             log_scale=False,
         ),
     ]
@@ -627,13 +636,20 @@ def make_control_plots(
 
     for plot_spec in default_plot_specs():
         console.print(f"[bold cyan]Processing plot[/bold cyan] [white]{plot_spec.name}[/white]")
-        hist_data = np.zeros(len(plot_spec.bins) - 1, dtype=float)
+        bins = plot_spec.bins
+        if bins is None:
+            values_by_sample = {
+                sample.name: sanitize_hist_values(plot_spec.extractor(sample_events))
+                for sample, sample_events in expanded_samples
+            }
+            bins = choose_bins(values_by_sample)
+        hist_data = np.zeros(len(bins) - 1, dtype=float)
         hist_mc: dict[str, np.ndarray] = {}
         hist_mc_err2: dict[str, np.ndarray] = {}
 
         for sample, sample_events in expanded_samples:
             values = sanitize_hist_values(plot_spec.extractor(sample_events))
-            hist, _ = np.histogram(values, bins=plot_spec.bins)
+            hist, _ = np.histogram(values, bins=bins)
 
             if sample.is_data:
                 hist_data += hist
@@ -647,7 +663,7 @@ def make_control_plots(
             hist_data=hist_data,
             hist_mc=hist_mc,
             hist_mc_err2=hist_mc_err2,
-            bin_edges=plot_spec.bins,
+            bin_edges=bins,
             x_label=plot_spec.x_label,
             title=plot_spec.title,
             output_path=output_dir / f"{plot_spec.name}.png",
@@ -662,7 +678,9 @@ def make_control_plots(
         console.print(f"[bold magenta]Processing truth plot[/bold magenta] [white]{plot_spec.name}[/white]")
         hist_mc: dict[str, np.ndarray] = {}
         hist_mc_err2: dict[str, np.ndarray] = {}
+        bins = plot_spec.bins
 
+        values_by_sample: dict[str, np.ndarray] = {}
         for sample, sample_events in expanded_samples:
             if sample.is_data:
                 continue
@@ -670,21 +688,32 @@ def make_control_plots(
             values = sanitize_hist_values(plot_spec.extractor(sample_events))
             if values.size == 0:
                 continue
+            values_by_sample[sample.name] = values
 
-            hist, _ = np.histogram(values, bins=plot_spec.bins)
+        if not values_by_sample:
+            console.print("  [yellow]Skipped[/yellow] no valid truth branches found")
+            continue
+        if bins is None:
+            bins = choose_bins(values_by_sample)
+
+        for sample, sample_events in expanded_samples:
+            if sample.is_data:
+                continue
+
+            values = values_by_sample.get(sample.name)
+            if values is None or values.size == 0:
+                continue
+
+            hist, _ = np.histogram(values, bins=bins)
             scale = sample_scale(sample, sample_events, resolved_luminosity)
             hist_mc[sample.name] = hist.astype(float) * scale
             hist_mc_err2[sample.name] = hist.astype(float) * (scale ** 2)
-
-        if not hist_mc:
-            console.print("  [yellow]Skipped[/yellow] no valid truth branches found")
-            continue
 
         plot_from_histograms(
             hist_data=None,
             hist_mc=hist_mc,
             hist_mc_err2=hist_mc_err2,
-            bin_edges=plot_spec.bins,
+            bin_edges=bins,
             x_label=plot_spec.x_label,
             title=plot_spec.title,
             output_path=output_dir / f"{plot_spec.name}.png",

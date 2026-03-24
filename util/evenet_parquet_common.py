@@ -7,6 +7,48 @@ import vector
 
 PHOTON_DR_MAX = 0.3
 FOUR_VECTOR_FEATURES = ["energy", "pt", "eta", "phi"]
+PART_AUX_FIELDS = [
+    "Part_charge",
+    "Part_pdgId",
+    "Part_vtxIdx",
+    "Part_hpcShowerEnergy",
+    "Part_hpcShowerTheta",
+    "Part_hpcShowerPhi",
+    "Part_hpcParticleCode",
+    "Part_hpcNumLayers",
+    "Part_hpcLayerHitPattern",
+    "Part_hpcNumAssociatedShowers",
+    "Part_hpcTotalShowerEnergy",
+    "Part_hacShowerEnergy",
+    "Part_hacShowerTheta",
+    "Part_hacShowerPhi",
+    "Part_hacParticleCode",
+    "Part_hacNumTowers",
+    "Part_hacTowerHitPattern",
+    "Part_hacNumAssociatedShowers",
+    "Part_hacTotalShowerEnergy",
+    "Part_sticShowerEnergy",
+    "Part_sticShowerTheta",
+    "Part_sticShowerPhi",
+    "Part_sticNumTowers",
+    "Part_sticChargedTag",
+    "Part_sticSiliconVertexPos",
+    "Part_hemisphere",
+]
+GLOBAL_FIELDS = [
+    "Event_totalChargedEnergy",
+    "Event_totalEMEnergy",
+    "Event_totalHadronicEnergy",
+    "thrust_Mag",
+    "charged_E",
+    "missing_px",
+    "missing_py",
+    "missing_pt",
+    "isolation_angle",
+    "thrust_x",
+    "thrust_y",
+    "thrust_z",
+]
 vector.register_awkward()
 
 
@@ -19,6 +61,15 @@ def build_momentum4d(px, py, pz, energy):
             "E": energy,
         },
         with_name="Momentum4D",
+    )
+
+
+def build_part_momentum4d(events: ak.Array):
+    return build_momentum4d(
+        events["Part_fourMomentum_fCoordinates_fX"],
+        events["Part_fourMomentum_fCoordinates_fY"],
+        events["Part_fourMomentum_fCoordinates_fZ"],
+        events["Part_fourMomentum_fCoordinates_fT"],
     )
 
 
@@ -50,12 +101,7 @@ def p4_to_features(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.nd
 
 
 def sum_masked_p4(events: ak.Array, mask: ak.Array):
-    part_p4 = build_momentum4d(
-        events["Part_fourMomentum_fCoordinates_fX"],
-        events["Part_fourMomentum_fCoordinates_fY"],
-        events["Part_fourMomentum_fCoordinates_fZ"],
-        events["Part_fourMomentum_fCoordinates_fT"],
-    )
+    part_p4 = build_part_momentum4d(events)
     return ak.sum(part_p4[mask], axis=1)
 
 
@@ -79,14 +125,7 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
     charge = events["Part_charge"]
     hemisphere = events["Part_hemisphere"]
     pdg_id = abs(events["Part_pdgId"])
-    part_p4 = build_momentum4d(
-        events["Part_fourMomentum_fCoordinates_fX"],
-        events["Part_fourMomentum_fCoordinates_fY"],
-        events["Part_fourMomentum_fCoordinates_fZ"],
-        events["Part_fourMomentum_fCoordinates_fT"],
-    )
-    eta = ak.where(np.isfinite(part_p4.eta), part_p4.eta, 0)
-    phi = part_p4.phi
+    part_p4 = build_part_momentum4d(events)
 
     hemisphere_masks = {
         "a": hemisphere == 1,
@@ -237,3 +276,89 @@ def build_tau_targets(
     num_invisible_raw[:] = 2
     num_invisible_valid[:] = x_invisible_mask.sum(axis=1).astype(np.int64)
     return x_invisible, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target, tau_vis_target_mask
+
+
+def extract_target_invisible_observable(events: ak.Array, observable: str) -> np.ndarray:
+    tau_vis_prong, tau_vis_prong_mask, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
+    x_invisible, x_invisible_mask, _, _, _, _ = build_tau_targets(
+        events,
+        tau_vis_prong,
+        tau_vis_prong_mask,
+        tau_vis_rho,
+        tau_vis_rho_mask,
+    )
+
+    if observable == "energy":
+        return x_invisible[..., 0][x_invisible_mask]
+    if observable == "pt":
+        return x_invisible[..., 1][x_invisible_mask]
+    if observable == "eta":
+        return x_invisible[..., 2][x_invisible_mask]
+    if observable == "phi":
+        return x_invisible[..., 3][x_invisible_mask]
+    if observable == "mass":
+        invisible_p4 = vector.zip(
+            {
+                "pt": np.asarray(x_invisible[..., 1], dtype=np.float32),
+                "eta": np.asarray(x_invisible[..., 2], dtype=np.float32),
+                "phi": np.asarray(x_invisible[..., 3], dtype=np.float32),
+                "E": np.asarray(x_invisible[..., 0], dtype=np.float32),
+            }
+        )
+        return np.asarray(invisible_p4.mass, dtype=np.float32)[x_invisible_mask]
+    raise ValueError(f"Unsupported target invisible observable '{observable}'.")
+
+
+def extract_visible_tau_observable(events: ak.Array, mode: str, observable: str) -> np.ndarray:
+    tau_vis_prong, tau_vis_prong_mask, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
+
+    if mode == "prong":
+        values = tau_vis_prong
+        mask = tau_vis_prong_mask
+    elif mode == "rho":
+        values = tau_vis_rho
+        mask = tau_vis_rho_mask
+    else:
+        raise ValueError(f"Unsupported visible tau mode '{mode}'.")
+
+    if observable == "energy":
+        return values[..., 0][mask]
+    if observable == "pt":
+        return values[..., 1][mask]
+    if observable == "eta":
+        return values[..., 2][mask]
+    if observable == "phi":
+        return values[..., 3][mask]
+    if observable == "mass":
+        visible_p4 = vector.zip(
+            {
+                "pt": np.asarray(values[..., 1], dtype=np.float32),
+                "eta": np.asarray(values[..., 2], dtype=np.float32),
+                "phi": np.asarray(values[..., 3], dtype=np.float32),
+                "E": np.asarray(values[..., 0], dtype=np.float32),
+            }
+        )
+        return np.asarray(visible_p4.mass, dtype=np.float32)[mask]
+    raise ValueError(f"Unsupported visible tau observable '{observable}'.")
+
+
+def extract_part_feature(events: ak.Array, field_name: str) -> np.ndarray:
+    if field_name not in events.fields:
+        return np.array([], dtype=np.float32)
+    values = ak.fill_none(events[field_name], np.nan)
+    return ak.to_numpy(ak.flatten(values, axis=None), allow_missing=False).astype(np.float32)
+
+
+def extract_part_momentum_observable(events: ak.Array, observable: str) -> np.ndarray:
+    part_p4 = build_part_momentum4d(events)
+    if observable == "energy":
+        values = part_p4.E
+    elif observable == "pt":
+        values = part_p4.pt
+    elif observable == "eta":
+        values = ak.where(np.isfinite(part_p4.eta), part_p4.eta, np.nan)
+    elif observable == "phi":
+        values = part_p4.phi
+    else:
+        raise ValueError(f"Unsupported part momentum observable '{observable}'.")
+    return ak.to_numpy(ak.flatten(values, axis=None), allow_missing=False).astype(np.float32)

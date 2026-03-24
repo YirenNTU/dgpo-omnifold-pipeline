@@ -8,14 +8,26 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import awkward as ak
-import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 from evenet_parquet_common import (
     FOUR_VECTOR_FEATURES,
+    GLOBAL_FIELDS,
+    PART_AUX_FIELDS,
     build_tau_targets,
     build_visible_tau_assumptions,
     build_momentum4d,
+    extract_target_invisible_observable,
+    extract_part_feature,
+    extract_part_momentum_observable,
+    extract_visible_tau_observable,
+)
+from parquet_plot_common import (
+    choose_bins,
+    infer_luminosity,
+    plot_from_histograms,
+    sanitize_hist_values,
+    sample_scale,
 )
 from rich.console import Console
 from rich.table import Table
@@ -23,57 +35,14 @@ from rich.table import Table
 
 console = Console()
 
-
-PART_FIELDS = [
-    "Part_charge",
-    "Part_pdgId",
-    "Part_vtxIdx",
-    "Part_hpcShowerEnergy",
-    "Part_hpcShowerTheta",
-    "Part_hpcShowerPhi",
-    "Part_hpcParticleCode",
-    "Part_hpcNumLayers",
-    "Part_hpcLayerHitPattern",
-    "Part_hpcNumAssociatedShowers",
-    "Part_hpcTotalShowerEnergy",
-    "Part_hacShowerEnergy",
-    "Part_hacShowerTheta",
-    "Part_hacShowerPhi",
-    "Part_hacParticleCode",
-    "Part_hacNumTowers",
-    "Part_hacTowerHitPattern",
-    "Part_hacNumAssociatedShowers",
-    "Part_hacTotalShowerEnergy",
-    "Part_sticShowerEnergy",
-    "Part_sticShowerTheta",
-    "Part_sticShowerPhi",
-    "Part_sticNumTowers",
-    "Part_sticChargedTag",
-    "Part_sticSiliconVertexPos",
-    "Part_hemisphere",
-]
-
-GLOBAL_FIELDS = [
-    "Event_totalChargedEnergy",
-    "Event_totalEMEnergy",
-    "Event_totalHadronicEnergy",
-    "thrust_Mag",
-    "charged_E",
-    "missing_px",
-    "missing_py",
-    "missing_pt",
-    "isolation_angle",
-    "thrust_x",
-    "thrust_y",
-    "thrust_z",
-]
-
 @dataclass(frozen=True)
 class Sample:
     key: str
     name: str
     is_data: bool
     input_files: tuple[str, ...]
+    norm_factor: float = 1.0
+    lumi: float | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +112,8 @@ def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[C
             name=sample_cfg.get("name", sample_key),
             is_data=bool(sample_cfg.get("is_data", False)),
             input_files=tuple(sample_cfg.get("input_files", [])),
+            norm_factor=float(sample_cfg.get("norm_factor", 1.0)),
+            lumi=sample_cfg.get("lumi"),
         )
         for sample_key, sample_cfg in raw_samples.items()
     }
@@ -257,7 +228,7 @@ def build_point_cloud(events: ak.Array, max_particles: int) -> tuple[np.ndarray,
         features.append(expanded)
         feature_names.extend(component_names(feature_name, expanded.ndim, expanded.shape[2:]))
 
-    for field_name in PART_FIELDS:
+    for field_name in PART_AUX_FIELDS:
         expanded = pad_and_flatten_part_feature(events[field_name], max_particles)
         features.append(expanded)
         feature_names.extend(component_names(field_name, expanded.ndim, expanded.shape[2:]))
@@ -388,130 +359,184 @@ def build_event_info_yaml(metadata: dict) -> dict:
     }
 
 
-def sanitize_plot_values(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=float)
-    return values[np.isfinite(values)]
+def write_monitor_plot(
+    expanded_samples: list[tuple[Sample, ak.Array]],
+    extractor,
+    bins: np.ndarray,
+    title: str,
+    xlabel: str,
+    output_path: Path,
+    luminosity: float | None,
+    normalize: bool,
+    log_scale: bool,
+    mc_only: bool = False,
+) -> None:
+    hist_data = None if mc_only else np.zeros(len(bins) - 1, dtype=float)
+    hist_mc: dict[str, np.ndarray] = {}
+    hist_mc_err2: dict[str, np.ndarray] = {}
 
+    for sample, events in expanded_samples:
+        values = sanitize_hist_values(extractor(events))
+        hist, _ = np.histogram(values, bins=bins)
 
-def choose_bins(values_by_sample: dict[str, np.ndarray], num_bins: int = 60) -> np.ndarray:
-    non_empty = [values for values in values_by_sample.values() if values.size > 0]
-    if not non_empty:
-        return np.linspace(0, 1, 2)
-    merged = np.concatenate(non_empty)
-
-    low, high = np.percentile(merged, [1, 99])
-    if not np.isfinite(low) or not np.isfinite(high) or low == high:
-        low = float(np.min(merged))
-        high = float(np.max(merged))
-        if low == high:
-            low -= 0.5
-            high += 0.5
-    return np.linspace(low, high, num_bins + 1)
-
-
-def plot_step_histograms(values_by_sample: dict[str, np.ndarray], bins: np.ndarray, title: str, xlabel: str, output_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(8, 5), dpi=220)
-    for sample_name, values in values_by_sample.items():
-        if values.size == 0:
+        if sample.is_data and not mc_only:
+            hist_data += hist
             continue
-        ax.hist(values, bins=bins, histtype="step", linewidth=1.8, label=sample_name)
+        if sample.is_data:
+            continue
 
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Entries")
-    ax.legend(loc="best")
-    fig.tight_layout()
-    fig.savefig(output_path)
-    plt.close(fig)
-    console.print(f"  [green]Wrote monitor[/green] [white]{output_path}[/white]")
+        scale = sample_scale(sample, events, luminosity)
+        hist_mc[sample.name] = hist.astype(float) * scale
+        hist_mc_err2[sample.name] = hist.astype(float) * (scale ** 2)
 
-
-def write_preselection_plot(sample_name: str, raw_events: ak.Array, selected_events: ak.Array, output_dir: Path) -> None:
-    if "nprong" not in raw_events.fields:
+    if not hist_mc and mc_only:
         return
 
-    raw_values = sanitize_plot_values(ak.to_numpy(raw_events["nprong"], allow_missing=False))
-    selected_values = sanitize_plot_values(ak.to_numpy(selected_events["nprong"], allow_missing=False))
-    bins = np.arange(-0.5, max(np.max(raw_values, initial=0), np.max(selected_values, initial=0)) + 1.5, 1.0)
-    if bins.size < 2:
-        bins = np.arange(-0.5, 3.5, 1.0)
-
-    fig, ax = plt.subplots(figsize=(7, 5), dpi=220)
-    ax.hist(raw_values, bins=bins, histtype="step", linewidth=2, label="before preselection")
-    ax.hist(selected_values, bins=bins, histtype="step", linewidth=2, label="after nprong == 2")
-    ax.set_title(f"{sample_name}: nprong preselection")
-    ax.set_xlabel("nprong")
-    ax.set_ylabel("Entries")
-    ax.legend(loc="best")
-    fig.tight_layout()
-    output_path = output_dir / f"{sample_name}_nprong_preselection.png"
-    fig.savefig(output_path)
-    plt.close(fig)
+    plot_from_histograms(
+        hist_data=hist_data,
+        hist_mc=hist_mc,
+        hist_mc_err2=hist_mc_err2,
+        bin_edges=bins,
+        x_label=xlabel,
+        title=title,
+        output_path=output_path,
+        normalize=normalize,
+        log_scale=log_scale,
+    )
     console.print(f"  [green]Wrote monitor[/green] [white]{output_path}[/white]")
 
 
 def write_monitoring_plots(
-    raw_sample_events: dict[str, ak.Array],
-    selected_sample_events: dict[str, ak.Array],
+    raw_expanded_samples: list[tuple[Sample, ak.Array]],
     expanded_samples: list[tuple[Sample, ak.Array]],
     output_dir: Path,
+    luminosity: float | None,
+    normalize: bool,
 ) -> None:
     monitor_dir = output_dir / "monitoring"
     monitor_dir.mkdir(parents=True, exist_ok=True)
 
     console.print(f"[bold]Monitoring plots[/bold] [white]{monitor_dir}[/white]")
 
-    for sample_key, raw_events in raw_sample_events.items():
-        write_preselection_plot(sample_key, raw_events, selected_sample_events[sample_key], monitor_dir)
+    write_monitor_plot(
+        expanded_samples=raw_expanded_samples,
+        extractor=lambda events: ak.to_numpy(events["nprong"], allow_missing=False),
+        bins=np.arange(-0.5, 8.5, 1.0),
+        title="nprong before preselection",
+        xlabel="nprong",
+        output_path=monitor_dir / "nprong_before_preselection.png",
+        luminosity=luminosity,
+        normalize=normalize,
+        log_scale=False,
+    )
+    write_monitor_plot(
+        expanded_samples=expanded_samples,
+        extractor=lambda events: ak.to_numpy(events["nprong"], allow_missing=False),
+        bins=np.arange(-0.5, 8.5, 1.0),
+        title="nprong after preselection",
+        xlabel="nprong",
+        output_path=monitor_dir / "nprong_after_preselection.png",
+        luminosity=luminosity,
+        normalize=normalize,
+        log_scale=False,
+    )
 
     for field_name in GLOBAL_FIELDS:
         values_by_sample = {
-            sample.name: sanitize_plot_values(ak.to_numpy(events[field_name], allow_missing=False))
+            sample.name: sanitize_hist_values(ak.to_numpy(events[field_name], allow_missing=False))
             for sample, events in expanded_samples
             if field_name in events.fields
         }
         if not values_by_sample:
             continue
         bins = choose_bins(values_by_sample)
-        plot_step_histograms(
-            values_by_sample=values_by_sample,
+        write_monitor_plot(
+            expanded_samples=[(sample, events) for sample, events in expanded_samples if field_name in events.fields],
+            extractor=lambda events, field_name=field_name: ak.to_numpy(events[field_name], allow_missing=False),
             bins=bins,
             title=field_name,
             xlabel=field_name,
             output_path=monitor_dir / f"{field_name}.png",
+            luminosity=luminosity,
+            normalize=normalize,
+            log_scale=True,
         )
 
-    tau_vis_prong_pt = {}
-    tau_vis_rho_pt = {}
-    invisible_pt = {}
-    for sample, events in expanded_samples:
-        tau_vis_prong, tau_vis_prong_mask, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
-        x_invisible, x_invisible_mask, _, _, _, _ = build_tau_targets(
-            events,
-            tau_vis_prong,
-            tau_vis_prong_mask,
-            tau_vis_rho,
-            tau_vis_rho_mask,
-        )
-
-        tau_vis_prong_pt[sample.name] = sanitize_plot_values(tau_vis_prong[..., 1][tau_vis_prong_mask])
-        tau_vis_rho_pt[sample.name] = sanitize_plot_values(tau_vis_rho[..., 1][tau_vis_rho_mask])
-        invisible_pt[sample.name] = sanitize_plot_values(x_invisible[..., 1][x_invisible_mask])
-
-    for plot_name, values_by_sample in [
-        ("tau_vis_prong_pt", tau_vis_prong_pt),
-        ("tau_vis_rho_pt", tau_vis_rho_pt),
-        ("target_invisible_pt", invisible_pt),
+    for plot_name, extractor, mc_only, log_scale in [
+        ("tau_vis_prong_energy", lambda events: extract_visible_tau_observable(events, "prong", "energy"), False, True),
+        ("tau_vis_prong_pt", lambda events: extract_visible_tau_observable(events, "prong", "pt"), False, True),
+        ("tau_vis_prong_eta", lambda events: extract_visible_tau_observable(events, "prong", "eta"), False, False),
+        ("tau_vis_prong_phi", lambda events: extract_visible_tau_observable(events, "prong", "phi"), False, False),
+        ("tau_vis_prong_mass", lambda events: extract_visible_tau_observable(events, "prong", "mass"), False, False),
+        ("tau_vis_rho_energy", lambda events: extract_visible_tau_observable(events, "rho", "energy"), False, True),
+        ("tau_vis_rho_pt", lambda events: extract_visible_tau_observable(events, "rho", "pt"), False, True),
+        ("tau_vis_rho_eta", lambda events: extract_visible_tau_observable(events, "rho", "eta"), False, False),
+        ("tau_vis_rho_phi", lambda events: extract_visible_tau_observable(events, "rho", "phi"), False, False),
+        ("tau_vis_rho_mass", lambda events: extract_visible_tau_observable(events, "rho", "mass"), False, False),
+        ("target_invisible_energy", lambda events: extract_target_invisible_observable(events, "energy"), True, False),
+        ("target_invisible_pt", lambda events: extract_target_invisible_observable(events, "pt"), True, False),
+        ("target_invisible_eta", lambda events: extract_target_invisible_observable(events, "eta"), True, False),
+        ("target_invisible_phi", lambda events: extract_target_invisible_observable(events, "phi"), True, False),
+        ("target_invisible_mass", lambda events: extract_target_invisible_observable(events, "mass"), True, False),
     ]:
+        values_by_sample = {
+            sample.name: sanitize_hist_values(extractor(events))
+            for sample, events in expanded_samples
+            if not (mc_only and sample.is_data)
+        }
         if not any(values.size > 0 for values in values_by_sample.values()):
             continue
         bins = choose_bins(values_by_sample)
-        plot_step_histograms(
-            values_by_sample=values_by_sample,
+        write_monitor_plot(
+            expanded_samples=expanded_samples,
+            extractor=extractor,
             bins=bins,
             title=plot_name,
             xlabel=plot_name,
             output_path=monitor_dir / f"{plot_name}.png",
+            luminosity=luminosity,
+            normalize=normalize,
+            log_scale=log_scale,
+            mc_only=mc_only,
+        )
+
+    for observable in FOUR_VECTOR_FEATURES:
+        values_by_sample = {
+            sample.name: sanitize_hist_values(extract_part_momentum_observable(events, observable))
+            for sample, events in expanded_samples
+        }
+        if not any(values.size > 0 for values in values_by_sample.values()):
+            continue
+        write_monitor_plot(
+            expanded_samples=expanded_samples,
+            extractor=lambda events, observable=observable: extract_part_momentum_observable(events, observable),
+            bins=choose_bins(values_by_sample),
+            title=f"Part_{observable}",
+            xlabel=f"Part_{observable}",
+            output_path=monitor_dir / f"Part_{observable}.png",
+            luminosity=luminosity,
+            normalize=normalize,
+            log_scale=observable not in {"eta", "phi"},
+        )
+
+    for field_name in PART_AUX_FIELDS:
+        values_by_sample = {
+            sample.name: sanitize_hist_values(extract_part_feature(events, field_name))
+            for sample, events in expanded_samples
+            if field_name in events.fields
+        }
+        if not any(values.size > 0 for values in values_by_sample.values()):
+            continue
+        write_monitor_plot(
+            expanded_samples=[(sample, events) for sample, events in expanded_samples if field_name in events.fields],
+            extractor=lambda events, field_name=field_name: extract_part_feature(events, field_name),
+            bins=choose_bins(values_by_sample),
+            title=field_name,
+            xlabel=field_name,
+            output_path=monitor_dir / f"{field_name}.png",
+            luminosity=luminosity,
+            normalize=normalize,
+            log_scale=False,
         )
 
 
@@ -571,9 +596,28 @@ def main() -> None:
         sample_key: apply_preselection(raw_sample_events[sample_key])
         for sample_key in samples
     }
+    raw_expanded_samples = expand_samples(samples, raw_sample_events, subcategories)
     expanded_samples = expand_samples(samples, sample_events, subcategories)
 
-    write_monitoring_plots(raw_sample_events, sample_events, expanded_samples, args.output_dir)
+    resolved_luminosity = infer_luminosity(samples, None)
+    normalize = resolved_luminosity is None
+    console.print(
+        f"[bold]Monitoring normalization[/bold] "
+        f"{'shape-only' if normalize else 'absolute-yield'}"
+        + (
+            f" (luminosity={resolved_luminosity} pb^-1)"
+            if resolved_luminosity is not None
+            else ""
+        )
+    )
+
+    write_monitoring_plots(
+        raw_expanded_samples=raw_expanded_samples,
+        expanded_samples=expanded_samples,
+        output_dir=args.output_dir,
+        luminosity=resolved_luminosity,
+        normalize=normalize,
+    )
 
     max_particles = infer_max_particles(expanded_samples, args.max_particles)
     console.print(f"[bold]Point-cloud padding[/bold] max_particles=[white]{max_particles}[/white]")
