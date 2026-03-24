@@ -100,6 +100,8 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
     for hemisphere_name, hemisphere_mask in hemisphere_masks.items():
         prong_mask = hemisphere_mask & (charge != 0)
         photon_mask = hemisphere_mask & (charge == 0) & (pdg_id == 21)
+        prong_p4_constituents = part_p4[prong_mask]
+        photon_p4_constituents = part_p4[photon_mask]
 
         prong_p4 = sum_masked_p4(events, prong_mask)
         prong_features[hemisphere_name] = p4_to_features(
@@ -110,30 +112,18 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
         )
         prong_charge_sums[hemisphere_name] = ak.to_numpy(ak.sum(charge[prong_mask], axis=1), allow_missing=False).astype(np.float32)
 
-        prong_eta = eta[prong_mask]
-        prong_phi = phi[prong_mask]
-        photon_eta = eta[photon_mask]
-        photon_phi = phi[photon_mask]
-
         pairs = ak.cartesian(
             {
-                "photon_eta": photon_eta,
-                "photon_phi": photon_phi,
-                "prong_eta": prong_eta,
-                "prong_phi": prong_phi,
+                "photon": photon_p4_constituents,
+                "prong": prong_p4_constituents,
             },
             axis=1,
             nested=True,
         )
-        delta_eta = pairs["photon_eta"] - pairs["prong_eta"]
-        delta_phi = np.arctan2(
-            np.sin(pairs["photon_phi"] - pairs["prong_phi"]),
-            np.cos(pairs["photon_phi"] - pairs["prong_phi"]),
-        )
-        delta_r = np.sqrt(delta_eta * delta_eta + delta_phi * delta_phi)
+        delta_r = pairs["photon"].deltaR(pairs["prong"])
         photon_near_prong = ak.fill_none(ak.any(delta_r < PHOTON_DR_MAX, axis=-1), False)
 
-        photon_p4 = ak.sum(part_p4[photon_mask][photon_near_prong], axis=1)
+        photon_p4 = ak.sum(photon_p4_constituents[photon_near_prong], axis=1)
         rho_p4 = prong_p4 + photon_p4
         rho_features[hemisphere_name] = p4_to_features(
             ak.to_numpy(rho_p4.px, allow_missing=False).astype(np.float32),
