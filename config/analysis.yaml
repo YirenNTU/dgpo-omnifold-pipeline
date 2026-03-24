@@ -1,0 +1,32 @@
+Samples:
+  data94:
+    name: "data94"
+    is_data: true
+    is_signal: false
+    lumi: 46.3 # pb^-1
+    input_files:
+      - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/data94/filtered___tautau.parquet"
+
+  Ztautau:
+    name: "Ztautau"
+    is_data: false
+    is_signal: false
+    norm_factor: 1458.9 # pb
+    input_files:
+      - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Ztautau/filtered___tautau.parquet"
+
+  Zll:
+    name: "Zll"
+    is_data: false
+    is_signal: false
+    norm_factor:  2844.4 # pb
+    input_files:
+      - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Zll/filtered___tautau.parquet"
+
+  Zqq:
+    name: "Zqq"
+    is_data: false
+    is_signal: false
+    norm_factor: 30511.2 # pb
+    input_files:
+      - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Zqq/filtered___tautau.parquet"
