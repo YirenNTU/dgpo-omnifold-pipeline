@@ -10,6 +10,8 @@ This directory contains the local ML-side utilities and configs used with the LE
 - `util/build_evenet_input_from_parquet.py`: convert DataLoader parquet outputs into a simple EveNet-style `.npz` bundle plus metadata and an `event_info.yaml` skeleton.
 - `util/evenet_parquet_common.py`: shared visible-tau and invisible-target helpers used by both scripts.
 
+The ML utilities use awkward/vector `Momentum4D` objects for the reconstructed particle four-vectors and visible-tau sums, so the plotting and conversion paths share the same four-momentum handling.
+
 ## Parquet Plotting
 
 The plotting script is intended for the filtered awkward parquet files written by the core analysis, for example:

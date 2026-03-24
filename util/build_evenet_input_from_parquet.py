@@ -15,7 +15,7 @@ from evenet_parquet_common import (
     FOUR_VECTOR_FEATURES,
     build_tau_targets,
     build_visible_tau_assumptions,
-    compute_pt_eta_phi,
+    build_momentum4d,
 )
 from rich.console import Console
 from rich.table import Table
@@ -235,20 +235,22 @@ def flatten_global_feature(values: ak.Array) -> np.ndarray:
 
 
 def build_point_cloud(events: ak.Array, max_particles: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    px = events["Part_fourMomentum_fCoordinates_fX"]
-    py = events["Part_fourMomentum_fCoordinates_fY"]
-    pz = events["Part_fourMomentum_fCoordinates_fZ"]
-    energy = events["Part_fourMomentum_fCoordinates_fT"]
-    pt, eta, phi = compute_pt_eta_phi(px, py, pz)
+    part_p4 = build_momentum4d(
+        events["Part_fourMomentum_fCoordinates_fX"],
+        events["Part_fourMomentum_fCoordinates_fY"],
+        events["Part_fourMomentum_fCoordinates_fZ"],
+        events["Part_fourMomentum_fCoordinates_fT"],
+    )
+    eta = ak.where(np.isfinite(part_p4.eta), part_p4.eta, 0)
 
     features = []
     feature_names: list[str] = []
 
     momentum_features = {
-        "Part_energy": energy,
-        "Part_pt": pt,
+        "Part_energy": part_p4.E,
+        "Part_pt": part_p4.pt,
         "Part_eta": eta,
-        "Part_phi": phi,
+        "Part_phi": part_p4.phi,
     }
     for feature_name, values in momentum_features.items():
         expanded = pad_and_flatten_part_feature(values, max_particles)

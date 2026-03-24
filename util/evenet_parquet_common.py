@@ -2,34 +2,53 @@ from __future__ import annotations
 
 import awkward as ak
 import numpy as np
+import vector
 
 
 PHOTON_DR_MAX = 0.3
 FOUR_VECTOR_FEATURES = ["energy", "pt", "eta", "phi"]
+vector.register_awkward()
+
+
+def build_momentum4d(px, py, pz, energy):
+    return ak.zip(
+        {
+            "px": px,
+            "py": py,
+            "pz": pz,
+            "E": energy,
+        },
+        with_name="Momentum4D",
+    )
 
 
 def compute_pt_eta_phi(px: ak.Array, py: ak.Array, pz: ak.Array) -> tuple[ak.Array, ak.Array, ak.Array]:
-    pt = np.sqrt(px * px + py * py)
-    phi = np.arctan2(py, px)
-    eta = np.arcsinh(np.divide(pz, pt, out=np.zeros_like(pz), where=pt != 0))
-    eta = ak.where(np.isfinite(eta), eta, 0)
-    return pt, eta, phi
+    p4 = build_momentum4d(px, py, pz, np.sqrt(px * px + py * py + pz * pz))
+    eta = ak.where(np.isfinite(p4.eta), p4.eta, 0)
+    return p4.pt, eta, p4.phi
 
 
 def p4_to_features(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.ndarray) -> np.ndarray:
-    pt = np.sqrt(px ** 2 + py ** 2)
-    eta = np.arcsinh(np.divide(pz, pt, out=np.zeros_like(pz), where=pt != 0))
-    eta = np.where(np.isfinite(eta), eta, 0.0)
-    phi = np.arctan2(py, px)
-    return np.stack([energy, pt, eta, phi], axis=1).astype(np.float32)
+    p4 = vector.zip(
+        {
+            "px": px,
+            "py": py,
+            "pz": pz,
+            "E": energy,
+        }
+    )
+    eta = np.where(np.isfinite(p4.eta), p4.eta, 0.0)
+    return np.stack([p4.E, p4.pt, eta, p4.phi], axis=1).astype(np.float32)
 
 
-def sum_masked_p4(events: ak.Array, mask: ak.Array) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    px = ak.to_numpy(ak.sum(events["Part_fourMomentum_fCoordinates_fX"][mask], axis=1), allow_missing=False)
-    py = ak.to_numpy(ak.sum(events["Part_fourMomentum_fCoordinates_fY"][mask], axis=1), allow_missing=False)
-    pz = ak.to_numpy(ak.sum(events["Part_fourMomentum_fCoordinates_fZ"][mask], axis=1), allow_missing=False)
-    energy = ak.to_numpy(ak.sum(events["Part_fourMomentum_fCoordinates_fT"][mask], axis=1), allow_missing=False)
-    return px.astype(np.float32), py.astype(np.float32), pz.astype(np.float32), energy.astype(np.float32)
+def sum_masked_p4(events: ak.Array, mask: ak.Array):
+    part_p4 = build_momentum4d(
+        events["Part_fourMomentum_fCoordinates_fX"],
+        events["Part_fourMomentum_fCoordinates_fY"],
+        events["Part_fourMomentum_fCoordinates_fZ"],
+        events["Part_fourMomentum_fCoordinates_fT"],
+    )
+    return ak.sum(part_p4[mask], axis=1)
 
 
 def map_hemisphere_to_tau_sign(
@@ -52,10 +71,14 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
     charge = events["Part_charge"]
     hemisphere = events["Part_hemisphere"]
     pdg_id = abs(events["Part_pdgId"])
-    px = events["Part_fourMomentum_fCoordinates_fX"]
-    py = events["Part_fourMomentum_fCoordinates_fY"]
-    pz = events["Part_fourMomentum_fCoordinates_fZ"]
-    pt, eta, phi = compute_pt_eta_phi(px, py, pz)
+    part_p4 = build_momentum4d(
+        events["Part_fourMomentum_fCoordinates_fX"],
+        events["Part_fourMomentum_fCoordinates_fY"],
+        events["Part_fourMomentum_fCoordinates_fZ"],
+        events["Part_fourMomentum_fCoordinates_fT"],
+    )
+    eta = ak.where(np.isfinite(part_p4.eta), part_p4.eta, 0)
+    phi = part_p4.phi
 
     hemisphere_masks = {
         "a": hemisphere == 1,
@@ -70,8 +93,13 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
         prong_mask = hemisphere_mask & (charge != 0)
         photon_mask = hemisphere_mask & (charge == 0) & (pdg_id == 21)
 
-        prong_px, prong_py, prong_pz, prong_energy = sum_masked_p4(events, prong_mask)
-        prong_features[hemisphere_name] = p4_to_features(prong_px, prong_py, prong_pz, prong_energy)
+        prong_p4 = sum_masked_p4(events, prong_mask)
+        prong_features[hemisphere_name] = p4_to_features(
+            ak.to_numpy(prong_p4.px, allow_missing=False).astype(np.float32),
+            ak.to_numpy(prong_p4.py, allow_missing=False).astype(np.float32),
+            ak.to_numpy(prong_p4.pz, allow_missing=False).astype(np.float32),
+            ak.to_numpy(prong_p4.E, allow_missing=False).astype(np.float32),
+        )
         prong_charge_sums[hemisphere_name] = ak.to_numpy(ak.sum(charge[prong_mask], axis=1), allow_missing=False).astype(np.float32)
 
         prong_eta = eta[prong_mask]
@@ -97,19 +125,13 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
         delta_r = np.sqrt(delta_eta * delta_eta + delta_phi * delta_phi)
         photon_near_prong = ak.fill_none(ak.any(delta_r < PHOTON_DR_MAX, axis=-1), False)
 
-        selected_photon_px = ak.to_numpy(ak.sum(px[photon_mask][photon_near_prong], axis=1), allow_missing=False).astype(np.float32)
-        selected_photon_py = ak.to_numpy(ak.sum(py[photon_mask][photon_near_prong], axis=1), allow_missing=False).astype(np.float32)
-        selected_photon_pz = ak.to_numpy(ak.sum(pz[photon_mask][photon_near_prong], axis=1), allow_missing=False).astype(np.float32)
-        selected_photon_energy = ak.to_numpy(
-            ak.sum(events["Part_fourMomentum_fCoordinates_fT"][photon_mask][photon_near_prong], axis=1),
-            allow_missing=False,
-        ).astype(np.float32)
-
+        photon_p4 = ak.sum(part_p4[photon_mask][photon_near_prong], axis=1)
+        rho_p4 = prong_p4 + photon_p4
         rho_features[hemisphere_name] = p4_to_features(
-            prong_px + selected_photon_px,
-            prong_py + selected_photon_py,
-            prong_pz + selected_photon_pz,
-            prong_energy + selected_photon_energy,
+            ak.to_numpy(rho_p4.px, allow_missing=False).astype(np.float32),
+            ak.to_numpy(rho_p4.py, allow_missing=False).astype(np.float32),
+            ak.to_numpy(rho_p4.pz, allow_missing=False).astype(np.float32),
+            ak.to_numpy(rho_p4.E, allow_missing=False).astype(np.float32),
         )
 
     prong_tau_minus, prong_tau_plus, prong_tau_minus_mask, prong_tau_plus_mask = map_hemisphere_to_tau_sign(
