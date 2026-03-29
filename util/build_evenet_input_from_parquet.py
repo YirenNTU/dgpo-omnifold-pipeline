@@ -21,7 +21,7 @@ from evenet_parquet_common import (
     extract_visible_tau_observable,
     features_from_p4,
 )
-from ml_pipeline_config import FeatureConfig, parse_feature_config
+from ml_pipeline_config import EveNetConfig, FeatureConfig, parse_evenet_config, parse_feature_config
 from parquet_plot_common import (
     choose_bins,
     infer_luminosity,
@@ -34,6 +34,8 @@ from rich.table import Table
 
 
 console = Console()
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+GENERATED_EVENT_INFO_PATH = CONFIG_DIR / "generated_event_info.yaml"
 
 @dataclass(frozen=True)
 class Sample:
@@ -99,7 +101,7 @@ def parse_category_values(raw_values) -> tuple[int, ...]:
     return (int(raw_values),)
 
 
-def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]], FeatureConfig]:
+def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]], FeatureConfig, EveNetConfig]:
     config = read_yaml(config_path)
 
     raw_samples = config.get("Samples", {})
@@ -126,7 +128,8 @@ def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[C
         ]
         for sample_key, split_cfg in raw_subcategories.items()
     }
-    return samples, subcategories, parse_feature_config(config)
+    feature_config = parse_feature_config(config)
+    return samples, subcategories, feature_config, parse_evenet_config(config, feature_config)
 
 
 def split_sample_by_category(sample: Sample, events: ak.Array, splits: list[CategorySplit]) -> list[tuple[Sample, ak.Array]]:
@@ -356,26 +359,60 @@ def build_dataset(
     return dataset, metadata
 
 
-def build_event_info_yaml(metadata: dict) -> dict:
+def _lookup_feature_tag(feature_name: str, tags: dict[str, str], default: str = "none") -> str:
+    if feature_name in tags:
+        return tags[feature_name]
+    stripped = feature_name[5:] if feature_name.startswith("Part_") else feature_name
+    return tags.get(stripped, default)
+
+
+def build_event_info_yaml(metadata: dict, feature_config: FeatureConfig, evenet_config: EveNetConfig) -> dict:
+    class_labels = metadata["class_labels"]
+    missing_processes = [label for label in class_labels if label not in evenet_config.process_topologies]
+    if missing_processes:
+        raise ValueError(
+            "Missing EveNet process topology definitions for: "
+            + ", ".join(missing_processes)
+        )
+
     return {
         "INPUTS": {
             "SEQUENTIAL": {
-                "Source": {feature_name: "none" for feature_name in metadata["point_cloud_features"]}
+                "Source": {
+                    feature_name: _lookup_feature_tag(feature_name, evenet_config.sequential_tags)
+                    for feature_name in metadata["point_cloud_features"]
+                }
             },
             "GLOBAL": {
-                "Conditions": {feature_name: "none" for feature_name in metadata["global_features"]}
+                "Conditions": {
+                    feature_name: _lookup_feature_tag(feature_name, evenet_config.global_tags)
+                    for feature_name in metadata["global_features"]
+                }
             },
         },
+        "EVENT": {
+            label: {
+                resonance_name: list(products)
+                for resonance_name, products in evenet_config.process_topologies[label].items()
+            }
+            for label in class_labels
+        },
         "CLASSIFICATIONS": {
-            "EVENT": ["category_subcategory"]
+            "EVENT": [evenet_config.classification_name]
         },
         "CLASSLABEL": {
             "EVENT": {
-                "category_subcategory": [metadata["class_labels"]]
+                evenet_config.classification_name: [class_labels]
             }
         },
         "GENERATIONS": {
-            "Neutrinos": {feature_name: "none" for feature_name in metadata["invisible_features"]}
+            "Conditions": list(evenet_config.generation_conditions),
+            "GlobalTargets": list(evenet_config.generation_global_targets),
+            "Events": list(evenet_config.generation_events),
+            "Neutrinos": {
+                feature_name: evenet_config.invisible_tags.get(feature_name, "none")
+                for feature_name in metadata["invisible_features"]
+            },
         },
     }
 
@@ -568,6 +605,8 @@ def write_outputs(
     output_dir: Path,
     stem: str,
     write_event_info: bool = False,
+    feature_config: FeatureConfig | None = None,
+    evenet_config: EveNetConfig | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -580,10 +619,20 @@ def write_outputs(
     console.print(f"[green]Wrote[/green] [white]{npz_path}[/white]")
     console.print(f"[green]Wrote[/green] [white]{metadata_path}[/white]")
     if write_event_info:
+        if feature_config is None or evenet_config is None:
+            raise ValueError("feature_config and evenet_config are required when write_event_info=True.")
+        event_info_payload = build_event_info_yaml(metadata, feature_config, evenet_config)
         event_info_path = output_dir / "event_info.yaml"
         with event_info_path.open("w") as handle:
-            yaml.safe_dump(build_event_info_yaml(metadata), handle, sort_keys=False)
+            yaml.safe_dump(event_info_payload, handle, sort_keys=False)
         console.print(f"[green]Wrote[/green] [white]{event_info_path}[/white]")
+
+        # Keep the latest generated schema in ml_pipeline/config so the
+        # static preprocess_config.yaml wrapper can always reference it.
+        GENERATED_EVENT_INFO_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with GENERATED_EVENT_INFO_PATH.open("w") as handle:
+            yaml.safe_dump(event_info_payload, handle, sort_keys=False)
+        console.print(f"[green]Wrote[/green] [white]{GENERATED_EVENT_INFO_PATH}[/white]")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -616,7 +665,7 @@ def main() -> None:
     args = parser.parse_args()
 
     console.print(f"[bold]Using config[/bold] [white]{args.config}[/white]")
-    samples, subcategories, feature_config = parse_config(args.config)
+    samples, subcategories, feature_config, evenet_config = parse_config(args.config)
     raw_sample_events = {
         sample_key: load_sample_events(sample)
         for sample_key, sample in samples.items()
@@ -675,7 +724,15 @@ def main() -> None:
     )
 
     mc_dataset, mc_metadata = build_dataset(training_samples, max_particles, feature_config, include_classification=True)
-    write_outputs(mc_dataset, mc_metadata, args.output_dir, stem="evenet_input", write_event_info=True)
+    write_outputs(
+        mc_dataset,
+        mc_metadata,
+        args.output_dir,
+        stem="evenet_input",
+        write_event_info=True,
+        feature_config=feature_config,
+        evenet_config=evenet_config,
+    )
 
     if data_samples:
         console.print(
@@ -683,7 +740,13 @@ def main() -> None:
             f"[white]{', '.join(sample.name for sample, _ in data_samples)}[/white]"
         )
         data_dataset, data_metadata = build_dataset(data_samples, max_particles, feature_config, include_classification=False)
-        write_outputs(data_dataset, data_metadata, args.output_dir, stem="data", write_event_info=False)
+        write_outputs(
+            data_dataset,
+            data_metadata,
+            args.output_dir,
+            stem="data",
+            write_event_info=False,
+        )
     else:
         console.print("[yellow]Skipped data.npz[/yellow] no data samples configured")
 

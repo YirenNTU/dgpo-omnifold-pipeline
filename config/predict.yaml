@@ -1,0 +1,36 @@
+platform:
+  data_parquet_dir: <data_parquet_dir>
+  number_of_workers: 1
+  resources_per_worker: {
+    "CPU": 1,
+    "GPU": 1,
+  }
+  batch_size: 4
+  prefetch_batches: 1
+  use_gpu: true
+
+options:
+  default: options.yaml
+
+  prediction:
+    output_dir: <output_dir>
+    filename: <filename>
+    save_point_cloud: true
+    extra_save: []
+
+  Training:
+    model_checkpoint_save_path: null
+    model_checkpoint_load_path: <ckpt_path>
+    pretrain_model_load_path: null
+
+  Dataset:
+    normalization_file: <normalization_file>
+
+network:
+  default: network.yaml
+
+event_info:
+  default: generated_event_info.yaml
+
+resonance:
+  default: ../EveNet-Full/share/resonance/standard_model.yaml

@@ -1,0 +1,8 @@
+default: ../EveNet-Full/share/network/network-20M.yaml
+
+Body:
+  PET:
+    feature_drop: 0.0
+
+TruthGeneration:
+  feature_drop: 0.0

@@ -1,0 +1,41 @@
+platform:
+  data_parquet_dir: <data_parquet_dir>
+  number_of_workers: 1
+  resources_per_worker: {
+    "CPU": 1,
+    "GPU": 1,
+  }
+  batch_size: 4
+  prefetch_batches: 1
+  use_gpu: true
+
+logger:
+  wandb:
+    project: "EveNet"
+    run_name: &logger_name "LEP-TauNu"
+    tags: ["EveNet", "LEP"]
+    simplified: false
+  local:
+    save_dir: <log_save_dir>
+    name: *logger_name
+    version: "v1"
+
+options:
+  default: options.yaml
+
+  Training:
+    model_checkpoint_save_path: <model_checkpoint_save_path>
+    model_checkpoint_load_path: null
+    pretrain_model_load_path: null
+
+  Dataset:
+    normalization_file: <normalization_file>
+
+network:
+  default: network.yaml
+
+event_info:
+  default: generated_event_info.yaml
+
+resonance:
+  default: ../EveNet-Full/share/resonance/standard_model.yaml

@@ -5,9 +5,14 @@ This directory contains the local ML-side utilities and configs used with the LE
 ## Layout
 
 - `EveNet-Full/`: upstream EveNet codebase and docs.
-- `config/analysis.yaml`: sample list plus configurable ML input feature lists.
+- `config/analysis.yaml`: sample list, configurable ML input feature lists, and the EveNet process/generation schema.
+- `config/preprocess_config.yaml`: static EveNet preprocessing wrapper that points to `config/generated_event_info.yaml`.
+- `config/train.yaml`: repo-local EveNet training config following the upstream `share/finetune-example.yaml` pattern.
+- `config/predict.yaml`: repo-local EveNet prediction config following the upstream `share/predict-example.yaml` pattern.
+- `config/options.yaml`: local EveNet options overrides layered on top of `EveNet-Full/share/options/options.yaml`.
+- `config/network.yaml`: local EveNet network overrides layered on top of `EveNet-Full/share/network/network-20M.yaml`.
 - `util/plot_control_parquets.py`: simple data-vs-MC control plotting script for parquet files produced by `processor/DataLoader.py`.
-- `util/build_evenet_input_from_parquet.py`: convert DataLoader parquet outputs into a simple EveNet-style `.npz` bundle plus metadata and an `event_info.yaml` skeleton.
+- `util/build_evenet_input_from_parquet.py`: convert DataLoader parquet outputs into an EveNet `.npz` bundle plus metadata and a generated multi-process `event_info.yaml`. It also refreshes `config/generated_event_info.yaml` for EveNet preprocessing and training configs.
 - `util/evenet_parquet_common.py`: shared visible-tau and invisible-target helpers used by both scripts.
 
 The ML utilities use awkward/vector `Momentum4D` objects for the reconstructed particle four-vectors and visible-tau sums, so the plotting and conversion paths share the same four-momentum handling.
@@ -99,6 +104,33 @@ Inputs:
     Fields:
       - Event_totalChargedEnergy
       - ...
+
+EveNet:
+  Classification:
+    Name: process
+  Processes:
+    Ztautau_pipi:
+      tau_minus: [tau_minus_vis]
+      tau_plus: [tau_plus_vis]
+  Generations:
+    Conditions: [...]
+    GlobalTargets: []
+    Events: [Part_energy, Part_pt, Part_eta, Part_phi]
+
+Normalization:
+  Sequential:
+    Part_energy: log_normalize
+    Part_pt: log_normalize
+    Part_eta: normalize
+    Part_phi: normalize_uniform
+  Global:
+    Event_totalChargedEnergy: log_normalize
+    ...
+  Invisible:
+    energy: log_normalize
+    pt: log_normalize
+    eta: normalize
+    phi: normalize_uniform
 ```
 
 `input_files` may also use glob patterns.
@@ -110,6 +142,24 @@ Inputs:
 - plotted by `util/plot_control_parquets.py`
 
 So if you want to add or remove `Part_*` or event-level inputs, edit `config/analysis.yaml` instead of the Python code.
+
+`EveNet.Processes` is the source of truth for the generated multi-process `EVENT` block. The process names here must match the MC labels that will appear after subcategory expansion, because the converter uses this block to build:
+
+- `EVENT`
+- `CLASSIFICATIONS`
+- `CLASSLABEL`
+- `GENERATIONS`
+
+for the generated `event_info.yaml`.
+
+`Normalization` is the source of truth for the tags written into the generated EveNet schema. Use it to control whether each feature is marked as:
+
+- `none`
+- `normalize`
+- `log_normalize`
+- `normalize_uniform`
+
+These tags are copied into the generated `event_info.yaml` and then consumed by EveNet preprocessing for log scaling and metadata.
 
 Optional `Subcategories` format:
 
@@ -163,6 +213,13 @@ It currently:
   - `target_invisible_mass`
 - uses the same data-vs-stacked-MC plotting style and normalization logic as `util/plot_control_parquets.py`
 - writes `evenet_input.npz`, `evenet_input_metadata.json`, and `event_info.yaml` from MC samples
+- refreshes `config/generated_event_info.yaml` from the same MC schema
+- writes a real multi-process EveNet `event_info` with:
+  - `INPUTS`
+  - `EVENT`
+  - `CLASSIFICATIONS`
+  - `CLASSLABEL`
+  - `GENERATIONS`
 - writes `data.npz` and `data_metadata.json` from data samples in the same run
 
 The visible-tau and target-invisible definitions are shared with `util/plot_control_parquets.py`, so the monitor plots and the standalone plotting script use the same reconstruction assumptions.
@@ -174,6 +231,7 @@ The output split is:
 - `evenet_input.npz`: MC-only payload for EveNet training / preprocessing
 - `data.npz`: data-only payload written alongside it
 - `event_info.yaml`: schema for the MC payload
+- `config/generated_event_info.yaml`: latest generated MC schema for EveNet preprocessing
 
 Run:
 
@@ -186,12 +244,17 @@ python3 util/build_evenet_input_from_parquet.py \
 
 ## EveNet Preprocess
 
-The converter above does **not** write the final EveNet training parquet shards by itself. It writes the two artifacts that EveNet expects as input:
+The converter above does **not** write the final EveNet training parquet shards by itself. It writes the inputs that EveNet preprocessing needs:
 
 - `evenet_input.npz`
 - `event_info.yaml`
+- `config/generated_event_info.yaml`
+- `config/preprocess_config.yaml`
 
-To turn those into the final EveNet parquet files, run EveNet's own preprocessing step from [preprocess.py](EveNet-Full/preprocessing/preprocess.py).
+To turn those into the final EveNet parquet files, run EveNet's own preprocessing step from [preprocess.py](EveNet-Full/preprocessing/preprocess.py). Use the static [config/preprocess_config.yaml](config/preprocess_config.yaml) for `--config`; it follows the same `default:` merge pattern as the upstream `share/*-example.yaml` files and points to:
+
+- `config/generated_event_info.yaml`
+- `../EveNet-Full/share/resonance/standard_model.yaml`
 
 ### Single NPZ -> train/val/test parquet
 
@@ -200,7 +263,7 @@ If you are using the single combined `.npz` produced by `util/build_evenet_input
 ```bash
 cd ml_pipeline
 python3 EveNet-Full/preprocessing/preprocess.py \
-  --config evenet_inputs/event_info.yaml \
+  --config config/preprocess_config.yaml \
   --file evenet_inputs/evenet_input.npz \
   --split_ratio 0.8,0.1,0.1 \
   --store_dir evenet_inputs/preprocessed \
@@ -215,6 +278,8 @@ This writes:
 - `shape_metadata.json`
 - `normalization.pt`
 
+The current repo copy of EveNet now validates the point-cloud feature count from `event_info` rather than assuming the old `(18, 7)` pretraining example shape, so custom `Part_*` feature layouts from `analysis.yaml` can pass preprocessing as long as the generated YAML and NPZ stay aligned.
+
 ### Explicit train/val/test NPZ splits
 
 If you split your `.npz` files upstream, use EveNet's explicit split mode instead:
@@ -222,13 +287,44 @@ If you split your `.npz` files upstream, use EveNet's explicit split mode instea
 ```bash
 cd ml_pipeline
 python3 EveNet-Full/preprocessing/preprocess.py \
-  --config evenet_inputs/event_info.yaml \
+  --config config/preprocess_config.yaml \
   --train /path/to/train.npz \
   --val /path/to/val.npz \
   --test /path/to/test.npz \
   --store_dir evenet_inputs/preprocessed \
   -v
 ```
+
+## EveNet Train / Predict Configs
+
+The repo-local EveNet configs under `config/` follow the same structure as the shipped `share` examples, but they point at the generated LEP schema:
+
+- [config/train.yaml](config/train.yaml)
+- [config/predict.yaml](config/predict.yaml)
+- [config/options.yaml](config/options.yaml)
+- [config/network.yaml](config/network.yaml)
+
+Typical training flow:
+
+```bash
+cd ml_pipeline
+python3 EveNet-Full/scripts/train.py config/train.yaml
+```
+
+Typical prediction flow:
+
+```bash
+cd ml_pipeline
+python3 EveNet-Full/scripts/predict.py config/predict.yaml
+```
+
+Before running either one, fill in the placeholder paths in `config/train.yaml`, `config/predict.yaml`, and `config/options.yaml`:
+
+- `<data_parquet_dir>`
+- `<normalization_file>`
+- `<model_checkpoint_save_path>`
+- `<log_save_dir>`
+- `<ckpt_path>` for prediction
 
 ### What EveNet uses at training time
 
@@ -241,6 +337,7 @@ For EveNet training or prediction configs, point to the preprocessing output:
 In practice, the end-to-end flow is:
 
 1. Start from DataLoader parquet files.
-2. Run [build_evenet_input_from_parquet.py](util/build_evenet_input_from_parquet.py) to make `evenet_input.npz` and `event_info.yaml`.
-3. Run EveNet preprocessing to make the final parquet shards plus normalization.
-4. Train EveNet against that preprocessing output.
+2. Define or update the process topology / generation settings in `config/analysis.yaml` under `EveNet`.
+3. Run [build_evenet_input_from_parquet.py](util/build_evenet_input_from_parquet.py) to make `evenet_input.npz`, `event_info.yaml`, and refresh `config/generated_event_info.yaml`.
+4. Run EveNet preprocessing with `config/preprocess_config.yaml` to make the final parquet shards plus normalization.
+5. Fill in `config/train.yaml` or `config/predict.yaml` and run the corresponding EveNet script.
