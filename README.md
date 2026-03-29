@@ -162,11 +162,18 @@ It currently:
   - `target_invisible_phi`
   - `target_invisible_mass`
 - uses the same data-vs-stacked-MC plotting style and normalization logic as `util/plot_control_parquets.py`
-- writes `evenet_input.npz`, `evenet_input_metadata.json`, and `event_info.yaml`
+- writes `evenet_input.npz`, `evenet_input_metadata.json`, and `event_info.yaml` from MC samples
+- writes `data.npz` and `data_metadata.json` from data samples in the same run
 
 The visible-tau and target-invisible definitions are shared with `util/plot_control_parquets.py`, so the monitor plots and the standalone plotting script use the same reconstruction assumptions.
 
 `classification` and the `CLASSLABEL` block in `event_info.yaml` are built from MC-only categories/subcategories. Data is treated as monitoring-only input and is never written into the EveNet training dataset.
+
+The output split is:
+
+- `evenet_input.npz`: MC-only payload for EveNet training / preprocessing
+- `data.npz`: data-only payload written alongside it
+- `event_info.yaml`: schema for the MC payload
 
 Run:
 

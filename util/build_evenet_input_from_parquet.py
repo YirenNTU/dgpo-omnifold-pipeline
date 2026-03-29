@@ -19,6 +19,7 @@ from evenet_parquet_common import (
     extract_part_feature,
     extract_part_momentum_observable,
     extract_visible_tau_observable,
+    features_from_p4,
 )
 from ml_pipeline_config import FeatureConfig, parse_feature_config
 from parquet_plot_common import (
@@ -259,6 +260,10 @@ def select_training_samples(expanded_samples: list[tuple[Sample, ak.Array]]) -> 
     return training_samples
 
 
+def select_data_samples(expanded_samples: list[tuple[Sample, ak.Array]]) -> list[tuple[Sample, ak.Array]]:
+    return [(sample, events) for sample, events in expanded_samples if sample.is_data]
+
+
 def to_numpy_array(values, dtype=None) -> np.ndarray:
     if isinstance(values, ak.Array):
         values = ak.to_numpy(values, allow_missing=False)
@@ -273,8 +278,9 @@ def build_dataset(
     expanded_samples: list[tuple[Sample, ak.Array]],
     max_particles: int,
     feature_config: FeatureConfig,
+    include_classification: bool = True,
 ) -> tuple[dict[str, np.ndarray], dict]:
-    class_labels = [sample.name for sample, _ in expanded_samples]
+    class_labels = [sample.name for sample, _ in expanded_samples] if include_classification else []
     class_index = {label: index for index, label in enumerate(class_labels)}
 
     batches = []
@@ -288,41 +294,43 @@ def build_dataset(
         conditions, conditions_mask, condition_names = build_global_conditions(events, feature_config)
         num_vectors = compute_event_totals(num_sequential_vectors, conditions_mask)
 
-        tau_vis_prong, tau_vis_prong_mask, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
-        x_invisible, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target, tau_vis_target_mask = build_tau_targets(
+        tau_vis_prong_p4, tau_vis_prong_mask, tau_vis_rho_p4, tau_vis_rho_mask = build_visible_tau_assumptions(events)
+        x_invisible_p4, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target_p4, tau_vis_target_mask = build_tau_targets(
             events,
-            tau_vis_prong,
+            tau_vis_prong_p4,
             tau_vis_prong_mask,
-            tau_vis_rho,
+            tau_vis_rho_p4,
             tau_vis_rho_mask,
         )
-        classification = np.full(len(events), class_index[sample.name], dtype=np.int64)
-        event_weight = np.ones(len(events), dtype=np.float32)
+        tau_vis_prong = features_from_p4(tau_vis_prong_p4)
+        tau_vis_rho = features_from_p4(tau_vis_rho_p4)
+        tau_vis_target = features_from_p4(tau_vis_target_p4)
+        x_invisible = features_from_p4(x_invisible_p4)
+        batch = {
+            # EveNet inputs: x [N, P, F_seq], conditions [N, F_global].
+            "x": to_numpy_array(x, np.float32),
+            "x_mask": to_numpy_array(x_mask, bool),
+            "conditions": to_numpy_array(conditions, np.float32),
+            "conditions_mask": to_numpy_array(conditions_mask, bool),
+            "num_vectors": to_numpy_array(num_vectors, np.float32),
+            "num_sequential_vectors": to_numpy_array(num_sequential_vectors, np.float32),
+            # Truth/auxiliary targets: [N, 2, 4] for tau- / tau+ and [N, 2] masks.
+            "x_invisible": to_numpy_array(x_invisible, np.float32),
+            "x_invisible_mask": to_numpy_array(x_invisible_mask, bool),
+            "num_invisible_raw": num_invisible_raw,
+            "num_invisible_valid": num_invisible_valid,
+            "tau_vis_prong": to_numpy_array(tau_vis_prong, np.float32),
+            "tau_vis_prong_mask": to_numpy_array(tau_vis_prong_mask, bool),
+            "tau_vis_rho": to_numpy_array(tau_vis_rho, np.float32),
+            "tau_vis_rho_mask": to_numpy_array(tau_vis_rho_mask, bool),
+            "tau_vis_target": to_numpy_array(tau_vis_target, np.float32),
+            "tau_vis_target_mask": to_numpy_array(tau_vis_target_mask, bool),
+        }
+        if include_classification:
+            batch["classification"] = np.full(len(events), class_index[sample.name], dtype=np.int64)
+            batch["event_weight"] = np.ones(len(events), dtype=np.float32)
 
-        batches.append(
-            {
-                # EveNet inputs: x [N, P, F_seq], conditions [N, F_global].
-                "x": to_numpy_array(x, np.float32),
-                "x_mask": to_numpy_array(x_mask, bool),
-                "conditions": to_numpy_array(conditions, np.float32),
-                "conditions_mask": to_numpy_array(conditions_mask, bool),
-                "classification": classification,
-                "event_weight": event_weight,
-                "num_vectors": to_numpy_array(num_vectors, np.float32),
-                "num_sequential_vectors": to_numpy_array(num_sequential_vectors, np.float32),
-                # Truth/auxiliary targets: [N, 2, 4] for tau- / tau+ and [N, 2] masks.
-                "x_invisible": to_numpy_array(x_invisible, np.float32),
-                "x_invisible_mask": to_numpy_array(x_invisible_mask, bool),
-                "num_invisible_raw": num_invisible_raw,
-                "num_invisible_valid": num_invisible_valid,
-                "tau_vis_prong": to_numpy_array(tau_vis_prong, np.float32),
-                "tau_vis_prong_mask": to_numpy_array(tau_vis_prong_mask, bool),
-                "tau_vis_rho": to_numpy_array(tau_vis_rho, np.float32),
-                "tau_vis_rho_mask": to_numpy_array(tau_vis_rho_mask, bool),
-                "tau_vis_target": to_numpy_array(tau_vis_target, np.float32),
-                "tau_vis_target_mask": to_numpy_array(tau_vis_target_mask, bool),
-            }
-        )
+        batches.append(batch)
 
         if point_cloud_feature_names is None:
             point_cloud_feature_names = point_cloud_names
@@ -335,14 +343,16 @@ def build_dataset(
     }
 
     metadata = {
-        "class_labels": class_labels,
         "point_cloud_features": point_cloud_feature_names,
         "global_features": global_feature_names,
         "invisible_features": FOUR_VECTOR_FEATURES,
         "visible_tau_features": FOUR_VECTOR_FEATURES,
         "max_particles": max_particles,
         "num_events": int(dataset["x"].shape[0]),
+        "source_samples": [sample.name for sample, _ in expanded_samples],
     }
+    if include_classification:
+        metadata["class_labels"] = class_labels
     return dataset, metadata
 
 
@@ -552,21 +562,28 @@ def write_monitoring_plots(
         )
 
 
-def write_outputs(dataset: dict[str, np.ndarray], metadata: dict, output_dir: Path) -> None:
+def write_outputs(
+    dataset: dict[str, np.ndarray],
+    metadata: dict,
+    output_dir: Path,
+    stem: str,
+    write_event_info: bool = False,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    npz_path = output_dir / "evenet_input.npz"
-    metadata_path = output_dir / "evenet_input_metadata.json"
-    event_info_path = output_dir / "event_info.yaml"
+    npz_path = output_dir / f"{stem}.npz"
+    metadata_path = output_dir / f"{stem}_metadata.json"
 
     np.savez_compressed(npz_path, **dataset)
     metadata_path.write_text(json.dumps(metadata, indent=2))
-    with event_info_path.open("w") as handle:
-        yaml.safe_dump(build_event_info_yaml(metadata), handle, sort_keys=False)
 
     console.print(f"[green]Wrote[/green] [white]{npz_path}[/white]")
     console.print(f"[green]Wrote[/green] [white]{metadata_path}[/white]")
-    console.print(f"[green]Wrote[/green] [white]{event_info_path}[/white]")
+    if write_event_info:
+        event_info_path = output_dir / "event_info.yaml"
+        with event_info_path.open("w") as handle:
+            yaml.safe_dump(build_event_info_yaml(metadata), handle, sort_keys=False)
+        console.print(f"[green]Wrote[/green] [white]{event_info_path}[/white]")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -633,6 +650,7 @@ def main() -> None:
     )
 
     training_samples = select_training_samples(expanded_samples)
+    data_samples = select_data_samples(expanded_samples)
 
     max_particles = infer_max_particles(training_samples, args.max_particles)
     console.print(f"[bold]Point-cloud padding[/bold] max_particles=[white]{max_particles}[/white]")
@@ -656,8 +674,18 @@ def main() -> None:
         f"[white]{', '.join(sample.name for sample, _ in training_samples)}[/white]"
     )
 
-    dataset, metadata = build_dataset(training_samples, max_particles, feature_config)
-    write_outputs(dataset, metadata, args.output_dir)
+    mc_dataset, mc_metadata = build_dataset(training_samples, max_particles, feature_config, include_classification=True)
+    write_outputs(mc_dataset, mc_metadata, args.output_dir, stem="evenet_input", write_event_info=True)
+
+    if data_samples:
+        console.print(
+            f"[bold]Data payload samples[/bold] "
+            f"[white]{', '.join(sample.name for sample, _ in data_samples)}[/white]"
+        )
+        data_dataset, data_metadata = build_dataset(data_samples, max_particles, feature_config, include_classification=False)
+        write_outputs(data_dataset, data_metadata, args.output_dir, stem="data", write_event_info=False)
+    else:
+        console.print("[yellow]Skipped data.npz[/yellow] no data samples configured")
 
 
 if __name__ == "__main__":
