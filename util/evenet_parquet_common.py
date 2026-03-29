@@ -7,7 +7,7 @@ import vector
 
 PHOTON_DR_MAX = 0.3
 FOUR_VECTOR_FEATURES = ["energy", "pt", "eta", "phi"]
-PART_AUX_FIELDS = [
+DEFAULT_PART_AUX_FIELDS = [
     "Part_charge",
     "Part_pdgId",
     "Part_vtxIdx",
@@ -35,7 +35,7 @@ PART_AUX_FIELDS = [
     "Part_sticSiliconVertexPos",
     "Part_hemisphere",
 ]
-GLOBAL_FIELDS = [
+DEFAULT_GLOBAL_FIELDS = [
     "Event_totalChargedEnergy",
     "Event_totalEMEnergy",
     "Event_totalHadronicEnergy",
@@ -66,38 +66,43 @@ def build_momentum4d(px, py, pz, energy):
 
 def build_part_momentum4d(events: ak.Array):
     return build_momentum4d(
-        events["Part_fourMomentum_fCoordinates_fX"],
-        events["Part_fourMomentum_fCoordinates_fY"],
-        events["Part_fourMomentum_fCoordinates_fZ"],
-        events["Part_fourMomentum_fCoordinates_fT"],
+        px = events["Part_fourMomentum_fCoordinates_fX"],
+        py = events["Part_fourMomentum_fCoordinates_fY"],
+        pz = events["Part_fourMomentum_fCoordinates_fZ"],
+        energy = events["Part_fourMomentum_fCoordinates_fT"],
     )
 
 
 def compute_pt_eta_phi(px: ak.Array, py: ak.Array, pz: ak.Array) -> tuple[ak.Array, ak.Array, ak.Array]:
     p4 = build_momentum4d(px, py, pz, np.sqrt(px * px + py * py + pz * pz))
-    eta = ak.where(np.isfinite(p4.eta), p4.eta, 0)
-    return p4.pt, eta, p4.phi
+    return p4.pt, p4.eta, p4.phi
 
 
-def p4_to_features(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.ndarray) -> np.ndarray:
+def p4_to_features(px, py, pz, energy):
+    if any(isinstance(values, ak.Array) for values in (px, py, pz, energy)):
+        p4 = build_momentum4d(px, py, pz, energy)
+        eta_values = ak.where(np.isfinite(p4.eta), p4.eta, 0)
+        return ak.concatenate(
+            [
+                ak.values_astype(p4.E, np.float32)[..., np.newaxis],
+                ak.values_astype(p4.pt, np.float32)[..., np.newaxis],
+                ak.values_astype(eta_values, np.float32)[..., np.newaxis],
+                ak.values_astype(p4.phi, np.float32)[..., np.newaxis],
+            ],
+            axis=-1,
+        )
+
     px = np.asarray(px, dtype=np.float32)
     py = np.asarray(py, dtype=np.float32)
     pz = np.asarray(pz, dtype=np.float32)
     energy = np.asarray(energy, dtype=np.float32)
-    p4 = vector.zip(
-        {
-            "px": px,
-            "py": py,
-            "pz": pz,
-            "E": energy,
-        }
-    )
+    p4 = vector.zip({"px": px, "py": py, "pz": pz, "E": energy})
     energy_values = np.asarray(p4.E, dtype=np.float32)
     pt_values = np.asarray(p4.pt, dtype=np.float32)
     eta_values = np.asarray(p4.eta, dtype=np.float32)
     phi_values = np.asarray(p4.phi, dtype=np.float32)
     eta_values = np.where(np.isfinite(eta_values), eta_values, 0.0)
-    return np.stack([energy_values, pt_values, eta_values, phi_values], axis=1).astype(np.float32)
+    return np.stack([energy_values, pt_values, eta_values, phi_values], axis=-1).astype(np.float32)
 
 
 def sum_masked_p4(events: ak.Array, mask: ak.Array):
@@ -106,22 +111,22 @@ def sum_masked_p4(events: ak.Array, mask: ak.Array):
 
 
 def map_hemisphere_to_tau_sign(
-    first_values: np.ndarray,
-    second_values: np.ndarray,
-    first_charge: np.ndarray,
-    second_charge: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    first_values,
+    second_values,
+    first_charge,
+    second_charge,
+):
     first_is_tau_minus = (first_charge < 0) & (second_charge > 0)
     second_is_tau_minus = (second_charge < 0) & (first_charge > 0)
     tau_minus_mask = first_is_tau_minus | second_is_tau_minus
     tau_plus_mask = tau_minus_mask
 
-    tau_minus = np.where(first_is_tau_minus[:, None], first_values, 0.0) + np.where(second_is_tau_minus[:, None], second_values, 0.0)
-    tau_plus = np.where(first_is_tau_minus[:, None], second_values, 0.0) + np.where(second_is_tau_minus[:, None], first_values, 0.0)
-    return tau_minus.astype(np.float32), tau_plus.astype(np.float32), tau_minus_mask, tau_plus_mask
+    tau_minus = ak.where(first_is_tau_minus[..., np.newaxis], first_values, 0.0) + ak.where(second_is_tau_minus[..., np.newaxis], second_values, 0.0)
+    tau_plus = ak.where(first_is_tau_minus[..., np.newaxis], second_values, 0.0) + ak.where(second_is_tau_minus[..., np.newaxis], first_values, 0.0)
+    return tau_minus, tau_plus, tau_minus_mask, tau_plus_mask
 
 
-def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def build_visible_tau_assumptions(events: ak.Array):
     charge = events["Part_charge"]
     hemisphere = events["Part_hemisphere"]
     pdg_id = abs(events["Part_pdgId"])
@@ -143,13 +148,8 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
         photon_p4_constituents = part_p4[photon_mask]
 
         prong_p4 = sum_masked_p4(events, prong_mask)
-        prong_features[hemisphere_name] = p4_to_features(
-            ak.to_numpy(prong_p4.px, allow_missing=False).astype(np.float32),
-            ak.to_numpy(prong_p4.py, allow_missing=False).astype(np.float32),
-            ak.to_numpy(prong_p4.pz, allow_missing=False).astype(np.float32),
-            ak.to_numpy(prong_p4.E, allow_missing=False).astype(np.float32),
-        )
-        prong_charge_sums[hemisphere_name] = ak.to_numpy(ak.sum(charge[prong_mask], axis=1), allow_missing=False).astype(np.float32)
+        prong_features[hemisphere_name] = p4_to_features(prong_p4.px, prong_p4.py, prong_p4.pz, prong_p4.E)
+        prong_charge_sums[hemisphere_name] = ak.values_astype(ak.sum(charge[prong_mask], axis=1), np.float32)
 
         pairs = ak.cartesian(
             {
@@ -164,12 +164,7 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
 
         photon_p4 = ak.sum(photon_p4_constituents[photon_near_prong], axis=1)
         rho_p4 = prong_p4 + photon_p4
-        rho_features[hemisphere_name] = p4_to_features(
-            ak.to_numpy(rho_p4.px, allow_missing=False).astype(np.float32),
-            ak.to_numpy(rho_p4.py, allow_missing=False).astype(np.float32),
-            ak.to_numpy(rho_p4.pz, allow_missing=False).astype(np.float32),
-            ak.to_numpy(rho_p4.E, allow_missing=False).astype(np.float32),
-        )
+        rho_features[hemisphere_name] = p4_to_features(rho_p4.px, rho_p4.py, rho_p4.pz, rho_p4.E)
 
     prong_tau_minus, prong_tau_plus, prong_tau_minus_mask, prong_tau_plus_mask = map_hemisphere_to_tau_sign(
         prong_features["a"],
@@ -184,33 +179,34 @@ def build_visible_tau_assumptions(events: ak.Array) -> tuple[np.ndarray, np.ndar
         prong_charge_sums["b"],
     )
 
-    tau_vis_prong = np.stack([prong_tau_minus, prong_tau_plus], axis=1).astype(np.float32)
-    tau_vis_prong_mask = np.stack([prong_tau_minus_mask, prong_tau_plus_mask], axis=1)
-    tau_vis_rho = np.stack([rho_tau_minus, rho_tau_plus], axis=1).astype(np.float32)
-    tau_vis_rho_mask = np.stack([rho_tau_minus_mask, rho_tau_plus_mask], axis=1)
+    # Shape convention is [event, tau(2), feature(4)] with tau order [tau-, tau+].
+    tau_vis_prong = ak.concatenate([prong_tau_minus[:, np.newaxis], prong_tau_plus[:, np.newaxis]], axis=1)
+    tau_vis_prong_mask = ak.concatenate([prong_tau_minus_mask[:, np.newaxis], prong_tau_plus_mask[:, np.newaxis]], axis=1)
+    tau_vis_rho = ak.concatenate([rho_tau_minus[:, np.newaxis], rho_tau_plus[:, np.newaxis]], axis=1)
+    tau_vis_rho_mask = ak.concatenate([rho_tau_minus_mask[:, np.newaxis], rho_tau_plus_mask[:, np.newaxis]], axis=1)
     return tau_vis_prong, tau_vis_prong_mask, tau_vis_rho, tau_vis_rho_mask
 
 
-def truth_feature(values: ak.Array | None) -> np.ndarray:
+def truth_feature(values: ak.Array | None):
     if values is None:
-        return np.array([], dtype=np.float32)
-    return ak.to_numpy(ak.fill_none(values, np.nan), allow_missing=False).astype(np.float32)
+        return ak.Array([])
+    return ak.values_astype(ak.fill_none(values, np.nan), np.float32)
 
 
 def build_tau_targets(
     events: ak.Array,
-    tau_vis_prong: np.ndarray,
-    tau_vis_prong_mask: np.ndarray,
-    tau_vis_rho: np.ndarray,
-    tau_vis_rho_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    tau_vis_prong,
+    tau_vis_prong_mask,
+    tau_vis_rho,
+    tau_vis_rho_mask,
+):
     n_events = len(events)
-    x_invisible = np.zeros((n_events, 2, 4), dtype=np.float32)
-    x_invisible_mask = np.zeros((n_events, 2), dtype=bool)
+    x_invisible = ak.zeros_like(tau_vis_prong, dtype=np.float32)
+    x_invisible_mask = ak.zeros_like(tau_vis_prong_mask, dtype=bool)
     num_invisible_raw = np.zeros(n_events, dtype=np.int64)
     num_invisible_valid = np.zeros(n_events, dtype=np.int64)
-    tau_vis_target = np.zeros((n_events, 2, 4), dtype=np.float32)
-    tau_vis_target_mask = np.zeros((n_events, 2), dtype=bool)
+    tau_vis_target = ak.zeros_like(tau_vis_prong, dtype=np.float32)
+    tau_vis_target_mask = ak.zeros_like(tau_vis_prong_mask, dtype=bool)
 
     required_fields = [
         "truth_tau_px",
@@ -235,46 +231,57 @@ def build_tau_targets(
     anti_tau_pz = truth_feature(events["truth_anti_tau_pz"])
     anti_tau_E = truth_feature(events["truth_anti_tau_E"])
 
-    truth_tau = np.stack([tau_E, tau_px, tau_py, tau_pz], axis=1).astype(np.float32)
-    truth_anti_tau = np.stack([anti_tau_E, anti_tau_px, anti_tau_py, anti_tau_pz], axis=1).astype(np.float32)
+    truth_tau = ak.concatenate(
+        [tau_E[:, np.newaxis], tau_px[:, np.newaxis], tau_py[:, np.newaxis], tau_pz[:, np.newaxis]],
+        axis=1,
+    )
+    truth_anti_tau = ak.concatenate(
+        [anti_tau_E[:, np.newaxis], anti_tau_px[:, np.newaxis], anti_tau_py[:, np.newaxis], anti_tau_pz[:, np.newaxis]],
+        axis=1,
+    )
 
-    event_category = ak.to_numpy(events["event_category"], allow_missing=False).astype(np.int64)
+    event_category = ak.values_astype(events["event_category"], np.int64)
     tau_minus_category = event_category % 10
     tau_plus_category = event_category // 10
 
     tau_minus_use_rho = tau_minus_category == 2
     tau_plus_use_rho = tau_plus_category == 2
 
-    tau_vis_target[:, 0, :] = np.where(tau_minus_use_rho[:, None], tau_vis_rho[:, 0, :], tau_vis_prong[:, 0, :])
-    tau_vis_target[:, 1, :] = np.where(tau_plus_use_rho[:, None], tau_vis_rho[:, 1, :], tau_vis_prong[:, 1, :])
-    tau_vis_target_mask[:, 0] = np.where(tau_minus_use_rho, tau_vis_rho_mask[:, 0], tau_vis_prong_mask[:, 0])
-    tau_vis_target_mask[:, 1] = np.where(tau_plus_use_rho, tau_vis_rho_mask[:, 1], tau_vis_prong_mask[:, 1])
+    tau_minus_target = ak.where(tau_minus_use_rho[..., np.newaxis], tau_vis_rho[:, 0, :], tau_vis_prong[:, 0, :])
+    tau_plus_target = ak.where(tau_plus_use_rho[..., np.newaxis], tau_vis_rho[:, 1, :], tau_vis_prong[:, 1, :])
+    tau_minus_target_mask = ak.where(tau_minus_use_rho, tau_vis_rho_mask[:, 0], tau_vis_prong_mask[:, 0])
+    tau_plus_target_mask = ak.where(tau_plus_use_rho, tau_vis_rho_mask[:, 1], tau_vis_prong_mask[:, 1])
+    tau_vis_target = ak.concatenate([tau_minus_target[:, np.newaxis], tau_plus_target[:, np.newaxis]], axis=1)
+    tau_vis_target_mask = ak.concatenate([tau_minus_target_mask[:, np.newaxis], tau_plus_target_mask[:, np.newaxis]], axis=1)
 
     target_tau_minus = truth_tau - tau_vis_target[:, 0, :]
     target_tau_plus = truth_anti_tau - tau_vis_target[:, 1, :]
 
-    x_invisible[:, 0, :] = p4_to_features(
+    x_invisible_minus = p4_to_features(
         target_tau_minus[:, 1],
         target_tau_minus[:, 2],
         target_tau_minus[:, 3],
         target_tau_minus[:, 0],
     )
-    x_invisible[:, 1, :] = p4_to_features(
+    x_invisible_plus = p4_to_features(
         target_tau_plus[:, 1],
         target_tau_plus[:, 2],
         target_tau_plus[:, 3],
         target_tau_plus[:, 0],
     )
+    # The invisible target follows the same [event, tau(2), feature(4)] layout.
+    x_invisible = ak.concatenate([x_invisible_minus[:, np.newaxis], x_invisible_plus[:, np.newaxis]], axis=1)
 
-    tau_truth_valid = np.isfinite(truth_tau).all(axis=1)
-    anti_tau_truth_valid = np.isfinite(truth_anti_tau).all(axis=1)
-    x_invisible_mask[:, 0] = tau_truth_valid & tau_vis_target_mask[:, 0] & np.isfinite(x_invisible[:, 0, :]).all(axis=1)
-    x_invisible_mask[:, 1] = anti_tau_truth_valid & tau_vis_target_mask[:, 1] & np.isfinite(x_invisible[:, 1, :]).all(axis=1)
-    x_invisible[~x_invisible_mask] = 0.0
-    tau_vis_target[~tau_vis_target_mask] = 0.0
+    tau_truth_valid = ak.all(np.isfinite(truth_tau), axis=1)
+    anti_tau_truth_valid = ak.all(np.isfinite(truth_anti_tau), axis=1)
+    x_invisible_minus_mask = tau_truth_valid & tau_vis_target_mask[:, 0] & ak.all(np.isfinite(x_invisible[:, 0, :]), axis=1)
+    x_invisible_plus_mask = anti_tau_truth_valid & tau_vis_target_mask[:, 1] & ak.all(np.isfinite(x_invisible[:, 1, :]), axis=1)
+    x_invisible_mask = ak.concatenate([x_invisible_minus_mask[:, np.newaxis], x_invisible_plus_mask[:, np.newaxis]], axis=1)
+    x_invisible = ak.where(x_invisible_mask[..., np.newaxis], x_invisible, 0.0)
+    tau_vis_target = ak.where(tau_vis_target_mask[..., np.newaxis], tau_vis_target, 0.0)
 
     num_invisible_raw[:] = 2
-    num_invisible_valid[:] = x_invisible_mask.sum(axis=1).astype(np.int64)
+    num_invisible_valid[:] = ak.to_numpy(ak.sum(ak.values_astype(x_invisible_mask, np.int64), axis=1), allow_missing=False).astype(np.int64)
     return x_invisible, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target, tau_vis_target_mask
 
 
@@ -289,23 +296,23 @@ def extract_target_invisible_observable(events: ak.Array, observable: str) -> np
     )
 
     if observable == "energy":
-        return x_invisible[..., 0][x_invisible_mask]
+        return ak.to_numpy(ak.flatten(x_invisible[..., 0][x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "pt":
-        return x_invisible[..., 1][x_invisible_mask]
+        return ak.to_numpy(ak.flatten(x_invisible[..., 1][x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "eta":
-        return x_invisible[..., 2][x_invisible_mask]
+        return ak.to_numpy(ak.flatten(x_invisible[..., 2][x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "phi":
-        return x_invisible[..., 3][x_invisible_mask]
+        return ak.to_numpy(ak.flatten(x_invisible[..., 3][x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "mass":
         invisible_p4 = vector.zip(
             {
-                "pt": np.asarray(x_invisible[..., 1], dtype=np.float32),
-                "eta": np.asarray(x_invisible[..., 2], dtype=np.float32),
-                "phi": np.asarray(x_invisible[..., 3], dtype=np.float32),
-                "E": np.asarray(x_invisible[..., 0], dtype=np.float32),
+                "pt": ak.to_numpy(x_invisible[..., 1], allow_missing=False).astype(np.float32),
+                "eta": ak.to_numpy(x_invisible[..., 2], allow_missing=False).astype(np.float32),
+                "phi": ak.to_numpy(x_invisible[..., 3], allow_missing=False).astype(np.float32),
+                "E": ak.to_numpy(x_invisible[..., 0], allow_missing=False).astype(np.float32),
             }
         )
-        return np.asarray(invisible_p4.mass, dtype=np.float32)[x_invisible_mask]
+        return np.asarray(invisible_p4.mass, dtype=np.float32)[ak.to_numpy(x_invisible_mask, allow_missing=False)]
     raise ValueError(f"Unsupported target invisible observable '{observable}'.")
 
 
@@ -322,23 +329,23 @@ def extract_visible_tau_observable(events: ak.Array, mode: str, observable: str)
         raise ValueError(f"Unsupported visible tau mode '{mode}'.")
 
     if observable == "energy":
-        return values[..., 0][mask]
+        return ak.to_numpy(ak.flatten(values[..., 0][mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "pt":
-        return values[..., 1][mask]
+        return ak.to_numpy(ak.flatten(values[..., 1][mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "eta":
-        return values[..., 2][mask]
+        return ak.to_numpy(ak.flatten(values[..., 2][mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "phi":
-        return values[..., 3][mask]
+        return ak.to_numpy(ak.flatten(values[..., 3][mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "mass":
         visible_p4 = vector.zip(
             {
-                "pt": np.asarray(values[..., 1], dtype=np.float32),
-                "eta": np.asarray(values[..., 2], dtype=np.float32),
-                "phi": np.asarray(values[..., 3], dtype=np.float32),
-                "E": np.asarray(values[..., 0], dtype=np.float32),
+                "pt": ak.to_numpy(values[..., 1], allow_missing=False).astype(np.float32),
+                "eta": ak.to_numpy(values[..., 2], allow_missing=False).astype(np.float32),
+                "phi": ak.to_numpy(values[..., 3], allow_missing=False).astype(np.float32),
+                "E": ak.to_numpy(values[..., 0], allow_missing=False).astype(np.float32),
             }
         )
-        return np.asarray(visible_p4.mass, dtype=np.float32)[mask]
+        return np.asarray(visible_p4.mass, dtype=np.float32)[ak.to_numpy(mask, allow_missing=False)]
     raise ValueError(f"Unsupported visible tau observable '{observable}'.")
 
 

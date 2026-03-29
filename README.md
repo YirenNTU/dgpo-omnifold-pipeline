@@ -5,7 +5,7 @@ This directory contains the local ML-side utilities and configs used with the LE
 ## Layout
 
 - `EveNet-Full/`: upstream EveNet codebase and docs.
-- `config/analysis.yaml`: sample list for plotting DataLoader parquet outputs.
+- `config/analysis.yaml`: sample list plus configurable ML input feature lists.
 - `util/plot_control_parquets.py`: simple data-vs-MC control plotting script for parquet files produced by `processor/DataLoader.py`.
 - `util/build_evenet_input_from_parquet.py`: convert DataLoader parquet outputs into a simple EveNet-style `.npz` bundle plus metadata and an `event_info.yaml` skeleton.
 - `util/evenet_parquet_common.py`: shared visible-tau and invisible-target helpers used by both scripts.
@@ -31,9 +31,10 @@ If `Subcategories` is present in the config, the script further splits a sample 
 ### Run
 
 ```bash
-python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/util/plot_control_parquets.py \
-  --config /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/config/analysis.yaml \
-  --output-dir /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/plots
+cd ml_pipeline
+python3 util/plot_control_parquets.py \
+  --config config/analysis.yaml \
+  --output-dir plots
 ```
 
 ### Current default plots
@@ -47,7 +48,7 @@ python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/util/plot_control_
 - `n_neutral`
 - `thrust_neglog1m`
 - one plot for each particle momentum feature: `Part_energy`, `Part_pt`, `Part_eta`, `Part_phi`
-- one plot for each auxiliary particle feature under `Part_*`
+- one plot for each auxiliary particle feature listed in `Inputs.Part.Auxiliary`
 - `tau_vis_prong_energy`
 - `tau_vis_prong_pt`
 - `tau_vis_prong_eta`
@@ -86,9 +87,29 @@ Samples:
     norm_factor: 1458.9 # MC only, optional
     input_files:
       - "/path/to/file.parquet"
+
+Inputs:
+  Part:
+    Momentum: [energy, pt, eta, phi]
+    Auxiliary:
+      - Part_charge
+      - Part_pdgId
+      - ...
+  Global:
+    Fields:
+      - Event_totalChargedEnergy
+      - ...
 ```
 
 `input_files` may also use glob patterns.
+
+`Inputs.Part.Auxiliary` and `Inputs.Global.Fields` control which features are:
+
+- written into the EveNet point-cloud and condition tensors
+- monitored by `util/build_evenet_input_from_parquet.py`
+- plotted by `util/plot_control_parquets.py`
+
+So if you want to add or remove `Part_*` or event-level inputs, edit `config/analysis.yaml` instead of the Python code.
 
 Optional `Subcategories` format:
 
@@ -108,6 +129,7 @@ The key under `Subcategories` should match the sample key or sample `name` from 
 
 It currently:
 
+- keeps data samples in the monitoring plots, but excludes them from the final EveNet `.npz` payload
 - converts `Part_*` into the point-cloud tensor `x`
 - replaces Cartesian four-momentum with `energy`, `pt`, `eta`, `phi`
 - builds event-level `conditions`
@@ -121,9 +143,9 @@ It currently:
   - `Rho` uses the prong-plus-photon visible tau
 - writes monitoring plots under `<output-dir>/monitoring/`, including:
   - `nprong` before/after the preselection for each input sample
-  - one histogram per global input field
+  - one histogram per global input field listed in `Inputs.Global.Fields`
   - one histogram per particle momentum feature: `Part_energy`, `Part_pt`, `Part_eta`, `Part_phi`
-  - one histogram per auxiliary `Part_*` feature
+  - one histogram per auxiliary `Part_*` feature listed in `Inputs.Part.Auxiliary`
   - `tau_vis_prong_energy`
   - `tau_vis_prong_pt`
   - `tau_vis_prong_eta`
@@ -144,10 +166,74 @@ It currently:
 
 The visible-tau and target-invisible definitions are shared with `util/plot_control_parquets.py`, so the monitor plots and the standalone plotting script use the same reconstruction assumptions.
 
+`classification` and the `CLASSLABEL` block in `event_info.yaml` are built from MC-only categories/subcategories. Data is treated as monitoring-only input and is never written into the EveNet training dataset.
+
 Run:
 
 ```bash
-python3 /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/util/build_evenet_input_from_parquet.py \
-  --config /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/config/analysis.yaml \
-  --output-dir /Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/evenet_inputs
+cd ml_pipeline
+python3 util/build_evenet_input_from_parquet.py \
+  --config config/analysis.yaml \
+  --output-dir evenet_inputs
 ```
+
+## EveNet Preprocess
+
+The converter above does **not** write the final EveNet training parquet shards by itself. It writes the two artifacts that EveNet expects as input:
+
+- `evenet_input.npz`
+- `event_info.yaml`
+
+To turn those into the final EveNet parquet files, run EveNet's own preprocessing step from [preprocess.py](EveNet-Full/preprocessing/preprocess.py).
+
+### Single NPZ -> train/val/test parquet
+
+If you are using the single combined `.npz` produced by `util/build_evenet_input_from_parquet.py`, use EveNet's event-level split mode:
+
+```bash
+cd ml_pipeline
+python3 EveNet-Full/preprocessing/preprocess.py \
+  --config evenet_inputs/event_info.yaml \
+  --file evenet_inputs/evenet_input.npz \
+  --split_ratio 0.8,0.1,0.1 \
+  --store_dir evenet_inputs/preprocessed \
+  -v
+```
+
+This writes:
+
+- `train.parquet`
+- `val.parquet`
+- `test.parquet`
+- `shape_metadata.json`
+- `normalization.pt`
+
+### Explicit train/val/test NPZ splits
+
+If you split your `.npz` files upstream, use EveNet's explicit split mode instead:
+
+```bash
+cd ml_pipeline
+python3 EveNet-Full/preprocessing/preprocess.py \
+  --config evenet_inputs/event_info.yaml \
+  --train /path/to/train.npz \
+  --val /path/to/val.npz \
+  --test /path/to/test.npz \
+  --store_dir evenet_inputs/preprocessed \
+  -v
+```
+
+### What EveNet uses at training time
+
+For EveNet training or prediction configs, point to the preprocessing output:
+
+- `platform.data_parquet_dir`: directory containing `train.parquet`, `val.parquet`, `test.parquet`
+- `options.Dataset.event_info`: the same `event_info.yaml`
+- `options.Dataset.normalization_file`: `normalization.pt`
+
+In practice, the end-to-end flow is:
+
+1. Start from DataLoader parquet files.
+2. Run [build_evenet_input_from_parquet.py](util/build_evenet_input_from_parquet.py) to make `evenet_input.npz` and `event_info.yaml`.
+3. Run EveNet preprocessing to make the final parquet shards plus normalization.
+4. Train EveNet against that preprocessing output.

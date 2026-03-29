@@ -12,12 +12,12 @@ import numpy as np
 import yaml
 from evenet_parquet_common import (
     FOUR_VECTOR_FEATURES,
-    PART_AUX_FIELDS,
     extract_target_invisible_observable,
     extract_part_feature,
     extract_part_momentum_observable,
     extract_visible_tau_observable,
 )
+from ml_pipeline_config import FeatureConfig, parse_feature_config
 from parquet_plot_common import (
     choose_bins,
     get_initial_total_num_events,
@@ -106,7 +106,7 @@ def _parse_category_values(raw_values) -> tuple[int, ...]:
     return (int(raw_values),)
 
 
-def parse_plot_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]]]:
+def parse_plot_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]], FeatureConfig]:
     config = read_yaml(config_path)
 
     raw_samples = config.get("Samples", {})
@@ -137,7 +137,7 @@ def parse_plot_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, l
             for split_name, category_values in split_cfg.items()
         ]
 
-    return samples, subcategories
+    return samples, subcategories, parse_feature_config(config)
 
 
 def split_sample_by_event_category(
@@ -348,7 +348,7 @@ def extract_target_invisible_mass(events: ak.Array) -> np.ndarray:
     return extract_target_invisible_observable(events, "mass")
 
 
-def default_plot_specs() -> list[PlotSpec]:
+def default_plot_specs(feature_config: FeatureConfig) -> list[PlotSpec]:
     specs = [
         PlotSpec(
             name="isolation_angle",
@@ -486,7 +486,7 @@ def default_plot_specs() -> list[PlotSpec]:
         ),
     ]
 
-    for observable in FOUR_VECTOR_FEATURES:
+    for observable in feature_config.part_momentum_fields:
         specs.append(
             PlotSpec(
                 name=f"Part_{observable}",
@@ -497,7 +497,7 @@ def default_plot_specs() -> list[PlotSpec]:
                 log_scale=observable not in {"eta", "phi"},
             )
         )
-    for field_name in PART_AUX_FIELDS:
+    for field_name in feature_config.part_aux_fields:
         specs.append(
             PlotSpec(
                 name=field_name,
@@ -599,7 +599,7 @@ def make_control_plots(
     luminosity: float | None = None,
     normalize: bool | None = None,
 ):
-    samples, subcategories = parse_plot_config(config_path)
+    samples, subcategories, feature_config = parse_plot_config(config_path)
     console.print(f"[bold]Using config[/bold] [white]{config_path}[/white]")
     loaded_events = {sample_key: load_sample_events(sample) for sample_key, sample in samples.items()}
     expanded_samples = expand_samples(samples, loaded_events, subcategories)
@@ -634,7 +634,7 @@ def make_control_plots(
         )
     console.print(sample_table)
 
-    for plot_spec in default_plot_specs():
+    for plot_spec in default_plot_specs(feature_config):
         console.print(f"[bold cyan]Processing plot[/bold cyan] [white]{plot_spec.name}[/white]")
         bins = plot_spec.bins
         if bins is None:

@@ -31,6 +31,51 @@ Samples:
     input_files:
       - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Zqq/filtered___tautau.parquet"
 
+Inputs:
+  Part:
+    Momentum: [energy, pt, eta, phi]
+    Auxiliary:
+      - Part_charge
+      - Part_pdgId
+      - Part_vtxIdx
+      - Part_hpcShowerEnergy
+      - Part_hpcShowerTheta
+      - Part_hpcShowerPhi
+      - Part_hpcParticleCode
+      - Part_hpcNumLayers
+      - Part_hpcLayerHitPattern
+      - Part_hpcNumAssociatedShowers
+      - Part_hpcTotalShowerEnergy
+      - Part_hacShowerEnergy
+      - Part_hacShowerTheta
+      - Part_hacShowerPhi
+      - Part_hacParticleCode
+      - Part_hacNumTowers
+      - Part_hacTowerHitPattern
+      - Part_hacNumAssociatedShowers
+      - Part_hacTotalShowerEnergy
+      - Part_sticShowerEnergy
+      - Part_sticShowerTheta
+      - Part_sticShowerPhi
+      - Part_sticNumTowers
+      - Part_sticChargedTag
+      - Part_sticSiliconVertexPos
+      - Part_hemisphere
+  Global:
+    Fields:
+      - Event_totalChargedEnergy
+      - Event_totalEMEnergy
+      - Event_totalHadronicEnergy
+      - thrust_Mag
+      - charged_E
+      - missing_px
+      - missing_py
+      - missing_pt
+      - isolation_angle
+      - thrust_x
+      - thrust_y
+      - thrust_z
+
 Subcategories:
   Ztautau:
     Ztautau_pipi: [11]

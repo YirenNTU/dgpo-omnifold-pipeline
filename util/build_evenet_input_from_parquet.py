@@ -12,8 +12,6 @@ import numpy as np
 import yaml
 from evenet_parquet_common import (
     FOUR_VECTOR_FEATURES,
-    GLOBAL_FIELDS,
-    PART_AUX_FIELDS,
     build_tau_targets,
     build_visible_tau_assumptions,
     build_momentum4d,
@@ -22,6 +20,7 @@ from evenet_parquet_common import (
     extract_part_momentum_observable,
     extract_visible_tau_observable,
 )
+from ml_pipeline_config import FeatureConfig, parse_feature_config
 from parquet_plot_common import (
     choose_bins,
     infer_luminosity,
@@ -99,7 +98,7 @@ def parse_category_values(raw_values) -> tuple[int, ...]:
     return (int(raw_values),)
 
 
-def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]]]:
+def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]], FeatureConfig]:
     config = read_yaml(config_path)
 
     raw_samples = config.get("Samples", {})
@@ -126,7 +125,7 @@ def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[C
         ]
         for sample_key, split_cfg in raw_subcategories.items()
     }
-    return samples, subcategories
+    return samples, subcategories, parse_feature_config(config)
 
 
 def split_sample_by_category(sample: Sample, events: ak.Array, splits: list[CategorySplit]) -> list[tuple[Sample, ak.Array]]:
@@ -178,34 +177,19 @@ def expand_samples(samples: dict[str, Sample], sample_events: dict[str, ak.Array
     return expanded
 
 
-def component_names(base_name: str, array_ndim: int, trailing_shape: tuple[int, ...]) -> list[str]:
-    if array_ndim == 2:
-        return [base_name]
-
-    flat_size = int(np.prod(trailing_shape))
-    if flat_size == 1:
-        return [base_name]
-    return [f"{base_name}_{index}" for index in range(flat_size)]
-
-
-def pad_and_flatten_part_feature(values: ak.Array, max_particles: int) -> np.ndarray:
+def pad_and_flatten_part_feature(values: ak.Array, max_particles: int) -> ak.Array:
     padded = ak.pad_none(values, max_particles, axis=1, clip=True)
     filled = ak.fill_none(padded, 0)
-    numpy_values = ak.to_numpy(filled)
-    if numpy_values.ndim == 2:
-        return numpy_values[..., np.newaxis].astype(np.float32)
-    return numpy_values.reshape(numpy_values.shape[0], numpy_values.shape[1], -1).astype(np.float32)
+    regular = ak.to_regular(filled, axis=1)
+    return ak.values_astype(regular, np.float32)[..., np.newaxis]
 
 
-def flatten_global_feature(values: ak.Array) -> np.ndarray:
+def flatten_global_feature(values: ak.Array) -> ak.Array:
     filled = ak.fill_none(values, 0)
-    numpy_values = ak.to_numpy(filled)
-    if numpy_values.ndim == 1:
-        return numpy_values[:, np.newaxis].astype(np.float32)
-    return numpy_values.reshape(numpy_values.shape[0], -1).astype(np.float32)
+    return ak.values_astype(filled, np.float32)[..., np.newaxis]
 
 
-def build_point_cloud(events: ak.Array, max_particles: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+def build_point_cloud(events: ak.Array, max_particles: int, feature_config: FeatureConfig):
     part_p4 = build_momentum4d(
         events["Part_fourMomentum_fCoordinates_fX"],
         events["Part_fourMomentum_fCoordinates_fY"],
@@ -217,45 +201,49 @@ def build_point_cloud(events: ak.Array, max_particles: int) -> tuple[np.ndarray,
     features = []
     feature_names: list[str] = []
 
-    momentum_features = {
-        "Part_energy": part_p4.E,
-        "Part_pt": part_p4.pt,
-        "Part_eta": eta,
-        "Part_phi": part_p4.phi,
+    available_momentum_features = {
+        "energy": part_p4.E,
+        "pt": part_p4.pt,
+        "eta": eta,
+        "phi": part_p4.phi,
     }
-    for feature_name, values in momentum_features.items():
+    for feature_name in feature_config.part_momentum_fields:
+        values = available_momentum_features[feature_name]
         expanded = pad_and_flatten_part_feature(values, max_particles)
         features.append(expanded)
-        feature_names.extend(component_names(feature_name, expanded.ndim, expanded.shape[2:]))
+        feature_names.append(f"Part_{feature_name}")
 
-    for field_name in PART_AUX_FIELDS:
+    for field_name in feature_config.part_aux_fields:
         expanded = pad_and_flatten_part_feature(events[field_name], max_particles)
         features.append(expanded)
-        feature_names.extend(component_names(field_name, expanded.ndim, expanded.shape[2:]))
+        feature_names.append(field_name)
 
-    x = np.concatenate(features, axis=2).astype(np.float32)
+    # Point-cloud tensor shape: [event, particle slot, feature].
+    x = ak.concatenate(features, axis=2)
 
-    num_particles = ak.to_numpy(ak.num(events["Part_pdgId"], axis=1), allow_missing=False).astype(np.float32)
-    x_mask = (np.arange(max_particles)[None, :] < num_particles[:, None])
+    num_particles = ak.values_astype(ak.num(events["Part_pdgId"], axis=1), np.float32)
+    # Mask shape: [event, particle slot].
+    x_mask = ak.Array(np.arange(max_particles)[None, :] < ak.to_numpy(num_particles, allow_missing=False)[:, None])
     return x, x_mask, num_particles, feature_names
 
 
-def build_global_conditions(events: ak.Array) -> tuple[np.ndarray, np.ndarray, list[str]]:
+def build_global_conditions(events: ak.Array, feature_config: FeatureConfig):
     features = []
     feature_names: list[str] = []
 
-    for field_name in GLOBAL_FIELDS:
+    for field_name in feature_config.global_fields:
         flattened = flatten_global_feature(events[field_name])
         features.append(flattened)
-        feature_names.extend(component_names(field_name, flattened.ndim, flattened.shape[1:]))
+        feature_names.append(field_name)
 
-    conditions = np.concatenate(features, axis=1).astype(np.float32)
-    conditions_mask = np.ones((len(events), 1), dtype=bool)
+    # Global-condition tensor shape: [event, feature].
+    conditions = ak.concatenate(features, axis=1)
+    conditions_mask = ak.Array(np.ones((len(events), 1), dtype=bool))
     return conditions, conditions_mask, feature_names
 
 
-def compute_event_totals(num_sequential_vectors: np.ndarray, conditions_mask: np.ndarray) -> np.ndarray:
-    return num_sequential_vectors + conditions_mask[:, 0].astype(np.float32)
+def compute_event_totals(num_sequential_vectors, conditions_mask):
+    return num_sequential_vectors + ak.values_astype(conditions_mask[:, 0], np.float32)
 
 
 def infer_max_particles(expanded_samples: list[tuple[Sample, ak.Array]], override: int | None) -> int:
@@ -264,7 +252,28 @@ def infer_max_particles(expanded_samples: list[tuple[Sample, ak.Array]], overrid
     return max(int(ak.max(ak.num(events["Part_pdgId"], axis=1))) for _, events in expanded_samples)
 
 
-def build_dataset(expanded_samples: list[tuple[Sample, ak.Array]], max_particles: int) -> tuple[dict[str, np.ndarray], dict]:
+def select_training_samples(expanded_samples: list[tuple[Sample, ak.Array]]) -> list[tuple[Sample, ak.Array]]:
+    training_samples = [(sample, events) for sample, events in expanded_samples if not sample.is_data]
+    if not training_samples:
+        raise ValueError("No MC samples remain for EveNet dataset building after filtering out data.")
+    return training_samples
+
+
+def to_numpy_array(values, dtype=None) -> np.ndarray:
+    if isinstance(values, ak.Array):
+        values = ak.to_numpy(values, allow_missing=False)
+    else:
+        values = np.asarray(values)
+    if dtype is not None:
+        values = values.astype(dtype)
+    return values
+
+
+def build_dataset(
+    expanded_samples: list[tuple[Sample, ak.Array]],
+    max_particles: int,
+    feature_config: FeatureConfig,
+) -> tuple[dict[str, np.ndarray], dict]:
     class_labels = [sample.name for sample, _ in expanded_samples]
     class_index = {label: index for index, label in enumerate(class_labels)}
 
@@ -275,8 +284,8 @@ def build_dataset(expanded_samples: list[tuple[Sample, ak.Array]], max_particles
     for sample, events in expanded_samples:
         console.print(f"[bold cyan]Converting[/bold cyan] [white]{sample.name}[/white]")
 
-        x, x_mask, num_sequential_vectors, point_cloud_names = build_point_cloud(events, max_particles)
-        conditions, conditions_mask, condition_names = build_global_conditions(events)
+        x, x_mask, num_sequential_vectors, point_cloud_names = build_point_cloud(events, max_particles, feature_config)
+        conditions, conditions_mask, condition_names = build_global_conditions(events, feature_config)
         num_vectors = compute_event_totals(num_sequential_vectors, conditions_mask)
 
         tau_vis_prong, tau_vis_prong_mask, tau_vis_rho, tau_vis_rho_mask = build_visible_tau_assumptions(events)
@@ -292,24 +301,26 @@ def build_dataset(expanded_samples: list[tuple[Sample, ak.Array]], max_particles
 
         batches.append(
             {
-                "x": x,
-                "x_mask": x_mask,
-                "conditions": conditions,
-                "conditions_mask": conditions_mask,
+                # EveNet inputs: x [N, P, F_seq], conditions [N, F_global].
+                "x": to_numpy_array(x, np.float32),
+                "x_mask": to_numpy_array(x_mask, bool),
+                "conditions": to_numpy_array(conditions, np.float32),
+                "conditions_mask": to_numpy_array(conditions_mask, bool),
                 "classification": classification,
                 "event_weight": event_weight,
-                "num_vectors": num_vectors.astype(np.float32),
-                "num_sequential_vectors": num_sequential_vectors.astype(np.float32),
-                "x_invisible": x_invisible,
-                "x_invisible_mask": x_invisible_mask,
+                "num_vectors": to_numpy_array(num_vectors, np.float32),
+                "num_sequential_vectors": to_numpy_array(num_sequential_vectors, np.float32),
+                # Truth/auxiliary targets: [N, 2, 4] for tau- / tau+ and [N, 2] masks.
+                "x_invisible": to_numpy_array(x_invisible, np.float32),
+                "x_invisible_mask": to_numpy_array(x_invisible_mask, bool),
                 "num_invisible_raw": num_invisible_raw,
                 "num_invisible_valid": num_invisible_valid,
-                "tau_vis_prong": tau_vis_prong,
-                "tau_vis_prong_mask": tau_vis_prong_mask,
-                "tau_vis_rho": tau_vis_rho,
-                "tau_vis_rho_mask": tau_vis_rho_mask,
-                "tau_vis_target": tau_vis_target,
-                "tau_vis_target_mask": tau_vis_target_mask,
+                "tau_vis_prong": to_numpy_array(tau_vis_prong, np.float32),
+                "tau_vis_prong_mask": to_numpy_array(tau_vis_prong_mask, bool),
+                "tau_vis_rho": to_numpy_array(tau_vis_rho, np.float32),
+                "tau_vis_rho_mask": to_numpy_array(tau_vis_rho_mask, bool),
+                "tau_vis_target": to_numpy_array(tau_vis_target, np.float32),
+                "tau_vis_target_mask": to_numpy_array(tau_vis_target_mask, bool),
             }
         )
 
@@ -412,6 +423,7 @@ def write_monitoring_plots(
     output_dir: Path,
     luminosity: float | None,
     normalize: bool,
+    feature_config: FeatureConfig,
 ) -> None:
     monitor_dir = output_dir / "monitoring"
     monitor_dir.mkdir(parents=True, exist_ok=True)
@@ -441,7 +453,7 @@ def write_monitoring_plots(
         log_scale=False,
     )
 
-    for field_name in GLOBAL_FIELDS:
+    for field_name in feature_config.global_fields:
         values_by_sample = {
             sample.name: sanitize_hist_values(ak.to_numpy(events[field_name], allow_missing=False))
             for sample, events in expanded_samples
@@ -519,7 +531,7 @@ def write_monitoring_plots(
             log_scale=observable not in {"eta", "phi"},
         )
 
-    for field_name in PART_AUX_FIELDS:
+    for field_name in feature_config.part_aux_fields:
         values_by_sample = {
             sample.name: sanitize_hist_values(extract_part_feature(events, field_name))
             for sample, events in expanded_samples
@@ -587,7 +599,7 @@ def main() -> None:
     args = parser.parse_args()
 
     console.print(f"[bold]Using config[/bold] [white]{args.config}[/white]")
-    samples, subcategories = parse_config(args.config)
+    samples, subcategories, feature_config = parse_config(args.config)
     raw_sample_events = {
         sample_key: load_sample_events(sample)
         for sample_key, sample in samples.items()
@@ -617,20 +629,34 @@ def main() -> None:
         output_dir=args.output_dir,
         luminosity=resolved_luminosity,
         normalize=normalize,
+        feature_config=feature_config,
     )
 
-    max_particles = infer_max_particles(expanded_samples, args.max_particles)
+    training_samples = select_training_samples(expanded_samples)
+
+    max_particles = infer_max_particles(training_samples, args.max_particles)
     console.print(f"[bold]Point-cloud padding[/bold] max_particles=[white]{max_particles}[/white]")
 
     sample_table = Table(title="Expanded Samples")
     sample_table.add_column("Sample")
     sample_table.add_column("Type")
     sample_table.add_column("Events", justify="right")
+    sample_table.add_column("Use in EveNet", justify="center")
     for sample, events in expanded_samples:
-        sample_table.add_row(sample.name, "data" if sample.is_data else "mc", str(len(events)))
+        sample_table.add_row(
+            sample.name,
+            "data" if sample.is_data else "mc",
+            str(len(events)),
+            "no" if sample.is_data else "yes",
+        )
     console.print(sample_table)
 
-    dataset, metadata = build_dataset(expanded_samples, max_particles)
+    console.print(
+        f"[bold]EveNet training samples[/bold] "
+        f"[white]{', '.join(sample.name for sample, _ in training_samples)}[/white]"
+    )
+
+    dataset, metadata = build_dataset(training_samples, max_particles, feature_config)
     write_outputs(dataset, metadata, args.output_dir)
 
 
