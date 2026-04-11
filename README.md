@@ -242,7 +242,7 @@ The converter above does **not** write the final EveNet training parquet shards 
 To turn those into the final EveNet parquet files, run EveNet's own preprocessing step from [preprocess.py](EveNet-Full/preprocessing/preprocess.py). Use the static [config/preprocess_config.yaml](config/preprocess_config.yaml) for `--config`; it follows the same `default:` merge pattern as the upstream `share/*-example.yaml` files and points to:
 
 - `config/generated_event_info.yaml`
-- `../EveNet-Full/share/resonance/standard_model.yaml`
+- `config/resonance.yaml`
 
 ### Single NPZ -> train/val/test parquet
 

@@ -3,48 +3,48 @@ Classification:
 
 Processes:
   Ztautau_pipi:
-    tau_minus:
-      - tau_minus_vis
-    tau_plus:
-      - tau_plus_vis
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_pirho:
-    tau_minus:
-      - tau_minus_vis
-    tau_plus:
-      - tau_plus_vis
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_pilep:
-    tau_minus:
-      - tau_minus_vis
-    tau_plus:
-      - tau_plus_vis
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_rhorho:
-    tau_minus:
-      - tau_minus_vis
-    tau_plus:
-      - tau_plus_vis
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_leplep:
-    tau_minus:
-      - tau_minus_vis
-    tau_plus:
-      - tau_plus_vis
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_piother:
-    tau_minus:
-      - tau_minus_vis
-    tau_plus:
-      - tau_plus_vis
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_others:
-    tau_minus:
-      - tau_minus_vis
-    tau_plus:
-      - tau_plus_vis
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Zll:
-    z_boson:
-      - lep_minus
-      - lep_plus
+    Z:
+      - l1
+      - l2
   Zqq:
-    z_boson:
-      - jet_1
-      - jet_2
+    Z:
+      - q1
+      - q2
 
 Generations:
   Conditions:

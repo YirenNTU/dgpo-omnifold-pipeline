@@ -38,4 +38,4 @@ event_info:
   default: generated_event_info.yaml
 
 resonance:
-  default: ../EveNet-Full/share/resonance/standard_model.yaml
+  default: resonance.yaml
