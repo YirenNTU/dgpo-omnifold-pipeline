@@ -81,7 +81,7 @@ options:
       replace_model_at_end: false
 
   Dataset:
-    dataset_limit: 1.0
+    dataset_limit: 0.1
     normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/event-input/normalization.pt
     val_split: [0.95, 1.0]
 
