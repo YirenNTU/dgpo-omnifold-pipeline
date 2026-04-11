@@ -375,6 +375,11 @@ def build_event_info_yaml(metadata: dict, feature_config: FeatureConfig, evenet_
             + ", ".join(missing_processes)
         )
 
+    # EveNet-Full's current training/metric code assumes the event-level
+    # classification head is named "signal". Keep that contract here and use
+    # the class list contents for the actual process labels.
+    classification_name = "signal"
+
     return {
         "INPUTS": {
             "SEQUENTIAL": {
@@ -398,11 +403,11 @@ def build_event_info_yaml(metadata: dict, feature_config: FeatureConfig, evenet_
             for label in class_labels
         },
         "CLASSIFICATIONS": {
-            "EVENT": [evenet_config.classification_name]
+            "EVENT": [classification_name]
         },
         "CLASSLABEL": {
             "EVENT": {
-                evenet_config.classification_name: [class_labels]
+                classification_name: [class_labels]
             }
         },
         "GENERATIONS": {
