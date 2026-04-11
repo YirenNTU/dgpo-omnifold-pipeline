@@ -128,11 +128,16 @@ def _resolve_normalization_cfg(config: dict) -> dict:
 
 
 def parse_evenet_config(config: dict, feature_config: FeatureConfig) -> EveNetConfig:
-    evenet_cfg = config.get("EveNet", {})
+    if "Processes" in config or "Classification" in config or "Generations" in config:
+        evenet_cfg = config
+    else:
+        evenet_cfg = config.get("EveNet", {})
 
     raw_processes = evenet_cfg.get("Processes", {})
     if not raw_processes:
-        raise ValueError("analysis.yaml is missing EveNet.Processes for multi-process event_info generation.")
+        raise ValueError(
+            "EveNet schema is missing Processes for multi-process event_info generation."
+        )
 
     classification_cfg = evenet_cfg.get("Classification", {})
     classification_name = classification_cfg.get("Name", "process")
