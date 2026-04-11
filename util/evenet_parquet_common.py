@@ -270,15 +270,11 @@ def build_tau_targets(
     tau_vis_target_p4 = stack_tau_pair(tau_minus_target_p4, tau_plus_target_p4)
     tau_vis_target_mask = stack_tau_pair_mask(tau_minus_target_mask, tau_plus_target_mask)
 
-    target_tau_minus_p4 = truth_tau - tau_minus_target_p4
-    target_tau_plus_p4 = truth_anti_tau - tau_plus_target_p4
-
-    x_invisible_p4 = stack_tau_pair(target_tau_minus_p4, target_tau_plus_p4)
-
     tau_truth_valid = np.isfinite(truth_tau.E) & np.isfinite(truth_tau.px) & np.isfinite(truth_tau.py) & np.isfinite(truth_tau.pz)
     anti_tau_truth_valid = np.isfinite(truth_anti_tau.E) & np.isfinite(truth_anti_tau.px) & np.isfinite(truth_anti_tau.py) & np.isfinite(truth_anti_tau.pz)
-    x_invisible_minus_mask = tau_truth_valid & tau_vis_target_mask[:, 0] & np.isfinite(target_tau_minus_p4.E) & np.isfinite(target_tau_minus_p4.px) & np.isfinite(target_tau_minus_p4.py) & np.isfinite(target_tau_minus_p4.pz)
-    x_invisible_plus_mask = anti_tau_truth_valid & tau_vis_target_mask[:, 1] & np.isfinite(target_tau_plus_p4.E) & np.isfinite(target_tau_plus_p4.px) & np.isfinite(target_tau_plus_p4.py) & np.isfinite(target_tau_plus_p4.pz)
+    x_invisible_p4 = stack_tau_pair(truth_tau, truth_anti_tau)
+    x_invisible_minus_mask = tau_truth_valid
+    x_invisible_plus_mask = anti_tau_truth_valid
     x_invisible_mask = ak.concatenate([x_invisible_minus_mask[:, np.newaxis], x_invisible_plus_mask[:, np.newaxis]], axis=1)
     x_invisible_p4 = mask_p4(x_invisible_p4, x_invisible_mask)
     tau_vis_target_p4 = mask_p4(tau_vis_target_p4, tau_vis_target_mask)
