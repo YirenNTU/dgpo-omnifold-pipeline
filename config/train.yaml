@@ -1,5 +1,5 @@
 platform:
-  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/event-input/train.parquet
+  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/event-input
   number_of_workers: 1
   resources_per_worker: {
     "CPU": 1,
