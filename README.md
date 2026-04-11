@@ -5,7 +5,8 @@ This directory contains the local ML-side utilities and configs used with the LE
 ## Layout
 
 - `EveNet-Full/`: upstream EveNet codebase and docs.
-- `config/analysis.yaml`: sample list, configurable ML input feature lists, and the EveNet process/generation schema.
+- `config/analysis.yaml`: sample list, configurable ML input feature lists, and normalization rules.
+- `config/evenet_schema.yaml`: EveNet process topology and generation schema used to build the generated `event_info.yaml`.
 - `config/preprocess_config.yaml`: static EveNet preprocessing wrapper that points to `config/generated_event_info.yaml`.
 - `config/train.yaml`: repo-local EveNet training config following the upstream `share/finetune-example.yaml` pattern.
 - `config/predict.yaml`: repo-local EveNet prediction config following the upstream `share/predict-example.yaml` pattern.
@@ -105,18 +106,6 @@ Inputs:
       - Event_totalChargedEnergy
       - ...
 
-EveNet:
-  Classification:
-    Name: process
-  Processes:
-    Ztautau_pipi:
-      tau_minus: [tau_minus_vis]
-      tau_plus: [tau_plus_vis]
-  Generations:
-    Conditions: [...]
-    GlobalTargets: []
-    Events: [Part_energy, Part_pt, Part_eta, Part_phi]
-
 Normalization:
   Sequential:
     Part_energy: log_normalize
@@ -143,15 +132,6 @@ Normalization:
 
 So if you want to add or remove `Part_*` or event-level inputs, edit `config/analysis.yaml` instead of the Python code.
 
-`EveNet.Processes` is the source of truth for the generated multi-process `EVENT` block. The process names here must match the MC labels that will appear after subcategory expansion, because the converter uses this block to build:
-
-- `EVENT`
-- `CLASSIFICATIONS`
-- `CLASSLABEL`
-- `GENERATIONS`
-
-for the generated `event_info.yaml`.
-
 `Normalization` is the source of truth for the tags written into the generated EveNet schema. Use it to control whether each feature is marked as:
 
 - `none`
@@ -160,6 +140,13 @@ for the generated `event_info.yaml`.
 - `normalize_uniform`
 
 These tags are copied into the generated `event_info.yaml` and then consumed by EveNet preprocessing for log scaling and metadata.
+
+`config/evenet_schema.yaml` is the source of truth for the generated multi-process EveNet physics schema. The process names there must match the MC labels that will appear after subcategory expansion, because the converter uses it to build:
+
+- `EVENT`
+- `CLASSIFICATIONS`
+- `CLASSLABEL`
+- `GENERATIONS`
 
 Optional `Subcategories` format:
 
@@ -239,6 +226,7 @@ Run:
 cd ml_pipeline
 python3 util/build_evenet_input_from_parquet.py \
   --config config/analysis.yaml \
+  --evenet-config config/evenet_schema.yaml \
   --output-dir evenet_inputs
 ```
 
@@ -337,7 +325,7 @@ For EveNet training or prediction configs, point to the preprocessing output:
 In practice, the end-to-end flow is:
 
 1. Start from DataLoader parquet files.
-2. Define or update the process topology / generation settings in `config/analysis.yaml` under `EveNet`.
-3. Run [build_evenet_input_from_parquet.py](util/build_evenet_input_from_parquet.py) to make `evenet_input.npz`, `event_info.yaml`, and refresh `config/generated_event_info.yaml`.
+2. Define or update the process topology / generation settings in `config/evenet_schema.yaml`.
+3. Run [build_evenet_input_from_parquet.py](util/build_evenet_input_from_parquet.py) with `config/analysis.yaml` and `config/evenet_schema.yaml` to make `evenet_input.npz`, `event_info.yaml`, and refresh `config/generated_event_info.yaml`.
 4. Run EveNet preprocessing with `config/preprocess_config.yaml` to make the final parquet shards plus normalization.
 5. Fill in `config/train.yaml` or `config/predict.yaml` and run the corresponding EveNet script.

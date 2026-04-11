@@ -101,7 +101,7 @@ def parse_category_values(raw_values) -> tuple[int, ...]:
     return (int(raw_values),)
 
 
-def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]], FeatureConfig, EveNetConfig]:
+def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[CategorySplit]], FeatureConfig]:
     config = read_yaml(config_path)
 
     raw_samples = config.get("Samples", {})
@@ -129,7 +129,7 @@ def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[C
         for sample_key, split_cfg in raw_subcategories.items()
     }
     feature_config = parse_feature_config(config)
-    return samples, subcategories, feature_config, parse_evenet_config(config, feature_config)
+    return samples, subcategories, feature_config
 
 
 def split_sample_by_category(sample: Sample, events: ak.Array, splits: list[CategorySplit]) -> list[tuple[Sample, ak.Array]]:
@@ -643,7 +643,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path("/Users/tihsu/PycharmProjects/lep_tree_ana/ml_pipeline/config/analysis.yaml"),
-        help="YAML config with Samples and optional Subcategories.",
+        help="YAML config with Samples, feature lists, and normalization rules.",
+    )
+    parser.add_argument(
+        "--evenet-config",
+        type=Path,
+        default=CONFIG_DIR / "evenet_schema.yaml",
+        help="YAML config with EveNet process topology and generation settings.",
     )
     parser.add_argument(
         "--output-dir",
@@ -665,7 +671,9 @@ def main() -> None:
     args = parser.parse_args()
 
     console.print(f"[bold]Using config[/bold] [white]{args.config}[/white]")
-    samples, subcategories, feature_config, evenet_config = parse_config(args.config)
+    console.print(f"[bold]Using EveNet schema[/bold] [white]{args.evenet_config}[/white]")
+    samples, subcategories, feature_config = parse_config(args.config)
+    evenet_config = parse_evenet_config(read_yaml(args.evenet_config), feature_config)
     raw_sample_events = {
         sample_key: load_sample_events(sample)
         for sample_key, sample in samples.items()
@@ -748,7 +756,7 @@ def main() -> None:
             write_event_info=False,
         )
     else:
-        console.print("[yellow]Skipped data.npz[/yellow] no data samples configured")
+        console.print("[yellow]Skipped dataw[/yellow] no data samples configured")
 
 
 if __name__ == "__main__":
