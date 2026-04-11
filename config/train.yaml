@@ -1,11 +1,11 @@
 platform:
-  data_parquet_dir: <data_parquet_dir>
+  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/event-input/train.parquet
   number_of_workers: 1
   resources_per_worker: {
     "CPU": 1,
     "GPU": 1,
   }
-  batch_size: 4
+  batch_size: 512
   prefetch_batches: 1
   use_gpu: true
 
@@ -16,7 +16,7 @@ logger:
     tags: ["EveNet", "LEP"]
     simplified: false
   local:
-    save_dir: <log_save_dir>
+    save_dir: /tmp/tihsu/logs
     name: *logger_name
     version: "v1"
 
@@ -24,12 +24,12 @@ options:
   default: options.yaml
 
   Training:
-    model_checkpoint_save_path: <model_checkpoint_save_path>
+    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/event-input/checkpoint
     model_checkpoint_load_path: null
     pretrain_model_load_path: null
 
   Dataset:
-    normalization_file: <normalization_file>
+    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/event-input/normalization.pt
 
 network:
   default: network.yaml
