@@ -45,6 +45,10 @@ Training:
     mode: "min"
     verbose: true
 
+  FAMO:
+    turn_on: false
+    detailed_loss: false
+
   EMA:
     enable: true
     decay: 0.999
