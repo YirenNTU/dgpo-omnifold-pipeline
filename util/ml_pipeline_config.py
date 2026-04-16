@@ -106,9 +106,28 @@ def _normalize_group_node(name: str, raw_value, *, top_level: bool) -> dict:
             )
         children.append({child_name: normalized_child})
 
+    explicit_dim = raw_value.get("dim", raw_value.get("output_dim"))
+    if explicit_dim is None:
+        if top_level:
+            if len(indices) == 0:
+                raise ValueError(f"Top-level grouped input '{name}' must define 'dim'.")
+            output_dim = len(indices)
+        else:
+            output_dim = 1
+    else:
+        output_dim = int(explicit_dim)
+
+    if output_dim <= 0:
+        raise ValueError(f"Grouped input '{name}' must have a positive 'dim'.")
+    if top_level and len(indices) > 0 and output_dim != len(indices):
+        raise ValueError(
+            f"Top-level grouped input '{name}' has dim={output_dim} but index width={len(indices)}. "
+            "Root groups must project exactly to their assigned slot count."
+        )
+
     normalized = {
         "name": name,
-        "output_dim": len(indices) if len(indices) > 0 else int(raw_value.get("output_dim", 1)),
+        "output_dim": output_dim,
         "input": children,
     }
     if len(indices) > 0:

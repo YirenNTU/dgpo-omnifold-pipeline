@@ -34,37 +34,45 @@ Samples:
 Inputs:
   Part:
     Momentum:
+      dim: 4
       index: [0, 1, 2, 3]
       input: [energy, pt, eta, phi]
     Auxiliary:
+      dim: 2
       index: [4, 5]
       input:
         - Part_pdgId
         - hpc:
-          - Part_hpcShowerEnergy
-          - Part_hpcShowerTheta
-          - Part_hpcShowerPhi
-          - Part_hpcParticleCode
-          - Part_hpcNumLayers
-          - Part_hpcLayerHitPattern
-          - Part_hpcNumAssociatedShowers
-          - Part_hpcTotalShowerEnergy
+            dim: 2
+            input:
+              - Part_hpcShowerEnergy
+              - Part_hpcShowerTheta
+              - Part_hpcShowerPhi
+              - Part_hpcParticleCode
+              - Part_hpcNumLayers
+              - Part_hpcLayerHitPattern
+              - Part_hpcNumAssociatedShowers
+              - Part_hpcTotalShowerEnergy
         - hac:
-          - Part_hacShowerEnergy
-          - Part_hacShowerTheta
-          - Part_hacShowerPhi
-          - Part_hacParticleCode
-          - Part_hacNumTowers
-          - Part_hacTowerHitPattern
-          - Part_hacNumAssociatedShowers
-          - Part_hacTotalShowerEnergy
+            dim: 2
+            input:
+              - Part_hacShowerEnergy
+              - Part_hacShowerTheta
+              - Part_hacShowerPhi
+              - Part_hacParticleCode
+              - Part_hacNumTowers
+              - Part_hacTowerHitPattern
+              - Part_hacNumAssociatedShowers
+              - Part_hacTotalShowerEnergy
         - stic:
-          - Part_sticShowerEnergy
-          - Part_sticShowerTheta
-          - Part_sticShowerPhi
-          - Part_sticNumTowers
-          - Part_sticChargedTag
-          - Part_sticSiliconVertexPos
+            dim: 2
+            input:
+              - Part_sticShowerEnergy
+              - Part_sticShowerTheta
+              - Part_sticShowerPhi
+              - Part_sticNumTowers
+              - Part_sticChargedTag
+              - Part_sticSiliconVertexPos
         - Part_charge
         - Part_vtxIdx
         - Part_hemisphere
