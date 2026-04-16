@@ -30,12 +30,21 @@ options:
     model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/event-input/checkpoint
     model_checkpoint_load_path: null
     pretrain_model_load_path: null
+    freeze_modules: []
     diffusion_every_n_epochs: 4
     diffusion_every_n_steps: 1
     eval_metrics_every_n_epochs: 1
     apply_event_weight: false
 
     Components:
+      GroupedSequentialEmbedding:
+        learning_rate: 0.001
+        optimizer_group: "body"
+        optimizer_type: "lion"
+        warm_up: true
+        weight_decay: 0.01
+        decoupled_weight_decay: true
+
       Classification:
         include: true
 
@@ -89,6 +98,10 @@ network:
   default: ../EveNet-Full/share/network/network-20M.yaml
 
   Body:
+    GroupedSequentialEmbedding:
+      hidden_dim_scale: 2.0
+      dropout: 0.0
+
     PET:
       feature_drop: 0.0
 

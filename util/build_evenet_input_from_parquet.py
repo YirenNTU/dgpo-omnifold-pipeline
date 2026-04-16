@@ -202,25 +202,25 @@ def build_point_cloud(events: ak.Array, max_particles: int, feature_config: Feat
     )
     eta = ak.where(np.isfinite(part_p4.eta), part_p4.eta, 0)
 
-    features = []
-    feature_names: list[str] = []
-
     available_momentum_features = {
         "energy": part_p4.E,
         "pt": part_p4.pt,
         "eta": eta,
         "phi": part_p4.phi,
     }
-    for feature_name in feature_config.part_momentum_fields:
-        values = available_momentum_features[feature_name]
+
+    features = []
+    feature_names: list[str] = []
+    for feature_name in feature_config.raw_sequential_fields:
+        if feature_name in available_momentum_features:
+            values = available_momentum_features[feature_name]
+        elif feature_name.startswith("Part_") and feature_name[5:] in available_momentum_features:
+            values = available_momentum_features[feature_name[5:]]
+        else:
+            values = events[feature_name]
         expanded = pad_and_flatten_part_feature(values, max_particles)
         features.append(expanded)
-        feature_names.append(f"Part_{feature_name}")
-
-    for field_name in feature_config.part_aux_fields:
-        expanded = pad_and_flatten_part_feature(events[field_name], max_particles)
-        features.append(expanded)
-        feature_names.append(field_name)
+        feature_names.append(feature_name)
 
     # Point-cloud tensor shape: [event, particle slot, feature].
     x = ak.concatenate(features, axis=2)
@@ -380,7 +380,7 @@ def build_event_info_yaml(metadata: dict, feature_config: FeatureConfig, evenet_
     # the class list contents for the actual process labels.
     classification_name = "signal"
 
-    return {
+    payload = {
         "INPUTS": {
             "SEQUENTIAL": {
                 "Source": {
@@ -420,6 +420,9 @@ def build_event_info_yaml(metadata: dict, feature_config: FeatureConfig, evenet_
             },
         },
     }
+    if feature_config.grouped_sequential_config is not None:
+        payload["GROUPED_INPUTS"] = feature_config.grouped_sequential_config
+    return payload
 
 
 def write_monitor_plot(
