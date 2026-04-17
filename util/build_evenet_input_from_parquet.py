@@ -42,6 +42,7 @@ class Sample:
     key: str
     name: str
     is_data: bool
+    is_signal: bool
     input_files: tuple[str, ...]
     norm_factor: float = 1.0
     lumi: float | None = None
@@ -113,6 +114,7 @@ def parse_config(config_path: Path) -> tuple[dict[str, Sample], dict[str, list[C
             key=sample_key,
             name=sample_cfg.get("name", sample_key),
             is_data=bool(sample_cfg.get("is_data", False)),
+            is_signal=bool(sample_cfg.get("is_signal", False)),
             input_files=tuple(sample_cfg.get("input_files", [])),
             norm_factor=float(sample_cfg.get("norm_factor", 1.0)),
             lumi=sample_cfg.get("lumi"),
@@ -305,6 +307,23 @@ def build_dataset(
             tau_vis_rho_p4,
             tau_vis_rho_mask,
         )
+        if not sample.is_signal:
+            x_invisible_mask = ak.Array(np.zeros((len(events), 2), dtype=bool))
+            x_invisible_p4 = build_momentum4d(
+                np.zeros((len(events), 2), dtype=np.float32),
+                np.zeros((len(events), 2), dtype=np.float32),
+                np.zeros((len(events), 2), dtype=np.float32),
+                np.zeros((len(events), 2), dtype=np.float32),
+            )
+            tau_vis_target_mask = ak.Array(np.zeros((len(events), 2), dtype=bool))
+            tau_vis_target_p4 = build_momentum4d(
+                np.zeros((len(events), 2), dtype=np.float32),
+                np.zeros((len(events), 2), dtype=np.float32),
+                np.zeros((len(events), 2), dtype=np.float32),
+                np.zeros((len(events), 2), dtype=np.float32),
+            )
+            num_invisible_raw = np.zeros(len(events), dtype=np.int64)
+            num_invisible_valid = np.zeros(len(events), dtype=np.int64)
         tau_vis_prong = features_from_p4(tau_vis_prong_p4)
         tau_vis_rho = features_from_p4(tau_vis_rho_p4)
         tau_vis_target = features_from_p4(tau_vis_target_p4)
@@ -436,12 +455,15 @@ def write_monitor_plot(
     normalize: bool,
     log_scale: bool,
     mc_only: bool = False,
+    signal_only: bool = False,
 ) -> None:
     hist_data = None if mc_only else np.zeros(len(bins) - 1, dtype=float)
     hist_mc: dict[str, np.ndarray] = {}
     hist_mc_err2: dict[str, np.ndarray] = {}
 
     for sample, events in expanded_samples:
+        if signal_only and not sample.is_signal:
+            continue
         values = sanitize_hist_values(extractor(events))
         hist, _ = np.histogram(values, bins=bins)
 
@@ -529,27 +551,27 @@ def write_monitoring_plots(
             log_scale=True,
         )
 
-    for plot_name, extractor, mc_only, log_scale in [
-        ("tau_vis_prong_energy", lambda events: extract_visible_tau_observable(events, "prong", "energy"), False, True),
-        ("tau_vis_prong_pt", lambda events: extract_visible_tau_observable(events, "prong", "pt"), False, True),
-        ("tau_vis_prong_eta", lambda events: extract_visible_tau_observable(events, "prong", "eta"), False, False),
-        ("tau_vis_prong_phi", lambda events: extract_visible_tau_observable(events, "prong", "phi"), False, False),
-        ("tau_vis_prong_mass", lambda events: extract_visible_tau_observable(events, "prong", "mass"), False, False),
-        ("tau_vis_rho_energy", lambda events: extract_visible_tau_observable(events, "rho", "energy"), False, True),
-        ("tau_vis_rho_pt", lambda events: extract_visible_tau_observable(events, "rho", "pt"), False, True),
-        ("tau_vis_rho_eta", lambda events: extract_visible_tau_observable(events, "rho", "eta"), False, False),
-        ("tau_vis_rho_phi", lambda events: extract_visible_tau_observable(events, "rho", "phi"), False, False),
-        ("tau_vis_rho_mass", lambda events: extract_visible_tau_observable(events, "rho", "mass"), False, False),
-        ("target_invisible_energy", lambda events: extract_target_invisible_observable(events, "energy"), True, False),
-        ("target_invisible_pt", lambda events: extract_target_invisible_observable(events, "pt"), True, False),
-        ("target_invisible_eta", lambda events: extract_target_invisible_observable(events, "eta"), True, False),
-        ("target_invisible_phi", lambda events: extract_target_invisible_observable(events, "phi"), True, False),
-        ("target_invisible_mass", lambda events: extract_target_invisible_observable(events, "mass"), True, False),
+    for plot_name, extractor, mc_only, log_scale, signal_only in [
+        ("tau_vis_prong_energy", lambda events: extract_visible_tau_observable(events, "prong", "energy"), False, True, False),
+        ("tau_vis_prong_pt", lambda events: extract_visible_tau_observable(events, "prong", "pt"), False, True, False),
+        ("tau_vis_prong_eta", lambda events: extract_visible_tau_observable(events, "prong", "eta"), False, False, False),
+        ("tau_vis_prong_phi", lambda events: extract_visible_tau_observable(events, "prong", "phi"), False, False, False),
+        ("tau_vis_prong_mass", lambda events: extract_visible_tau_observable(events, "prong", "mass"), False, False, False),
+        ("tau_vis_rho_energy", lambda events: extract_visible_tau_observable(events, "rho", "energy"), False, True, False),
+        ("tau_vis_rho_pt", lambda events: extract_visible_tau_observable(events, "rho", "pt"), False, True, False),
+        ("tau_vis_rho_eta", lambda events: extract_visible_tau_observable(events, "rho", "eta"), False, False, False),
+        ("tau_vis_rho_phi", lambda events: extract_visible_tau_observable(events, "rho", "phi"), False, False, False),
+        ("tau_vis_rho_mass", lambda events: extract_visible_tau_observable(events, "rho", "mass"), False, False, False),
+        ("target_invisible_energy", lambda events: extract_target_invisible_observable(events, "energy"), True, False, True),
+        ("target_invisible_pt", lambda events: extract_target_invisible_observable(events, "pt"), True, False, True),
+        ("target_invisible_eta", lambda events: extract_target_invisible_observable(events, "eta"), True, False, True),
+        ("target_invisible_phi", lambda events: extract_target_invisible_observable(events, "phi"), True, False, True),
+        ("target_invisible_mass", lambda events: extract_target_invisible_observable(events, "mass"), True, False, True),
     ]:
         values_by_sample = {
             sample.name: sanitize_hist_values(extractor(events))
             for sample, events in expanded_samples
-            if not (mc_only and sample.is_data)
+            if not (mc_only and sample.is_data) and not (signal_only and not sample.is_signal)
         }
         if not any(values.size > 0 for values in values_by_sample.values()):
             continue
@@ -565,6 +587,7 @@ def write_monitoring_plots(
             normalize=normalize,
             log_scale=log_scale,
             mc_only=mc_only,
+            signal_only=signal_only,
         )
 
     for observable in FOUR_VECTOR_FEATURES:

@@ -682,7 +682,7 @@ def make_control_plots(
 
         values_by_sample: dict[str, np.ndarray] = {}
         for sample, sample_events in expanded_samples:
-            if sample.is_data:
+            if sample.is_data or not sample.is_signal:
                 continue
 
             values = sanitize_hist_values(plot_spec.extractor(sample_events))
@@ -697,7 +697,7 @@ def make_control_plots(
             bins = choose_bins(values_by_sample)
 
         for sample, sample_events in expanded_samples:
-            if sample.is_data:
+            if sample.is_data or not sample.is_signal:
                 continue
 
             values = values_by_sample.get(sample.name)

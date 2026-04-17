@@ -17,6 +17,11 @@ Processes:
       - "vis-"
     "tau+":
       - "vis+"
+  Ztautau_rholep:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_rhorho:
     "tau-":
       - "vis-"

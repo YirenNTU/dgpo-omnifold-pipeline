@@ -10,7 +10,7 @@ Samples:
   Ztautau:
     name: "Ztautau"
     is_data: false
-    is_signal: false
+    is_signal: true
     norm_factor: 1458.9 # pb
     input_files:
       - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Ztautau/filtered___tautau.parquet"
