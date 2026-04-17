@@ -296,7 +296,7 @@ Typical training flow:
 
 ```bash
 cd ml_pipeline
-python3 EveNet-Full/scripts/train.py config/train.yaml
+shifter --image=docker:avencast1994/evenet:1.5 python3 EveNet-Full/scripts/train.py config/train.yaml
 ```
 
 Typical prediction flow:
