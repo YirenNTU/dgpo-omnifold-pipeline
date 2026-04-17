@@ -36,7 +36,11 @@ Inputs:
     Momentum:
       dim: 4
       index: [0, 1, 2, 3]
-      input: [energy, pt, eta, phi]
+      input:
+        - Part_energy
+        - Part_pt,
+        - Part_eta,
+        - Part_phi
     Auxiliary:
       dim: 2
       index: [4, 5]
@@ -48,9 +52,7 @@ Inputs:
               - Part_hpcShowerEnergy
               - Part_hpcShowerTheta
               - Part_hpcShowerPhi
-              - Part_hpcParticleCode
               - Part_hpcNumLayers
-              - Part_hpcLayerHitPattern
               - Part_hpcNumAssociatedShowers
               - Part_hpcTotalShowerEnergy
         - hac:
@@ -59,9 +61,7 @@ Inputs:
               - Part_hacShowerEnergy
               - Part_hacShowerTheta
               - Part_hacShowerPhi
-              - Part_hacParticleCode
               - Part_hacNumTowers
-              - Part_hacTowerHitPattern
               - Part_hacNumAssociatedShowers
               - Part_hacTotalShowerEnergy
         - stic:
@@ -72,10 +72,11 @@ Inputs:
               - Part_sticShowerPhi
               - Part_sticNumTowers
               - Part_sticChargedTag
-              - Part_sticSiliconVertexPos
+    Charge:
+      dim: 1
+      index: [6]
+      input:
         - Part_charge
-        - Part_vtxIdx
-        - Part_hemisphere
   Global:
     Fields:
       - Event_totalChargedEnergy
@@ -96,9 +97,10 @@ Subcategories:
     Ztautau_pipi: [11]
     Ztautau_pirho: [12, 21]
     Ztautau_pilep: [13, 31, 14, 41]
+    Ztautau_rholep: [23, 32, 42, 24]
     Ztautau_rhorho: [22]
     Ztautau_leplep: [33, 34, 43, 44]
-    Ztautau_piother: [15, 51]
+#    Ztautau_piother: [15, 51]
 
 Normalization:
   Sequential:
@@ -107,6 +109,22 @@ Normalization:
     Part_pt: log_normalize
     Part_eta: normalize
     Part_phi: normalize_uniform
+    Part_hpcShowerEnergy: normalize
+    Part_hpcShowerTheta: normalize
+    Part_hpcShowerPhi: normalize
+    Part_hpcNumLayers: normalize
+    Part_hpcNumAssociatedShowers: normalize
+    Part_hpcTotalShowerEnergy: normalize
+    Part_hacShowerEnergy: normalize
+    Part_hacShowerTheta: normalize
+    Part_hacShowerPhi: normalize
+    Part_hacNumTowers: normalize
+    Part_hacNumAssociatedShowers: normalize
+    Part_hacTotalShowerEnergy: normalize
+    Part_sticShowerEnergy: normalize
+    Part_sticShowerTheta: normalize
+    Part_sticShowerPhi: normalize
+    Part_sticNumTowers: normalize
   Global:
     default: none
     Event_totalChargedEnergy: log_normalize
@@ -114,8 +132,8 @@ Normalization:
     Event_totalHadronicEnergy: log_normalize
     thrust_Mag: normalize
     charged_E: log_normalize
-    missing_px: normalize
-    missing_py: normalize
+    missing_px: log_normalize
+    missing_py: log_normalize
     missing_pt: log_normalize
     isolation_angle: normalize
     thrust_x: normalize
