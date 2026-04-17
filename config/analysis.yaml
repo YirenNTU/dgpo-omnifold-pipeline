@@ -36,12 +36,8 @@ Inputs:
     Momentum:
       dim: 4
       index: [0, 1, 2, 3]
-      input:
-        - Part_energy
-        - Part_pt,
-        - Part_eta,
-        - Part_phi
-    Auxiliary:
+      input: [energy, pt, eta, phi]
+    ObjectTag:
       dim: 2
       index: [4, 5]
       input:
