@@ -194,24 +194,31 @@ def _build_grouped_sequential_config(
             seen_raw_fields.add(raw_name)
             raw_sequential_fields.append(raw_name)
 
-    projected_dim = len(raw_sequential_fields)
-    projected_feature_names = list(raw_sequential_fields)
     occupied_slots: dict[int, str] = {}
-
     for root in grouped_roots:
-        root_leaves = _flatten_leaf_features(root["input"], allow_top_level_groups=True)
         for slot in root["index"]:
-            if slot < 0 or slot >= projected_dim:
-                raise ValueError(
-                    f"Projected sequential slot {slot} for '{root['name']}' is out of range "
-                    f"for raw sequential dim {projected_dim}."
-                )
+            if slot < 0:
+                raise ValueError(f"Projected sequential slot {slot} for '{root['name']}' must be non-negative.")
             if slot in occupied_slots:
                 raise ValueError(
                     f"Projected sequential slot {slot} is assigned to both "
                     f"'{occupied_slots[slot]}' and '{root['name']}'."
                 )
             occupied_slots[slot] = root["name"]
+
+    projected_dim = max(occupied_slots) + 1
+    actual_slots = sorted(occupied_slots)
+    expected_slots = list(range(projected_dim))
+    if actual_slots != expected_slots:
+        raise ValueError(
+            "Projected sequential slots must cover a dense range starting at 0. "
+            f"Expected {expected_slots}, got {actual_slots}."
+        )
+
+    projected_feature_names = [f"grouped_{index}" for index in range(projected_dim)]
+
+    for root in grouped_roots:
+        root_leaves = _flatten_leaf_features(root["input"], allow_top_level_groups=True)
 
         if root["name"] == "Momentum":
             expected_momentum = [f"Part_{field}" for field in FOUR_VECTOR_FEATURES]
