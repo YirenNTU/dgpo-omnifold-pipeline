@@ -12,12 +12,22 @@ Processes:
       - "vis-"
     "tau+":
       - "vis+"
-  Ztautau_pilep:
+  Ztautau_pie:
     "tau-":
       - "vis-"
     "tau+":
       - "vis+"
-  Ztautau_rholep:
+  Ztautau_rhoe:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
+  Ztautau_pimu:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
+  Ztautau_rhomu:
     "tau-":
       - "vis-"
     "tau+":
@@ -27,12 +37,22 @@ Processes:
       - "vis-"
     "tau+":
       - "vis+"
-  Ztautau_leplep:
+  Ztautau_piother:
     "tau-":
       - "vis-"
     "tau+":
       - "vis+"
-  Ztautau_piother:
+  Ztautau_ee:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
+  Ztautau_mumu:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
+  Ztautau_emu:
     "tau-":
       - "vis-"
     "tau+":
@@ -42,6 +62,7 @@ Processes:
       - "vis-"
     "tau+":
       - "vis+"
+
   Zll:
     Z:
       - l1

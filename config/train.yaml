@@ -120,6 +120,37 @@ options:
     normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert/normalization.pt
     val_split: [0.95, 1.0]
 
+  Metrics:
+    Generation-Binning:
+      # EveNet-Full currently interprets this value as the number of edges,
+      # so 61 here gives 60 visible bins in wandb.
+      "neutrino-mass": [ 61, -5.0, 5.0 ]
+      "neutrino-log_pt": [ 61, -1.0, 7.0 ]
+      "neutrino-eta": [ 61, -3.5, 3.5 ]
+      "neutrino-phi": [ 61, -3.2, 3.2 ]
+    ObjectTag-Embedding:
+      enable: true
+      group_name: "ObjectTag"
+      label_feature: "Part_pdgId"
+      max_points: 5000
+      max_batches: 2
+      log_every_n_epochs: 1
+      alpha: 0.45
+      marker_size: 8.0
+      others_label: "others"
+      interested_labels:
+        "41": "pi"
+        "2": "e"
+        "6": "mu"
+        "21": "gamma"
+        "42": "K"
+        "47": "pi0"
+        "61": "K_S0"
+        "62": "K_L0"
+        "65": "p"
+        "66": "n"
+        "81": "Lambda"
+
 network:
   default: ../EveNet-Full/share/network/network-20M.yaml
 

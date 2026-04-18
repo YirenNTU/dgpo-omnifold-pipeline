@@ -24,6 +24,7 @@ class EveNetConfig:
     generation_events: tuple[str, ...]
     sequential_tags: dict[str, str]
     global_tags: dict[str, str]
+    invisible_features: tuple[str, ...]
     invisible_tags: dict[str, str]
 
 
@@ -350,6 +351,22 @@ def _default_global_tags(feature_config: FeatureConfig) -> dict[str, str]:
     return tags
 
 
+def _default_invisible_tags(feature_names: tuple[str, ...]) -> dict[str, str]:
+    tags: dict[str, str] = {}
+    for field in feature_names:
+        if field in {"energy", "pt"}:
+            tags[field] = "log_normalize"
+        elif field == "mass":
+            tags[field] = "normalize"
+        elif field == "eta":
+            tags[field] = "normalize"
+        elif field == "phi":
+            tags[field] = "normalize_uniform"
+        else:
+            tags[field] = "none"
+    return tags
+
+
 def _merge_tags(default_tags: dict[str, str], raw_tags: dict | None) -> dict[str, str]:
     merged = dict(default_tags)
     if not raw_tags:
@@ -410,6 +427,12 @@ def parse_evenet_config(config: dict, feature_config: FeatureConfig) -> EveNetCo
     )
 
     feature_tags_cfg = _resolve_normalization_cfg(config)
+    invisible_cfg = feature_tags_cfg.get("Invisible")
+    invisible_features = tuple(
+        key for key in (invisible_cfg or {}).keys()
+        if key != "default"
+    ) or tuple(FOUR_VECTOR_FEATURES)
+
     sequential_tags = _merge_tags(
         _default_sequential_tags(feature_config),
         feature_tags_cfg.get("Sequential"),
@@ -419,13 +442,8 @@ def parse_evenet_config(config: dict, feature_config: FeatureConfig) -> EveNetCo
         feature_tags_cfg.get("Global"),
     )
     invisible_tags = _merge_tags(
-        {
-            "energy": "log_normalize",
-            "pt": "log_normalize",
-            "eta": "normalize",
-            "phi": "normalize_uniform",
-        },
-        feature_tags_cfg.get("Invisible"),
+        _default_invisible_tags(invisible_features),
+        invisible_cfg,
     )
 
     return EveNetConfig(
@@ -436,5 +454,6 @@ def parse_evenet_config(config: dict, feature_config: FeatureConfig) -> EveNetCo
         generation_events=generation_events,
         sequential_tags=sequential_tags,
         global_tags=global_tags,
+        invisible_features=invisible_features,
         invisible_tags=invisible_tags,
     )

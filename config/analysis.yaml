@@ -92,10 +92,14 @@ Subcategories:
   Ztautau:
     Ztautau_pipi: [11]
     Ztautau_pirho: [12, 21]
-    Ztautau_pilep: [13, 31, 14, 41]
-    Ztautau_rholep: [23, 32, 42, 24]
+    Ztautau_pie: [13, 31]
+    Ztautau_pimu: [14, 41]
+    Ztautau_rhoe: [23, 32]
+    Ztautau_rhomu: [42, 24]
     Ztautau_rhorho: [22]
-    Ztautau_leplep: [33, 34, 43, 44]
+    Ztautau_ee: [33]
+    Ztautau_mumu: [44]
+    Ztautau_emu: [34, 43]
 #    Ztautau_piother: [15, 51]
 
 Normalization:
@@ -137,7 +141,7 @@ Normalization:
     thrust_z: normalize
   Invisible:
     default: none
-    energy: log_normalize
+    mass: normalize
     pt: log_normalize
     eta: normalize
     phi: normalize_uniform

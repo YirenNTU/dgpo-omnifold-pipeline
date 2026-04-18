@@ -4,7 +4,6 @@ import awkward as ak
 import numpy as np
 import vector
 
-
 PHOTON_DR_MAX = 0.3
 FOUR_VECTOR_FEATURES = ["energy", "pt", "eta", "phi"]
 DEFAULT_PART_AUX_FIELDS = [
@@ -78,33 +77,44 @@ def compute_pt_eta_phi(px: ak.Array, py: ak.Array, pz: ak.Array) -> tuple[ak.Arr
     return p4.pt, p4.eta, p4.phi
 
 
-def features_from_p4(p4):
+def features_from_p4(p4, feature_names=FOUR_VECTOR_FEATURES):
     if isinstance(p4, ak.Array):
-        eta = ak.where(np.isfinite(p4.eta), p4.eta, 0.0)
-        phi = ak.where(np.isfinite(p4.phi), p4.phi, 0.0)
-        return ak.concatenate(
-            [
-                ak.values_astype(p4.E, np.float32)[..., np.newaxis],
-                ak.values_astype(p4.pt, np.float32)[..., np.newaxis],
-                ak.values_astype(eta, np.float32)[..., np.newaxis],
-                ak.values_astype(phi, np.float32)[..., np.newaxis],
-            ],
-            axis=-1,
-        )
+        components = []
+        for feature_name in feature_names:
+            if feature_name == "energy":
+                values = p4.E
+            elif feature_name == "mass":
+                values = ak.where(np.isfinite(p4.mass), p4.mass, 0.0)
+            elif feature_name == "pt":
+                values = p4.pt
+            elif feature_name == "eta":
+                values = ak.where(np.isfinite(p4.eta), p4.eta, 0.0)
+            elif feature_name == "phi":
+                values = ak.where(np.isfinite(p4.phi), p4.phi, 0.0)
+            else:
+                raise ValueError(f"Unsupported four-vector feature '{feature_name}'.")
+            components.append(ak.values_astype(values, np.float32)[..., np.newaxis])
+        return ak.concatenate(components, axis=-1)
 
-    eta = np.asarray(p4.eta, dtype=np.float32)
-    phi = np.asarray(p4.phi, dtype=np.float32)
-    eta = np.where(np.isfinite(eta), eta, 0.0)
-    phi = np.where(np.isfinite(phi), phi, 0.0)
-    return np.stack(
-        [
-            np.asarray(p4.E, dtype=np.float32),
-            np.asarray(p4.pt, dtype=np.float32),
-            eta,
-            phi,
-        ],
-        axis=-1,
-    ).astype(np.float32)
+    components = []
+    for feature_name in feature_names:
+        if feature_name == "energy":
+            values = np.asarray(p4.E, dtype=np.float32)
+        elif feature_name == "mass":
+            values = np.asarray(p4.mass, dtype=np.float32)
+            values = np.where(np.isfinite(values), values, 0.0)
+        elif feature_name == "pt":
+            values = np.asarray(p4.pt, dtype=np.float32)
+        elif feature_name == "eta":
+            values = np.asarray(p4.eta, dtype=np.float32)
+            values = np.where(np.isfinite(values), values, 0.0)
+        elif feature_name == "phi":
+            values = np.asarray(p4.phi, dtype=np.float32)
+            values = np.where(np.isfinite(values), values, 0.0)
+        else:
+            raise ValueError(f"Unsupported four-vector feature '{feature_name}'.")
+        components.append(values)
+    return np.stack(components, axis=-1).astype(np.float32)
 
 
 def stack_tau_pair(tau_minus, tau_plus):
@@ -157,8 +167,7 @@ def build_visible_tau_assumption_p4(events: ak.Array):
     }
 
     prong_charge_sums = {}
-    prong_p4_by_hemisphere = {}
-    rho_p4_by_hemisphere = {}
+    visible_p4_by_hemisphere = {}
 
     for hemisphere_name, hemisphere_mask in hemisphere_masks.items():
         prong_mask = hemisphere_mask & (charge != 0)
@@ -167,7 +176,6 @@ def build_visible_tau_assumption_p4(events: ak.Array):
         photon_p4_constituents = part_p4[photon_mask]
 
         prong_p4 = sum_masked_p4(events, prong_mask)
-        prong_p4_by_hemisphere[hemisphere_name] = prong_p4
         prong_charge_sums[hemisphere_name] = ak.values_astype(ak.sum(charge[prong_mask], axis=1), np.float32)
 
         pairs = ak.cartesian(
@@ -182,25 +190,23 @@ def build_visible_tau_assumption_p4(events: ak.Array):
         photon_near_prong = ak.fill_none(ak.any(delta_r < PHOTON_DR_MAX, axis=-1), False)
 
         photon_p4 = ak.sum(photon_p4_constituents[photon_near_prong], axis=1)
-        rho_p4_by_hemisphere[hemisphere_name] = prong_p4 + photon_p4
+        visible_p4_by_hemisphere[hemisphere_name] = prong_p4 + photon_p4
 
-    prong_tau_minus, prong_tau_plus, prong_tau_minus_mask, prong_tau_plus_mask = map_hemisphere_to_tau_sign(
-        prong_p4_by_hemisphere["a"],
-        prong_p4_by_hemisphere["b"],
+    visible_tau_minus, visible_tau_plus, visible_tau_minus_mask, visible_tau_plus_mask = map_hemisphere_to_tau_sign(
+        visible_p4_by_hemisphere["a"],
+        visible_p4_by_hemisphere["b"],
         prong_charge_sums["a"],
         prong_charge_sums["b"],
     )
-    rho_tau_minus, rho_tau_plus, rho_tau_minus_mask, rho_tau_plus_mask = map_hemisphere_to_tau_sign(
-        rho_p4_by_hemisphere["a"],
-        rho_p4_by_hemisphere["b"],
-        prong_charge_sums["a"],
-        prong_charge_sums["b"],
-    )
+    visible_tau = stack_tau_pair(visible_tau_minus, visible_tau_plus)
+    visible_tau_mask = stack_tau_pair_mask(visible_tau_minus_mask, visible_tau_plus_mask)
+
+    # Keep the legacy dual return structure to avoid changing downstream consumers.
     return (
-        stack_tau_pair(prong_tau_minus, prong_tau_plus),
-        stack_tau_pair_mask(prong_tau_minus_mask, prong_tau_plus_mask),
-        stack_tau_pair(rho_tau_minus, rho_tau_plus),
-        stack_tau_pair_mask(rho_tau_minus_mask, rho_tau_plus_mask),
+        visible_tau,
+        visible_tau_mask,
+        visible_tau,
+        visible_tau_mask,
     )
 
 
@@ -227,8 +233,8 @@ def build_tau_targets(
     x_invisible_mask = ak.Array(np.zeros((n_events, 2), dtype=bool))
     num_invisible_raw = np.zeros(n_events, dtype=np.int64)
     num_invisible_valid = np.zeros(n_events, dtype=np.int64)
-    tau_vis_target_p4 = zero_p4((n_events, 2))
-    tau_vis_target_mask = ak.Array(np.zeros((n_events, 2), dtype=bool))
+    tau_vis_target_p4 = tau_vis_prong_p4
+    tau_vis_target_mask = tau_vis_prong_mask
 
     required_fields = [
         "truth_tau_px",
@@ -239,7 +245,6 @@ def build_tau_targets(
         "truth_anti_tau_py",
         "truth_anti_tau_pz",
         "truth_anti_tau_E",
-        "event_category",
     ]
     if not all(field in events.fields for field in required_fields):
         return x_invisible_p4, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target_p4, tau_vis_target_mask
@@ -256,25 +261,13 @@ def build_tau_targets(
         truth_feature(events["truth_anti_tau_pz"]),
         truth_feature(events["truth_anti_tau_E"]),
     )
-    event_category = ak.values_astype(events["event_category"], np.int64)
-    tau_minus_category = event_category % 10
-    tau_plus_category = event_category // 10
-
-    tau_minus_use_rho = tau_minus_category == 2
-    tau_plus_use_rho = tau_plus_category == 2
-
-    tau_minus_target_p4 = ak.where(tau_minus_use_rho, tau_vis_rho_p4[:, 0], tau_vis_prong_p4[:, 0])
-    tau_plus_target_p4 = ak.where(tau_plus_use_rho, tau_vis_rho_p4[:, 1], tau_vis_prong_p4[:, 1])
-    tau_minus_target_mask = ak.where(tau_minus_use_rho, tau_vis_rho_mask[:, 0], tau_vis_prong_mask[:, 0])
-    tau_plus_target_mask = ak.where(tau_plus_use_rho, tau_vis_rho_mask[:, 1], tau_vis_prong_mask[:, 1])
-    tau_vis_target_p4 = stack_tau_pair(tau_minus_target_p4, tau_plus_target_p4)
-    tau_vis_target_mask = stack_tau_pair_mask(tau_minus_target_mask, tau_plus_target_mask)
-
     tau_truth_valid = np.isfinite(truth_tau.E) & np.isfinite(truth_tau.px) & np.isfinite(truth_tau.py) & np.isfinite(truth_tau.pz)
     anti_tau_truth_valid = np.isfinite(truth_anti_tau.E) & np.isfinite(truth_anti_tau.px) & np.isfinite(truth_anti_tau.py) & np.isfinite(truth_anti_tau.pz)
-    x_invisible_p4 = stack_tau_pair(truth_tau, truth_anti_tau)
-    x_invisible_minus_mask = tau_truth_valid
-    x_invisible_plus_mask = anti_tau_truth_valid
+    invisible_tau_minus = truth_tau - tau_vis_target_p4[:, 0]
+    invisible_tau_plus = truth_anti_tau - tau_vis_target_p4[:, 1]
+    x_invisible_p4 = stack_tau_pair(invisible_tau_minus, invisible_tau_plus)
+    x_invisible_minus_mask = tau_truth_valid & tau_vis_target_mask[:, 0]
+    x_invisible_plus_mask = anti_tau_truth_valid & tau_vis_target_mask[:, 1]
     x_invisible_mask = ak.concatenate([x_invisible_minus_mask[:, np.newaxis], x_invisible_plus_mask[:, np.newaxis]], axis=1)
     x_invisible_p4 = mask_p4(x_invisible_p4, x_invisible_mask)
     tau_vis_target_p4 = mask_p4(tau_vis_target_p4, tau_vis_target_mask)

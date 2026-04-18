@@ -283,6 +283,7 @@ def build_dataset(
     expanded_samples: list[tuple[Sample, ak.Array]],
     max_particles: int,
     feature_config: FeatureConfig,
+    evenet_config: EveNetConfig,
     include_classification: bool = True,
 ) -> tuple[dict[str, np.ndarray], dict]:
     class_labels = [sample.name for sample, _ in expanded_samples] if include_classification else []
@@ -327,7 +328,7 @@ def build_dataset(
         tau_vis_prong = features_from_p4(tau_vis_prong_p4)
         tau_vis_rho = features_from_p4(tau_vis_rho_p4)
         tau_vis_target = features_from_p4(tau_vis_target_p4)
-        x_invisible = features_from_p4(x_invisible_p4)
+        x_invisible = features_from_p4(x_invisible_p4, evenet_config.invisible_features)
         batch = {
             # EveNet inputs: x [N, P, F_seq], conditions [N, F_global].
             "x": to_numpy_array(x, np.float32),
@@ -367,7 +368,7 @@ def build_dataset(
     metadata = {
         "point_cloud_features": point_cloud_feature_names,
         "global_features": global_feature_names,
-        "invisible_features": FOUR_VECTOR_FEATURES,
+        "invisible_features": list(evenet_config.invisible_features),
         "visible_tau_features": FOUR_VECTOR_FEATURES,
         "max_particles": max_particles,
         "num_events": int(dataset["x"].shape[0]),
@@ -762,7 +763,13 @@ def main() -> None:
         f"[white]{', '.join(sample.name for sample, _ in training_samples)}[/white]"
     )
 
-    mc_dataset, mc_metadata = build_dataset(training_samples, max_particles, feature_config, include_classification=True)
+    mc_dataset, mc_metadata = build_dataset(
+        training_samples,
+        max_particles,
+        feature_config,
+        evenet_config,
+        include_classification=True,
+    )
     write_outputs(
         mc_dataset,
         mc_metadata,
@@ -778,7 +785,13 @@ def main() -> None:
             f"[bold]Data payload samples[/bold] "
             f"[white]{', '.join(sample.name for sample, _ in data_samples)}[/white]"
         )
-        data_dataset, data_metadata = build_dataset(data_samples, max_particles, feature_config, include_classification=False)
+        data_dataset, data_metadata = build_dataset(
+            data_samples,
+            max_particles,
+            feature_config,
+            evenet_config,
+            include_classification=False,
+        )
         write_outputs(
             data_dataset,
             data_metadata,
