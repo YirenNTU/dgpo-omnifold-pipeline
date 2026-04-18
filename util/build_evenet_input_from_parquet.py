@@ -59,6 +59,26 @@ def read_yaml(path: Path) -> dict:
         return yaml.safe_load(handle) or {}
 
 
+def merge_evenet_config(
+    schema_config: dict,
+    analysis_config: dict,
+) -> dict:
+    merged_config = dict(schema_config)
+
+    normalization_cfg = analysis_config.get("Normalization")
+    if normalization_cfg is not None:
+        merged_config["Normalization"] = normalization_cfg
+        return merged_config
+
+    feature_tags_cfg = analysis_config.get("EveNet", {}).get("FeatureTags")
+    if feature_tags_cfg is not None:
+        merged_evenet = dict(merged_config.get("EveNet", {}))
+        merged_evenet["FeatureTags"] = feature_tags_cfg
+        merged_config["EveNet"] = merged_evenet
+
+    return merged_config
+
+
 def expand_input_files(patterns: tuple[str, ...]) -> list[str]:
     files: list[str] = []
     for pattern in patterns:
@@ -704,8 +724,13 @@ def main() -> None:
 
     console.print(f"[bold]Using config[/bold] [white]{args.config}[/white]")
     console.print(f"[bold]Using EveNet schema[/bold] [white]{args.evenet_config}[/white]")
+    analysis_config = read_yaml(args.config)
+    evenet_schema_config = read_yaml(args.evenet_config)
     samples, subcategories, feature_config = parse_config(args.config)
-    evenet_config = parse_evenet_config(read_yaml(args.evenet_config), feature_config)
+    evenet_config = parse_evenet_config(
+        merge_evenet_config(evenet_schema_config, analysis_config),
+        feature_config,
+    )
     raw_sample_events = {
         sample_key: load_sample_events(sample)
         for sample_key, sample in samples.items()
