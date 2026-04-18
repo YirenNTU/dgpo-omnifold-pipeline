@@ -142,6 +142,6 @@ Normalization:
   Invisible:
     default: none
     mass: normalize
-    pt: log_normalize
+    pt: normalize
     eta: normalize
     phi: normalize_uniform

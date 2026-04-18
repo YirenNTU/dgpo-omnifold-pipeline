@@ -124,9 +124,9 @@ options:
     Generation-Binning:
       # EveNet-Full currently interprets this value as the number of edges,
       # so 61 here gives 60 visible bins in wandb.
-      "neutrino-mass": [ 61, -5.0, 5.0 ]
-      "neutrino-log_pt": [ 61, -1.0, 7.0 ]
-      "neutrino-eta": [ 61, -3.5, 3.5 ]
+      "neutrino-mass": [ 61, -2.0, 2.0 ]
+      "neutrino-pt": [ 51, 0.0, 50.0 ]
+      "neutrino-eta": [ 61, -1.0, 1.0 ]
       "neutrino-phi": [ 61, -3.2, 3.2 ]
     ObjectTag-Embedding:
       enable: true
