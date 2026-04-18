@@ -6,6 +6,13 @@ import vector
 
 PHOTON_DR_MAX = 0.3
 FOUR_VECTOR_FEATURES = ["energy", "pt", "eta", "phi"]
+VISIBLE_KIND_PRIORITY = {
+    "electron": 0,
+    "muon": 1,
+    "pion": 2,
+    "rho": 3,
+    "other": 4,
+}
 DEFAULT_PART_AUX_FIELDS = [
     "Part_charge",
     "Part_pdgId",
@@ -155,7 +162,33 @@ def map_hemisphere_to_tau_sign(first_values, second_values, first_charge, second
     return tau_minus, tau_plus, tau_minus_mask, tau_plus_mask
 
 
-def build_visible_tau_assumption_p4(events: ak.Array):
+def reorder_tau_pair(pair_values, swap_mask):
+    first = ak.where(swap_mask, pair_values[:, 1], pair_values[:, 0])
+    second = ak.where(swap_mask, pair_values[:, 0], pair_values[:, 1])
+    return ak.concatenate([first[:, np.newaxis], second[:, np.newaxis]], axis=1)
+
+
+def _classify_visible_kind_rank(lead_abs_pdg, has_nearby_photon):
+    return ak.where(
+        lead_abs_pdg == 2,
+        VISIBLE_KIND_PRIORITY["electron"],
+        ak.where(
+            lead_abs_pdg == 6,
+            VISIBLE_KIND_PRIORITY["muon"],
+            ak.where(
+                lead_abs_pdg == 41,
+                ak.where(
+                    has_nearby_photon,
+                    VISIBLE_KIND_PRIORITY["rho"],
+                    VISIBLE_KIND_PRIORITY["pion"],
+                ),
+                VISIBLE_KIND_PRIORITY["other"],
+            ),
+        ),
+    )
+
+
+def _build_visible_tau_layout(events: ak.Array):
     charge = events["Part_charge"]
     hemisphere = events["Part_hemisphere"]
     pdg_id = abs(events["Part_pdgId"])
@@ -168,15 +201,23 @@ def build_visible_tau_assumption_p4(events: ak.Array):
 
     prong_charge_sums = {}
     visible_p4_by_hemisphere = {}
+    visible_kind_rank_by_hemisphere = {}
 
     for hemisphere_name, hemisphere_mask in hemisphere_masks.items():
         prong_mask = hemisphere_mask & (charge != 0)
         photon_mask = hemisphere_mask & (charge == 0) & (pdg_id == 21)
         prong_p4_constituents = part_p4[prong_mask]
         photon_p4_constituents = part_p4[photon_mask]
+        prong_abs_pdg = pdg_id[prong_mask]
 
         prong_p4 = sum_masked_p4(events, prong_mask)
         prong_charge_sums[hemisphere_name] = ak.values_astype(ak.sum(charge[prong_mask], axis=1), np.float32)
+
+        prong_sort = ak.argsort(prong_p4_constituents.p, axis=1, ascending=False)
+        lead_prong_abs_pdg = ak.values_astype(
+            ak.fill_none(ak.firsts(prong_abs_pdg[prong_sort]), 0),
+            np.int64,
+        )
 
         pairs = ak.cartesian(
             {
@@ -188,9 +229,14 @@ def build_visible_tau_assumption_p4(events: ak.Array):
         )
         delta_r = pairs["photon"].deltaR(pairs["prong"])
         photon_near_prong = ak.fill_none(ak.any(delta_r < PHOTON_DR_MAX, axis=-1), False)
+        has_nearby_photon = ak.fill_none(ak.any(photon_near_prong, axis=1), False)
 
         photon_p4 = ak.sum(photon_p4_constituents[photon_near_prong], axis=1)
         visible_p4_by_hemisphere[hemisphere_name] = prong_p4 + photon_p4
+        visible_kind_rank_by_hemisphere[hemisphere_name] = _classify_visible_kind_rank(
+            lead_prong_abs_pdg,
+            has_nearby_photon,
+        )
 
     visible_tau_minus, visible_tau_plus, visible_tau_minus_mask, visible_tau_plus_mask = map_hemisphere_to_tau_sign(
         visible_p4_by_hemisphere["a"],
@@ -198,8 +244,47 @@ def build_visible_tau_assumption_p4(events: ak.Array):
         prong_charge_sums["a"],
         prong_charge_sums["b"],
     )
+    visible_kind_rank_minus, visible_kind_rank_plus, _, _ = map_hemisphere_to_tau_sign(
+        visible_kind_rank_by_hemisphere["a"],
+        visible_kind_rank_by_hemisphere["b"],
+        prong_charge_sums["a"],
+        prong_charge_sums["b"],
+    )
+    visible_charge_minus, visible_charge_plus, _, _ = map_hemisphere_to_tau_sign(
+        prong_charge_sums["a"],
+        prong_charge_sums["b"],
+        prong_charge_sums["a"],
+        prong_charge_sums["b"],
+    )
+
     visible_tau = stack_tau_pair(visible_tau_minus, visible_tau_plus)
     visible_tau_mask = stack_tau_pair_mask(visible_tau_minus_mask, visible_tau_plus_mask)
+    visible_kind_rank = stack_tau_pair(visible_kind_rank_minus, visible_kind_rank_plus)
+    visible_charge = stack_tau_pair(visible_charge_minus, visible_charge_plus)
+
+    visible_kind_rank_0 = ak.to_numpy(visible_kind_rank[:, 0], allow_missing=False)
+    visible_kind_rank_1 = ak.to_numpy(visible_kind_rank[:, 1], allow_missing=False)
+    visible_charge_0 = ak.to_numpy(visible_charge[:, 0], allow_missing=False)
+    visible_charge_1 = ak.to_numpy(visible_charge[:, 1], allow_missing=False)
+    visible_mask_0 = ak.to_numpy(visible_tau_mask[:, 0], allow_missing=False)
+    visible_mask_1 = ak.to_numpy(visible_tau_mask[:, 1], allow_missing=False)
+
+    swap_mask = (~visible_mask_0 & visible_mask_1) | (
+        visible_mask_0 == visible_mask_1
+    ) & (
+        (visible_kind_rank_0 > visible_kind_rank_1)
+        | (
+            (visible_kind_rank_0 == visible_kind_rank_1)
+            & (visible_charge_0 < visible_charge_1)
+        )
+    )
+    swap_mask = ak.Array(swap_mask)
+
+    return reorder_tau_pair(visible_tau, swap_mask), reorder_tau_pair(visible_tau_mask, swap_mask), swap_mask
+
+
+def build_visible_tau_assumption_p4(events: ak.Array):
+    visible_tau, visible_tau_mask, _ = _build_visible_tau_layout(events)
 
     # Keep the legacy dual return structure to avoid changing downstream consumers.
     return (
@@ -211,7 +296,7 @@ def build_visible_tau_assumption_p4(events: ak.Array):
 
 
 def build_visible_tau_assumptions(events: ak.Array):
-    # Shape convention is [event, tau(2)] with tau order [tau-, tau+].
+    # Shape convention is [event, visible_slot(2)] in canonical visible-type order.
     return build_visible_tau_assumption_p4(events)
 
 
@@ -227,6 +312,7 @@ def build_tau_targets(
     tau_vis_prong_mask,
     tau_vis_rho_p4,
     tau_vis_rho_mask,
+    slot_swap_mask=None,
 ):
     n_events = len(events)
     x_invisible_p4 = zero_p4((n_events, 2))
@@ -263,12 +349,16 @@ def build_tau_targets(
     )
     tau_truth_valid = np.isfinite(truth_tau.E) & np.isfinite(truth_tau.px) & np.isfinite(truth_tau.py) & np.isfinite(truth_tau.pz)
     anti_tau_truth_valid = np.isfinite(truth_anti_tau.E) & np.isfinite(truth_anti_tau.px) & np.isfinite(truth_anti_tau.py) & np.isfinite(truth_anti_tau.pz)
-    invisible_tau_minus = truth_tau - tau_vis_target_p4[:, 0]
-    invisible_tau_plus = truth_anti_tau - tau_vis_target_p4[:, 1]
-    x_invisible_p4 = stack_tau_pair(invisible_tau_minus, invisible_tau_plus)
-    x_invisible_minus_mask = tau_truth_valid & tau_vis_target_mask[:, 0]
-    x_invisible_plus_mask = anti_tau_truth_valid & tau_vis_target_mask[:, 1]
-    x_invisible_mask = ak.concatenate([x_invisible_minus_mask[:, np.newaxis], x_invisible_plus_mask[:, np.newaxis]], axis=1)
+    truth_tau_pair = stack_tau_pair(truth_tau, truth_anti_tau)
+    truth_tau_valid_pair = stack_tau_pair_mask(tau_truth_valid, anti_tau_truth_valid)
+
+    if slot_swap_mask is None:
+        _, _, slot_swap_mask = _build_visible_tau_layout(events)
+
+    truth_tau_pair = reorder_tau_pair(truth_tau_pair, slot_swap_mask)
+    truth_tau_valid_pair = reorder_tau_pair(truth_tau_valid_pair, slot_swap_mask)
+    x_invisible_p4 = truth_tau_pair - tau_vis_target_p4
+    x_invisible_mask = truth_tau_valid_pair & tau_vis_target_mask
     x_invisible_p4 = mask_p4(x_invisible_p4, x_invisible_mask)
     tau_vis_target_p4 = mask_p4(tau_vis_target_p4, tau_vis_target_mask)
 

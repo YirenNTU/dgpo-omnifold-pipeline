@@ -357,7 +357,8 @@ def build_dataset(
             "conditions_mask": to_numpy_array(conditions_mask, bool),
             "num_vectors": to_numpy_array(num_vectors, np.float32),
             "num_sequential_vectors": to_numpy_array(num_sequential_vectors, np.float32),
-            # Truth/auxiliary targets: [N, 2, 4] for tau- / tau+ and [N, 2] masks.
+            # Truth/auxiliary targets use two canonical visible slots per event,
+            # not a fixed tau- / tau+ ordering.
             "x_invisible": to_numpy_array(x_invisible, np.float32),
             "x_invisible_mask": to_numpy_array(x_invisible_mask, bool),
             "num_invisible_raw": num_invisible_raw,
