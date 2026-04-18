@@ -132,9 +132,9 @@ Normalization:
     Event_totalHadronicEnergy: log_normalize
     thrust_Mag: normalize
     charged_E: log_normalize
-    missing_px: log_normalize
-    missing_py: log_normalize
-    missing_pt: log_normalize
+    missing_px: normalize
+    missing_py: normalize
+    missing_pt: normalize
     isolation_angle: normalize
     thrust_x: normalize
     thrust_y: normalize
