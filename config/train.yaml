@@ -132,8 +132,8 @@ options:
       enable: true
       group_name: "ObjectTag"
       label_feature: "Part_pdgId"
-      max_points: 5000
-      max_batches: 2
+      max_points: 10000
+      max_batches: 10
       log_every_n_epochs: 1
       alpha: 0.45
       marker_size: 8.0
