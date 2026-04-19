@@ -90,6 +90,10 @@ def expand_input_files(patterns: tuple[str, ...]) -> list[str]:
     return files
 
 
+def sample_uses_invisible_target(sample: Sample) -> bool:
+    return sample.is_signal and sample.name != "Ztautau_others"
+
+
 def load_sample_events(sample: Sample) -> ak.Array:
     parquet_files = expand_input_files(sample.input_files)
     console.print(
@@ -328,7 +332,7 @@ def build_dataset(
             tau_vis_rho_p4,
             tau_vis_rho_mask,
         )
-        if not sample.is_signal:
+        if not sample_uses_invisible_target(sample):
             x_invisible_mask = ak.Array(np.zeros((len(events), 2), dtype=bool))
             x_invisible_p4 = build_momentum4d(
                 np.zeros((len(events), 2), dtype=np.float32),
@@ -484,7 +488,7 @@ def write_monitor_plot(
     hist_mc_err2: dict[str, np.ndarray] = {}
 
     for sample, events in expanded_samples:
-        if signal_only and not sample.is_signal:
+        if signal_only and not sample_uses_invisible_target(sample):
             continue
         values = sanitize_hist_values(extractor(events))
         hist, _ = np.histogram(values, bins=bins)
@@ -584,16 +588,15 @@ def write_monitoring_plots(
         ("tau_vis_rho_eta", lambda events: extract_visible_tau_observable(events, "rho", "eta"), False, False, False),
         ("tau_vis_rho_phi", lambda events: extract_visible_tau_observable(events, "rho", "phi"), False, False, False),
         ("tau_vis_rho_mass", lambda events: extract_visible_tau_observable(events, "rho", "mass"), False, False, False),
-        ("target_invisible_energy", lambda events: extract_target_invisible_observable(events, "energy"), True, False, True),
-        ("target_invisible_pt", lambda events: extract_target_invisible_observable(events, "pt"), True, False, True),
-        ("target_invisible_eta", lambda events: extract_target_invisible_observable(events, "eta"), True, False, True),
-        ("target_invisible_phi", lambda events: extract_target_invisible_observable(events, "phi"), True, False, True),
-        ("target_invisible_mass", lambda events: extract_target_invisible_observable(events, "mass"), True, False, True),
+        ("target_invisible_E", lambda events: extract_target_invisible_observable(events, "E"), True, False, True),
+        ("target_invisible_px", lambda events: extract_target_invisible_observable(events, "px"), True, False, True),
+        ("target_invisible_py", lambda events: extract_target_invisible_observable(events, "py"), True, False, True),
+        ("target_invisible_pz", lambda events: extract_target_invisible_observable(events, "pz"), True, False, True),
     ]:
         values_by_sample = {
             sample.name: sanitize_hist_values(extractor(events))
             for sample, events in expanded_samples
-            if not (mc_only and sample.is_data) and not (signal_only and not sample.is_signal)
+            if not (mc_only and sample.is_data) and not (signal_only and not sample_uses_invisible_target(sample))
         }
         if not any(values.size > 0 for values in values_by_sample.values()):
             continue

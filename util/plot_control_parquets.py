@@ -75,6 +75,10 @@ def expand_input_files(patterns: tuple[str, ...]) -> list[str]:
     return files
 
 
+def sample_uses_invisible_target(sample: Sample) -> bool:
+    return sample.is_signal and sample.name != "Ztautau_others"
+
+
 def load_sample_events(sample: Sample) -> ak.Array:
     arrays = []
     parquet_files = expand_input_files(sample.input_files)
@@ -328,24 +332,20 @@ def extract_truth_nunu_pt(events: ak.Array) -> np.ndarray:
     return np.sqrt(px ** 2 + py ** 2)
 
 
-def extract_target_invisible_pt(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "pt")
+def extract_target_invisible_E(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "E")
 
 
-def extract_target_invisible_energy(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "energy")
+def extract_target_invisible_px(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "px")
 
 
-def extract_target_invisible_eta(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "eta")
+def extract_target_invisible_py(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "py")
 
 
-def extract_target_invisible_phi(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "phi")
-
-
-def extract_target_invisible_mass(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "mass")
+def extract_target_invisible_pz(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "pz")
 
 
 def default_plot_specs(feature_config: FeatureConfig) -> list[PlotSpec]:
@@ -551,43 +551,35 @@ def default_truth_plot_specs() -> list[PlotSpec]:
             log_scale=False,
         ),
         PlotSpec(
-            name="target_invisible_energy",
-            x_label="Target invisible energy [GeV]",
-            title="Target invisible energy",
+            name="target_invisible_E",
+            x_label="Target invisible E [GeV]",
+            title="Target invisible E",
             bins=None,
-            extractor=extract_target_invisible_energy,
+            extractor=extract_target_invisible_E,
             log_scale=False,
         ),
         PlotSpec(
-            name="target_invisible_pt",
-            x_label="Target invisible pT [GeV]",
-            title="Target invisible pT",
-            bins=None,
-            extractor=extract_target_invisible_pt,
+            name="target_invisible_px",
+            x_label="Target invisible px [GeV]",
+            title="Target invisible px",
+            bins=np.linspace(-40, 40, 81),
+            extractor=extract_target_invisible_px,
             log_scale=False,
         ),
         PlotSpec(
-            name="target_invisible_eta",
-            x_label="Target invisible eta",
-            title="Target invisible eta",
-            bins=np.linspace(-5, 5, 81),
-            extractor=extract_target_invisible_eta,
+            name="target_invisible_py",
+            x_label="Target invisible py [GeV]",
+            title="Target invisible py",
+            bins=np.linspace(-40, 40, 81),
+            extractor=extract_target_invisible_py,
             log_scale=False,
         ),
         PlotSpec(
-            name="target_invisible_phi",
-            x_label="Target invisible phi",
-            title="Target invisible phi",
-            bins=np.linspace(-np.pi, np.pi, 81),
-            extractor=extract_target_invisible_phi,
-            log_scale=False,
-        ),
-        PlotSpec(
-            name="target_invisible_mass",
-            x_label="Target invisible mass [GeV]",
-            title="Target invisible mass",
-            bins=np.linspace(0, 3, 81),
-            extractor=extract_target_invisible_mass,
+            name="target_invisible_pz",
+            x_label="Target invisible pz [GeV]",
+            title="Target invisible pz",
+            bins=np.linspace(-60, 60, 81),
+            extractor=extract_target_invisible_pz,
             log_scale=False,
         ),
     ]
@@ -684,6 +676,8 @@ def make_control_plots(
         for sample, sample_events in expanded_samples:
             if sample.is_data or not sample.is_signal:
                 continue
+            if plot_spec.name.startswith("target_invisible_") and not sample_uses_invisible_target(sample):
+                continue
 
             values = sanitize_hist_values(plot_spec.extractor(sample_events))
             if values.size == 0:
@@ -698,6 +692,8 @@ def make_control_plots(
 
         for sample, sample_events in expanded_samples:
             if sample.is_data or not sample.is_signal:
+                continue
+            if plot_spec.name.startswith("target_invisible_") and not sample_uses_invisible_target(sample):
                 continue
 
             values = values_by_sample.get(sample.name)

@@ -354,11 +354,9 @@ def _default_global_tags(feature_config: FeatureConfig) -> dict[str, str]:
 def _default_invisible_tags(feature_names: tuple[str, ...]) -> dict[str, str]:
     tags: dict[str, str] = {}
     for field in feature_names:
-        if field in {"energy", "pt"}:
+        if field == "energy":
             tags[field] = "log_normalize"
-        elif field == "mass":
-            tags[field] = "normalize"
-        elif field == "eta":
+        elif field in {"E", "px", "py", "pz", "pt", "mass", "eta"}:
             tags[field] = "normalize"
         elif field == "phi":
             tags[field] = "normalize_uniform"

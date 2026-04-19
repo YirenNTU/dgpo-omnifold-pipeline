@@ -88,8 +88,14 @@ def features_from_p4(p4, feature_names=FOUR_VECTOR_FEATURES):
     if isinstance(p4, ak.Array):
         components = []
         for feature_name in feature_names:
-            if feature_name == "energy":
+            if feature_name in {"energy", "E"}:
                 values = p4.E
+            elif feature_name == "px":
+                values = p4.px
+            elif feature_name == "py":
+                values = p4.py
+            elif feature_name == "pz":
+                values = p4.pz
             elif feature_name == "mass":
                 values = ak.where(np.isfinite(p4.mass), p4.mass, 0.0)
             elif feature_name == "pt":
@@ -105,8 +111,14 @@ def features_from_p4(p4, feature_names=FOUR_VECTOR_FEATURES):
 
     components = []
     for feature_name in feature_names:
-        if feature_name == "energy":
+        if feature_name in {"energy", "E"}:
             values = np.asarray(p4.E, dtype=np.float32)
+        elif feature_name == "px":
+            values = np.asarray(p4.px, dtype=np.float32)
+        elif feature_name == "py":
+            values = np.asarray(p4.py, dtype=np.float32)
+        elif feature_name == "pz":
+            values = np.asarray(p4.pz, dtype=np.float32)
         elif feature_name == "mass":
             values = np.asarray(p4.mass, dtype=np.float32)
             values = np.where(np.isfinite(values), values, 0.0)
@@ -377,8 +389,14 @@ def extract_target_invisible_observable(events: ak.Array, observable: str) -> np
         tau_vis_rho_mask,
     )
 
-    if observable == "energy":
+    if observable in {"energy", "E"}:
         return ak.to_numpy(ak.flatten(x_invisible_p4.E[x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
+    if observable == "px":
+        return ak.to_numpy(ak.flatten(x_invisible_p4.px[x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
+    if observable == "py":
+        return ak.to_numpy(ak.flatten(x_invisible_p4.py[x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
+    if observable == "pz":
+        return ak.to_numpy(ak.flatten(x_invisible_p4.pz[x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "pt":
         return ak.to_numpy(ak.flatten(x_invisible_p4.pt[x_invisible_mask], axis=None), allow_missing=False).astype(np.float32)
     if observable == "eta":

@@ -29,7 +29,7 @@ options:
     epochs: 100
     model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint
     model_checkpoint_load_path: null
-    pretrain_model_load_path: null
+    pretrain_model_load_path: /global/homes/t/tihsu/CMSOpenData_GridStudy/pretrain-weights/checkpoints.20M.a4.last.ckpt
     freeze_modules: []
     diffusion_every_n_epochs: 4
     diffusion_every_n_steps: 1
@@ -37,7 +37,7 @@ options:
     apply_event_weight: false
 
     learning_rate: &lr 0.001
-    learning_rate_body: &lr_body 0.001
+    learning_rate_body: &lr_body 0.0001
 
     Components:
       GroupedSequentialEmbedding:

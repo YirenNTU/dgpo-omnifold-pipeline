@@ -141,7 +141,7 @@ Normalization:
     thrust_z: normalize
   Invisible:
     default: none
-    mass: normalize
-    pt: normalize
-    eta: normalize
-    phi: normalize_uniform
+    E: normalize
+    px: normalize
+    py: normalize
+    pz: normalize
