@@ -12,7 +12,7 @@ platform:
 logger:
   wandb:
     project: "EveNet"
-    run_name: &logger_name "LEP-TauNu"
+    run_name: &logger_name "LEP-TauNu-Pretrain"
     tags: ["EveNet", "LEP"]
     entity: ytchou97-university-of-washington
     simplified: false
