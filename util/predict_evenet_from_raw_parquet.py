@@ -23,6 +23,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ML_PIPELINE_ROOT = REPO_ROOT / "ml_pipeline"
 EVENET_ROOT = ML_PIPELINE_ROOT / "EveNet-Full"
 
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(EVENET_ROOT) not in sys.path:
     sys.path.insert(0, str(EVENET_ROOT))
 if str(ML_PIPELINE_ROOT / "util") not in sys.path:
