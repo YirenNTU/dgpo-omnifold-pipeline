@@ -245,6 +245,12 @@ def extract_n_neutral(events: ak.Array) -> np.ndarray:
     return ak.to_numpy(ak.sum(neutral_mask, axis=-1), allow_missing=False)
 
 
+def extract_optional_part_feature(events: ak.Array, field_name: str) -> np.ndarray:
+    if field_name not in events.fields:
+        return np.array([], dtype=np.float32)
+    return extract_part_feature(events, field_name)
+
+
 def extract_thrust_neglog1m(events: ak.Array) -> np.ndarray:
     thrust = events["thrust_Mag"]
     return ak.to_numpy(-np.log10(1 - thrust + 1e-10), allow_missing=False)
@@ -400,6 +406,14 @@ def default_plot_specs(feature_config: FeatureConfig) -> list[PlotSpec]:
             title="Number of neutral particles",
             bins=np.arange(-0.5, 10.6, 1.0),
             extractor=extract_n_neutral,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="Part_lock",
+            x_label="Part_lock",
+            title="Part_lock",
+            bins=np.arange(-0.5, 3.5, 1.0),
+            extractor=lambda events: extract_optional_part_feature(events, "Part_lock"),
             log_scale=False,
         ),
         PlotSpec(

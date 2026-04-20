@@ -659,6 +659,26 @@ def write_monitoring_plots(
             log_scale=False,
         )
 
+    for field_name in ["Part_lock"]:
+        values_by_sample = {
+            sample.name: sanitize_hist_values(extract_part_feature(events, field_name))
+            for sample, events in expanded_samples
+            if field_name in events.fields
+        }
+        if not any(values.size > 0 for values in values_by_sample.values()):
+            continue
+        write_monitor_plot(
+            expanded_samples=[(sample, events) for sample, events in expanded_samples if field_name in events.fields],
+            extractor=lambda events, field_name=field_name: extract_part_feature(events, field_name),
+            bins=np.arange(-0.5, 3.5, 1.0),
+            title=field_name,
+            xlabel=field_name,
+            output_path=monitor_dir / f"{field_name}.png",
+            luminosity=luminosity,
+            normalize=normalize,
+            log_scale=False,
+        )
+
 
 def write_outputs(
     dataset: dict[str, np.ndarray],
