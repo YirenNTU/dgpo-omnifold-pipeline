@@ -66,6 +66,15 @@ Training:
     replace_model_after_load: true
     replace_model_at_end: false
 
+  ProgressiveTraining:
+    stages:
+      - name: "full_training"
+        epoch_ratio: 1.0
+        transition_ratio: 0.0
+        loss_weights:
+          generation-truth: [ 1.5, 1.5 ]
+          classification: [ 1.0, 1.0 ]
+
 Dataset:
   dataset_limit: 1.0
   normalization_file: <normalization_file>
