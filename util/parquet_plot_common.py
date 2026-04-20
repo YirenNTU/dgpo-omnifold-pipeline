@@ -216,7 +216,7 @@ def plot_from_histograms(
 
         if use_log_scale:
             ax.set_yscale("log")
-            ax.set_ylim(bottom=1e-1 if use_normalize else 1)
+            ax.set_ylim(bottom=1e-1)
         else:
             ax.set_ylim(bottom=0)
 
