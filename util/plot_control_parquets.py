@@ -264,6 +264,14 @@ def extract_tau_vis_prong_energy(events: ak.Array) -> np.ndarray:
     return extract_visible_tau_observable(events, "prong", "energy")
 
 
+def extract_tau_vis_prong_only_pt(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong_only", "pt")
+
+
+def extract_tau_vis_prong_only_energy(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong_only", "energy")
+
+
 def extract_tau_vis_rho_pt(events: ak.Array) -> np.ndarray:
     return extract_visible_tau_observable(events, "rho", "pt")
 
@@ -282,6 +290,18 @@ def extract_tau_vis_prong_phi(events: ak.Array) -> np.ndarray:
 
 def extract_tau_vis_prong_mass(events: ak.Array) -> np.ndarray:
     return extract_visible_tau_observable(events, "prong", "mass")
+
+
+def extract_tau_vis_prong_only_eta(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong_only", "eta")
+
+
+def extract_tau_vis_prong_only_phi(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong_only", "phi")
+
+
+def extract_tau_vis_prong_only_mass(events: ak.Array) -> np.ndarray:
+    return extract_visible_tau_observable(events, "prong_only", "mass")
 
 
 def extract_tau_vis_rho_eta(events: ak.Array) -> np.ndarray:
@@ -422,6 +442,44 @@ def default_plot_specs(feature_config: FeatureConfig) -> list[PlotSpec]:
             title="-log10(1 - thrust)",
             bins=np.linspace(0, 10, 81),
             extractor=extract_thrust_neglog1m,
+        ),
+        PlotSpec(
+            name="tau_vis_prong_only_energy",
+            x_label="Visible tau energy from prongs only [GeV]",
+            title="Visible tau energy from prongs only",
+            bins=None,
+            extractor=extract_tau_vis_prong_only_energy,
+        ),
+        PlotSpec(
+            name="tau_vis_prong_only_pt",
+            x_label="Visible tau pT from prongs only [GeV]",
+            title="Visible tau pT from prongs only",
+            bins=None,
+            extractor=extract_tau_vis_prong_only_pt,
+        ),
+        PlotSpec(
+            name="tau_vis_prong_only_eta",
+            x_label="Visible tau eta from prongs only",
+            title="Visible tau eta from prongs only",
+            bins=np.linspace(-5, 5, 81),
+            extractor=extract_tau_vis_prong_only_eta,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="tau_vis_prong_only_phi",
+            x_label="Visible tau phi from prongs only",
+            title="Visible tau phi from prongs only",
+            bins=np.linspace(-np.pi, np.pi, 81),
+            extractor=extract_tau_vis_prong_only_phi,
+            log_scale=False,
+        ),
+        PlotSpec(
+            name="tau_vis_prong_only_mass",
+            x_label="Visible tau mass from prongs only [GeV]",
+            title="Visible tau mass from prongs only",
+            bins=np.linspace(0, 3, 81),
+            extractor=extract_tau_vis_prong_only_mass,
+            log_scale=False,
         ),
         PlotSpec(
             name="tau_vis_prong_energy",

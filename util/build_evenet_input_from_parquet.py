@@ -16,10 +16,12 @@ from evenet_parquet_common import (
     build_visible_tau_assumptions,
     build_momentum4d,
     extract_target_invisible_observable,
+    filter_part_values,
     extract_part_feature,
     extract_part_momentum_observable,
     extract_visible_tau_observable,
     features_from_p4,
+    part_energy_mask,
 )
 from ml_pipeline_config import EveNetConfig, FeatureConfig, parse_evenet_config, parse_feature_config
 from parquet_plot_common import (
@@ -221,12 +223,13 @@ def flatten_global_feature(values: ak.Array) -> ak.Array:
 
 
 def build_point_cloud(events: ak.Array, max_particles: int, feature_config: FeatureConfig):
-    part_p4 = build_momentum4d(
+    valid_part_mask = part_energy_mask(events)
+    part_p4 = filter_part_values(events, build_momentum4d(
         events["Part_fourMomentum_fCoordinates_fX"],
         events["Part_fourMomentum_fCoordinates_fY"],
         events["Part_fourMomentum_fCoordinates_fZ"],
         events["Part_fourMomentum_fCoordinates_fT"],
-    )
+    ))
     eta = ak.where(np.isfinite(part_p4.eta), part_p4.eta, 0)
 
     available_momentum_features = {
@@ -244,7 +247,7 @@ def build_point_cloud(events: ak.Array, max_particles: int, feature_config: Feat
         elif feature_name.startswith("Part_") and feature_name[5:] in available_momentum_features:
             values = available_momentum_features[feature_name[5:]]
         else:
-            values = events[feature_name]
+            values = filter_part_values(events, events[feature_name])
         expanded = pad_and_flatten_part_feature(values, max_particles)
         features.append(expanded)
         feature_names.append(feature_name)
@@ -252,7 +255,7 @@ def build_point_cloud(events: ak.Array, max_particles: int, feature_config: Feat
     # Point-cloud tensor shape: [event, particle slot, feature].
     x = ak.concatenate(features, axis=2)
 
-    num_particles = ak.values_astype(ak.num(events["Part_pdgId"], axis=1), np.float32)
+    num_particles = ak.values_astype(ak.num(events["Part_pdgId"][valid_part_mask], axis=1), np.float32)
     # Mask shape: [event, particle slot].
     x_mask = ak.Array(np.arange(max_particles)[None, :] < ak.to_numpy(num_particles, allow_missing=False)[:, None])
     return x, x_mask, num_particles, feature_names
@@ -583,6 +586,11 @@ def write_monitoring_plots(
         )
 
     for plot_name, extractor, mc_only, log_scale, signal_only in [
+        ("tau_vis_prong_only_energy", lambda events: extract_visible_tau_observable(events, "prong_only", "energy"), False, True, False),
+        ("tau_vis_prong_only_pt", lambda events: extract_visible_tau_observable(events, "prong_only", "pt"), False, True, False),
+        ("tau_vis_prong_only_eta", lambda events: extract_visible_tau_observable(events, "prong_only", "eta"), False, False, False),
+        ("tau_vis_prong_only_phi", lambda events: extract_visible_tau_observable(events, "prong_only", "phi"), False, False, False),
+        ("tau_vis_prong_only_mass", lambda events: extract_visible_tau_observable(events, "prong_only", "mass"), False, False, False),
         ("tau_vis_prong_energy", lambda events: extract_visible_tau_observable(events, "prong", "energy"), False, True, False),
         ("tau_vis_prong_pt", lambda events: extract_visible_tau_observable(events, "prong", "pt"), False, True, False),
         ("tau_vis_prong_eta", lambda events: extract_visible_tau_observable(events, "prong", "eta"), False, False, False),

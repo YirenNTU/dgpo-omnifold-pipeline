@@ -5,6 +5,7 @@ import numpy as np
 import vector
 
 PHOTON_DR_MAX = 0.3
+MAX_PART_ENERGY_GEV = 91.25
 FOUR_VECTOR_FEATURES = ["energy", "pt", "eta", "phi"]
 VISIBLE_KIND_PRIORITY = {
     "electron": 0,
@@ -77,6 +78,22 @@ def build_part_momentum4d(events: ak.Array):
         pz = events["Part_fourMomentum_fCoordinates_fZ"],
         energy = events["Part_fourMomentum_fCoordinates_fT"],
     )
+
+
+def part_energy_mask(events: ak.Array) -> ak.Array:
+    if "Part_fourMomentum_fCoordinates_fT" not in events.fields:
+        return ak.ones_like(events["Part_pdgId"], dtype=bool)
+
+    energy = events["Part_fourMomentum_fCoordinates_fT"]
+    return ak.values_astype(np.isfinite(energy) & (energy <= MAX_PART_ENERGY_GEV), bool)
+
+
+def filter_part_values(events: ak.Array, values: ak.Array) -> ak.Array:
+    return values[part_energy_mask(events)]
+
+
+def build_filtered_part_momentum4d(events: ak.Array):
+    return filter_part_values(events, build_part_momentum4d(events))
 
 
 def compute_pt_eta_phi(px: ak.Array, py: ak.Array, pz: ak.Array) -> tuple[ak.Array, ak.Array, ak.Array]:
@@ -160,7 +177,7 @@ def mask_p4(p4, mask):
 
 def sum_masked_p4(events: ak.Array, mask: ak.Array):
     part_p4 = build_part_momentum4d(events)
-    return ak.sum(part_p4[mask], axis=1)
+    return ak.sum(part_p4[mask & part_energy_mask(events)], axis=1)
 
 
 def map_hemisphere_to_tau_sign(first_values, second_values, first_charge, second_charge):
@@ -200,15 +217,16 @@ def _classify_visible_kind_rank(lead_abs_pdg, has_nearby_photon):
     )
 
 
-def _build_visible_tau_layout(events: ak.Array):
+def _build_visible_tau_layout(events: ak.Array, include_nearby_photons: bool = True):
     charge = events["Part_charge"]
     hemisphere = events["Part_hemisphere"]
     pdg_id = abs(events["Part_pdgId"])
     part_p4 = build_part_momentum4d(events)
+    energy_valid = part_energy_mask(events)
 
     hemisphere_masks = {
-        "a": hemisphere == 1,
-        "b": hemisphere == -1,
+        "a": (hemisphere == 1) & energy_valid,
+        "b": (hemisphere == -1) & energy_valid,
     }
 
     prong_charge_sums = {}
@@ -244,7 +262,9 @@ def _build_visible_tau_layout(events: ak.Array):
         has_nearby_photon = ak.fill_none(ak.any(photon_near_prong, axis=1), False)
 
         photon_p4 = ak.sum(photon_p4_constituents[photon_near_prong], axis=1)
-        visible_p4_by_hemisphere[hemisphere_name] = prong_p4 + photon_p4
+        visible_p4_by_hemisphere[hemisphere_name] = prong_p4 + (
+            photon_p4 if include_nearby_photons else zero_p4((len(events),))
+        )
         visible_kind_rank_by_hemisphere[hemisphere_name] = _classify_visible_kind_rank(
             lead_prong_abs_pdg,
             has_nearby_photon,
@@ -310,6 +330,10 @@ def build_visible_tau_assumption_p4(events: ak.Array):
 def build_visible_tau_assumptions(events: ak.Array):
     # Shape convention is [event, visible_slot(2)] in canonical visible-type order.
     return build_visible_tau_assumption_p4(events)
+
+
+def build_prong_only_visible_tau_p4(events: ak.Array):
+    return _build_visible_tau_layout(events, include_nearby_photons=False)
 
 
 def truth_feature(values: ak.Array | None):
@@ -410,10 +434,14 @@ def extract_target_invisible_observable(events: ak.Array, observable: str) -> np
 
 def extract_visible_tau_observable(events: ak.Array, mode: str, observable: str) -> np.ndarray:
     tau_vis_prong_p4, tau_vis_prong_mask, tau_vis_rho_p4, tau_vis_rho_mask = build_visible_tau_assumptions(events)
+    tau_vis_prong_only_p4, tau_vis_prong_only_mask, _ = build_prong_only_visible_tau_p4(events)
 
     if mode == "prong":
         values = tau_vis_prong_p4
         mask = tau_vis_prong_mask
+    elif mode == "prong_only":
+        values = tau_vis_prong_only_p4
+        mask = tau_vis_prong_only_mask
     elif mode == "rho":
         values = tau_vis_rho_p4
         mask = tau_vis_rho_mask
@@ -436,12 +464,12 @@ def extract_visible_tau_observable(events: ak.Array, mode: str, observable: str)
 def extract_part_feature(events: ak.Array, field_name: str) -> np.ndarray:
     if field_name not in events.fields:
         return np.array([], dtype=np.float32)
-    values = ak.fill_none(events[field_name], np.nan)
+    values = ak.fill_none(filter_part_values(events, events[field_name]), np.nan)
     return ak.to_numpy(ak.flatten(values, axis=None), allow_missing=False).astype(np.float32)
 
 
 def extract_part_momentum_observable(events: ak.Array, observable: str) -> np.ndarray:
-    part_p4 = build_part_momentum4d(events)
+    part_p4 = build_filtered_part_momentum4d(events)
     if observable == "energy":
         values = part_p4.E
     elif observable == "pt":
