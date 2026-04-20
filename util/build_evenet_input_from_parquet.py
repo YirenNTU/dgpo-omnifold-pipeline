@@ -28,6 +28,7 @@ from parquet_plot_common import (
     plot_from_histograms,
     sanitize_hist_values,
     sample_scale,
+    summarize_invalid_hist_values,
 )
 from rich.console import Console
 from rich.table import Table
@@ -486,11 +487,14 @@ def write_monitor_plot(
     hist_data = None if mc_only else np.zeros(len(bins) - 1, dtype=float)
     hist_mc: dict[str, np.ndarray] = {}
     hist_mc_err2: dict[str, np.ndarray] = {}
+    raw_values_by_sample: dict[str, np.ndarray] = {}
 
     for sample, events in expanded_samples:
         if signal_only and not sample_uses_invisible_target(sample):
             continue
-        values = sanitize_hist_values(extractor(events))
+        raw_values = np.asarray(extractor(events), dtype=float)
+        raw_values_by_sample[sample.name] = raw_values
+        values = sanitize_hist_values(raw_values)
         hist, _ = np.histogram(values, bins=bins)
 
         if sample.is_data and not mc_only:
@@ -516,6 +520,7 @@ def write_monitor_plot(
         output_path=output_path,
         normalize=normalize,
         log_scale=log_scale,
+        invalid_summary=summarize_invalid_hist_values(raw_values_by_sample),
     )
     console.print(f"  [green]Wrote monitor[/green] [white]{output_path}[/white]")
 

@@ -52,6 +52,17 @@ def sanitize_hist_values(values: np.ndarray) -> np.ndarray:
     return values[np.isfinite(values)]
 
 
+def summarize_invalid_hist_values(values_by_sample: dict[str, np.ndarray]) -> dict[str, dict[str, int]]:
+    summary: dict[str, dict[str, int]] = {}
+    for sample_name, values in values_by_sample.items():
+        values = np.asarray(values, dtype=float)
+        nan_count = int(np.isnan(values).sum())
+        inf_count = int(np.isinf(values).sum())
+        if nan_count > 0 or inf_count > 0:
+            summary[sample_name] = {"nan": nan_count, "inf": inf_count}
+    return summary
+
+
 def choose_bins(values_by_sample: dict[str, np.ndarray], num_bins: int = 60) -> np.ndarray:
     non_empty = [sanitize_hist_values(values) for values in values_by_sample.values() if np.asarray(values).size > 0]
     non_empty = [values for values in non_empty if values.size > 0]
@@ -65,13 +76,11 @@ def choose_bins(values_by_sample: dict[str, np.ndarray], num_bins: int = 60) -> 
         high = int(np.max(rounded))
         return np.arange(low - 0.5, high + 1.5, 1.0)
 
-    low, high = np.percentile(merged, [1, 99])
-    if not np.isfinite(low) or not np.isfinite(high) or low == high:
-        low = float(np.min(merged))
-        high = float(np.max(merged))
-        if low == high:
-            low -= 0.5
-            high += 0.5
+    low = float(np.min(merged))
+    high = float(np.max(merged))
+    if low == high:
+        low -= 0.5
+        high += 0.5
     return np.linspace(low, high, num_bins + 1)
 
 
@@ -85,6 +94,7 @@ def plot_from_histograms(
     output_path: Path,
     normalize: bool,
     log_scale: bool,
+    invalid_summary: dict[str, dict[str, int]] | None = None,
 ):
     has_data = hist_data is not None
     if has_data:
@@ -179,6 +189,28 @@ def plot_from_histograms(
         ax_ratio.set_ylim(0.5, 1.5)
 
     ax.legend(loc="best")
+
+    if invalid_summary:
+        summary_lines = ["Dropped invalid entries:"]
+        for sample_name, counts in invalid_summary.items():
+            parts = []
+            if counts.get("nan", 0) > 0:
+                parts.append(f"NaN={counts['nan']}")
+            if counts.get("inf", 0) > 0:
+                parts.append(f"Inf={counts['inf']}")
+            if parts:
+                summary_lines.append(f"{sample_name}: {', '.join(parts)}")
+        if len(summary_lines) > 1:
+            ax.text(
+                0.02,
+                0.98,
+                "\n".join(summary_lines),
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8, "edgecolor": "gray"},
+            )
 
     if log_scale:
         ax.set_yscale("log")

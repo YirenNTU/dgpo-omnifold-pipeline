@@ -25,6 +25,7 @@ from parquet_plot_common import (
     plot_from_histograms,
     sanitize_hist_values,
     sample_scale,
+    summarize_invalid_hist_values,
 )
 from rich.console import Console
 from rich.table import Table
@@ -638,9 +639,12 @@ def make_control_plots(
         hist_data = np.zeros(len(bins) - 1, dtype=float)
         hist_mc: dict[str, np.ndarray] = {}
         hist_mc_err2: dict[str, np.ndarray] = {}
+        raw_values_by_sample: dict[str, np.ndarray] = {}
 
         for sample, sample_events in expanded_samples:
-            values = sanitize_hist_values(plot_spec.extractor(sample_events))
+            raw_values = np.asarray(plot_spec.extractor(sample_events), dtype=float)
+            raw_values_by_sample[sample.name] = raw_values
+            values = sanitize_hist_values(raw_values)
             hist, _ = np.histogram(values, bins=bins)
 
             if sample.is_data:
@@ -661,6 +665,7 @@ def make_control_plots(
             output_path=output_dir / f"{plot_spec.name}.png",
             normalize=normalize,
             log_scale=plot_spec.log_scale,
+            invalid_summary=summarize_invalid_hist_values(raw_values_by_sample),
         )
         console.print(
             f"  [green]Wrote[/green] [white]{output_dir / f'{plot_spec.name}.png'}[/white]"
@@ -671,6 +676,7 @@ def make_control_plots(
         hist_mc: dict[str, np.ndarray] = {}
         hist_mc_err2: dict[str, np.ndarray] = {}
         bins = plot_spec.bins
+        raw_values_by_sample: dict[str, np.ndarray] = {}
 
         values_by_sample: dict[str, np.ndarray] = {}
         for sample, sample_events in expanded_samples:
@@ -679,7 +685,9 @@ def make_control_plots(
             if plot_spec.name.startswith("target_invisible_") and not sample_uses_invisible_target(sample):
                 continue
 
-            values = sanitize_hist_values(plot_spec.extractor(sample_events))
+            raw_values = np.asarray(plot_spec.extractor(sample_events), dtype=float)
+            raw_values_by_sample[sample.name] = raw_values
+            values = sanitize_hist_values(raw_values)
             if values.size == 0:
                 continue
             values_by_sample[sample.name] = values
@@ -715,6 +723,7 @@ def make_control_plots(
             output_path=output_dir / f"{plot_spec.name}.png",
             normalize=normalize,
             log_scale=plot_spec.log_scale,
+            invalid_summary=summarize_invalid_hist_values(raw_values_by_sample),
         )
         console.print(
             f"  [green]Wrote[/green] [white]{output_dir / f'{plot_spec.name}.png'}[/white]"
