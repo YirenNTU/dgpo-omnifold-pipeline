@@ -13,6 +13,7 @@ from typing import Any
 
 import awkward as ak
 import numpy as np
+import pyarrow.parquet as pq
 import torch
 import torch.multiprocessing as mp
 import vector
@@ -81,6 +82,9 @@ class InferenceTask:
     lumi: float | None
     input_path: str
     output_path: str
+    event_start: int | None = None
+    event_stop: int | None = None
+    final_output_path: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,6 +364,47 @@ def build_converted_tasks(converted_parquet: list[str], output_dir: Path) -> lis
                 output_path=str(output_path),
             )
         )
+    return tasks
+
+
+def parquet_num_rows(parquet_path: Path) -> int:
+    return int(pq.ParquetFile(parquet_path).metadata.num_rows)
+
+
+def split_event_ranges(num_events: int, num_chunks: int) -> list[tuple[int, int]]:
+    if num_chunks <= 1 or num_events <= 0:
+        return [(0, num_events)]
+    edges = np.linspace(0, num_events, num_chunks + 1, dtype=int)
+    return [(int(edges[i]), int(edges[i + 1])) for i in range(num_chunks) if int(edges[i + 1]) > int(edges[i])]
+
+
+def build_converted_chunked_tasks(
+    converted_parquet: list[str],
+    output_dir: Path,
+    num_chunks_per_file: int,
+) -> list[InferenceTask]:
+    tasks: list[InferenceTask] = []
+    for input_path in converted_parquet:
+        input_file = Path(input_path).expanduser().resolve()
+        final_output_path = output_dir / f"{input_file.stem}__evenet_pred.parquet"
+        num_events = parquet_num_rows(input_file)
+        for shard_index, (start, stop) in enumerate(split_event_ranges(num_events, num_chunks_per_file)):
+            chunk_output_path = output_dir / f"{input_file.stem}__evenet_pred.part{shard_index:03d}.parquet"
+            tasks.append(
+                InferenceTask(
+                    sample_key=input_file.stem,
+                    sample_name=input_file.stem,
+                    is_data=False,
+                    is_signal=False,
+                    norm_factor=1.0,
+                    lumi=None,
+                    input_path=str(input_file),
+                    output_path=str(chunk_output_path),
+                    event_start=start,
+                    event_stop=stop,
+                    final_output_path=str(final_output_path),
+                )
+            )
     return tasks
 
 
@@ -673,15 +718,30 @@ def resolve_shape_metadata_path(input_path: Path, override: Path | None) -> Path
     return candidate.resolve()
 
 
-def load_converted_batch(parquet_path: Path, shape_metadata_path: Path) -> dict[str, np.ndarray]:
-    flat_events = ak.from_parquet(parquet_path)
+def load_flat_parquet_dict(
+    parquet_path: Path,
+    event_start: int | None = None,
+    event_stop: int | None = None,
+) -> dict[str, np.ndarray]:
+    table = pq.read_table(parquet_path)
+    if event_start is not None or event_stop is not None:
+        start = 0 if event_start is None else int(event_start)
+        stop = table.num_rows if event_stop is None else int(event_stop)
+        table = table.slice(start, max(0, stop - start))
+    pydict = table.to_pydict()
+    return {key: np.asarray(value) for key, value in pydict.items()}
+
+
+def load_converted_batch(
+    parquet_path: Path,
+    shape_metadata_path: Path,
+    event_start: int | None = None,
+    event_stop: int | None = None,
+) -> dict[str, np.ndarray]:
     with shape_metadata_path.open() as handle:
         shape_metadata = json.load(handle)
 
-    flat_batch = {
-        field: ak.to_numpy(flat_events[field], allow_missing=False)
-        for field in flat_events.fields
-    }
+    flat_batch = load_flat_parquet_dict(parquet_path, event_start=event_start, event_stop=event_stop)
     return unflatten_dict(flat_batch, shape_metadata, drop_column_prefix=None)
 
 
@@ -1273,10 +1333,18 @@ def augment_converted_parquet_task(
     input_path = Path(task.input_path).resolve()
     print(f"[converted-task] loading {input_path}")
     metadata_path = resolve_shape_metadata_path(input_path, shape_metadata_path)
-    batch_np = load_converted_batch(input_path, metadata_path)
+    batch_np = load_converted_batch(
+        input_path,
+        metadata_path,
+        event_start=task.event_start,
+        event_stop=task.event_stop,
+    )
     print(
         f"[converted-task] loaded {input_path.name} "
-        f"events={int(batch_np['x'].shape[0])} shape_metadata={metadata_path}"
+        f"events={int(batch_np['x'].shape[0])} "
+        f"range=[{task.event_start if task.event_start is not None else 0},"
+        f"{task.event_stop if task.event_stop is not None else int(batch_np['x'].shape[0])}) "
+        f"shape_metadata={metadata_path}"
     )
     outputs = predict_converted_events(
         batch_np=batch_np,
@@ -1290,8 +1358,9 @@ def augment_converted_parquet_task(
     )
 
     num_events = int(batch_np["x"].shape[0])
+    event_start = 0 if task.event_start is None else int(task.event_start)
     output_columns: dict[str, Any] = {
-        "event_index": np.arange(num_events, dtype=np.int64),
+        "event_index": np.arange(event_start, event_start + num_events, dtype=np.int64),
         "evenet_pred_class_index": outputs["pred_class_index"],
         "evenet_pred_class_prob": outputs["pred_class_prob"],
         "evenet_pred_class_name": ak.Array(outputs["pred_class_name"].tolist()),
@@ -1322,7 +1391,8 @@ def augment_converted_parquet_task(
     ak.to_parquet(augmented_events, output_path)
     print(
         f"[converted:{task.sample_name}] wrote {output_path} "
-        f"(events={num_events}, valid={int(outputs['valid_signal_prediction'].sum())})"
+        f"(events={num_events}, range=[{event_start},{event_start + num_events}), "
+        f"valid={int(outputs['valid_signal_prediction'].sum())})"
     )
 
 
@@ -1338,6 +1408,32 @@ def signal_class_names_from_analysis(analysis_config_path: Path) -> set[str]:
         else:
             signal_names.add(sample.name)
     return signal_names
+
+
+def merge_converted_chunk_outputs(tasks: list[InferenceTask]) -> None:
+    grouped_tasks: dict[str, list[InferenceTask]] = {}
+    for task in tasks:
+        final_output_path = task.final_output_path or task.output_path
+        grouped_tasks.setdefault(final_output_path, []).append(task)
+
+    for final_output_path, group in grouped_tasks.items():
+        if len(group) == 1 and group[0].output_path == final_output_path:
+            continue
+
+        chunk_paths = [Path(task.output_path) for task in sorted(group, key=lambda item: item.event_start or 0)]
+        arrays = [ak.from_parquet(chunk_path) for chunk_path in chunk_paths]
+        merged = ak.concatenate(arrays, axis=0) if len(arrays) > 1 else arrays[0]
+        order = np.argsort(ak.to_numpy(merged["event_index"], allow_missing=False))
+        merged = merged[order]
+
+        final_path = Path(final_output_path)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        ak.to_parquet(merged, final_path)
+        print(f"[converted-merge] wrote {final_path} from {len(chunk_paths)} chunk(s)")
+
+        for chunk_path in chunk_paths:
+            if chunk_path != final_path and chunk_path.exists():
+                chunk_path.unlink()
 
 
 def worker_main(
@@ -1411,6 +1507,8 @@ def main() -> None:
     checkpoint_path = resolve_checkpoint_path(runtime_train_config)
     sample_filter = set(args.samples) if args.samples else None
     converted_mode = bool(args.converted_parquet)
+    use_cuda = torch.cuda.is_available() and args.num_gpus > 0
+    num_workers = min(args.num_gpus, torch.cuda.device_count()) if use_cuda else 1
     analysis_config_data = read_yaml(args.analysis_config.resolve())
     _, _, analysis_feature_config = parse_config(args.analysis_config.resolve())
     merged_evenet_config = parse_evenet_config(
@@ -1419,7 +1517,7 @@ def main() -> None:
     )
     loaded_class_names = runtime_class_names(Path(runtime_train_config))
     if converted_mode:
-        tasks = build_converted_tasks(args.converted_parquet, output_dir)
+        tasks = build_converted_chunked_tasks(args.converted_parquet, output_dir, num_chunks_per_file=max(1, num_workers))
         samples, subcategories = {}, {}
     else:
         tasks, samples, subcategories = build_tasks(args.analysis_config.resolve(), output_dir, sample_filter=sample_filter)
@@ -1458,8 +1556,6 @@ def main() -> None:
             sort_keys=False,
         )
 
-    use_cuda = torch.cuda.is_available() and args.num_gpus > 0
-    num_workers = min(args.num_gpus, torch.cuda.device_count()) if use_cuda else 1
     if num_workers <= 1:
         worker_main(
             rank=0,
@@ -1477,6 +1573,8 @@ def main() -> None:
             class_weight_map=class_weight_map,
             converted_split_fraction=args.converted_split_fraction,
         )
+        if converted_mode:
+            merge_converted_chunk_outputs(tasks)
         return
 
     mp.spawn(
@@ -1499,6 +1597,8 @@ def main() -> None:
             nprocs=num_workers,
             join=True,
         )
+    if converted_mode:
+        merge_converted_chunk_outputs(tasks)
 
 
 if __name__ == "__main__":
