@@ -137,6 +137,8 @@ options:
       log_every_n_epochs: 1
       alpha: 0.8
       marker_size: 8.0
+      outlier_percentile_low: 0.5
+      outlier_percentile_high: 99.5
       others_label: "others"
       interested_labels:
         "41": "pi"
