@@ -588,10 +588,10 @@ def write_monitoring_plots(
         ("tau_vis_rho_eta", lambda events: extract_visible_tau_observable(events, "rho", "eta"), False, False, False),
         ("tau_vis_rho_phi", lambda events: extract_visible_tau_observable(events, "rho", "phi"), False, False, False),
         ("tau_vis_rho_mass", lambda events: extract_visible_tau_observable(events, "rho", "mass"), False, False, False),
-        ("target_invisible_E", lambda events: extract_target_invisible_observable(events, "E"), True, False, True),
-        ("target_invisible_px", lambda events: extract_target_invisible_observable(events, "px"), True, False, True),
-        ("target_invisible_py", lambda events: extract_target_invisible_observable(events, "py"), True, False, True),
-        ("target_invisible_pz", lambda events: extract_target_invisible_observable(events, "pz"), True, False, True),
+        ("target_invisible_energy", lambda events: extract_target_invisible_observable(events, "energy"), True, True, True),
+        ("target_invisible_pt", lambda events: extract_target_invisible_observable(events, "pt"), True, True, True),
+        ("target_invisible_eta", lambda events: extract_target_invisible_observable(events, "eta"), True, False, True),
+        ("target_invisible_phi", lambda events: extract_target_invisible_observable(events, "phi"), True, False, True),
     ]:
         values_by_sample = {
             sample.name: sanitize_hist_values(extractor(events))

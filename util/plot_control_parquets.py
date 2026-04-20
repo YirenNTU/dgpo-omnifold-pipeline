@@ -332,20 +332,20 @@ def extract_truth_nunu_pt(events: ak.Array) -> np.ndarray:
     return np.sqrt(px ** 2 + py ** 2)
 
 
-def extract_target_invisible_E(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "E")
+def extract_target_invisible_energy(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "energy")
 
 
-def extract_target_invisible_px(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "px")
+def extract_target_invisible_pt(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "pt")
 
 
-def extract_target_invisible_py(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "py")
+def extract_target_invisible_eta(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "eta")
 
 
-def extract_target_invisible_pz(events: ak.Array) -> np.ndarray:
-    return extract_target_invisible_observable(events, "pz")
+def extract_target_invisible_phi(events: ak.Array) -> np.ndarray:
+    return extract_target_invisible_observable(events, "phi")
 
 
 def default_plot_specs(feature_config: FeatureConfig) -> list[PlotSpec]:
@@ -551,35 +551,35 @@ def default_truth_plot_specs() -> list[PlotSpec]:
             log_scale=False,
         ),
         PlotSpec(
-            name="target_invisible_E",
-            x_label="Target invisible E [GeV]",
-            title="Target invisible E",
+            name="target_invisible_energy",
+            x_label="Target invisible energy [GeV]",
+            title="Target invisible energy",
             bins=None,
-            extractor=extract_target_invisible_E,
+            extractor=extract_target_invisible_energy,
+            log_scale=True,
+        ),
+        PlotSpec(
+            name="target_invisible_pt",
+            x_label="Target invisible pT [GeV]",
+            title="Target invisible pT",
+            bins=None,
+            extractor=extract_target_invisible_pt,
+            log_scale=True,
+        ),
+        PlotSpec(
+            name="target_invisible_eta",
+            x_label="Target invisible eta",
+            title="Target invisible eta",
+            bins=np.linspace(-4, 4, 81),
+            extractor=extract_target_invisible_eta,
             log_scale=False,
         ),
         PlotSpec(
-            name="target_invisible_px",
-            x_label="Target invisible px [GeV]",
-            title="Target invisible px",
-            bins=np.linspace(-40, 40, 81),
-            extractor=extract_target_invisible_px,
-            log_scale=False,
-        ),
-        PlotSpec(
-            name="target_invisible_py",
-            x_label="Target invisible py [GeV]",
-            title="Target invisible py",
-            bins=np.linspace(-40, 40, 81),
-            extractor=extract_target_invisible_py,
-            log_scale=False,
-        ),
-        PlotSpec(
-            name="target_invisible_pz",
-            x_label="Target invisible pz [GeV]",
-            title="Target invisible pz",
-            bins=np.linspace(-60, 60, 81),
-            extractor=extract_target_invisible_pz,
+            name="target_invisible_phi",
+            x_label="Target invisible phi",
+            title="Target invisible phi",
+            bins=np.linspace(-3.5, 3.5, 81),
+            extractor=extract_target_invisible_phi,
             log_scale=False,
         ),
     ]

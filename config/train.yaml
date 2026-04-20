@@ -123,11 +123,11 @@ options:
   Metrics:
     Generation-Binning:
       # EveNet-Full currently interprets this value as the number of edges,
-      # so 61 here gives 60 visible bins in wandb.
-      "neutrino-E": [ 121, 0.0, 60.0 ]
-      "neutrino-px": [ 121, -60.0, 60.0 ]
-      "neutrino-py": [ 121, -60.0, 60.0 ]
-      "neutrino-pz": [ 121, -60.0, 60.0 ]
+      # so 121 here gives 120 visible bins in wandb.
+      "neutrino-energy": [ 121, 0, 60 ]
+      "neutrino-pt": [ 121, 0, 60 ]
+      "neutrino-eta": [ 121, -1, 1 ]
+      "neutrino-phi": [ 121, -3.2, 3.2 ]
     ObjectTag-Embedding:
       enable: true
       group_name: "ObjectTag"
