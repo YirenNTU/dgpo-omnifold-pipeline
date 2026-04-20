@@ -68,6 +68,7 @@ vector.register_awkward()
 DEFAULT_FLOAT = -99.0
 DEFAULT_INT = -99
 DEFAULT_CLASS_NAME = "unselected"
+PROGRESS_PRINT_EVERY = 10
 
 
 @dataclass(frozen=True)
@@ -824,9 +825,16 @@ def predict_selected_events(
     pred_class_name = np.full(num_selected, DEFAULT_CLASS_NAME, dtype=object)
     valid_signal_prediction = np.zeros(num_selected, dtype=bool)
     outputs = component_defaults(num_selected)
+    total_batches = max(1, math.ceil(num_selected / batch_size))
 
     for start in range(0, num_selected, batch_size):
         stop = min(start + batch_size, num_selected)
+        batch_id = start // batch_size + 1
+        if batch_id == 1 or batch_id == total_batches or batch_id % PROGRESS_PRINT_EVERY == 0:
+            print(
+                f"[raw-predict] classification batch {batch_id}/{total_batches} "
+                f"events={start}:{stop}"
+            )
         event_batch = selected_events[start:stop]
         batch_np, tau_vis_prong_p4, tau_vis_prong_mask = build_inference_batch(
             event_batch,
@@ -863,6 +871,10 @@ def predict_selected_events(
         if not np.any(batch_signal_mask_np):
             continue
 
+        print(
+            f"[raw-predict] neutrino sampling batch {batch_id}/{total_batches} "
+            f"signal_events={int(batch_signal_mask_np.sum())}"
+        )
         tau_vis_hemi_p4, tau_vis_hemi_mask = canonical_pair_to_hemisphere(
             tau_vis_prong_p4,
             tau_vis_prong_mask,
@@ -967,6 +979,7 @@ def predict_converted_events(
     valid_signal_prediction = np.zeros(num_events, dtype=bool)
     pred_invisible = invisible_feature_defaults(num_events, num_slots, invisible_feature_names, prefix="pred_invisible")
     target_invisible = invisible_feature_defaults(num_events, num_slots, invisible_feature_names, prefix="target_invisible")
+    total_batches = max(1, math.ceil(num_events / batch_size))
 
     target_mask = batch_np["x_invisible_mask"].astype(bool)
     fill_invisible_feature_outputs(
@@ -980,6 +993,12 @@ def predict_converted_events(
 
     for start in range(0, num_events, batch_size):
         stop = min(start + batch_size, num_events)
+        batch_id = start // batch_size + 1
+        if batch_id == 1 or batch_id == total_batches or batch_id % PROGRESS_PRINT_EVERY == 0:
+            print(
+                f"[converted-predict] classification batch {batch_id}/{total_batches} "
+                f"events={start}:{stop}"
+            )
         batch_slice = {
             key: value[start:stop]
             for key, value in batch_np.items()
@@ -1018,6 +1037,10 @@ def predict_converted_events(
         if not np.any(batch_signal_mask_np):
             continue
 
+        print(
+            f"[converted-predict] neutrino sampling batch {batch_id}/{total_batches} "
+            f"signal_events={int(batch_signal_mask_np.sum())}"
+        )
         signal_indices = torch.from_numpy(np.nonzero(batch_signal_mask_np)[0].astype(np.int64)).to(device=device)
         signal_batch = slice_torch_batch(batch_torch, signal_indices)
         signal_batch["classification"] = batch_pred_index.index_select(0, signal_indices).to(torch.int64)
@@ -1099,6 +1122,7 @@ def augment_events_for_task(
     luminosity: float | None,
     device: torch.device,
 ) -> None:
+    print(f"[raw-task] loading {task.input_path}")
     events = ak.from_parquet(task.input_path)
     selected_events, selection_summary = run_tautau_selection(events)
     num_events = len(events)
@@ -1247,8 +1271,13 @@ def augment_converted_parquet_task(
     device: torch.device,
 ) -> None:
     input_path = Path(task.input_path).resolve()
+    print(f"[converted-task] loading {input_path}")
     metadata_path = resolve_shape_metadata_path(input_path, shape_metadata_path)
     batch_np = load_converted_batch(input_path, metadata_path)
+    print(
+        f"[converted-task] loaded {input_path.name} "
+        f"events={int(batch_np['x'].shape[0])} shape_metadata={metadata_path}"
+    )
     outputs = predict_converted_events(
         batch_np=batch_np,
         model_bundle=model_bundle,
