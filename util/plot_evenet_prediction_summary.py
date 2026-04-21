@@ -607,19 +607,43 @@ def choose_scatter_indices(num_points: int, max_points: int = MAX_NEUTRINO_SCATT
     return np.sort(rng.choice(num_points, size=max_points, replace=False))
 
 
+def build_neutrino_observable_map(leg_values: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    px = leg_values["px"]
+    py = leg_values["py"]
+    pz = leg_values["pz"]
+    energy = leg_values["E"]
+    pt = np.sqrt(px ** 2 + py ** 2)
+    eta = np.arcsinh(np.divide(pz, np.maximum(pt, 1e-8)))
+    phi = np.arctan2(py, px)
+    return {
+        "E": energy,
+        "energy": energy,
+        "px": px,
+        "py": py,
+        "pz": pz,
+        "pt": pt,
+        "eta": eta,
+        "phi": phi,
+    }
+
+
 def plot_neutrino_grid(
     events: ak.Array,
     process_name: str,
     output_path: Path,
+    component_specs: list[tuple[str, str]],
+    title_suffix: str,
 ) -> dict[str, dict[str, dict[str, float]]]:
-    components = ["E", "px", "py", "pz"]
     leg_data = extract_leg_components(events)
     if not leg_data:
         raise ValueError("Prediction parquet does not contain recognizable truth/predicted neutrino fields.")
     leg_names = list(leg_data.keys())
-    fig, axes = plt.subplots(len(leg_names), len(components), figsize=(4.5 * len(components), 4.0 * len(leg_names)), dpi=220)
+    num_columns = len(component_specs)
+    fig, axes = plt.subplots(len(leg_names), num_columns, figsize=(4.5 * num_columns, 4.0 * len(leg_names)), dpi=220)
     if len(leg_names) == 1:
         axes = np.expand_dims(axes, axis=0)
+    if num_columns == 1:
+        axes = np.expand_dims(axes, axis=1)
 
     metrics: dict[str, dict[str, dict[str, float]]] = {}
     weights = to_numpy(events["evenet_weight"], np.float64)
@@ -632,23 +656,25 @@ def plot_neutrino_grid(
         metrics[leg_name] = {}
         leg_pred = leg_data[leg_name]["pred"]
         leg_truth = leg_data[leg_name]["truth"]
+        pred_observables = build_neutrino_observable_map(leg_pred)
+        truth_observables = build_neutrino_observable_map(leg_truth)
         leg_valid = leg_pred["valid"] & leg_truth["valid"] & np.isfinite(weights) & (weights > 0)
 
-        for col_index, component in enumerate(components):
+        for col_index, (component_key, component_label) in enumerate(component_specs):
             ax = axes[row_index, col_index]
-            truth_values = leg_truth[component]
-            pred_values = leg_pred[component]
+            truth_values = truth_observables[component_key]
+            pred_values = pred_observables[component_key]
             valid = leg_valid & finite_mask(truth_values, pred_values)
             if not np.any(valid):
-                ax.set_title(f"{leg_name} {component}\nno valid events")
+                ax.set_title(f"{leg_name} {component_label}\nno valid events")
                 ax.axis("off")
-                metrics[leg_name][component] = {"weighted_ccc": float("nan")}
+                metrics[leg_name][component_key] = {"weighted_ccc": float("nan")}
                 continue
 
             truth_valid = truth_values[valid]
             pred_valid = pred_values[valid]
             weight_valid = weights[valid]
-            x_min, x_max = panel_limits(truth_valid, pred_valid, component)
+            x_min, x_max = panel_limits(truth_valid, pred_valid, component_key)
 
             match_valid = class_match[valid]
             scatter_index = choose_scatter_indices(len(truth_valid))
@@ -679,23 +705,23 @@ def plot_neutrino_grid(
             ax.plot([x_min, x_max], [x_min, x_max], color=TRUTH_COLOR, linestyle="--", linewidth=1.5)
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(x_min, x_max)
-            ax.set_xlabel(f"Truth {component}")
-            ax.set_ylabel(f"Pred {component}")
+            ax.set_xlabel(f"Truth {component_label}")
+            ax.set_ylabel(f"Pred {component_label}")
             if not legend_drawn:
                 ax.legend(loc="upper left", frameon=False, fontsize=9)
                 legend_drawn = True
 
             panel_metrics = make_neutrino_metrics(truth_valid, pred_valid, weight_valid)
-            metrics[leg_name][component] = panel_metrics
+            metrics[leg_name][component_key] = panel_metrics
             ax.set_title(
-                f"{leg_name} {component}\n"
+                f"{leg_name} {component_label}\n"
                 f"CCC={panel_metrics['weighted_ccc']:.3f}, "
                 f"R2={panel_metrics['weighted_r2']:.3f}, "
                 f"nRMSE={panel_metrics['weighted_nrmse']:.3f}",
                 fontsize=10,
             )
 
-    fig.suptitle(f"Truth vs Predicted Neutrino Four-Momentum: {process_name}", fontsize=16)
+    fig.suptitle(f"Truth vs Predicted Neutrino {title_suffix}: {process_name}", fontsize=16)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -714,32 +740,58 @@ def gather_neutrino_metrics(
     if max_processes is not None:
         process_names_present = process_names_present[:max_processes]
 
-    summary: dict[str, Any] = {"all_processes": {}, "per_process": {}}
+    cartesian_specs = [("E", "E"), ("px", "px"), ("py", "py"), ("pz", "pz")]
+    kinematic_specs = [("energy", "energy"), ("pt", "pt"), ("eta", "eta"), ("phi", "phi")]
+    summary: dict[str, Any] = {
+        "all_processes": {"cartesian": {}, "kinematics": {}},
+        "per_process": {},
+    }
 
     all_events = events[valid_truth]
-    summary["all_processes"] = plot_neutrino_grid(
+    summary["all_processes"]["cartesian"] = plot_neutrino_grid(
         all_events,
         process_name="All Processes",
         output_path=output_dir / "neutrino_truth_vs_pred_all.png",
+        component_specs=cartesian_specs,
+        title_suffix="Four-Momentum (Cartesian)",
+    )
+    summary["all_processes"]["kinematics"] = plot_neutrino_grid(
+        all_events,
+        process_name="All Processes",
+        output_path=output_dir / "neutrino_truth_vs_pred_kinematics_all.png",
+        component_specs=kinematic_specs,
+        title_suffix="Kinematics",
     )
 
     for process_name in process_names_present:
         process_events = events[truth_name == process_name]
         if len(process_events) == 0:
             continue
-        summary["per_process"][process_name] = plot_neutrino_grid(
-            process_events,
-            process_name=process_name,
-            output_path=output_dir / f"neutrino_truth_vs_pred_{process_name}.png",
-        )
+        summary["per_process"][process_name] = {
+            "cartesian": plot_neutrino_grid(
+                process_events,
+                process_name=process_name,
+                output_path=output_dir / f"neutrino_truth_vs_pred_{process_name}.png",
+                component_specs=cartesian_specs,
+                title_suffix="Four-Momentum (Cartesian)",
+            ),
+            "kinematics": plot_neutrino_grid(
+                process_events,
+                process_name=process_name,
+                output_path=output_dir / f"neutrino_truth_vs_pred_kinematics_{process_name}.png",
+                component_specs=kinematic_specs,
+                title_suffix="Kinematics",
+            ),
+        }
 
     ccc_values: list[float] = []
     for scope_metrics in [summary["all_processes"], *summary["per_process"].values()]:
-        for leg_metrics in scope_metrics.values():
-            for panel_metrics in leg_metrics.values():
-                ccc = panel_metrics.get("weighted_ccc", float("nan"))
-                if np.isfinite(ccc):
-                    ccc_values.append(ccc)
+        for view_metrics in scope_metrics.values():
+            for leg_metrics in view_metrics.values():
+                for panel_metrics in leg_metrics.values():
+                    ccc = panel_metrics.get("weighted_ccc", float("nan"))
+                    if np.isfinite(ccc):
+                        ccc_values.append(ccc)
     summary["consistency_score_ccc_mean"] = float(np.mean(ccc_values)) if ccc_values else float("nan")
     summary["consistency_score_ccc_mean_0to1"] = normalize_score(summary["consistency_score_ccc_mean"])
     return summary
