@@ -311,6 +311,29 @@ def _plot_single_confusion_matrix(
     ax.set_ylabel("Truth")
     ax.set_title(title)
 
+    if np.all(np.isfinite(matrix)):
+        max_value = float(np.max(matrix)) if matrix.size > 0 else 0.0
+        normalized_like = max_value <= 1.05
+        text_threshold = 0.45 * max_value if max_value > 0 else 0.0
+        font_size = 9 if num_classes <= 10 else 7 if num_classes <= 14 else 6
+        for row in range(num_classes):
+            for col in range(num_classes):
+                value = float(matrix[row, col])
+                if normalized_like:
+                    label = f"{value:.2f}"
+                else:
+                    label = f"{value:.0f}" if value >= 100 else f"{value:.1f}"
+                text_color = "white" if value >= text_threshold and max_value > 0 else "#1F2937"
+                ax.text(
+                    col,
+                    row,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=font_size,
+                    color=text_color,
+                )
+
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -600,6 +623,10 @@ def plot_neutrino_grid(
 
     metrics: dict[str, dict[str, dict[str, float]]] = {}
     weights = to_numpy(events["evenet_weight"], np.float64)
+    pred_name = np.asarray(ak.to_list(events["evenet_pred_class_name"]), dtype=object)
+    truth_name = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
+    class_match = pred_name == truth_name
+    legend_drawn = False
 
     for row_index, leg_name in enumerate(leg_names):
         metrics[leg_name] = {}
@@ -623,21 +650,40 @@ def plot_neutrino_grid(
             weight_valid = weights[valid]
             x_min, x_max = panel_limits(truth_valid, pred_valid, component)
 
+            match_valid = class_match[valid]
             scatter_index = choose_scatter_indices(len(truth_valid))
-            ax.scatter(
-                truth_valid[scatter_index],
-                pred_valid[scatter_index],
-                s=6,
-                alpha=0.28,
-                color=SCATTER_COLOR,
-                edgecolors="none",
-                rasterized=True,
-            )
+            match_sample = match_valid[scatter_index]
+
+            if np.any(match_sample):
+                ax.scatter(
+                    truth_valid[scatter_index][match_sample],
+                    pred_valid[scatter_index][match_sample],
+                    s=6,
+                    alpha=0.28,
+                    color=SCATTER_COLOR,
+                    edgecolors="none",
+                    rasterized=True,
+                    label="Correct class" if not legend_drawn else None,
+                )
+            if np.any(~match_sample):
+                ax.scatter(
+                    truth_valid[scatter_index][~match_sample],
+                    pred_valid[scatter_index][~match_sample],
+                    s=7,
+                    alpha=0.38,
+                    color=ACCENT_COLOR,
+                    edgecolors="none",
+                    rasterized=True,
+                    label="Mis-ID" if not legend_drawn else None,
+                )
             ax.plot([x_min, x_max], [x_min, x_max], color=TRUTH_COLOR, linestyle="--", linewidth=1.5)
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(x_min, x_max)
             ax.set_xlabel(f"Truth {component}")
             ax.set_ylabel(f"Pred {component}")
+            if not legend_drawn:
+                ax.legend(loc="upper left", frameon=False, fontsize=9)
+                legend_drawn = True
 
             panel_metrics = make_neutrino_metrics(truth_valid, pred_valid, weight_valid)
             metrics[leg_name][component] = panel_metrics
