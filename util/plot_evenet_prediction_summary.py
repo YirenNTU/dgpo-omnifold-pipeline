@@ -89,6 +89,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap on the number of per-process neutrino figures.",
     )
+    parser.add_argument(
+        "--unblind",
+        action="store_true",
+        help="If set, overlay data on data-vs-MC plots. Otherwise data inputs are ignored in summary figures.",
+    )
+    parser.add_argument(
+        "--unweighted",
+        action="store_true",
+        help="If set, ignore evenet_weight and evaluate all MC events with unit weight.",
+    )
     return parser.parse_args()
 
 
@@ -139,6 +149,14 @@ def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     if dtype is not None:
         output = output.astype(dtype)
     return output
+
+
+def event_weights(events: ak.Array, use_weighted: bool) -> np.ndarray:
+    if use_weighted and "evenet_weight" in events.fields:
+        weights = to_numpy(events["evenet_weight"], np.float64)
+        valid = np.isfinite(weights) & (weights > 0)
+        return np.where(valid, weights, 0.0)
+    return np.ones(len(events), dtype=np.float64)
 
 
 def weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
@@ -522,6 +540,28 @@ def build_full_tau_kinematics(
 ) -> dict[str, Any]:
     visible, visible_mask = extract_visible_tau_prong(pred_events)
     visible_p4 = p4_from_energy_pt_eta_phi(visible)
+    visible_components = [
+        {
+            "E": visible_p4["E"][:, 0],
+            "px": visible_p4["px"][:, 0],
+            "py": visible_p4["py"][:, 0],
+            "pz": visible_p4["pz"][:, 0],
+            "pt": visible_p4["pt"][:, 0],
+            "eta": visible_p4["eta"][:, 0],
+            "phi": visible_p4["phi"][:, 0],
+            "valid": visible_mask[:, 0],
+        },
+        {
+            "E": visible_p4["E"][:, 1],
+            "px": visible_p4["px"][:, 1],
+            "py": visible_p4["py"][:, 1],
+            "pz": visible_p4["pz"][:, 1],
+            "pt": visible_p4["pt"][:, 1],
+            "eta": visible_p4["eta"][:, 1],
+            "phi": visible_p4["phi"][:, 1],
+            "valid": visible_mask[:, 1],
+        },
+    ]
 
     def invisible_leg(prefix: str, slot: int) -> dict[str, np.ndarray]:
         values = values_for_prefix(pred_events, f"{prefix}_slot{slot}")
@@ -530,7 +570,8 @@ def build_full_tau_kinematics(
                 f"Prediction parquet is missing recognizable neutrino fields for {prefix}_slot{slot}. "
                 "Expected E/px/py/pz, energy/pt/eta/phi, or log_energy/log_pt/eta/phi."
             )
-        return values
+        observables = build_neutrino_observable_map(values)
+        return {**observables, "valid": values["valid"]}
 
     pred_invisible = [invisible_leg("pred_invisible", slot) for slot in range(2)]
     truth_invisible = [invisible_leg("target_invisible", slot) for slot in range(2)]
@@ -560,19 +601,30 @@ def build_full_tau_kinematics(
     pred_tau = [combine_tau(slot, pred_invisible[slot]) for slot in range(2)]
     truth_tau = [combine_tau(slot, truth_invisible[slot]) for slot in range(2)]
 
-    def pair_metrics(tau_pair: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
-        total_px = tau_pair[0]["px"] + tau_pair[1]["px"]
-        total_py = tau_pair[0]["py"] + tau_pair[1]["py"]
-        total_pz = tau_pair[0]["pz"] + tau_pair[1]["pz"]
-        total_E = tau_pair[0]["E"] + tau_pair[1]["E"]
+    def pair_metrics(component_pair: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+        total_px = component_pair[0]["px"] + component_pair[1]["px"]
+        total_py = component_pair[0]["py"] + component_pair[1]["py"]
+        total_pz = component_pair[0]["pz"] + component_pair[1]["pz"]
+        total_E = component_pair[0]["E"] + component_pair[1]["E"]
         momentum2 = total_px ** 2 + total_py ** 2 + total_pz ** 2
         mass = np.sqrt(np.maximum(total_E ** 2 - momentum2, 0.0))
-        delta_eta = np.abs(tau_pair[0]["eta"] - tau_pair[1]["eta"])
-        delta_phi = np.abs(np.arctan2(np.sin(tau_pair[0]["phi"] - tau_pair[1]["phi"]), np.cos(tau_pair[0]["phi"] - tau_pair[1]["phi"])))
-        valid = tau_pair[0]["valid"] & tau_pair[1]["valid"]
+        delta_eta = np.abs(component_pair[0]["eta"] - component_pair[1]["eta"])
+        delta_phi = np.abs(
+            np.arctan2(
+                np.sin(component_pair[0]["phi"] - component_pair[1]["phi"]),
+                np.cos(component_pair[0]["phi"] - component_pair[1]["phi"]),
+            )
+        )
+        valid = component_pair[0]["valid"] & component_pair[1]["valid"]
         return {"mass": mass, "delta_eta": delta_eta, "delta_phi": delta_phi, "valid": valid}
 
     return {
+        "visible_tau": visible_components,
+        "visible_pair": pair_metrics(visible_components),
+        "pred_invisible": pred_invisible,
+        "truth_invisible": truth_invisible,
+        "pred_invisible_pair": pair_metrics(pred_invisible),
+        "truth_invisible_pair": pair_metrics(truth_invisible),
         "pred_tau": pred_tau,
         "truth_tau": truth_tau,
         "pred_pair": pair_metrics(pred_tau),
@@ -660,6 +712,7 @@ def plot_neutrino_grid(
     output_path: Path,
     component_specs: list[tuple[str, str]],
     title_suffix: str,
+    use_weighted: bool,
 ) -> dict[str, dict[str, dict[str, float]]]:
     leg_data = extract_leg_components(events)
     if not leg_data:
@@ -673,7 +726,7 @@ def plot_neutrino_grid(
         axes = np.expand_dims(axes, axis=1)
 
     metrics: dict[str, dict[str, dict[str, float]]] = {}
-    weights = to_numpy(events["evenet_weight"], np.float64)
+    weights = event_weights(events, use_weighted=use_weighted)
     pred_name = np.asarray(ak.to_list(events["evenet_pred_class_name"]), dtype=object)
     truth_name = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
     class_match = pred_name == truth_name
@@ -760,6 +813,7 @@ def gather_neutrino_metrics(
     class_names: list[str],
     output_dir: Path,
     max_processes: int | None,
+    use_weighted: bool,
 ) -> dict[str, Any]:
     truth_name = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
     valid_truth = truth_name != DEFAULT_CLASS_NAME
@@ -781,6 +835,7 @@ def gather_neutrino_metrics(
         output_path=output_dir / "neutrino_truth_vs_pred_all.png",
         component_specs=cartesian_specs,
         title_suffix="Four-Momentum (Cartesian)",
+        use_weighted=use_weighted,
     )
     summary["all_processes"]["kinematics"] = plot_neutrino_grid(
         all_events,
@@ -788,6 +843,7 @@ def gather_neutrino_metrics(
         output_path=output_dir / "neutrino_truth_vs_pred_kinematics_all.png",
         component_specs=kinematic_specs,
         title_suffix="Kinematics",
+        use_weighted=use_weighted,
     )
 
     for process_name in process_names_present:
@@ -801,6 +857,7 @@ def gather_neutrino_metrics(
                 output_path=output_dir / f"neutrino_truth_vs_pred_{process_name}.png",
                 component_specs=cartesian_specs,
                 title_suffix="Four-Momentum (Cartesian)",
+                use_weighted=use_weighted,
             ),
             "kinematics": plot_neutrino_grid(
                 process_events,
@@ -808,6 +865,7 @@ def gather_neutrino_metrics(
                 output_path=output_dir / f"neutrino_truth_vs_pred_kinematics_{process_name}.png",
                 component_specs=kinematic_specs,
                 title_suffix="Kinematics",
+                use_weighted=use_weighted,
             ),
         }
 
@@ -829,9 +887,10 @@ def plot_predicted_class_comparison(
     data_events: ak.Array,
     class_names: list[str],
     output_path: Path,
+    use_weighted: bool,
 ) -> None:
     mc_pred = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
-    mc_weight = to_numpy(mc_events["evenet_weight"], np.float64)
+    mc_weight = event_weights(mc_events, use_weighted=use_weighted)
     data_pred = np.asarray(ak.to_list(data_events["evenet_pred_class_name"]), dtype=object)
 
     mc_counts = np.array([float(np.sum(mc_weight[mc_pred == name])) for name in class_names], dtype=np.float64)
@@ -856,10 +915,11 @@ def plot_predicted_channel_purity(
     data_events: ak.Array | None,
     class_names: list[str],
     output_path: Path,
+    use_weighted: bool,
 ) -> dict[str, Any]:
     mc_pred = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
     mc_truth = np.asarray(ak.to_list(mc_events["evenet_truth_class_name"]), dtype=object)
-    mc_weight = to_numpy(mc_events["evenet_weight"], np.float64)
+    mc_weight = event_weights(mc_events, use_weighted=use_weighted)
 
     valid_mc = np.isfinite(mc_weight) & (mc_weight > 0)
     mc_pred = mc_pred[valid_mc]
@@ -1061,6 +1121,7 @@ def plot_region_kinematics(
     data_events: ak.Array | None,
     class_names: list[str],
     output_path: Path,
+    use_weighted: bool,
 ) -> dict[str, Any]:
     region_mc = mc_events[np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object) == region_name]
     region_data = None
@@ -1068,7 +1129,7 @@ def plot_region_kinematics(
         region_data = data_events[np.asarray(ak.to_list(data_events["evenet_pred_class_name"]), dtype=object) == region_name]
 
     truth_names_mc = np.asarray(ak.to_list(region_mc["evenet_truth_class_name"]), dtype=object)
-    base_mc_weights = to_numpy(region_mc["evenet_weight"], np.float64) if len(region_mc) > 0 else np.array([], dtype=np.float64)
+    base_mc_weights = event_weights(region_mc, use_weighted=use_weighted) if len(region_mc) > 0 else np.array([], dtype=np.float64)
     truth_processes = [name for name in class_names if np.any(truth_names_mc == name)]
 
     mc_kin = build_full_tau_kinematics(region_mc) if len(region_mc) > 0 else None
@@ -1078,14 +1139,20 @@ def plot_region_kinematics(
         ("z_mass", "Z mass from reconstructed tau pair", r"$m_{\tau\tau}$"),
         ("delta_eta", r"$\Delta\eta(\tau,\tau)$", r"$|\Delta\eta|$"),
         ("delta_phi", r"$\Delta\phi(\tau,\tau)$", r"$|\Delta\phi|$"),
+        ("vis_delta_eta", r"$\Delta\eta(\tau_{\mathrm{vis}},\tau_{\mathrm{vis}})$", r"$|\Delta\eta_{\mathrm{vis}}|$"),
+        ("vis_delta_phi", r"$\Delta\phi(\tau_{\mathrm{vis}},\tau_{\mathrm{vis}})$", r"$|\Delta\phi_{\mathrm{vis}}|$"),
+        ("invis_delta_eta", r"$\Delta\eta(\tau_{\mathrm{inv}},\tau_{\mathrm{inv}})$", r"$|\Delta\eta_{\mathrm{inv}}|$"),
+        ("invis_delta_phi", r"$\Delta\phi(\tau_{\mathrm{inv}},\tau_{\mathrm{inv}})$", r"$|\Delta\phi_{\mathrm{inv}}|$"),
         ("tau_E", r"Tau energy", r"$E_\tau$"),
         ("tau_px", r"Tau px", r"$p_{x,\tau}$"),
         ("tau_py", r"Tau py", r"$p_{y,\tau}$"),
         ("tau_pz", r"Tau pz", r"$p_{z,\tau}$"),
     ]
 
-    fig, axes = plt.subplots(2, 4, figsize=(20, 9), dpi=220)
-    axes = axes.flatten()
+    ncols = 4
+    nrows = math.ceil(len(panel_specs) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(20, 4.5 * nrows), dpi=220)
+    axes = np.atleast_1d(axes).flatten()
     summary: dict[str, Any] = {}
 
     for axis, (key, title, xlabel) in zip(axes, panel_specs):
@@ -1117,6 +1184,38 @@ def plot_region_kinematics(
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_pair"]["delta_phi"] if data_kin is not None else None
             data_valid = data_kin["pred_pair"]["valid"] if data_kin is not None else None
+            symmetric = False
+        elif key == "vis_delta_eta":
+            mc_pred_values = mc_kin["visible_pair"]["delta_eta"]
+            mc_truth_values = mc_kin["visible_pair"]["delta_eta"]
+            mc_valid = mc_kin["visible_pair"]["valid"]
+            mc_weights_for_hist = base_mc_weights
+            data_values = data_kin["visible_pair"]["delta_eta"] if data_kin is not None else None
+            data_valid = data_kin["visible_pair"]["valid"] if data_kin is not None else None
+            symmetric = False
+        elif key == "vis_delta_phi":
+            mc_pred_values = mc_kin["visible_pair"]["delta_phi"]
+            mc_truth_values = mc_kin["visible_pair"]["delta_phi"]
+            mc_valid = mc_kin["visible_pair"]["valid"]
+            mc_weights_for_hist = base_mc_weights
+            data_values = data_kin["visible_pair"]["delta_phi"] if data_kin is not None else None
+            data_valid = data_kin["visible_pair"]["valid"] if data_kin is not None else None
+            symmetric = False
+        elif key == "invis_delta_eta":
+            mc_pred_values = mc_kin["pred_invisible_pair"]["delta_eta"]
+            mc_truth_values = mc_kin["truth_invisible_pair"]["delta_eta"]
+            mc_valid = mc_kin["pred_invisible_pair"]["valid"] & mc_kin["truth_invisible_pair"]["valid"]
+            mc_weights_for_hist = base_mc_weights
+            data_values = data_kin["pred_invisible_pair"]["delta_eta"] if data_kin is not None else None
+            data_valid = data_kin["pred_invisible_pair"]["valid"] if data_kin is not None else None
+            symmetric = False
+        elif key == "invis_delta_phi":
+            mc_pred_values = mc_kin["pred_invisible_pair"]["delta_phi"]
+            mc_truth_values = mc_kin["truth_invisible_pair"]["delta_phi"]
+            mc_valid = mc_kin["pred_invisible_pair"]["valid"] & mc_kin["truth_invisible_pair"]["valid"]
+            mc_weights_for_hist = base_mc_weights
+            data_values = data_kin["pred_invisible_pair"]["delta_phi"] if data_kin is not None else None
+            data_valid = data_kin["pred_invisible_pair"]["valid"] if data_kin is not None else None
             symmetric = False
         else:
             component = key.split("_", 1)[1]
@@ -1178,11 +1277,14 @@ def plot_region_kinematics(
             "data_yield": float(np.sum(data_hist)) if data_hist is not None else float("nan"),
         }
 
+    for axis in axes[len(panel_specs):]:
+        axis.axis("off")
+
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
-        axes[-1].legend(handles, labels, loc="center")
-        axes[-1].axis("off")
-    fig.suptitle(f"Region {region_name}: data vs stacked MC (with MC truth reference)", fontsize=16)
+        fig.legend(handles, labels, loc="center right", frameon=False)
+    title_suffix = "data vs stacked MC" if data_events is not None else "stacked MC"
+    fig.suptitle(f"Region {region_name}: {title_suffix} (with MC truth reference)", fontsize=16)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -1195,6 +1297,7 @@ def gather_region_kinematics_plots(
     class_names: list[str],
     output_dir: Path,
     max_processes: int | None,
+    use_weighted: bool,
 ) -> dict[str, Any]:
     predicted_names = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
     region_names = [name for name in class_names if np.any(predicted_names == name)]
@@ -1209,6 +1312,7 @@ def gather_region_kinematics_plots(
             data_events=data_events,
             class_names=class_names,
             output_path=output_dir / f"region_kinematics_{region_name}.png",
+            use_weighted=use_weighted,
         )
     return summary
 
@@ -1221,13 +1325,14 @@ def main() -> None:
     mc_paths = expand_paths(args.mc_parquet)
     data_paths = expand_paths(args.data_parquet)
     mc_events = load_events(mc_paths)
-    data_events = load_events(data_paths) if data_paths else None
+    data_events = load_events(data_paths) if (data_paths and args.unblind) else None
+    use_weighted = not args.unweighted
 
     class_names = build_class_names_from_analysis(args.analysis_config.resolve(), args.evenet_config.resolve())
 
     truth_idx = to_numpy(mc_events["evenet_truth_class_index"], np.int64)
     pred_idx = to_numpy(mc_events["evenet_pred_class_index"], np.int64)
-    weights = to_numpy(mc_events["evenet_weight"], np.float64)
+    weights = event_weights(mc_events, use_weighted=use_weighted)
     valid_class = (truth_idx >= 0) & (truth_idx < len(class_names)) & (pred_idx >= 0) & (pred_idx < len(class_names)) & np.isfinite(weights) & (weights > 0)
 
     confusion_metrics = plot_confusion_summary(
@@ -1246,6 +1351,7 @@ def main() -> None:
         class_names=class_names,
         output_dir=output_dir,
         max_processes=args.max_processes,
+        use_weighted=use_weighted,
     )
 
     if data_events is not None:
@@ -1254,12 +1360,14 @@ def main() -> None:
             data_events=data_events,
             class_names=class_names,
             output_path=output_dir / "predicted_class_data_vs_mc.png",
+            use_weighted=use_weighted,
         )
     purity_metrics = plot_predicted_channel_purity(
         mc_events=mc_events,
         data_events=data_events,
         class_names=class_names,
         output_path=output_dir / "predicted_channel_purity.png",
+        use_weighted=use_weighted,
     )
     region_kinematics_metrics = gather_region_kinematics_plots(
         mc_events=mc_events,
@@ -1267,6 +1375,7 @@ def main() -> None:
         class_names=class_names,
         output_dir=output_dir,
         max_processes=args.max_processes,
+        use_weighted=use_weighted,
     )
 
     metrics_payload = {
@@ -1275,6 +1384,7 @@ def main() -> None:
             "data_parquet": [str(Path(path).resolve()) for path in data_paths],
             "analysis_config": str(args.analysis_config.resolve()),
             "evenet_config": str(args.evenet_config.resolve()),
+            "use_weighted": use_weighted,
         },
         "classification": confusion_metrics,
         "purity": purity_metrics,

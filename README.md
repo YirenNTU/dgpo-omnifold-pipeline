@@ -336,12 +336,11 @@ For the LEP case study, the recommended inference path is the standalone predict
 
 - [util/predict_evenet_from_raw_parquet.py](util/predict_evenet_from_raw_parquet.py)
 
-It supports:
+The filename is legacy, but the current script is intentionally simplified:
 
-- `raw parquet` mode: start from analysis-side parquet files and re-run the `tautau` selection
-- `converted parquet` mode: start from EveNet preprocessed parquet files such as `data.parquet` and `test.parquet`
-
-For the current workflow, `converted parquet` mode is the main path.
+- it only supports `converted parquet` inference
+- it starts from EveNet preprocessed parquet files such as `data.parquet` and `test.parquet`
+- it no longer re-runs any raw-parquet-side selection inside the predictor
 
 ### Converted parquet inference
 
@@ -363,6 +362,8 @@ python3 util/predict_evenet_from_raw_parquet.py \
 Notes:
 
 - `--num-gpus` is now event-chunk parallel for converted parquet mode, so a single large parquet can be split across multiple GPUs.
+- `--disable-ema` lets you force prediction to use `checkpoint["state_dict"]` instead of `checkpoint["ema_state_dict"]`.
+- `--unweighted-output` forces `evenet_weight = 1` for all events, which is useful when you want predictor output closer to unweighted training/validation comparisons.
 - `--converted-split-fraction` is used to rescale MC `evenet_weight` back to the full-sample normalization for data-vs-MC plots.
   - Example: if `test.parquet` corresponds to half of the original MC sample, pass `0.5`, so MC gets `x2` in the output plotting weight.
 - Data is not assigned MC truth labels and keeps `evenet_weight = 1`.
@@ -423,6 +424,11 @@ python3 util/plot_evenet_prediction_summary.py \
   --data-parquet /path/to/data__evenet_pred.parquet \
   --output-dir /path/to/predict_summary
 ```
+
+Optional switches:
+
+- `--unweighted`: ignore `evenet_weight` and evaluate every MC event with unit weight
+- `--unblind`: overlay data on the data-vs-MC figures
 
 Current outputs include:
 
