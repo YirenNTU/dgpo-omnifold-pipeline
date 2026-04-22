@@ -682,6 +682,42 @@ def fill_invisible_feature_outputs(
                 output_columns[f"{prefix}_slot{slot}_{linear_name}"][target_indices] = linear_values
 
 
+def visible_feature_defaults(
+    num_events: int,
+    num_slots: int,
+    prefix: str,
+) -> dict[str, np.ndarray]:
+    output: dict[str, np.ndarray] = {}
+    for slot in range(num_slots):
+        output[f"{prefix}_slot{slot}_valid"] = np.zeros(num_events, dtype=bool)
+        for feature_name in ["energy", "pt", "eta", "phi"]:
+            output[f"{prefix}_slot{slot}_{feature_name}"] = np.full(num_events, DEFAULT_FLOAT, dtype=np.float32)
+    return output
+
+
+def fill_visible_feature_outputs(
+    output_columns: dict[str, np.ndarray],
+    prefix: str,
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    target_indices: np.ndarray,
+) -> None:
+    for slot in range(values.shape[1]):
+        output_columns[f"{prefix}_slot{slot}_valid"][target_indices] = valid_mask[:, slot]
+        output_columns[f"{prefix}_slot{slot}_energy"][target_indices] = np.where(
+            valid_mask[:, slot], values[:, slot, 0], DEFAULT_FLOAT
+        ).astype(np.float32)
+        output_columns[f"{prefix}_slot{slot}_pt"][target_indices] = np.where(
+            valid_mask[:, slot], values[:, slot, 1], DEFAULT_FLOAT
+        ).astype(np.float32)
+        output_columns[f"{prefix}_slot{slot}_eta"][target_indices] = np.where(
+            valid_mask[:, slot], values[:, slot, 2], DEFAULT_FLOAT
+        ).astype(np.float32)
+        output_columns[f"{prefix}_slot{slot}_phi"][target_indices] = np.where(
+            valid_mask[:, slot], values[:, slot, 3], DEFAULT_FLOAT
+        ).astype(np.float32)
+
+
 def ensure_converted_batch_fields(
     batch_np: dict[str, np.ndarray],
     invisible_dim: int,
@@ -1370,6 +1406,22 @@ def augment_converted_parquet_task(
         "event_weight": outputs["event_weight"],
         "evenet_weight": outputs["physics_weight"],
     }
+
+    if "tau_vis_prong" in batch_np:
+        tau_vis_prong = batch_np["tau_vis_prong"].astype(np.float32)
+        tau_vis_prong_mask = batch_np.get(
+            "tau_vis_prong_mask",
+            np.ones(tau_vis_prong.shape[:2], dtype=bool),
+        ).astype(bool)
+        tau_vis_output = visible_feature_defaults(num_events, tau_vis_prong.shape[1], prefix="tau_vis_prong")
+        fill_visible_feature_outputs(
+            tau_vis_output,
+            prefix="tau_vis_prong",
+            values=tau_vis_prong,
+            valid_mask=tau_vis_prong_mask,
+            target_indices=np.arange(num_events, dtype=np.int64),
+        )
+        output_columns.update(tau_vis_output)
 
     for key, value in outputs.items():
         if key in {

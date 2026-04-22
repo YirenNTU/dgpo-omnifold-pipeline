@@ -329,3 +329,128 @@ In practice, the end-to-end flow is:
 3. Run [build_evenet_input_from_parquet.py](util/build_evenet_input_from_parquet.py) with `config/analysis.yaml` and `config/evenet_schema.yaml` to make `evenet_input.npz`, `event_info.yaml`, and refresh `config/generated_event_info.yaml`.
 4. Run EveNet preprocessing with `config/preprocess_config.yaml` to make the final parquet shards plus normalization.
 5. Fill in `config/train.yaml` or `config/predict.yaml` and run the corresponding EveNet script.
+
+## Standalone Predict
+
+For the LEP case study, the recommended inference path is the standalone predictor:
+
+- [util/predict_evenet_from_raw_parquet.py](util/predict_evenet_from_raw_parquet.py)
+
+It supports:
+
+- `raw parquet` mode: start from analysis-side parquet files and re-run the `tautau` selection
+- `converted parquet` mode: start from EveNet preprocessed parquet files such as `data.parquet` and `test.parquet`
+
+For the current workflow, `converted parquet` mode is the main path.
+
+### Converted parquet inference
+
+Example:
+
+```bash
+cd ml_pipeline
+python3 util/predict_evenet_from_raw_parquet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train.yaml \
+  --checkpoint /path/to/last.ckpt \
+  --output-dir /path/to/predict_output \
+  --converted-parquet /path/to/data.parquet /path/to/test.parquet \
+  --converted-split-fraction 0.5 \
+  --batch-size 1024 \
+  --num-gpus 4
+```
+
+Notes:
+
+- `--num-gpus` is now event-chunk parallel for converted parquet mode, so a single large parquet can be split across multiple GPUs.
+- `--converted-split-fraction` is used to rescale MC `evenet_weight` back to the full-sample normalization for data-vs-MC plots.
+  - Example: if `test.parquet` corresponds to half of the original MC sample, pass `0.5`, so MC gets `x2` in the output plotting weight.
+- Data is not assigned MC truth labels and keeps `evenet_weight = 1`.
+
+### Prediction parquet contents
+
+The converted-mode prediction output is intentionally self-contained for downstream evaluation and plotting. In addition to classification and neutrino prediction outputs, it stores:
+
+- `evenet_pred_class_index`
+- `evenet_pred_class_prob`
+- `evenet_pred_class_name`
+- `evenet_truth_class_index`
+- `evenet_truth_class_name`
+- `flags_valid`
+- `event_weight`
+- `evenet_weight`
+- `pred_invisible_slot{0,1}_*`
+- `target_invisible_slot{0,1}_*`
+- `tau_vis_prong_slot{0,1}_energy`
+- `tau_vis_prong_slot{0,1}_pt`
+- `tau_vis_prong_slot{0,1}_eta`
+- `tau_vis_prong_slot{0,1}_phi`
+- `tau_vis_prong_slot{0,1}_valid`
+
+This means the later evaluation step does **not** need the original converted parquet or `shape_metadata.json` anymore.
+
+### Data-only converted parquet
+
+If you only have `data.npz`, a practical way to turn it into a converted parquet for standalone prediction is:
+
+```bash
+cd ml_pipeline
+python3 EveNet-Full/preprocessing/preprocess.py \
+  --config config/preprocess_config.yaml \
+  --train /path/to/data.npz \
+  --test /path/to/data.npz \
+  --store_dir /path/to/evenet_data
+```
+
+This is a conversion workaround for inference only. After that, use the produced `test.parquet` (or `train.parquet`) as the `--converted-parquet` input.
+
+## Standalone Evaluation
+
+The recommended summary plotting script is:
+
+- [util/plot_evenet_prediction_summary.py](util/plot_evenet_prediction_summary.py)
+
+It reads only the prediction parquet files produced by the standalone predictor. It no longer requires source converted parquet inputs.
+
+Example:
+
+```bash
+cd ml_pipeline
+python3 util/plot_evenet_prediction_summary.py \
+  --analysis-config config/analysis.yaml \
+  --evenet-config config/evenet_schema.yaml \
+  --mc-parquet /path/to/test__evenet_pred.parquet \
+  --data-parquet /path/to/data__evenet_pred.parquet \
+  --output-dir /path/to/predict_summary
+```
+
+Current outputs include:
+
+- `classification_confusion_weighted.png`
+- `classification_confusion_row_normalized.png`
+- `predicted_channel_purity.png`
+- `predicted_class_data_vs_mc.png`
+- `neutrino_truth_vs_pred_all.png`
+- `neutrino_truth_vs_pred_kinematics_all.png`
+- `neutrino_truth_vs_pred_<process>.png`
+- `neutrino_truth_vs_pred_kinematics_<process>.png`
+- `region_kinematics_<region>.png`
+- `summary_metrics.yaml`
+
+The summary plots use the stored prediction-parquet content directly:
+
+- classification confusion is event-weighted with `evenet_weight`
+- purity is shown as stacked truth-process yield per predicted channel, with `signal purity` written on the right-hand side
+- neutrino comparison is split by correct classification vs mis-ID using different colors
+- region plots compare data vs stacked MC and also overlay the MC truth reference
+
+## Alignment Notes
+
+When comparing standalone test-time prediction to the validation plots logged during training, keep these important differences in mind:
+
+- Standalone neutrino inference is conditioned on the **predicted** class label.
+- The diffusion monitoring during validation is typically conditioned on the dataset `classification`, i.e. the **truth** class label.
+- The standalone predictor currently loads EMA weights when `EMA.enable: true` and `EMA.replace_model_after_load: true`.
+- The standalone summary plots use `evenet_weight`, while training loss uses `apply_event_weight: false` in the current local config.
+
+So a visible degradation from validation to standalone test does not automatically imply a broken prediction pipeline; some of the difference can come from these intentionally different evaluation conditions.

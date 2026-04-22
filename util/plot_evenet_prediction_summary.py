@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import json
 import math
 import sys
 from pathlib import Path
@@ -12,7 +11,6 @@ from typing import Any
 import awkward as ak
 import matplotlib.pyplot as plt
 import numpy as np
-import pyarrow.parquet as pq
 import yaml
 from matplotlib.colors import LinearSegmentedColormap
 
@@ -24,7 +22,6 @@ if str(EVENET_ROOT) not in sys.path:
 
 from build_evenet_input_from_parquet import merge_evenet_config, parse_config, read_yaml
 from ml_pipeline_config import parse_evenet_config
-from evenet.dataset.preprocess import unflatten_dict
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "plots" / "prediction_summary"
@@ -81,24 +78,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional data prediction parquet files or glob patterns for a predicted-class comparison plot.",
     )
     parser.add_argument(
-        "--mc-source-converted",
-        nargs="*",
-        default=None,
-        help="Optional original converted MC parquet file(s) used to reconstruct tau/Z kinematics.",
-    )
-    parser.add_argument(
-        "--data-source-converted",
-        nargs="*",
-        default=None,
-        help="Optional original converted data parquet file(s) used to reconstruct tau/Z kinematics.",
-    )
-    parser.add_argument(
-        "--source-shape-metadata",
-        type=Path,
-        default=None,
-        help="Optional shape_metadata.json for source converted parquet inputs.",
-    )
-    parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
@@ -131,35 +110,6 @@ def load_events(paths: list[str]) -> ak.Array:
     if not arrays:
         raise ValueError("No parquet inputs found.")
     return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
-
-
-def resolve_shape_metadata_path(paths: list[str], override: Path | None) -> Path:
-    if override is not None:
-        return override.expanduser().resolve()
-    if not paths:
-        raise ValueError("No source converted parquet paths were provided.")
-    candidate = Path(paths[0]).expanduser().resolve().parent / "shape_metadata.json"
-    if not candidate.exists():
-        raise FileNotFoundError(
-            f"shape_metadata.json not found next to {paths[0]}. Pass --source-shape-metadata explicitly."
-        )
-    return candidate
-
-
-def load_source_converted_batch(paths: list[str], shape_metadata_path: Path) -> dict[str, np.ndarray]:
-    with shape_metadata_path.open() as handle:
-        shape_metadata = json.load(handle)
-
-    reconstructed_batches: list[dict[str, np.ndarray]] = []
-    for path in paths:
-        table = pq.read_table(path)
-        flat_batch = {key: np.asarray(value) for key, value in table.to_pydict().items()}
-        reconstructed_batches.append(unflatten_dict(flat_batch, shape_metadata, drop_column_prefix=None))
-
-    merged: dict[str, np.ndarray] = {}
-    for key in reconstructed_batches[0]:
-        merged[key] = np.concatenate([batch[key] for batch in reconstructed_batches], axis=0)
-    return merged
 
 
 def build_class_names_from_analysis(analysis_config_path: Path, evenet_config_path: Path) -> list[str]:
@@ -483,15 +433,42 @@ def p4_from_energy_pt_eta_phi(values: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def extract_visible_tau_prong(events: ak.Array) -> tuple[np.ndarray, np.ndarray]:
+    fields = set(events.fields)
+    num_events = len(events)
+    values = np.full((num_events, 2, 4), np.nan, dtype=np.float64)
+    valid = np.zeros((num_events, 2), dtype=bool)
+
+    for slot in range(2):
+        required_fields = {
+            f"tau_vis_prong_slot{slot}_energy",
+            f"tau_vis_prong_slot{slot}_pt",
+            f"tau_vis_prong_slot{slot}_eta",
+            f"tau_vis_prong_slot{slot}_phi",
+        }
+        if not required_fields.issubset(fields):
+            raise ValueError(
+                "Prediction parquet is missing stored visible tau information. "
+                "Re-run predict_evenet_from_raw_parquet.py after updating it to store tau_vis_prong slots."
+            )
+
+        values[:, slot, 0] = to_numpy(events[f"tau_vis_prong_slot{slot}_energy"], np.float64)
+        values[:, slot, 1] = to_numpy(events[f"tau_vis_prong_slot{slot}_pt"], np.float64)
+        values[:, slot, 2] = to_numpy(events[f"tau_vis_prong_slot{slot}_eta"], np.float64)
+        values[:, slot, 3] = to_numpy(events[f"tau_vis_prong_slot{slot}_phi"], np.float64)
+        valid_field = f"tau_vis_prong_slot{slot}_valid"
+        if valid_field in fields:
+            valid[:, slot] = to_numpy(events[valid_field], bool)
+        else:
+            valid[:, slot] = finite_mask(values[:, slot, 0], values[:, slot, 1], values[:, slot, 2], values[:, slot, 3])
+
+    return values, valid
+
+
 def build_full_tau_kinematics(
     pred_events: ak.Array,
-    source_batch: dict[str, np.ndarray],
 ) -> dict[str, Any]:
-    if "tau_vis_prong" not in source_batch:
-        raise ValueError("Source converted parquet is missing tau_vis_prong.")
-    event_index = to_numpy(pred_events["event_index"], np.int64)
-    visible = source_batch["tau_vis_prong"][event_index]
-    visible_mask = source_batch.get("tau_vis_prong_mask", np.ones(visible.shape[:2], dtype=bool))[event_index].astype(bool)
+    visible, visible_mask = extract_visible_tau_prong(pred_events)
     visible_p4 = p4_from_energy_pt_eta_phi(visible)
 
     def invisible_leg(prefix: str, slot: int) -> dict[str, np.ndarray]:
@@ -1031,9 +1008,7 @@ def plot_region_histogram_panel(
 def plot_region_kinematics(
     region_name: str,
     mc_events: ak.Array,
-    mc_source_batch: dict[str, np.ndarray],
     data_events: ak.Array | None,
-    data_source_batch: dict[str, np.ndarray] | None,
     class_names: list[str],
     output_path: Path,
 ) -> dict[str, Any]:
@@ -1046,8 +1021,8 @@ def plot_region_kinematics(
     base_mc_weights = to_numpy(region_mc["evenet_weight"], np.float64) if len(region_mc) > 0 else np.array([], dtype=np.float64)
     truth_processes = [name for name in class_names if np.any(truth_names_mc == name)]
 
-    mc_kin = build_full_tau_kinematics(region_mc, mc_source_batch) if len(region_mc) > 0 else None
-    data_kin = build_full_tau_kinematics(region_data, data_source_batch) if (region_data is not None and len(region_data) > 0 and data_source_batch is not None) else None
+    mc_kin = build_full_tau_kinematics(region_mc) if len(region_mc) > 0 else None
+    data_kin = build_full_tau_kinematics(region_data) if (region_data is not None and len(region_data) > 0) else None
 
     panel_specs = [
         ("z_mass", "Z mass from reconstructed tau pair", r"$m_{\tau\tau}$"),
@@ -1166,16 +1141,11 @@ def plot_region_kinematics(
 
 def gather_region_kinematics_plots(
     mc_events: ak.Array,
-    mc_source_batch: dict[str, np.ndarray] | None,
     data_events: ak.Array | None,
-    data_source_batch: dict[str, np.ndarray] | None,
     class_names: list[str],
     output_dir: Path,
     max_processes: int | None,
 ) -> dict[str, Any]:
-    if mc_source_batch is None:
-        return {}
-
     predicted_names = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
     region_names = [name for name in class_names if np.any(predicted_names == name)]
     if max_processes is not None:
@@ -1186,9 +1156,7 @@ def gather_region_kinematics_plots(
         summary[region_name] = plot_region_kinematics(
             region_name=region_name,
             mc_events=mc_events,
-            mc_source_batch=mc_source_batch,
             data_events=data_events,
-            data_source_batch=data_source_batch,
             class_names=class_names,
             output_path=output_dir / f"region_kinematics_{region_name}.png",
         )
@@ -1202,13 +1170,8 @@ def main() -> None:
 
     mc_paths = expand_paths(args.mc_parquet)
     data_paths = expand_paths(args.data_parquet)
-    mc_source_paths = expand_paths(args.mc_source_converted)
-    data_source_paths = expand_paths(args.data_source_converted)
     mc_events = load_events(mc_paths)
     data_events = load_events(data_paths) if data_paths else None
-    source_shape_metadata = resolve_shape_metadata_path(mc_source_paths or data_source_paths, args.source_shape_metadata) if (mc_source_paths or data_source_paths) else None
-    mc_source_batch = load_source_converted_batch(mc_source_paths, source_shape_metadata) if mc_source_paths and source_shape_metadata is not None else None
-    data_source_batch = load_source_converted_batch(data_source_paths, source_shape_metadata) if data_source_paths and source_shape_metadata is not None else None
 
     class_names = build_class_names_from_analysis(args.analysis_config.resolve(), args.evenet_config.resolve())
 
@@ -1250,9 +1213,7 @@ def main() -> None:
     )
     region_kinematics_metrics = gather_region_kinematics_plots(
         mc_events=mc_events,
-        mc_source_batch=mc_source_batch,
         data_events=data_events,
-        data_source_batch=data_source_batch,
         class_names=class_names,
         output_dir=output_dir,
         max_processes=args.max_processes,
@@ -1262,9 +1223,6 @@ def main() -> None:
         "inputs": {
             "mc_parquet": [str(Path(path).resolve()) for path in mc_paths],
             "data_parquet": [str(Path(path).resolve()) for path in data_paths],
-            "mc_source_converted": [str(Path(path).resolve()) for path in mc_source_paths],
-            "data_source_converted": [str(Path(path).resolve()) for path in data_source_paths],
-            "source_shape_metadata": str(source_shape_metadata.resolve()) if source_shape_metadata is not None else None,
             "analysis_config": str(args.analysis_config.resolve()),
             "evenet_config": str(args.evenet_config.resolve()),
         },
