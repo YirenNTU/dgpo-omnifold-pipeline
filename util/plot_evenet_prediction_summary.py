@@ -1072,6 +1072,7 @@ def plot_region_histogram_panel(
     truth_hist: np.ndarray | None,
     title: str,
     xlabel: str,
+    data_note: str | None = None,
 ) -> None:
     centers = 0.5 * (bins[:-1] + bins[1:])
     widths = np.diff(bins)
@@ -1113,6 +1114,18 @@ def plot_region_histogram_panel(
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Yield")
     ax.grid(axis="y", linestyle=":", alpha=0.3)
+    if data_note:
+        ax.text(
+            0.98,
+            0.95,
+            data_note,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            color=DATA_COLOR,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8, "pad": 1.5},
+        )
 
 
 def plot_region_kinematics(
@@ -1154,6 +1167,7 @@ def plot_region_kinematics(
     fig, axes = plt.subplots(nrows, ncols, figsize=(20, 4.5 * nrows), dpi=220)
     axes = np.atleast_1d(axes).flatten()
     summary: dict[str, Any] = {}
+    region_data_count = len(region_data) if region_data is not None else 0
 
     for axis, (key, title, xlabel) in zip(axes, panel_specs):
         if mc_kin is None:
@@ -1256,9 +1270,13 @@ def plot_region_kinematics(
             truth_hist = make_weighted_hist(mc_truth_values[mc_finite], mc_weights_for_hist[mc_finite], bins)
 
         data_hist = data_err = None
+        data_note = None
         if data_values is not None and data_valid is not None:
             data_mask = data_valid & finite_mask(data_values)
-            data_hist, data_err = make_count_hist(data_values[data_mask], bins)
+            if np.any(data_mask):
+                data_hist, data_err = make_count_hist(data_values[data_mask], bins)
+            elif region_data_count > 0:
+                data_note = "Data present, but no valid prediction\nstored for this observable"
 
         plot_region_histogram_panel(
             axis,
@@ -1269,6 +1287,7 @@ def plot_region_kinematics(
             truth_hist=truth_hist,
             title=title,
             xlabel=xlabel,
+            data_note=data_note,
         )
 
         summary[key] = {

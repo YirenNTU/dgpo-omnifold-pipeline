@@ -668,14 +668,14 @@ def predict_converted_events(
             noise_mask=signal_batch["x_invisible_mask"].unsqueeze(-1),
         )
         generated_np = generated.detach().cpu().numpy().astype(np.float32)
-        signal_target_mask = batch_slice["x_invisible_mask"][batch_signal_mask_np].astype(bool)
+        pred_slot_valid = np.all(np.isfinite(generated_np), axis=-1)
         target_positions = np.nonzero(batch_signal_mask_np)[0]
-        valid_signal_prediction[start + target_positions] = np.all(signal_target_mask, axis=1)
+        valid_signal_prediction[start + target_positions] = np.all(pred_slot_valid, axis=1)
         fill_invisible_feature_outputs(
             pred_invisible,
             prefix="pred_invisible",
             values=generated_np,
-            valid_mask=signal_target_mask,
+            valid_mask=pred_slot_valid,
             feature_names=invisible_feature_names,
             target_indices=start + target_positions,
         )
