@@ -417,6 +417,58 @@ def extract_leg_components(events: ak.Array) -> dict[str, dict[str, np.ndarray]]
     return leg_map
 
 
+def values_for_prefix(events: ak.Array, prefix: str) -> dict[str, np.ndarray] | None:
+    fields = set(events.fields)
+    direct = {f"{prefix}_{name}" for name in ["E", "px", "py", "pz"]}
+    if direct.issubset(fields):
+        valid_field = f"{prefix}_valid"
+        valid = to_numpy(events[valid_field], bool) if valid_field in fields else np.ones(len(events), dtype=bool)
+        return {
+            "valid": valid,
+            "E": to_numpy(events[f"{prefix}_E"], np.float64),
+            "px": to_numpy(events[f"{prefix}_px"], np.float64),
+            "py": to_numpy(events[f"{prefix}_py"], np.float64),
+            "pz": to_numpy(events[f"{prefix}_pz"], np.float64),
+        }
+
+    energy_field = f"{prefix}_energy"
+    pt_field = f"{prefix}_pt"
+    eta_field = f"{prefix}_eta"
+    phi_field = f"{prefix}_phi"
+    if {energy_field, pt_field, eta_field, phi_field}.issubset(fields):
+        valid_field = f"{prefix}_valid"
+        valid = to_numpy(events[valid_field], bool) if valid_field in fields else np.ones(len(events), dtype=bool)
+        energy = to_numpy(events[energy_field], np.float64)
+        pt = to_numpy(events[pt_field], np.float64)
+        eta = to_numpy(events[eta_field], np.float64)
+        phi = to_numpy(events[phi_field], np.float64)
+        return {
+            "valid": valid,
+            "E": energy,
+            "px": pt * np.cos(phi),
+            "py": pt * np.sin(phi),
+            "pz": pt * np.sinh(eta),
+        }
+
+    log_energy_field = f"{prefix}_log_energy"
+    log_pt_field = f"{prefix}_log_pt"
+    if {log_energy_field, log_pt_field, eta_field, phi_field}.issubset(fields):
+        valid_field = f"{prefix}_valid"
+        valid = to_numpy(events[valid_field], bool) if valid_field in fields else np.ones(len(events), dtype=bool)
+        energy = np.expm1(to_numpy(events[log_energy_field], np.float64))
+        pt = np.expm1(to_numpy(events[log_pt_field], np.float64))
+        eta = to_numpy(events[eta_field], np.float64)
+        phi = to_numpy(events[phi_field], np.float64)
+        return {
+            "valid": valid,
+            "E": energy,
+            "px": pt * np.cos(phi),
+            "py": pt * np.sin(phi),
+            "pz": pt * np.sinh(eta),
+        }
+    return None
+
+
 def p4_from_energy_pt_eta_phi(values: np.ndarray) -> dict[str, np.ndarray]:
     energy = values[..., 0].astype(np.float64)
     pt = values[..., 1].astype(np.float64)
@@ -472,15 +524,13 @@ def build_full_tau_kinematics(
     visible_p4 = p4_from_energy_pt_eta_phi(visible)
 
     def invisible_leg(prefix: str, slot: int) -> dict[str, np.ndarray]:
-        valid_name = f"{prefix}_slot{slot}_valid"
-        valid = to_numpy(pred_events[valid_name], bool) if valid_name in pred_events.fields else np.ones(len(pred_events), dtype=bool)
-        return {
-            "valid": valid,
-            "E": to_numpy(pred_events[f"{prefix}_slot{slot}_E"], np.float64),
-            "px": to_numpy(pred_events[f"{prefix}_slot{slot}_px"], np.float64),
-            "py": to_numpy(pred_events[f"{prefix}_slot{slot}_py"], np.float64),
-            "pz": to_numpy(pred_events[f"{prefix}_slot{slot}_pz"], np.float64),
-        }
+        values = values_for_prefix(pred_events, f"{prefix}_slot{slot}")
+        if values is None:
+            raise ValueError(
+                f"Prediction parquet is missing recognizable neutrino fields for {prefix}_slot{slot}. "
+                "Expected E/px/py/pz, energy/pt/eta/phi, or log_energy/log_pt/eta/phi."
+            )
+        return values
 
     pred_invisible = [invisible_leg("pred_invisible", slot) for slot in range(2)]
     truth_invisible = [invisible_leg("target_invisible", slot) for slot in range(2)]
