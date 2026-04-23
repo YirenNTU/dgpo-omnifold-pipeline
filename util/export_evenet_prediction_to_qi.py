@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import glob
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -145,6 +147,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional subdirectory under output-dir for the EveNet export, e.g. 'evenet'. "
             "If omitted, writes directly under output-dir."
+        ),
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of CPU worker processes for config-driven export. "
+            "If omitted, use EveNetPrediction.num_workers from analysis.yaml or 1."
         ),
     )
     return parser.parse_args()
@@ -801,6 +812,23 @@ def config_split_fraction(args: argparse.Namespace, analysis_cfg: dict) -> float
     return float(value) if value is not None else None
 
 
+def config_num_workers(args: argparse.Namespace, analysis_cfg: dict) -> int:
+    if args.num_workers is not None:
+        return max(1, int(args.num_workers))
+    pred_cfg = analysis_cfg.get("EveNetPrediction", {})
+    value = pred_cfg.get("num_workers") or pred_cfg.get("export_num_workers")
+    return max(1, int(value)) if value is not None else 1
+
+
+def print_progress(label: str, done: int, total: int, detail: str = "") -> None:
+    total = max(total, 1)
+    width = 28
+    filled = min(width, int(round(width * done / total)))
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = f" {detail}" if detail else ""
+    print(f"[export-evenet-to-qi] {label} [{bar}] {done}/{total}{suffix}", flush=True)
+
+
 def merge_prediction_group(
     full_events: ak.Array,
     source_events: ak.Array,
@@ -817,6 +845,63 @@ def merge_prediction_group(
     )
 
 
+def export_config_group(
+    parent_name: str,
+    group: dict[str, Any],
+    analysis_cfg: dict,
+    output_root: Path,
+    regions: list[str],
+    prediction_split_fraction: float | None,
+    output_label: str,
+) -> tuple[str, dict[str, Any]]:
+    print(f"[export-evenet-to-qi] worker {os.getpid()} start {parent_name}", flush=True)
+    raw_files = sample_raw_files(analysis_cfg, group["parent_key"], parent_name)
+    full_events = load_concat_events(raw_files)
+    print(
+        f"[export-evenet-to-qi] worker {os.getpid()} loaded {parent_name} raw_events={len(full_events)}",
+        flush=True,
+    )
+    pred_group = ak.concatenate(group["pred_parts"], axis=0) if len(group["pred_parts"]) > 1 else group["pred_parts"][0]
+    source_group = ak.concatenate(group["source_parts"], axis=0) if len(group["source_parts"]) > 1 else group["source_parts"][0]
+    split_fraction = None if group["is_data"] else prediction_split_fraction
+
+    full_index_parts = []
+    for source_info, selected_indices in zip(group["source_infos"], group["selected_index_parts"]):
+        selected_to_full = map_subset_rows_to_full(
+            full_events=full_events,
+            subset_events=source_info["events"],
+            context=f"{source_info['expanded_name']} selected rows",
+        )
+        full_index_parts.append(selected_to_full[selected_indices])
+    full_indices = np.concatenate(full_index_parts).astype(np.int64) if full_index_parts else np.array([], dtype=np.int64)
+    print(
+        f"[export-evenet-to-qi] worker {os.getpid()} mapped {parent_name} predictions={len(full_indices)}",
+        flush=True,
+    )
+
+    evenet_events, metrics = with_evenet_reconstruction(
+        full_events=full_events,
+        central_pred_events=source_group,
+        pred_events=pred_group,
+        full_indices=full_indices,
+        prediction_split_fraction=split_fraction,
+    )
+    sample_output_root = output_root / output_label
+    counts = write_qi_tree(evenet_events, sample_output_root, parent_name, regions)
+    print(f"[export-evenet-to-qi] worker {os.getpid()} wrote {parent_name}", flush=True)
+    metrics["region_counts"] = counts
+    metrics["parent_sample"] = parent_name
+    metrics["expanded_samples"] = group["expanded_samples"]
+    metrics["raw_files"] = raw_files
+    metrics["is_data"] = group["is_data"]
+    metrics["worker_pid"] = os.getpid()
+    return parent_name, metrics
+
+
+def export_config_group_worker(payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str]) -> tuple[str, dict[str, Any]]:
+    return export_config_group(*payload)
+
+
 def export_config_prediction(
     pred_path: Path,
     source_mapping: dict[int, dict[str, Any]],
@@ -826,6 +911,7 @@ def export_config_prediction(
     prediction_split_fraction: float | None,
     output_label: str,
     summary_label: str,
+    num_workers: int,
 ) -> dict[str, Any]:
     pred_events = load_events(pred_path)
     require_source_columns(pred_events, pred_path)
@@ -884,36 +970,41 @@ def export_config_prediction(
         group["selected_index_parts"].append(selected_indices)
         group["expanded_samples"].append(source_info["expanded_name"])
 
-    for parent_name, group in grouped.items():
-        raw_files = sample_raw_files(analysis_cfg, group["parent_key"], parent_name)
-        full_events = load_concat_events(raw_files)
-        pred_group = ak.concatenate(group["pred_parts"], axis=0) if len(group["pred_parts"]) > 1 else group["pred_parts"][0]
-        source_group = ak.concatenate(group["source_parts"], axis=0) if len(group["source_parts"]) > 1 else group["source_parts"][0]
-        split_fraction = None if group["is_data"] else prediction_split_fraction
-        full_index_parts = []
-        for source_info, selected_indices in zip(group["source_infos"], group["selected_index_parts"]):
-            selected_to_full = map_subset_rows_to_full(
-                full_events=full_events,
-                subset_events=source_info["events"],
-                context=f"{source_info['expanded_name']} selected rows",
+    group_items = list(grouped.items())
+    total_groups = len(group_items)
+    worker_count = min(max(1, int(num_workers)), max(total_groups, 1))
+    print_progress(f"{summary_label} export", 0, total_groups, f"workers={worker_count}")
+    if worker_count == 1 or total_groups <= 1:
+        for done, (parent_name, group) in enumerate(group_items, start=1):
+            print(f"[export-evenet-to-qi] start {summary_label}:{parent_name}", flush=True)
+            _, metrics = export_config_group(
+                parent_name=parent_name,
+                group=group,
+                analysis_cfg=analysis_cfg,
+                output_root=output_root,
+                regions=regions,
+                prediction_split_fraction=prediction_split_fraction,
+                output_label=output_label,
             )
-            full_index_parts.append(selected_to_full[selected_indices])
-        full_indices = np.concatenate(full_index_parts).astype(np.int64) if full_index_parts else np.array([], dtype=np.int64)
-        evenet_events, metrics = with_evenet_reconstruction(
-            full_events=full_events,
-            central_pred_events=source_group,
-            pred_events=pred_group,
-            full_indices=full_indices,
-            prediction_split_fraction=split_fraction,
-        )
-        sample_output_root = output_root / output_label
-        counts = write_qi_tree(evenet_events, sample_output_root, parent_name, regions)
-        metrics["region_counts"] = counts
-        metrics["parent_sample"] = parent_name
-        metrics["expanded_samples"] = group["expanded_samples"]
-        metrics["raw_files"] = raw_files
-        metrics["is_data"] = group["is_data"]
-        summary["samples"][parent_name] = metrics
+            summary["samples"][parent_name] = metrics
+            print_progress(f"{summary_label} export", done, total_groups, parent_name)
+    else:
+        payloads = [
+            (parent_name, group, analysis_cfg, output_root, regions, prediction_split_fraction, output_label)
+            for parent_name, group in group_items
+        ]
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_parent = {
+                executor.submit(export_config_group_worker, payload): payload[0]
+                for payload in payloads
+            }
+            done = 0
+            for future in as_completed(future_to_parent):
+                parent_name = future_to_parent[future]
+                result_parent_name, metrics = future.result()
+                summary["samples"][result_parent_name] = metrics
+                done += 1
+                print_progress(f"{summary_label} export", done, total_groups, parent_name)
 
     output_root.mkdir(parents=True, exist_ok=True)
     with (output_root / f"{output_label}__{summary_label}_analysis_config_export_summary.json").open("w") as handle:
@@ -931,6 +1022,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
     output_label = str(args.qi_method_label or pred_cfg.get("qi_method_label", "evenet"))
     mc_pred, data_pred = config_prediction_paths(args, analysis_cfg)
     split_fraction = config_split_fraction(args, analysis_cfg)
+    num_workers = config_num_workers(args, analysis_cfg)
 
     summaries: dict[str, Any] = {}
     if mc_pred is not None:
@@ -943,6 +1035,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
             prediction_split_fraction=split_fraction,
             output_label=output_label,
             summary_label="mc",
+            num_workers=num_workers,
         )
     if data_pred is not None:
         summaries["data"] = export_config_prediction(
@@ -954,6 +1047,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
             prediction_split_fraction=None,
             output_label=output_label,
             summary_label="data",
+            num_workers=num_workers,
         )
     if not summaries:
         raise ValueError(

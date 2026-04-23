@@ -297,7 +297,8 @@ python3 util/export_evenet_prediction_to_qi.py \
   --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/test__evenet_pred.parquet \
   --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/data__evenet_pred.parquet \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export \
-  --qi-method-label evenet_scratch
+  --qi-method-label evenet_scratch \
+  --num-workers 4
 ```
 
 Pretrain export:
@@ -308,7 +309,8 @@ python3 util/export_evenet_prediction_to_qi.py \
   --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-pretrain/test__evenet_pred.parquet \
   --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-pretrain/data__evenet_pred.parquet \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export \
-  --qi-method-label evenet_pretrain
+  --qi-method-label evenet_pretrain \
+  --num-workers 4
 ```
 
 Output structure:
@@ -325,6 +327,8 @@ Output structure:
 ```
 
 For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the central `weight` field for rows with EveNet predictions. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw-only rows without EveNet predictions keep their original central weight.
+
+`--num-workers` parallelizes the config-driven export over parent samples and prints progress bars such as `mc export [####----] 1/3 Ztautau`. Keep it at `1` if memory pressure is high.
 
 The export preserves central fields such as:
 
