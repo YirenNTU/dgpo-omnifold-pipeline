@@ -294,10 +294,10 @@ Scratch export:
 cd /path/to/lep_tree_ana/ml_pipeline
 python3 util/export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/test__evenet_pred.parquet \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/data__evenet_pred.parquet \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export \
-  --qi-method-label evenet_scratch \
+  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/test__evenet_pred.parquet \
+  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/data__evenet_pred.parquet \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch \
+  --qi-method-label qi-export \
   --num-workers 4
 ```
 
@@ -306,24 +306,23 @@ Pretrain export:
 ```bash
 python3 util/export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-pretrain/test__evenet_pred.parquet \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-pretrain/data__evenet_pred.parquet \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export \
-  --qi-method-label evenet_pretrain \
+  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/test__evenet_pred.parquet \
+  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/data__evenet_pred.parquet \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain \
+  --qi-method-label qi-export \
   --num-workers 4
 ```
 
 Output structure:
 
 ```text
-/pscratch/.../qi-evenet-export/
-  evenet_scratch/
+/pscratch/.../ml_based/predict-scratch/qi-export/
     data94/filtered___raw.parquet
+    data94/filtered___Ztautau_pipi.parquet
     Ztautau/filtered___raw.parquet
+    Ztautau/filtered___Ztautau_pipi.parquet
     Zll/filtered___raw.parquet
     Zqq/filtered___raw.parquet
-  evenet_pretrain/
-    ...
 ```
 
 For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the central `weight` field for rows with EveNet predictions. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw-only rows without EveNet predictions keep their original central weight.
@@ -375,7 +374,62 @@ EveNet converted slots are not central `lead_a/lead_b`. The adapter uses visible
 
 ## 7. Central/QI Evaluation
 
-To run the central QI/unfolding framework on EveNet output, point the central config input/output tree at the exported method directory. For example:
+This step runs the central `QIProcessor` on the EveNet-exported parquet trees. It is intentionally separate from the standalone ML summary plots.
+
+The important convention is:
+
+- Central cut-based regions are still available: `baseline`, `hadhad`, `ee`, `mumu`, `emu`.
+- ML dedicated QI regions are EveNet predicted fine channels: `Ztautau_pipi`, `Ztautau_pirho`, `Ztautau_pie`, `Ztautau_pimu`, `Ztautau_rhoe`, `Ztautau_rhomu`, `Ztautau_rhorho`, `Ztautau_ee`, `Ztautau_mumu`, `Ztautau_emu`.
+- The QIProcessor configs in `config/config_qi_evenet_pretrain.yaml` and `config/config_qi_evenet_scratch.yaml` use the ML dedicated regions, not the central broad regions.
+
+First run the Step 6 export for each method. For the QIProcessor configs below, the exported roots must be:
+
+- Pretrain: `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export`
+- Scratch: `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/qi-export`
+
+Each exported root should contain:
+
+```text
+/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/
+  data94/filtered___raw.parquet
+  data94/filtered___Ztautau_pipi.parquet
+  ...
+  Ztautau/filtered___raw.parquet
+  Ztautau/filtered___Ztautau_pipi.parquet
+  ...
+  Zll/...
+  Zqq/...
+```
+
+The raw parquet also contains matching cut flags such as `Ztautau_pipi_cut`, which QIProcessor needs when building response matrices.
+
+Then run QIProcessor from the repository root, not from `ml_pipeline`:
+
+```bash
+cd /path/to/lep_tree_ana
+python3 bin/tree_ana -c config/config_qi_evenet_pretrain.yaml
+python3 bin/tree_ana -c config/config_qi_evenet_scratch.yaml
+```
+
+Expected QIProcessor outputs:
+
+```text
+/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/
+  results.txt
+  response_Ztautau_pipi.root
+  response_Ztautau_pirho.root
+  ...
+  Ztautau_pipi/
+    plots/
+    unfolding/
+  Ztautau_pirho/
+    plots/
+    unfolding/
+```
+
+If you want the central broad-region QIProcessor instead, use the normal central config style and regions such as `hadhad`, `ee`, `mumu`, and `emu`. Do not mix that with the ML dedicated configs unless the comparison explicitly calls for it.
+
+For older central-style exports, point the central config input/output tree at the exported method directory. For example:
 
 ```text
 default_output_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export/evenet_scratch
