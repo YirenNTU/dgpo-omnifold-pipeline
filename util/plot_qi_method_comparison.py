@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from quantum.observables_builder import get_observable_names
 from utils.common_functions import rebuild_p4
+from parquet_plot_common import choose_bins, plot_from_histograms, summarize_invalid_hist_values
 
 
 vector.register_awkward()
@@ -39,6 +40,8 @@ METHOD_COLORS = {
     "EveNet": OKABE_ITO["blue"],
     "EveNet-Pretrain": OKABE_ITO["blue"],
     "EveNet-Scratch": OKABE_ITO["bluish_green"],
+    "Pretrain": OKABE_ITO["blue"],
+    "Scratch": OKABE_ITO["bluish_green"],
 }
 COLOR_CYCLE = [
     OKABE_ITO["vermillion"],
@@ -65,7 +68,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-dir", type=Path, default=None, help="Legacy shortcut for --method Baseline:<dir>.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for comparison plots and metrics JSON.")
     parser.add_argument("--sample-name", default="Ztautau", help="Sample directory name.")
+    parser.add_argument("--data-sample-name", default="data94", help="Data sample directory name for data-vs-MC plots.")
+    parser.add_argument(
+        "--mc-sample-names",
+        nargs="+",
+        default=["Ztautau", "Zll", "Zqq"],
+        help="MC sample directory names for data-vs-MC plots.",
+    )
     parser.add_argument("--regions", nargs="+", default=["hadhad", "ee", "mumu", "emu"], help="Regions to compare.")
+    parser.add_argument(
+        "--physics-observables",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional observable list for data-vs-MC plots. If omitted, use QI observables plus "
+            "reconstructed tau-pair kinematics."
+        ),
+    )
     parser.add_argument("--max-scatter-points", type=int, default=8000, help="Maximum points per scatter panel.")
     return parser.parse_args()
 
@@ -95,6 +114,10 @@ def parse_method_specs(args: argparse.Namespace) -> dict[str, Path]:
 
 def method_color(method: str, index: int) -> str:
     return METHOD_COLORS.get(method, COLOR_CYCLE[index % len(COLOR_CYCLE)])
+
+
+def method_display_name(method: str) -> str:
+    return method.removeprefix("EveNet-")
 
 
 def load_events(path: Path) -> ak.Array:
@@ -166,6 +189,94 @@ def p4_component(p4: ak.Array, name: str) -> np.ndarray:
     return to_numpy(getattr(p4, name))
 
 
+def delta_phi(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    return np.abs(np.arctan2(np.sin(first - second), np.cos(first - second)))
+
+
+def extract_physics_observable(events: ak.Array, observable: str) -> np.ndarray:
+    if observable in events.fields:
+        return to_numpy(events[observable])
+
+    if observable in {"reco_tau_pair_mass", "reco_tau_pair_pt", "reco_tau_pair_E"}:
+        if "reco_tau_a_p4" not in events.fields or "reco_tau_b_p4" not in events.fields:
+            return np.array([], dtype=np.float64)
+        pair = rebuild_vector(events["reco_tau_a_p4"]) + rebuild_vector(events["reco_tau_b_p4"])
+        component = {"reco_tau_pair_mass": "mass", "reco_tau_pair_pt": "pt", "reco_tau_pair_E": "E"}[observable]
+        return p4_component(pair, component)
+
+    if observable in {"reco_tau_delta_eta", "reco_tau_delta_phi"}:
+        if "reco_tau_a_p4" not in events.fields or "reco_tau_b_p4" not in events.fields:
+            return np.array([], dtype=np.float64)
+        tau_a = rebuild_vector(events["reco_tau_a_p4"])
+        tau_b = rebuild_vector(events["reco_tau_b_p4"])
+        if observable == "reco_tau_delta_eta":
+            return np.abs(p4_component(tau_a, "eta") - p4_component(tau_b, "eta"))
+        return delta_phi(p4_component(tau_a, "phi"), p4_component(tau_b, "phi"))
+
+    if observable.startswith("reco_tau_"):
+        component = observable.removeprefix("reco_tau_")
+        if component in {"E", "px", "py", "pz", "pt", "eta", "phi"}:
+            values = []
+            for leg in ("a", "b"):
+                field = f"reco_tau_{leg}_p4"
+                if field in events.fields:
+                    values.append(p4_component(rebuild_vector(events[field]), component))
+            if values:
+                return np.concatenate(values)
+
+    if observable in {"visible_tau_pair_mass", "visible_tau_pair_pt"}:
+        if "lead_a_visible_p4" not in events.fields or "lead_b_visible_p4" not in events.fields:
+            return np.array([], dtype=np.float64)
+        pair = rebuild_vector(events["lead_a_visible_p4"]) + rebuild_vector(events["lead_b_visible_p4"])
+        component = "mass" if observable.endswith("_mass") else "pt"
+        return p4_component(pair, component)
+
+    return np.array([], dtype=np.float64)
+
+
+def physics_observable_specs(requested: list[str] | None) -> list[tuple[str, str, bool]]:
+    if requested:
+        names = requested
+    else:
+        names = [
+            "reco_tau_pair_mass",
+            "reco_tau_pair_pt",
+            "reco_tau_delta_eta",
+            "reco_tau_delta_phi",
+            "reco_tau_E",
+            "reco_tau_px",
+            "reco_tau_py",
+            "reco_tau_pz",
+            "visible_tau_pair_mass",
+            "visible_tau_pair_pt",
+            *get_observable_names(),
+        ]
+
+    labels = {
+        "reco_tau_pair_mass": r"$m_{\tau\tau}^{reco}$ [GeV]",
+        "reco_tau_pair_pt": r"$p_{T,\tau\tau}^{reco}$ [GeV]",
+        "reco_tau_delta_eta": r"$|\Delta\eta(\tau,\tau)|$",
+        "reco_tau_delta_phi": r"$|\Delta\phi(\tau,\tau)|$",
+        "reco_tau_E": r"$E_\tau^{reco}$ [GeV]",
+        "reco_tau_px": r"$p_{x,\tau}^{reco}$ [GeV]",
+        "reco_tau_py": r"$p_{y,\tau}^{reco}$ [GeV]",
+        "reco_tau_pz": r"$p_{z,\tau}^{reco}$ [GeV]",
+        "visible_tau_pair_mass": r"$m_{\tau\tau}^{vis}$ [GeV]",
+        "visible_tau_pair_pt": r"$p_{T,\tau\tau}^{vis}$ [GeV]",
+        "theta_cm": r"$\theta_{CM}$",
+    }
+    seen = set()
+    specs = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        label = labels.get(name, name.replace("_", " "))
+        log_scale = name.endswith("_mass") or name.endswith("_pt") or name.endswith("_E")
+        specs.append((name, label, log_scale))
+    return specs
+
+
 def truth_missing_available(events: ak.Array) -> bool:
     return "truth_missing_a_p4" in events.fields and "truth_missing_b_p4" in events.fields
 
@@ -218,62 +329,190 @@ def cms_label(ax, text: str = "Work in progress") -> None:
     ax.text(0.12, 1.02, text, transform=ax.transAxes, fontsize=10, style="italic", ha="left", va="bottom")
 
 
+METRIC_PLOT_SPECS = [
+    ("valid_fraction", "Valid fraction", "Fraction", "{:.3f}", "fraction"),
+    ("qi_acceptance", "QI acceptance", "Fraction", "{:.3f}", "fraction"),
+    ("nu_a_E_mae", r"$\nu_a$ E MAE", "MAE [GeV]", "{:.3f}", "absolute"),
+    ("nu_b_E_mae", r"$\nu_b$ E MAE", "MAE [GeV]", "{:.3f}", "absolute"),
+    ("nu_a_pt_mae", r"$\nu_a$ pT MAE", "MAE [GeV]", "{:.3f}", "absolute"),
+    ("nu_b_pt_mae", r"$\nu_b$ pT MAE", "MAE [GeV]", "{:.3f}", "absolute"),
+]
+
+
+def sanitize_filename(name: str) -> str:
+    output = []
+    for char in name:
+        output.append(char if char.isalnum() else "_")
+    return "_".join("".join(output).strip("_").lower().split("_"))
+
+
+def metric_precision(value: float, uncertainty: float, precision_mode: str) -> float:
+    if not np.isfinite(uncertainty):
+        return np.nan
+    if precision_mode == "fraction":
+        return uncertainty * 100.0
+    if not np.isfinite(value) or value == 0:
+        return np.nan
+    return abs(uncertainty / value) * 100.0
+
+
+def finite_metric_values(
+    metrics: dict[str, dict[str, dict[str, Any]]],
+    method_names: list[str],
+    regions: list[str],
+    metric_key: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    values = []
+    errors = []
+    for method in method_names:
+        for region in regions:
+            region_metrics = metrics.get(method, {}).get(region, {})
+            values.append(region_metrics.get(metric_key, np.nan))
+            errors.append(region_metrics.get(f"{metric_key}_unc", np.nan))
+    return np.asarray(values, dtype=np.float64), np.asarray(errors, dtype=np.float64)
+
+
+def plot_single_metric_summary(
+    metrics: dict[str, dict[str, dict[str, Any]]],
+    output_dir: Path,
+    regions: list[str],
+    method_names: list[str],
+    metric_key: str,
+    title: str,
+    xlabel: str,
+    uncertainty_format: str,
+    precision_mode: str,
+) -> None:
+    values, errors = finite_metric_values(metrics, method_names, regions, metric_key)
+    if not np.any(np.isfinite(values)):
+        return
+
+    fig_height = max(3.4, 0.62 * len(regions) + 1.2)
+    fig, ax = plt.subplots(figsize=(9.4, fig_height), dpi=180)
+    y_positions = np.arange(len(regions), dtype=np.float64)
+    offsets = np.linspace(-0.22, 0.22, len(method_names)) if len(method_names) > 1 else np.array([0.0])
+
+    finite_values = values[np.isfinite(values)]
+    finite_errors = errors[np.isfinite(errors)]
+    if finite_values.size:
+        span = np.nanmax(finite_values) - np.nanmin(finite_values)
+        pad = max(0.12 * span, 1.0e-3)
+        if finite_errors.size:
+            pad += np.nanmax(finite_errors)
+        xmin = np.nanmin(finite_values) - pad
+        xmax = np.nanmax(finite_values) + pad
+        if xmin == xmax:
+            xmin -= 0.5
+            xmax += 0.5
+        ax.set_xlim(xmin, xmax)
+
+    x_text_unc = 1.035
+    x_text_prec = 1.17
+    for method_index, method in enumerate(method_names):
+        color = method_color(method, method_index)
+        label = method_display_name(method)
+        method_values = []
+        method_errors = []
+        method_y = []
+        for region_index, region in enumerate(regions):
+            region_metrics = metrics.get(method, {}).get(region, {})
+            value = float(region_metrics.get(metric_key, np.nan))
+            uncertainty = float(region_metrics.get(f"{metric_key}_unc", np.nan))
+            y = y_positions[region_index] + offsets[method_index]
+            method_values.append(value)
+            method_errors.append(uncertainty)
+            method_y.append(y)
+            if np.isfinite(value):
+                uncertainty_text = uncertainty_format.format(uncertainty) if np.isfinite(uncertainty) else "n/a"
+                precision = metric_precision(value, uncertainty, precision_mode)
+                precision_text = f"{precision:.2f}%" if np.isfinite(precision) else "n/a"
+                ax.text(
+                    x_text_unc,
+                    y,
+                    uncertainty_text,
+                    color=color,
+                    fontsize=7.2,
+                    va="center",
+                    ha="left",
+                    transform=ax.get_yaxis_transform(),
+                    clip_on=False,
+                )
+                ax.text(
+                    x_text_prec,
+                    y,
+                    precision_text,
+                    color=color,
+                    fontsize=7.2,
+                    va="center",
+                    ha="left",
+                    transform=ax.get_yaxis_transform(),
+                    clip_on=False,
+                )
+
+        method_values = np.asarray(method_values, dtype=np.float64)
+        method_errors = np.asarray(method_errors, dtype=np.float64)
+        method_y = np.asarray(method_y, dtype=np.float64)
+        plot_mask = np.isfinite(method_values)
+        plot_errors = np.where(np.isfinite(method_errors[plot_mask]), method_errors[plot_mask], 0.0)
+        ax.errorbar(
+            method_values[plot_mask],
+            method_y[plot_mask],
+            xerr=plot_errors,
+            fmt="o",
+            color=color,
+            label=label,
+            capsize=2.5,
+            markersize=5.0,
+            lw=1.2,
+        )
+
+    ax.text(x_text_unc, 1.02, "Unc.", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
+    ax.text(x_text_prec, 1.02, "Precision", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(regions)
+    ax.invert_yaxis()
+    ax.grid(axis="x", alpha=0.25)
+    ax.grid(axis="y", alpha=0.18, linestyle=":")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Channel")
+    ax.set_title(title)
+    cms_label(ax)
+    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, 1.17), ncols=min(len(method_names), 4))
+    fig.subplots_adjust(right=0.76, top=0.82, left=0.16, bottom=0.16)
+    fig.savefig(output_dir / f"qi_metric_{sanitize_filename(metric_key)}.png")
+    plt.close(fig)
+
+
 def plot_metric_summary(
     metrics: dict[str, dict[str, dict[str, Any]]],
     output_dir: Path,
     regions: list[str],
     method_names: list[str],
 ) -> None:
-    rows = []
-    for region in regions:
-        for metric_key, label in [
-            ("valid_fraction", "Valid fraction"),
-            ("qi_acceptance", "QI acceptance"),
-            ("nu_a_E_mae", r"$\nu_a$ E MAE [GeV]"),
-            ("nu_b_E_mae", r"$\nu_b$ E MAE [GeV]"),
-            ("nu_a_pt_mae", r"$\nu_a$ pT MAE [GeV]"),
-            ("nu_b_pt_mae", r"$\nu_b$ pT MAE [GeV]"),
-        ]:
-            if any(metric_key in metrics[method].get(region, {}) for method in method_names):
-                rows.append((region, metric_key, label))
-
-    if not rows:
-        return
-
-    fig_height = max(5.0, 0.42 * len(rows))
-    fig, ax = plt.subplots(figsize=(8.5, fig_height), dpi=180)
-    y_positions = np.arange(len(rows))
-    offsets = np.linspace(-0.22, 0.22, len(method_names)) if len(method_names) > 1 else np.array([0.0])
-
-    for method_index, method in enumerate(method_names):
-        values = []
-        errors = []
-        for region, metric_key, _ in rows:
-            region_metrics = metrics.get(method, {}).get(region, {})
-            values.append(region_metrics.get(metric_key, np.nan))
-            errors.append(region_metrics.get(f"{metric_key}_unc", np.nan))
-        ax.errorbar(
-            values,
-            y_positions + offsets[method_index],
-            xerr=errors,
-            fmt="o",
-            color=method_color(method, method_index),
-            label=method,
-            capsize=2.5,
-            markersize=4.5,
+    specs = list(METRIC_PLOT_SPECS)
+    for observable in get_observable_names():
+        specs.append(
+            (
+                f"{observable}_mean",
+                observable.replace("_", " "),
+                "Weighted mean",
+                "{:.3f}",
+                "absolute",
+            )
         )
 
-    labels = [f"{region}: {label}" for region, _, label in rows]
-    ax.set_yticks(y_positions)
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.invert_yaxis()
-    ax.grid(axis="x", alpha=0.25)
-    ax.set_xlabel("Metric value")
-    cms_label(ax)
-    ax.legend(frameon=False, loc="lower right")
-    fig.tight_layout()
-    fig.savefig(output_dir / "qi_method_metric_summary.png")
-    plt.close(fig)
+    for metric_key, title, xlabel, uncertainty_format, precision_mode in specs:
+        plot_single_metric_summary(
+            metrics=metrics,
+            output_dir=output_dir,
+            regions=regions,
+            method_names=method_names,
+            metric_key=metric_key,
+            title=title,
+            xlabel=xlabel,
+            uncertainty_format=uncertainty_format,
+            precision_mode=precision_mode,
+        )
 
 
 def sample_indices(mask: np.ndarray, max_points: int) -> np.ndarray:
@@ -373,6 +612,242 @@ def plot_cut_based_vs_evenet(events: ak.Array, output_dir: Path, regions: list[s
     plt.close(fig)
 
 
+def load_optional_region(root: Path, sample_name: str, region: str) -> ak.Array | None:
+    path = parquet_for(root, sample_name, region)
+    if not path.exists():
+        return None
+    return load_events(path)
+
+
+def weighted_hist_and_err2(values: np.ndarray, weights: np.ndarray, bins: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mask = np.isfinite(values) & np.isfinite(weights)
+    hist = np.histogram(values[mask], bins=bins, weights=weights[mask])[0].astype(np.float64)
+    err2 = np.histogram(values[mask], bins=bins, weights=np.square(weights[mask]))[0].astype(np.float64)
+    return hist, err2
+
+
+def count_hist(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
+    values = values[np.isfinite(values)]
+    return np.histogram(values, bins=bins)[0].astype(np.float64)
+
+
+def plot_physics_data_mc_comparisons(
+    methods: dict[str, Path],
+    output_dir: Path,
+    regions: list[str],
+    data_sample_name: str,
+    mc_sample_names: list[str],
+    requested_observables: list[str] | None,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    specs = physics_observable_specs(requested_observables)
+
+    for method_index, (method, root) in enumerate(methods.items()):
+        method_dir = output_dir / f"physics_data_mc_{sanitize_filename(method)}"
+        method_dir.mkdir(parents=True, exist_ok=True)
+        method_summary: dict[str, Any] = {}
+
+        for region in regions:
+            data_events = load_optional_region(root, data_sample_name, region)
+            mc_events_by_sample = {
+                sample_name: events
+                for sample_name in mc_sample_names
+                if (events := load_optional_region(root, sample_name, region)) is not None
+            }
+            if data_events is None and not mc_events_by_sample:
+                continue
+
+            region_summary: dict[str, Any] = {
+                "data_sample": data_sample_name,
+                "data_events": int(len(data_events)) if data_events is not None else 0,
+                "mc_samples": {name: int(len(events)) for name, events in mc_events_by_sample.items()},
+                "plots": [],
+            }
+
+            for observable, x_label, log_scale in specs:
+                values_by_sample: dict[str, np.ndarray] = {}
+                if data_events is not None:
+                    values_by_sample[data_sample_name] = extract_physics_observable(data_events, observable)
+                for sample_name, events in mc_events_by_sample.items():
+                    values_by_sample[sample_name] = extract_physics_observable(events, observable)
+
+                if not any(np.asarray(values).size > 0 and np.any(np.isfinite(values)) for values in values_by_sample.values()):
+                    continue
+
+                bins = choose_bins(values_by_sample, num_bins=50)
+                data_hist = None
+                if data_events is not None:
+                    data_hist = count_hist(values_by_sample[data_sample_name], bins)
+
+                hist_mc: dict[str, np.ndarray] = {}
+                hist_mc_err2: dict[str, np.ndarray] = {}
+                for sample_name, events in mc_events_by_sample.items():
+                    values = values_by_sample[sample_name]
+                    weights = event_weights(events)
+                    if observable.startswith("reco_tau_") and observable not in {
+                        "reco_tau_pair_mass",
+                        "reco_tau_pair_pt",
+                        "reco_tau_pair_E",
+                        "reco_tau_delta_eta",
+                        "reco_tau_delta_phi",
+                    }:
+                        weights = np.concatenate([weights, weights])
+                    hist_mc[sample_name], hist_mc_err2[sample_name] = weighted_hist_and_err2(values, weights, bins)
+
+                output_path = method_dir / f"{region}_{sanitize_filename(observable)}.png"
+                plot_from_histograms(
+                    hist_data=data_hist,
+                    hist_mc=hist_mc,
+                    hist_mc_err2=hist_mc_err2,
+                    bin_edges=bins,
+                    x_label=x_label,
+                    title=f"{method_display_name(method)} {region}: {observable}",
+                    output_path=output_path,
+                    normalize=False,
+                    log_scale=False,
+                    invalid_summary=summarize_invalid_hist_values(values_by_sample),
+                )
+                region_summary["plots"].append(str(output_path.relative_to(output_dir)))
+
+            method_summary[region] = region_summary
+
+        summary[method] = method_summary
+    return summary
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return json_safe(value.item())
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    return value
+
+
+def build_audit_summary(
+    methods: dict[str, Path],
+    metrics: dict[str, dict[str, dict[str, Any]]],
+    regions: list[str],
+    sample_name: str,
+    output_dir: Path,
+    raw_matrix_available: bool,
+    physics_data_mc_summary: dict[str, Any],
+) -> dict[str, Any]:
+    generated_plots = sorted(str(path.relative_to(output_dir)) for path in output_dir.rglob("*.png"))
+    method_summary: dict[str, Any] = {}
+    for method, root in methods.items():
+        channel_summary: dict[str, Any] = {}
+        for region in regions:
+            parquet_path = parquet_for(root, sample_name, region)
+            region_metrics = metrics.get(method, {}).get(region, {})
+            channel_summary[region] = {
+                "parquet": str(parquet_path),
+                "parquet_exists": parquet_path.exists(),
+                "num_events": region_metrics.get("num_events"),
+                "weighted_yield": region_metrics.get("weighted_yield"),
+                "valid_fraction": region_metrics.get("valid_fraction"),
+                "valid_fraction_unc": region_metrics.get("valid_fraction_unc"),
+                "qi_acceptance": region_metrics.get("qi_acceptance"),
+                "qi_acceptance_unc": region_metrics.get("qi_acceptance_unc"),
+                "available_metric_keys": sorted(region_metrics.keys()),
+            }
+        method_summary[method] = {
+            "root": str(root),
+            "display_name": method_display_name(method),
+            "channels": channel_summary,
+        }
+
+    return {
+        "methods": method_summary,
+        "regions": regions,
+        "sample_name": sample_name,
+        "generated_plots": generated_plots,
+        "physics_data_mc": physics_data_mc_summary,
+        "diagnostics": {
+            "per_observable_metric_plots": [name for name in generated_plots if name.startswith("qi_metric_")],
+            "neutrino_truth_scatter_plots": [name for name in generated_plots if name.startswith("neutrino_truth_vs_pred_")],
+            "physics_data_mc_plots": [
+                name for name in generated_plots if name.startswith("physics_data_mc_")
+            ],
+            "cut_based_vs_evenet_region_matrix": raw_matrix_available,
+            "metrics_json": "qi_method_comparison_metrics.json",
+        },
+    }
+
+
+def format_optional_float(value: Any, precision: int = 4) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        value_float = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not np.isfinite(value_float):
+        return "n/a"
+    return f"{value_float:.{precision}f}"
+
+
+def write_audit_report(audit: dict[str, Any], output_dir: Path) -> None:
+    lines = [
+        "# QI Method Comparison Audit",
+        "",
+        "This report is intended to make the comparison traceable before looking at final summary plots.",
+        "",
+        "## Inputs",
+        "",
+        "| Method | Input root |",
+        "|---|---|",
+    ]
+    for method, method_info in audit["methods"].items():
+        lines.append(f"| {method} | `{method_info['root']}` |")
+
+    lines.extend(
+        [
+            "",
+            "## Channel Coverage",
+            "",
+            "| Method | Channel | Parquet | Events | Weighted yield | Valid fraction | QI acceptance |",
+            "|---|---|---|---:|---:|---:|---:|",
+        ]
+    )
+    for method, method_info in audit["methods"].items():
+        for region, region_info in method_info["channels"].items():
+            exists = "yes" if region_info["parquet_exists"] else "no"
+            lines.append(
+                "| "
+                f"{method} | {region} | {exists} | "
+                f"{region_info['num_events'] if region_info['num_events'] is not None else 'n/a'} | "
+                f"{format_optional_float(region_info['weighted_yield'])} | "
+                f"{format_optional_float(region_info['valid_fraction'])} | "
+                f"{format_optional_float(region_info['qi_acceptance'])} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Diagnostics",
+            "",
+            f"- Metrics JSON: `{audit['diagnostics']['metrics_json']}`",
+            f"- Per-observable metric plots: {len(audit['diagnostics']['per_observable_metric_plots'])}",
+            f"- Neutrino truth scatter plots: {len(audit['diagnostics']['neutrino_truth_scatter_plots'])}",
+            f"- Physics data-vs-MC plots: {len(audit['diagnostics']['physics_data_mc_plots'])}",
+            f"- Cut-based vs EveNet region matrix: {'available' if audit['diagnostics']['cut_based_vs_evenet_region_matrix'] else 'not available'}",
+            "",
+            "## Generated Plots",
+            "",
+        ]
+    )
+    for plot_name in audit["generated_plots"]:
+        lines.append(f"- `{plot_name}`")
+
+    output_dir.joinpath("qi_method_comparison_report.md").write_text("\n".join(lines) + "\n")
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -405,9 +880,30 @@ def main() -> None:
     plot_metric_summary(metrics, args.output_dir, args.regions, method_names)
     if raw_for_matrix is not None:
         plot_cut_based_vs_evenet(raw_for_matrix, args.output_dir, args.regions)
+    physics_data_mc_summary = plot_physics_data_mc_comparisons(
+        methods=methods,
+        output_dir=args.output_dir,
+        regions=args.regions,
+        data_sample_name=args.data_sample_name,
+        mc_sample_names=list(args.mc_sample_names),
+        requested_observables=args.physics_observables,
+    )
+
+    audit = build_audit_summary(
+        methods=methods,
+        metrics=metrics,
+        regions=args.regions,
+        sample_name=args.sample_name,
+        output_dir=args.output_dir,
+        raw_matrix_available=raw_for_matrix is not None,
+        physics_data_mc_summary=physics_data_mc_summary,
+    )
+    with (args.output_dir / "qi_method_comparison_audit.json").open("w") as handle:
+        json.dump(json_safe(audit), handle, indent=2, sort_keys=True)
+    write_audit_report(json_safe(audit), args.output_dir)
 
     with (args.output_dir / "qi_method_comparison_metrics.json").open("w") as handle:
-        json.dump(metrics, handle, indent=2, sort_keys=True)
+        json.dump(json_safe(metrics), handle, indent=2, sort_keys=True)
 
     print(f"[plot-qi-method-comparison] wrote {args.output_dir}", flush=True)
 

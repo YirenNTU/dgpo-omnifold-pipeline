@@ -182,7 +182,9 @@ Check these paths before launching:
 - `options.Training.model_checkpoint_save_path`
 - `options.Training.pretrain_model_load_path`, only for the pretrain config
 
-Prediction uses EMA weights by default when the training config has:
+For this analysis pipeline, the documented prediction commands use non-EMA weights by default via `--disable-ema`. This keeps standalone prediction closer to direct checkpoint validation unless an EMA comparison is explicitly intended.
+
+The predictor can still use EMA weights when the training config has:
 
 ```yaml
 EMA:
@@ -190,7 +192,7 @@ EMA:
   replace_model_after_load: true
 ```
 
-Pass `--disable-ema` during prediction if non-EMA weights are needed.
+To run an EMA prediction intentionally, omit `--disable-ema`.
 
 ## 4. Standalone EveNet Prediction
 
@@ -205,6 +207,7 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --train-config config/train.yaml \
   --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/scratch/last.ckpt \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch \
+  --disable-ema \
   --converted-parquet \
     /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert/test.parquet \
     /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_data/test.parquet \
@@ -221,6 +224,7 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --train-config config/train_pretrain.yaml \
   --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/pretrain/last.ckpt \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-pretrain \
+  --disable-ema \
   --converted-parquet \
     /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert/test.parquet \
     /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_data/test.parquet \
@@ -378,15 +382,25 @@ python3 util/plot_qi_method_comparison.py \
   --method EveNet-Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export/evenet_pretrain \
   --method EveNet-Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export/evenet_scratch \
   --sample-name Ztautau \
+  --data-sample-name data94 \
+  --mc-sample-names Ztautau Zll Zqq \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison
 ```
 
 Outputs:
 
-- `qi_method_metric_summary.png`
+- `qi_metric_<observable>.png`, one channel-vs-method plot per metric or QI observable
+- `physics_data_mc_<method>/<region>_<observable>.png`, data-vs-stacked-MC physics distributions
+- `physics_data_mc_<method>/<region>_<observable>_log.png`, log-y companion plots
 - `neutrino_truth_vs_pred_<region>.png`
 - `cut_based_vs_evenet_region_matrix.png`, when the raw parquet contains EveNet predicted class labels
 - `qi_method_comparison_metrics.json`
+- `qi_method_comparison_audit.json`
+- `qi_method_comparison_report.md`
+
+The audit JSON and Markdown report are meant for process validation. They list method input roots, per-channel parquet coverage, event counts, weighted yields, valid fractions, QI acceptance, available metric keys, generated diagnostic plots, and physics data-vs-MC plot coverage.
+
+By default, the data-vs-MC plots use `data94` as data and `Ztautau Zll Zqq` as MC. Override those with `--data-sample-name` and `--mc-sample-names`. Use `--physics-observables` to restrict the plotted observable list.
 
 Baseline means the central traditional reconstruction:
 
@@ -410,7 +424,7 @@ Do not mix the two split-weight corrections:
 If standalone prediction looks worse than training validation plots, check:
 
 - The prediction command used the intended checkpoint and config.
-- EMA usage matches the intended evaluation. Prediction uses EMA by default unless `--disable-ema` is passed.
+- EMA usage matches the intended evaluation. The documented workflow uses `--disable-ema`; omit it only for an explicit EMA prediction.
 - Standalone neutrino prediction is conditioned on predicted class. Training validation monitoring may be conditioned on truth class.
 - The prediction parquet is regenerated and includes `source_sample_index/source_event_key`.
 - `analysis.yaml` `input_files` and `raw_files` come from the same central production.
