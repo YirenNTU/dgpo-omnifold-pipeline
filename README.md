@@ -411,6 +411,15 @@ PYTHONPATH=$PWD python3 bin/tree_ana -c config/config_qi_evenet_pretrain.yaml
 PYTHONPATH=$PWD python3 bin/tree_ana -c config/config_qi_evenet_scratch.yaml
 ```
 
+If ROOT/cppyy crashes during import in the active environment, use the ml_pipeline wrapper
+instead of editing `bin/tree_ana`:
+
+```bash
+cd /path/to/lep_tree_ana
+python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
+python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_scratch.yaml
+```
+
 Expected QIProcessor outputs:
 
 ```text

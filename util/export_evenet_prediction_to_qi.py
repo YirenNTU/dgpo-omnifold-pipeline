@@ -592,15 +592,15 @@ def add_evenet_region_cut_fields(events: ak.Array, regions: list[str]) -> ak.Arr
     if "evenet_pred_class_name" not in output.fields:
         return output
     pred_class = np.asarray(ak.to_list(output["evenet_pred_class_name"]), dtype=object)
-    flags_valid = (
-        ak.to_numpy(output["flags_valid"], allow_missing=False).astype(bool)
-        if "flags_valid" in output.fields
-        else np.ones(len(output), dtype=bool)
+    has_prediction = (
+        ak.to_numpy(output["evenet_has_prediction"], allow_missing=False).astype(bool)
+        if "evenet_has_prediction" in output.fields
+        else pred_class != ""
     )
     for region in regions:
         if not region.startswith("Ztautau_"):
             continue
-        output[f"{region}_cut"] = (pred_class == region) & flags_valid
+        output[f"{region}_cut"] = (pred_class == region) & has_prediction
     return output
 
 
