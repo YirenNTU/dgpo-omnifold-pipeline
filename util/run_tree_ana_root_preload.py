@@ -9,6 +9,12 @@ import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TREE_ANA = REPO_ROOT / "bin" / "tree_ana"
+LEGACY_IMPORT_PATHS = (
+    REPO_ROOT,
+    REPO_ROOT / "processor",
+    REPO_ROOT / "RegionSelections",
+    REPO_ROOT / "quantum",
+)
 
 
 def set_thread_defaults() -> None:
@@ -27,8 +33,10 @@ def set_thread_defaults() -> None:
 
 def main() -> None:
     set_thread_defaults()
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
+    for path in reversed(LEGACY_IMPORT_PATHS):
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
 
     try:
         import ROOT  # noqa: F401
