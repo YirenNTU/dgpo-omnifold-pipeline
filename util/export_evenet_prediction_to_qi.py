@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import glob
 import json
 import os
@@ -154,8 +154,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Number of CPU worker processes for config-driven export. "
+            "Number of CPU workers for config-driven export. "
             "If omitted, use EveNetPrediction.num_workers from analysis.yaml or 1."
+        ),
+    )
+    parser.add_argument(
+        "--worker-backend",
+        choices=["thread", "process"],
+        default=None,
+        help=(
+            "Parallel backend for config-driven export. Defaults to 'thread' to avoid copying large "
+            "awkward arrays into subprocesses. Use 'process' only if memory is sufficient."
         ),
     )
     return parser.parse_args()
@@ -838,6 +847,13 @@ def config_num_workers(args: argparse.Namespace, analysis_cfg: dict) -> int:
     return max(1, int(value)) if value is not None else 1
 
 
+def config_worker_backend(args: argparse.Namespace, analysis_cfg: dict) -> str:
+    if args.worker_backend is not None:
+        return args.worker_backend
+    pred_cfg = analysis_cfg.get("EveNetPrediction", {})
+    return str(pred_cfg.get("worker_backend") or pred_cfg.get("export_worker_backend") or "thread")
+
+
 def print_progress(label: str, done: int, total: int, detail: str = "") -> None:
     total = max(total, 1)
     width = 28
@@ -930,6 +946,7 @@ def export_config_prediction(
     output_label: str,
     summary_label: str,
     num_workers: int,
+    worker_backend: str,
 ) -> dict[str, Any]:
     pred_events = load_events(pred_path)
     require_source_columns(pred_events, pred_path)
@@ -991,7 +1008,8 @@ def export_config_prediction(
     group_items = list(grouped.items())
     total_groups = len(group_items)
     worker_count = min(max(1, int(num_workers)), max(total_groups, 1))
-    print_progress(f"{summary_label} export", 0, total_groups, f"workers={worker_count}")
+    backend = "process" if worker_backend == "process" else "thread"
+    print_progress(f"{summary_label} export", 0, total_groups, f"workers={worker_count} backend={backend}")
     if worker_count == 1 or total_groups <= 1:
         for done, (parent_name, group) in enumerate(group_items, start=1):
             print(f"[export-evenet-to-qi] start {summary_label}:{parent_name}", flush=True)
@@ -1011,7 +1029,8 @@ def export_config_prediction(
             (parent_name, group, analysis_cfg, output_root, regions, prediction_split_fraction, output_label)
             for parent_name, group in group_items
         ]
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        executor_class = ProcessPoolExecutor if backend == "process" else ThreadPoolExecutor
+        with executor_class(max_workers=worker_count) as executor:
             future_to_parent = {
                 executor.submit(export_config_group_worker, payload): payload[0]
                 for payload in payloads
@@ -1041,6 +1060,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
     mc_pred, data_pred = config_prediction_paths(args, analysis_cfg)
     split_fraction = config_split_fraction(args, analysis_cfg)
     num_workers = config_num_workers(args, analysis_cfg)
+    worker_backend = config_worker_backend(args, analysis_cfg)
 
     summaries: dict[str, Any] = {}
     if mc_pred is not None:
@@ -1054,6 +1074,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
             output_label=output_label,
             summary_label="mc",
             num_workers=num_workers,
+            worker_backend=worker_backend,
         )
     if data_pred is not None:
         summaries["data"] = export_config_prediction(
@@ -1066,6 +1087,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
             output_label=output_label,
             summary_label="data",
             num_workers=num_workers,
+            worker_backend=worker_backend,
         )
     if not summaries:
         raise ValueError(

@@ -328,7 +328,7 @@ Output structure:
 
 For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the central `weight` field for rows with EveNet predictions. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw-only rows without EveNet predictions keep their original central weight.
 
-`--num-workers` parallelizes the config-driven export over parent samples and prints progress bars such as `mc export [####----] 1/3 Ztautau`. Keep it at `1` if memory pressure is high.
+`--num-workers` parallelizes the config-driven export over parent samples and prints progress bars such as `mc export [####----] 1/3 Ztautau`. The default backend is thread-based so large awkward arrays are shared instead of copied into subprocesses. Keep it at `1` if memory pressure is high. Use `--worker-backend process` only when enough memory is available.
 
 For the ML-based QIProcessor configs in the repository, write the export directly to the method-specific root:
 
