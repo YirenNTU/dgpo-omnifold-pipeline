@@ -483,6 +483,14 @@ def assign_at_indices(base_values: Any, indices: np.ndarray, pred_values: Any):
         try:
             array = ak.to_numpy(base_values, allow_missing=False)
             pred_array = ak.to_numpy(pred_values, allow_missing=False)
+            if array.dtype.kind in {"U", "S", "O"} or pred_array.dtype.kind in {"U", "S", "O"}:
+                # Preserve full string labels such as "Ztautau_rhorho" when merging prediction
+                # fields back into the full raw event table. Fixed-width Unicode numpy arrays would
+                # silently truncate longer labels and break the exported region cuts.
+                object_array = np.asarray(array, dtype=object)
+                object_pred_array = np.asarray(pred_array, dtype=object)
+                object_array[indices] = object_pred_array
+                return ak.Array(object_array.tolist())
             array[indices] = pred_array
             return ak.Array(array) if array.dtype.kind in {"U", "O"} else array
         except Exception:

@@ -31,8 +31,24 @@ def set_thread_defaults() -> None:
         os.environ.setdefault(key, value)
 
 
+def maybe_load_roounfold() -> None:
+    roounfold_lib = os.environ.get("ROOUNFOLD_LIB")
+    if not roounfold_lib:
+        return
+
+    import ROOT
+
+    load_status = ROOT.gSystem.Load(roounfold_lib)
+    if load_status < 0:
+        raise RuntimeError(
+            f"Failed to load RooUnfold library from ROOUNFOLD_LIB={roounfold_lib}. "
+            "Set ROOUNFOLD_LIB to the full path of libRooUnfold.so."
+        )
+
+
 def main() -> None:
     set_thread_defaults()
+    os.environ.setdefault("TREE_ANA_DIR", str(REPO_ROOT))
     for path in reversed(LEGACY_IMPORT_PATHS):
         path_str = str(path)
         if path_str not in sys.path:
@@ -45,6 +61,7 @@ def main() -> None:
             "Failed to import ROOT before running bin/tree_ana. "
             "This is an environment issue, not an EveNet parquet-content issue."
         ) from exc
+    maybe_load_roounfold()
 
     sys.argv = [str(TREE_ANA), *sys.argv[1:]]
     runpy.run_path(str(TREE_ANA), run_name="__main__")

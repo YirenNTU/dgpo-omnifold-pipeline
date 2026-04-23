@@ -420,6 +420,19 @@ python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet
 python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_scratch.yaml
 ```
 
+If `QIProcessor` fails with `AttributeError: Failed to get attribute RooUnfoldResponse from ROOT`,
+ROOT is available but the external RooUnfold library is not loaded. In that case, set the full path
+before running the wrapper:
+
+```bash
+export ROOUNFOLD_LIB=/full/path/to/libRooUnfold.so
+python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
+```
+
+The repository notebook `notebook/unfolding_discussion.ipynb` also expects an explicit
+`ROOT.gSystem.Load("/path/to/libRooUnfold.so")`, so this is a central unfolding environment
+requirement rather than an EveNet export-format issue.
+
 Expected QIProcessor outputs:
 
 ```text
