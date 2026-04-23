@@ -44,6 +44,7 @@ ACCENT_COLOR = OKABE_ITO[1]
 TRUTH_COLOR = OKABE_ITO[3]
 DATA_COLOR = OKABE_ITO[-1]
 SCATTER_COLOR = OKABE_ITO[0]
+BACKGROUND_COLOR = "#D8D8D8"
 HEATMAP_CMAP = LinearSegmentedColormap.from_list(
     "okabe_heat",
     ["#FAFAFA", "#D9EEF7", "#56B4E9", "#0072B2"],
@@ -203,10 +204,35 @@ def is_background_like_channel(name: str) -> bool:
     )
 
 
+def summary_channel_priority(name: str) -> int:
+    lowered = name.lower()
+    if lowered in {"ztautau_others", "tautau_others", "tau_tau_others"} or lowered.endswith("_others"):
+        return 0
+    if lowered in {"zll", "zqq"} or "background" in lowered:
+        return 1
+    if name == DEFAULT_CLASS_NAME:
+        return 2
+    return 3
+
+
 def summary_channel_order(class_names: list[str]) -> list[str]:
-    top_channels = [name for name in class_names if is_background_like_channel(name)]
-    signal_channels = [name for name in class_names if name not in set(top_channels)]
-    return top_channels + signal_channels
+    return [
+        name
+        for _, name in sorted(
+            enumerate(class_names),
+            key=lambda indexed_name: (summary_channel_priority(indexed_name[1]), indexed_name[0]),
+        )
+    ]
+
+
+def signal_channel_order(class_names: list[str]) -> list[str]:
+    return [name for name in class_names if not is_background_like_channel(name)]
+
+
+def process_stack_color(process_name: str, index: int) -> str:
+    if is_background_like_channel(process_name):
+        return BACKGROUND_COLOR
+    return STACK_COLORS[index % len(STACK_COLORS)]
 
 
 def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
@@ -1046,7 +1072,7 @@ def plot_predicted_channel_purity(
             values,
             left=left,
             height=0.75,
-            color=STACK_COLORS[truth_idx % len(STACK_COLORS)],
+            color=process_stack_color(truth_name, truth_idx),
             edgecolor="white",
             linewidth=0.5,
             label=latex_process_label(truth_name),
@@ -1203,7 +1229,7 @@ def plot_region_histogram_panel(
             hist,
             width=widths,
             bottom=bottom,
-            color=STACK_COLORS[index % len(STACK_COLORS)],
+            color=process_stack_color(process_name, index),
             edgecolor="white",
             linewidth=0.4,
             align="center",
