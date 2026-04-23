@@ -35,22 +35,66 @@ OKABE_ITO = {
 }
 
 METHOD_COLORS = {
-    "EveNet": OKABE_ITO["blue"],
     "Baseline": OKABE_ITO["vermillion"],
+    "EveNet": OKABE_ITO["blue"],
+    "EveNet-Pretrain": OKABE_ITO["blue"],
+    "EveNet-Scratch": OKABE_ITO["bluish_green"],
 }
+COLOR_CYCLE = [
+    OKABE_ITO["vermillion"],
+    OKABE_ITO["blue"],
+    OKABE_ITO["bluish_green"],
+    OKABE_ITO["orange"],
+    OKABE_ITO["reddish_purple"],
+    OKABE_ITO["sky_blue"],
+    OKABE_ITO["black"],
+]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare EveNet-QI export against central MMC/algebraic baseline export."
+        description="Compare central-schema QI exports for multiple neutrino-reconstruction methods."
     )
-    parser.add_argument("--evenet-dir", type=Path, required=True, help="Directory containing EveNet <sample>/filtered___*.parquet.")
-    parser.add_argument("--baseline-dir", type=Path, required=True, help="Directory containing baseline <sample>/filtered___*.parquet.")
+    parser.add_argument(
+        "--method",
+        action="append",
+        default=None,
+        help="Method spec in the form Label:/path/to/central_schema_tree. Repeat for Baseline/EveNet variants.",
+    )
+    parser.add_argument("--evenet-dir", type=Path, default=None, help="Legacy shortcut for --method EveNet:<dir>.")
+    parser.add_argument("--baseline-dir", type=Path, default=None, help="Legacy shortcut for --method Baseline:<dir>.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for comparison plots and metrics JSON.")
     parser.add_argument("--sample-name", default="Ztautau", help="Sample directory name.")
     parser.add_argument("--regions", nargs="+", default=["hadhad", "ee", "mumu", "emu"], help="Regions to compare.")
     parser.add_argument("--max-scatter-points", type=int, default=8000, help="Maximum points per scatter panel.")
     return parser.parse_args()
+
+
+def parse_method_specs(args: argparse.Namespace) -> dict[str, Path]:
+    specs = list(args.method or [])
+    if args.baseline_dir is not None:
+        specs.append(f"Baseline:{args.baseline_dir}")
+    if args.evenet_dir is not None:
+        specs.append(f"EveNet:{args.evenet_dir}")
+    if not specs:
+        raise ValueError("Provide at least one --method Label:/path, or legacy --baseline-dir/--evenet-dir.")
+
+    methods: dict[str, Path] = {}
+    for spec in specs:
+        if ":" not in spec:
+            raise ValueError(f"Invalid --method '{spec}'. Expected Label:/path/to/tree.")
+        label, path = spec.split(":", 1)
+        label = label.strip()
+        if not label:
+            raise ValueError(f"Invalid --method '{spec}': empty label.")
+        if label in methods:
+            raise ValueError(f"Duplicate method label '{label}'.")
+        methods[label] = Path(path).expanduser()
+    return methods
+
+
+def method_color(method: str, index: int) -> str:
+    return METHOD_COLORS.get(method, COLOR_CYCLE[index % len(COLOR_CYCLE)])
 
 
 def load_events(path: Path) -> ak.Array:
@@ -174,7 +218,12 @@ def cms_label(ax, text: str = "Work in progress") -> None:
     ax.text(0.12, 1.02, text, transform=ax.transAxes, fontsize=10, style="italic", ha="left", va="bottom")
 
 
-def plot_metric_summary(metrics: dict[str, dict[str, dict[str, Any]]], output_dir: Path, regions: list[str]) -> None:
+def plot_metric_summary(
+    metrics: dict[str, dict[str, dict[str, Any]]],
+    output_dir: Path,
+    regions: list[str],
+    method_names: list[str],
+) -> None:
     rows = []
     for region in regions:
         for metric_key, label in [
@@ -185,7 +234,7 @@ def plot_metric_summary(metrics: dict[str, dict[str, dict[str, Any]]], output_di
             ("nu_a_pt_mae", r"$\nu_a$ pT MAE [GeV]"),
             ("nu_b_pt_mae", r"$\nu_b$ pT MAE [GeV]"),
         ]:
-            if all(metric_key in metrics[method].get(region, {}) for method in ("Baseline", "EveNet")):
+            if any(metric_key in metrics[method].get(region, {}) for method in method_names):
                 rows.append((region, metric_key, label))
 
     if not rows:
@@ -194,21 +243,21 @@ def plot_metric_summary(metrics: dict[str, dict[str, dict[str, Any]]], output_di
     fig_height = max(5.0, 0.42 * len(rows))
     fig, ax = plt.subplots(figsize=(8.5, fig_height), dpi=180)
     y_positions = np.arange(len(rows))
-    offsets = {"Baseline": -0.13, "EveNet": 0.13}
+    offsets = np.linspace(-0.22, 0.22, len(method_names)) if len(method_names) > 1 else np.array([0.0])
 
-    for method in ("Baseline", "EveNet"):
+    for method_index, method in enumerate(method_names):
         values = []
         errors = []
         for region, metric_key, _ in rows:
-            region_metrics = metrics[method][region]
+            region_metrics = metrics.get(method, {}).get(region, {})
             values.append(region_metrics.get(metric_key, np.nan))
             errors.append(region_metrics.get(f"{metric_key}_unc", np.nan))
         ax.errorbar(
             values,
-            y_positions + offsets[method],
+            y_positions + offsets[method_index],
             xerr=errors,
             fmt="o",
-            color=METHOD_COLORS[method],
+            color=method_color(method, method_index),
             label=method,
             capsize=2.5,
             markersize=4.5,
@@ -250,7 +299,7 @@ def plot_neutrino_truth_scatter(
         for col, leg in enumerate(("a", "b")):
             ax = axes[row, col]
             all_values = []
-            for method, events in events_by_method.items():
+            for method_index, (method, events) in enumerate(events_by_method.items()):
                 weights = event_weights(events)
                 valid = (to_numpy(events["flags_valid"], bool) if "flags_valid" in events.fields else np.ones(len(events), dtype=bool))
                 pred = rebuild_vector(events[f"lead_{leg}_missing_p4"])
@@ -266,7 +315,7 @@ def plot_neutrino_truth_scatter(
                     y[chosen],
                     s=5,
                     alpha=0.35,
-                    color=METHOD_COLORS[method],
+                    color=method_color(method, method_index),
                     label=method if row == 0 and col == 0 else None,
                     rasterized=True,
                 )
@@ -327,14 +376,22 @@ def plot_cut_based_vs_evenet(events: ak.Array, output_dir: Path, regions: list[s
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    methods = parse_method_specs(args)
+    method_names = list(methods)
 
-    metrics: dict[str, dict[str, dict[str, Any]]] = {"Baseline": {}, "EveNet": {}}
-    raw_evenet_path = parquet_for(args.evenet_dir, args.sample_name, "raw")
-    raw_evenet = load_events(raw_evenet_path) if raw_evenet_path.exists() else None
+    metrics: dict[str, dict[str, dict[str, Any]]] = {method: {} for method in method_names}
+    raw_for_matrix = None
+    for method, root in methods.items():
+        raw_path = parquet_for(root, args.sample_name, "raw")
+        if raw_path.exists():
+            raw_events = load_events(raw_path)
+            if "evenet_pred_class_name" in raw_events.fields:
+                raw_for_matrix = raw_events
+                break
 
     for region in args.regions:
         region_events: dict[str, ak.Array] = {}
-        for method, root in [("Baseline", args.baseline_dir), ("EveNet", args.evenet_dir)]:
+        for method, root in methods.items():
             path = parquet_for(root, args.sample_name, region)
             if not path.exists():
                 continue
@@ -342,12 +399,12 @@ def main() -> None:
             region_events[method] = events
             metrics[method][region] = method_region_metrics(events)
 
-        if set(region_events) == {"Baseline", "EveNet"}:
+        if len(region_events) >= 2:
             plot_neutrino_truth_scatter(region_events, args.output_dir, region, args.max_scatter_points)
 
-    plot_metric_summary(metrics, args.output_dir, args.regions)
-    if raw_evenet is not None:
-        plot_cut_based_vs_evenet(raw_evenet, args.output_dir, args.regions)
+    plot_metric_summary(metrics, args.output_dir, args.regions, method_names)
+    if raw_for_matrix is not None:
+        plot_cut_based_vs_evenet(raw_for_matrix, args.output_dir, args.regions)
 
     with (args.output_dir / "qi_method_comparison_metrics.json").open("w") as handle:
         json.dump(metrics, handle, indent=2, sort_keys=True)

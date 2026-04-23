@@ -118,6 +118,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--qi-method-label",
+        default=None,
+        help=(
+            "Output method subdirectory for config-driven export, e.g. evenet_pretrain or evenet_scratch. "
+            "Overrides EveNetPrediction.qi_method_label."
+        ),
+    )
+    parser.add_argument(
         "--write-baseline-copy",
         action="store_true",
         help=(
@@ -281,13 +289,10 @@ def infer_slot_to_central_leg(
     valid_slot1: np.ndarray,
 ) -> dict[str, Any]:
     if "lead_a_visible_p4" not in central_events.fields or "lead_b_visible_p4" not in central_events.fields:
-        use_slot1_for_a = np.zeros(len(central_events), dtype=bool)
-        return {
-            "use_slot1_for_a": use_slot1_for_a,
-            "delta_r_a": np.full(len(central_events), np.nan, dtype=np.float32),
-            "delta_r_b": np.full(len(central_events), np.nan, dtype=np.float32),
-            "aligned_by": "fallback_slot_order",
-        }
+        raise ValueError(
+            "Cannot export EveNet slots back to the central a/b convention without "
+            "lead_a_visible_p4 and lead_b_visible_p4 in the central source parquet."
+        )
 
     lead_a = rebuild_vector(central_events["lead_a_visible_p4"])
     lead_b = rebuild_vector(central_events["lead_b_visible_p4"])
@@ -344,24 +349,18 @@ def build_predicted_reconstruction(
     pred_valid_a = np.where(use_slot1_for_a, pred_missing1_valid, pred_missing0_valid)
     pred_valid_b = np.where(use_slot1_for_a, pred_missing0_valid, pred_missing1_valid)
 
-    lead_a_visible = (
-        rebuild_vector(central_pred_events["lead_a_visible_p4"])
-        if "lead_a_visible_p4" in central_pred_events.fields
-        else evenet_visible_a
-    )
-    lead_b_visible = (
-        rebuild_vector(central_pred_events["lead_b_visible_p4"])
-        if "lead_b_visible_p4" in central_pred_events.fields
-        else evenet_visible_b
-    )
+    lead_a_visible = rebuild_vector(central_pred_events["lead_a_visible_p4"])
+    lead_b_visible = rebuild_vector(central_pred_events["lead_b_visible_p4"])
 
-    # Preserve the tau predicted by EveNet, but express the missing p4 in the central a/b convention.
+    # EveNet slots are ordered by visible-particle kind, not by central a/b.
+    # Restore the central convention here: lead_a is tau+ and lead_b is tau-.
     reco_tau_a = evenet_visible_a + evenet_missing_a_raw
     reco_tau_b = evenet_visible_b + evenet_missing_b_raw
     lead_a_missing = reco_tau_a - lead_a_visible
     lead_b_missing = reco_tau_b - lead_b_visible
 
-    flags_valid = pred_valid_a & pred_valid_b & finite_p4_mask(reco_tau_a) & finite_p4_mask(reco_tau_b)
+    alignment_valid = np.isfinite(alignment["delta_r_a"]) & np.isfinite(alignment["delta_r_b"])
+    flags_valid = pred_valid_a & pred_valid_b & alignment_valid & finite_p4_mask(reco_tau_a) & finite_p4_mask(reco_tau_b)
     observables = build_observables(
         tau_a_p4=reco_tau_a,
         tau_b_p4=reco_tau_b,
@@ -841,7 +840,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
     output_root = config_output_dir(args, analysis_cfg)
     pred_cfg = analysis_cfg.get("EveNetPrediction", {})
     regions = list(pred_cfg.get("regions", args.regions))
-    output_label = str(pred_cfg.get("qi_method_label", "evenet"))
+    output_label = str(args.qi_method_label or pred_cfg.get("qi_method_label", "evenet"))
     mc_pred, data_pred = config_prediction_paths(args, analysis_cfg)
     split_fraction = config_split_fraction(args, analysis_cfg)
 

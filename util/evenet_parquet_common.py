@@ -175,6 +175,92 @@ def mask_p4(p4, mask):
     )
 
 
+def rebuild_momentum4d(values: ak.Array):
+    fields = set(values.fields)
+    if {"px", "py", "pz", "E"}.issubset(fields):
+        return build_momentum4d(values["px"], values["py"], values["pz"], values["E"])
+    if {"x", "y", "z", "t"}.issubset(fields):
+        return build_momentum4d(values["x"], values["y"], values["z"], values["t"])
+    raise ValueError(f"Cannot rebuild Momentum4D from fields: {sorted(fields)}")
+
+
+def p4_is_finite(p4) -> ak.Array:
+    return ak.fill_none(
+        np.isfinite(p4.E) & np.isfinite(p4.px) & np.isfinite(p4.py) & np.isfinite(p4.pz),
+        False,
+    )
+
+
+def _truth_component(values: ak.Array) -> ak.Array:
+    return ak.values_astype(ak.fill_none(values, np.nan), np.float32)
+
+
+def _genpart_tau_p4(events: ak.Array, pdg_id: int):
+    flag = events["GenPart_pdgId"] == pdg_id
+    return build_momentum4d(
+        _truth_component(ak.firsts(events["GenPart_vector_fCoordinates_fX"][flag][..., ::-1])),
+        _truth_component(ak.firsts(events["GenPart_vector_fCoordinates_fY"][flag][..., ::-1])),
+        _truth_component(ak.firsts(events["GenPart_vector_fCoordinates_fZ"][flag][..., ::-1])),
+        _truth_component(ak.firsts(events["GenPart_vector_fCoordinates_fT"][flag][..., ::-1])),
+    )
+
+
+def resolve_truth_tau_pair(events: ak.Array):
+    """Return truth taus in the same base order as visible taus: [tau-, tau+]."""
+    n_events = len(events)
+
+    if {"truth_tau_a_p4", "truth_tau_b_p4"}.issubset(set(events.fields)):
+        # Central convention: a is tau+ (pdgId -15), b is tau- (pdgId +15).
+        tau_plus = rebuild_momentum4d(events["truth_tau_a_p4"])
+        tau_minus = rebuild_momentum4d(events["truth_tau_b_p4"])
+        truth_pair = stack_tau_pair(tau_minus, tau_plus)
+        truth_mask = stack_tau_pair_mask(p4_is_finite(tau_minus), p4_is_finite(tau_plus))
+        return truth_pair, truth_mask, "truth_tau_a_p4/truth_tau_b_p4"
+
+    genpart_fields = {
+        "GenPart_pdgId",
+        "GenPart_vector_fCoordinates_fX",
+        "GenPart_vector_fCoordinates_fY",
+        "GenPart_vector_fCoordinates_fZ",
+        "GenPart_vector_fCoordinates_fT",
+    }
+    if genpart_fields.issubset(set(events.fields)):
+        tau_minus = _genpart_tau_p4(events, 15)
+        tau_plus = _genpart_tau_p4(events, -15)
+        truth_pair = stack_tau_pair(tau_minus, tau_plus)
+        truth_mask = stack_tau_pair_mask(p4_is_finite(tau_minus), p4_is_finite(tau_plus))
+        return truth_pair, truth_mask, "GenPart_pdgId/GenPart_vector"
+
+    legacy_fields = [
+        "truth_tau_px",
+        "truth_tau_py",
+        "truth_tau_pz",
+        "truth_tau_E",
+        "truth_anti_tau_px",
+        "truth_anti_tau_py",
+        "truth_anti_tau_pz",
+        "truth_anti_tau_E",
+    ]
+    if all(field in events.fields for field in legacy_fields):
+        tau_minus = build_momentum4d(
+            truth_feature(events["truth_tau_px"]),
+            truth_feature(events["truth_tau_py"]),
+            truth_feature(events["truth_tau_pz"]),
+            truth_feature(events["truth_tau_E"]),
+        )
+        tau_plus = build_momentum4d(
+            truth_feature(events["truth_anti_tau_px"]),
+            truth_feature(events["truth_anti_tau_py"]),
+            truth_feature(events["truth_anti_tau_pz"]),
+            truth_feature(events["truth_anti_tau_E"]),
+        )
+        truth_pair = stack_tau_pair(tau_minus, tau_plus)
+        truth_mask = stack_tau_pair_mask(p4_is_finite(tau_minus), p4_is_finite(tau_plus))
+        return truth_pair, truth_mask, "truth_tau_* legacy components"
+
+    return zero_p4((n_events, 2)), ak.Array(np.zeros((n_events, 2), dtype=bool)), None
+
+
 def sum_masked_p4(events: ak.Array, mask: ak.Array):
     part_p4 = build_part_momentum4d(events)
     return ak.sum(part_p4[mask & part_energy_mask(events)], axis=1)
@@ -269,6 +355,8 @@ def _build_hemisphere_masks(events: ak.Array, part_p4: ak.Array, charge: ak.Arra
 
 
 def _build_visible_tau_layout(events: ak.Array, include_nearby_photons: bool = True):
+    # ML training slots are canonicalized by visible-particle kind, not central lead_a/lead_b.
+    # Downstream QI export must map these slots back to central legs using visible-p4 matching.
     charge = events["Part_charge"]
     pdg_id = abs(events["Part_pdgId"])
     part_p4 = build_part_momentum4d(events)
@@ -405,35 +493,9 @@ def build_tau_targets(
     tau_vis_target_p4 = tau_vis_prong_p4
     tau_vis_target_mask = tau_vis_prong_mask
 
-    required_fields = [
-        "truth_tau_px",
-        "truth_tau_py",
-        "truth_tau_pz",
-        "truth_tau_E",
-        "truth_anti_tau_px",
-        "truth_anti_tau_py",
-        "truth_anti_tau_pz",
-        "truth_anti_tau_E",
-    ]
-    if not all(field in events.fields for field in required_fields):
+    truth_tau_pair, truth_tau_valid_pair, truth_source = resolve_truth_tau_pair(events)
+    if truth_source is None:
         return x_invisible_p4, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target_p4, tau_vis_target_mask
-
-    truth_tau = build_momentum4d(
-        truth_feature(events["truth_tau_px"]),
-        truth_feature(events["truth_tau_py"]),
-        truth_feature(events["truth_tau_pz"]),
-        truth_feature(events["truth_tau_E"]),
-    )
-    truth_anti_tau = build_momentum4d(
-        truth_feature(events["truth_anti_tau_px"]),
-        truth_feature(events["truth_anti_tau_py"]),
-        truth_feature(events["truth_anti_tau_pz"]),
-        truth_feature(events["truth_anti_tau_E"]),
-    )
-    tau_truth_valid = np.isfinite(truth_tau.E) & np.isfinite(truth_tau.px) & np.isfinite(truth_tau.py) & np.isfinite(truth_tau.pz)
-    anti_tau_truth_valid = np.isfinite(truth_anti_tau.E) & np.isfinite(truth_anti_tau.px) & np.isfinite(truth_anti_tau.py) & np.isfinite(truth_anti_tau.pz)
-    truth_tau_pair = stack_tau_pair(truth_tau, truth_anti_tau)
-    truth_tau_valid_pair = stack_tau_pair_mask(tau_truth_valid, anti_tau_truth_valid)
 
     if slot_swap_mask is None:
         _, _, slot_swap_mask = _build_visible_tau_layout(events)
