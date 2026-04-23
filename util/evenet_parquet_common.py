@@ -217,17 +217,64 @@ def _classify_visible_kind_rank(lead_abs_pdg, has_nearby_photon):
     )
 
 
+def _build_hemisphere_masks(events: ak.Array, part_p4: ak.Array, charge: ak.Array, energy_valid: ak.Array):
+    if "Part_in_hemisphere_a" in events.fields and "Part_in_hemisphere_b" in events.fields:
+        return {
+            "a": ak.values_astype(events["Part_in_hemisphere_a"], bool) & energy_valid,
+            "b": ak.values_astype(events["Part_in_hemisphere_b"], bool) & energy_valid,
+        }
+
+    if "Part_hemisphere" in events.fields:
+        hemisphere = events["Part_hemisphere"]
+        return {
+            "a": (hemisphere == 1) & energy_valid,
+            "b": (hemisphere == -1) & energy_valid,
+        }
+
+    required_thrust = {"thrust_x", "thrust_y", "thrust_z"}
+    if not required_thrust.issubset(set(events.fields)):
+        raise ValueError(
+            "Visible tau construction needs either Part_in_hemisphere_a/b, Part_hemisphere, "
+            "or thrust_x/y/z to infer hemispheres."
+        )
+
+    thrust = vector.zip({"x": events["thrust_x"], "y": events["thrust_y"], "z": events["thrust_z"]})
+    raw_hemisphere = ak.values_astype(part_p4.to_Vector3D().dot(thrust) > 0, bool)
+    part_idx_all = ak.local_index(events["Part_pdgId"])
+
+    lead_charges = {}
+    lead_flags = {}
+    raw_masks = {"a": raw_hemisphere, "b": ~raw_hemisphere}
+    for hemisphere_name, raw_mask in raw_masks.items():
+        charged_mask = raw_mask & (charge != 0) & energy_valid
+        charged_p4 = part_p4[charged_mask]
+        charged_idx = part_idx_all[charged_mask]
+        sorted_idx = ak.argsort(charged_p4.p, axis=1, ascending=False)
+        leading_idx = ak.firsts(charged_idx[sorted_idx])
+        lead_flag = part_idx_all == leading_idx
+        lead_flags[hemisphere_name] = lead_flag
+        lead_charges[hemisphere_name] = ak.fill_none(ak.firsts(charge[lead_flag]), 0)
+
+    is_leading_os = (
+        (lead_charges["a"] + lead_charges["b"] == 0)
+        & (lead_charges["a"] != 0)
+        & (lead_charges["b"] != 0)
+    )
+    switch_hemisphere = is_leading_os & (lead_charges["a"] < 0) & (lead_charges["b"] > 0)
+    switch_broadcasted = ak.broadcast_arrays(switch_hemisphere, raw_hemisphere)[0]
+    return {
+        "a": (raw_hemisphere ^ switch_broadcasted) & energy_valid,
+        "b": ((~raw_hemisphere) ^ switch_broadcasted) & energy_valid,
+    }
+
+
 def _build_visible_tau_layout(events: ak.Array, include_nearby_photons: bool = True):
     charge = events["Part_charge"]
-    hemisphere = events["Part_hemisphere"]
     pdg_id = abs(events["Part_pdgId"])
     part_p4 = build_part_momentum4d(events)
     energy_valid = part_energy_mask(events)
 
-    hemisphere_masks = {
-        "a": (hemisphere == 1) & energy_valid,
-        "b": (hemisphere == -1) & energy_valid,
-    }
+    hemisphere_masks = _build_hemisphere_masks(events, part_p4, charge, energy_valid)
 
     prong_charge_sums = {}
     visible_p4_by_hemisphere = {}
