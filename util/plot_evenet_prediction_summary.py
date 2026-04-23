@@ -1065,7 +1065,7 @@ def plot_predicted_channel_purity(
         data_unc = np.sqrt(data_counts)
 
     fig_height = max(7, 0.58 * len(class_names) + 2.5)
-    fig, ax = plt.subplots(figsize=(16, fig_height), dpi=220)
+    fig, ax = plt.subplots(figsize=(13.5, fig_height), dpi=220)
     y = np.arange(len(class_names))
     left = np.zeros(len(class_names), dtype=np.float64)
 
@@ -1106,8 +1106,7 @@ def plot_predicted_channel_purity(
         visible_max = max(visible_max, float(np.max(data_counts + data_unc)))
     if visible_max <= 0:
         visible_max = 1.0
-    text_x = visible_max * 1.02
-    ax.set_xlim(0.0, visible_max * 2.15)
+    ax.set_xlim(0.0, visible_max * 1.18)
 
     def yield_label(value: float) -> str:
         if not np.isfinite(value):
@@ -1139,7 +1138,7 @@ def plot_predicted_channel_purity(
             label = f"P={purity_label}\nMC={yield_label(mc_total)}"
 
         ax.text(
-            text_x,
+            1.01,
             y[index],
             label,
             va="center",
@@ -1148,6 +1147,8 @@ def plot_predicted_channel_purity(
             color=DATA_COLOR,
             fontweight="semibold",
             linespacing=1.15,
+            transform=ax.get_yaxis_transform(),
+            clip_on=False,
         )
 
     ax.set_yticks(y)
@@ -1157,8 +1158,8 @@ def plot_predicted_channel_purity(
     ax.set_title("Predicted Channel Purity: stacked truth-process yield with data overlay")
     ax.grid(axis="x", linestyle=":", alpha=0.35)
     ax.invert_yaxis()
-    ax.legend(loc="upper left", bbox_to_anchor=(1.24, 1.0), frameon=False)
-    fig.tight_layout()
+    ax.legend(loc="lower right", frameon=False, fontsize=8, ncols=2)
+    fig.subplots_adjust(left=0.18, right=0.78, top=0.91, bottom=0.10)
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
