@@ -144,6 +144,53 @@ def build_class_names_from_analysis(analysis_config_path: Path, evenet_config_pa
     return class_names
 
 
+def latex_process_label(name: str) -> str:
+    if name == DEFAULT_CLASS_NAME:
+        return name
+
+    label = name
+    if label.startswith("Ztautau_"):
+        label = label[len("Ztautau_"):]
+    elif label == "Ztautau":
+        return r"$Z\to\tau\tau$"
+    elif label == "Zll":
+        return r"$Z\to\ell\ell$"
+    elif label == "Zqq":
+        return r"$Z\to q\bar{q}$"
+
+    if label == "others":
+        return r"$\tau\tau$ others"
+
+    token_map = {
+        "rho": r"\rho",
+        "pi": r"\pi",
+        "e": "e",
+        "mu": r"\mu",
+    }
+    tokens: list[str] = []
+    index = 0
+    ordered_keys = sorted(token_map, key=len, reverse=True)
+    while index < len(label):
+        matched = False
+        for key in ordered_keys:
+            if label.startswith(key, index):
+                tokens.append(token_map[key])
+                index += len(key)
+                matched = True
+                break
+        if not matched:
+            tokens.append(label[index])
+            index += 1
+
+    if tokens:
+        return r"$\tau\tau\to " + " ".join(tokens) + "$"
+    return name
+
+
+def latex_labels(names: list[str]) -> list[str]:
+    return [latex_process_label(name) for name in names]
+
+
 def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     output = ak.to_numpy(values, allow_missing=False)
     if dtype is not None:
@@ -273,8 +320,8 @@ def _plot_single_confusion_matrix(
 
     ax.set_xticks(np.arange(num_classes))
     ax.set_yticks(np.arange(num_classes))
-    ax.set_xticklabels(class_names, rotation=45, ha="right")
-    ax.set_yticklabels(class_names)
+    ax.set_xticklabels(latex_labels(class_names), rotation=45, ha="right")
+    ax.set_yticklabels(latex_labels(class_names))
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Truth")
     ax.set_title(title)
@@ -801,7 +848,7 @@ def plot_neutrino_grid(
                 fontsize=10,
             )
 
-    fig.suptitle(f"Truth vs Predicted Neutrino {title_suffix}: {process_name}", fontsize=16)
+    fig.suptitle(f"Truth vs Predicted Neutrino {title_suffix}: {latex_process_label(process_name)}", fontsize=16)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -901,7 +948,7 @@ def plot_predicted_class_comparison(
     ax.bar(x - 0.2, mc_counts, width=0.4, label="Weighted MC", color=MC_COLOR, alpha=0.82)
     ax.bar(x + 0.2, data_counts, width=0.4, label="Data", color=DATA_COLOR, alpha=0.82)
     ax.set_xticks(x)
-    ax.set_xticklabels(class_names, rotation=45, ha="right")
+    ax.set_xticklabels(latex_labels(class_names), rotation=45, ha="right")
     ax.set_ylabel("Events")
     ax.set_title("Predicted Class Distribution: Data vs Weighted MC")
     ax.legend()
@@ -942,8 +989,8 @@ def plot_predicted_channel_purity(
         data_counts = np.array([float(np.sum(data_pred == name)) for name in class_names], dtype=np.float64)
         data_unc = np.sqrt(data_counts)
 
-    fig_height = max(6, 0.45 * len(class_names) + 2.0)
-    fig, ax = plt.subplots(figsize=(13, fig_height), dpi=220)
+    fig_height = max(7, 0.58 * len(class_names) + 2.5)
+    fig, ax = plt.subplots(figsize=(16, fig_height), dpi=220)
     y = np.arange(len(class_names))
     left = np.zeros(len(class_names), dtype=np.float64)
 
@@ -959,7 +1006,7 @@ def plot_predicted_channel_purity(
             color=STACK_COLORS[truth_idx % len(STACK_COLORS)],
             edgecolor="white",
             linewidth=0.5,
-            label=truth_name,
+            label=latex_process_label(truth_name),
         )
         left += values
 
@@ -984,35 +1031,57 @@ def plot_predicted_channel_purity(
     if visible_max <= 0:
         visible_max = 1.0
     text_x = visible_max * 1.02
-    ax.set_xlim(0.0, visible_max * 1.22)
+    ax.set_xlim(0.0, visible_max * 2.15)
+
+    def yield_label(value: float) -> str:
+        if not np.isfinite(value):
+            return "n/a"
+        return f"{value:.0f}" if abs(value) >= 100 else f"{value:.1f}"
 
     for index, class_name in enumerate(class_names):
-        total = float(row_sums[index])
-        if total > 0 and class_name in truth_index:
-            signal_purity = float(stack_matrix[index, truth_index[class_name]] / total)
-            label = f"{signal_purity:.3f}"
+        mc_total = float(row_sums[index])
+        data_yield = float(data_counts[index]) if data_counts is not None else float("nan")
+        if mc_total > 0 and class_name in truth_index:
+            signal_purity = float(stack_matrix[index, truth_index[class_name]] / mc_total)
+            purity_label = f"{signal_purity:.3f}"
         else:
             signal_purity = float("nan")
-            label = "n/a"
+            purity_label = "n/a"
+
+        if np.isfinite(data_yield):
+            data_minus_mc = data_yield - mc_total
+            data_minus_mc_frac = data_minus_mc / mc_total if mc_total > 0 else float("nan")
+            diff_label = (
+                f"Δ={yield_label(data_minus_mc)}"
+                + (f" ({data_minus_mc_frac:+.1%})" if np.isfinite(data_minus_mc_frac) else "")
+            )
+            label = (
+                f"P={purity_label} | {diff_label}\n"
+                f"MC={yield_label(mc_total)}  Data={yield_label(data_yield)}"
+            )
+        else:
+            label = f"P={purity_label}\nMC={yield_label(mc_total)}"
+
         ax.text(
             text_x,
             y[index],
             label,
             va="center",
             ha="left",
-            fontsize=9,
+            fontsize=8.2,
             color=DATA_COLOR,
             fontweight="semibold",
+            linespacing=1.15,
         )
 
     ax.set_yticks(y)
-    ax.set_yticklabels(class_names)
+    ax.set_yticklabels(latex_labels(class_names))
     ax.set_xlabel("Yield")
     ax.set_ylabel("Predicted channel")
     ax.set_title("Predicted Channel Purity: stacked truth-process yield with data overlay")
     ax.grid(axis="x", linestyle=":", alpha=0.35)
     ax.invert_yaxis()
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), frameon=False)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.24, 1.0), frameon=False)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -1023,13 +1092,18 @@ def plot_predicted_channel_purity(
         row = stack_matrix[index]
         total = float(row_sums[index])
         dominant_idx = int(np.argmax(row)) if row.size > 0 else -1
+        data_yield = float(data_counts[index]) if data_counts is not None else float("nan")
+        data_minus_mc = data_yield - total if np.isfinite(data_yield) else float("nan")
+        data_minus_mc_fraction = data_minus_mc / total if total > 0 and np.isfinite(data_minus_mc) else float("nan")
         purity_summary[class_name] = {
             "total_mc_yield": total,
             "dominant_truth_process": truth_processes[dominant_idx] if total > 0 and dominant_idx >= 0 else DEFAULT_CLASS_NAME,
             "dominant_fraction": float(row[dominant_idx] / total) if total > 0 and dominant_idx >= 0 else float("nan"),
             "signal_purity": float(row[truth_index[class_name]] / total) if total > 0 and class_name in truth_index else float("nan"),
-            "data_yield": float(data_counts[index]) if data_counts is not None else float("nan"),
+            "data_yield": data_yield,
             "data_stat_unc": float(data_unc[index]) if data_unc is not None else float("nan"),
+            "data_minus_mc": data_minus_mc,
+            "data_minus_mc_fraction": data_minus_mc_fraction,
         }
     return {
         "truth_processes": truth_processes,
@@ -1090,7 +1164,7 @@ def plot_region_histogram_panel(
             edgecolor="white",
             linewidth=0.4,
             align="center",
-            label=process_name,
+            label=latex_process_label(process_name),
         )
         bottom += hist
 
@@ -1303,7 +1377,7 @@ def plot_region_kinematics(
     if handles:
         fig.legend(handles, labels, loc="center right", frameon=False)
     title_suffix = "data vs stacked MC" if data_events is not None else "stacked MC"
-    fig.suptitle(f"Region {region_name}: {title_suffix} (with MC truth reference)", fontsize=16)
+    fig.suptitle(f"Region {latex_process_label(region_name)}: {title_suffix} (with MC truth reference)", fontsize=16)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
