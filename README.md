@@ -296,7 +296,6 @@ python3 util/export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
   --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/test__evenet_pred.parquet \
   --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/data__evenet_pred.parquet \
-  --prediction-split-fraction 0.5 \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export \
   --qi-method-label evenet_scratch
 ```
@@ -308,7 +307,6 @@ python3 util/export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
   --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-pretrain/test__evenet_pred.parquet \
   --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-pretrain/data__evenet_pred.parquet \
-  --prediction-split-fraction 0.5 \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export \
   --qi-method-label evenet_pretrain
 ```
@@ -326,7 +324,7 @@ Output structure:
     ...
 ```
 
-`--prediction-split-fraction` affects the central/QI export `weight` field. For example, if prediction only ran on the test half, pass `0.5`. The adapter scales only MC rows with EveNet predictions by `1 / fraction`. Raw-only rows without EveNet predictions keep their original central weight.
+For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the central `weight` field for rows with EveNet predictions. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw-only rows without EveNet predictions keep their original central weight.
 
 The export preserves central fields such as:
 
@@ -411,12 +409,13 @@ EveNet methods come from `export_evenet_prediction_to_qi.py` method trees.
 
 ## Weighting Rules
 
-Do not mix the two split-weight corrections:
+Do not apply the split-weight correction twice:
 
 - `predict_evenet_from_raw_parquet.py --converted-split-fraction`: writes `evenet_weight` in the prediction parquet for standalone EveNet plots.
-- `export_evenet_prediction_to_qi.py --prediction-split-fraction`: writes the central/QI export `weight` for central/QI/unfolding.
+- `export_evenet_prediction_to_qi.py`: uses prediction-parquet `evenet_weight` for predicted rows when that field is available.
+- `export_evenet_prediction_to_qi.py --prediction-split-fraction`: legacy fallback only for old prediction parquets that do not contain `evenet_weight`.
 - Data is never MC split-reweighted.
-- If the MC test split is 0.5, use fraction `0.5` to recover full MC yield in data/MC comparisons.
+- If the MC test split is 0.5, pass `--converted-split-fraction 0.5` during prediction to recover full MC yield in data/MC comparisons.
 - Raw-only rows without EveNet predictions do not receive the split factor.
 
 ## Alignment Checklist
