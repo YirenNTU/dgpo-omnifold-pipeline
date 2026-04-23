@@ -691,6 +691,13 @@ def predict_converted_events(
         signal_indices = torch.from_numpy(np.nonzero(batch_signal_mask_np)[0].astype(np.int64)).to(device=device)
         signal_batch = slice_torch_batch(batch_torch, signal_indices)
         signal_batch["classification"] = batch_pred_index.index_select(0, signal_indices).to(torch.int64)
+        prediction_invisible_mask = torch.ones(
+            signal_batch["x_invisible"].shape[:2],
+            dtype=torch.bool,
+            device=device,
+        )
+        signal_batch["x_invisible_mask"] = prediction_invisible_mask
+        prediction_noise_mask = prediction_invisible_mask.unsqueeze(-1)
 
         generated = sampler.sample(
             data_shape=signal_batch["x_invisible"].shape,
@@ -699,7 +706,7 @@ def predict_converted_events(
                 cond_x=signal_batch,
                 time=time,
                 mode="neutrino",
-                noise_mask=signal_batch["x_invisible_mask"].unsqueeze(-1),
+                noise_mask=prediction_noise_mask,
             ),
             normalize_fn=model.invisible_normalizer,
             eta=1.0,
@@ -707,10 +714,10 @@ def predict_converted_events(
             use_tqdm=False,
             process_name="NeutrinoPredict",
             remove_padding=(getattr(model, "invisible_padding", 0) > 0),
-            noise_mask=signal_batch["x_invisible_mask"].unsqueeze(-1),
+            noise_mask=prediction_noise_mask,
         )
         generated_np = generated.detach().cpu().numpy().astype(np.float32)
-        pred_slot_valid = np.all(np.isfinite(generated_np), axis=-1)
+        pred_slot_valid = prediction_invisible_mask.detach().cpu().numpy() & np.all(np.isfinite(generated_np), axis=-1)
         target_positions = np.nonzero(batch_signal_mask_np)[0]
         valid_signal_prediction[start + target_positions] = np.all(pred_slot_valid, axis=1)
         fill_invisible_feature_outputs(

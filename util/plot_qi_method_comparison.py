@@ -311,6 +311,18 @@ def method_region_metrics(events: ak.Array) -> dict[str, Any]:
     return metrics
 
 
+def is_background_like_region(region: str) -> bool:
+    lowered = region.lower()
+    return lowered in {"other", "others", "background"} or lowered.endswith("_others")
+
+
+def summary_region_order(regions: list[str]) -> list[str]:
+    unique_regions = list(dict.fromkeys(regions))
+    top_regions = [region for region in unique_regions if is_background_like_region(region)]
+    signal_regions = [region for region in unique_regions if region not in set(top_regions)]
+    return top_regions + signal_regions
+
+
 def classify_evenet_region(class_name: str) -> str:
     name = str(class_name)
     if name in {"Ztautau_pipi", "Ztautau_pirho", "Ztautau_rhorho"}:
@@ -853,6 +865,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     methods = parse_method_specs(args)
     method_names = list(methods)
+    candidate_regions = summary_region_order(["other", *args.regions])
 
     metrics: dict[str, dict[str, dict[str, Any]]] = {method: {} for method in method_names}
     raw_for_matrix = None
@@ -864,7 +877,7 @@ def main() -> None:
                 raw_for_matrix = raw_events
                 break
 
-    for region in args.regions:
+    for region in candidate_regions:
         region_events: dict[str, ak.Array] = {}
         for method, root in methods.items():
             path = parquet_for(root, args.sample_name, region)
@@ -877,13 +890,16 @@ def main() -> None:
         if len(region_events) >= 2:
             plot_neutrino_truth_scatter(region_events, args.output_dir, region, args.max_scatter_points)
 
-    plot_metric_summary(metrics, args.output_dir, args.regions, method_names)
+    active_regions = [region for region in candidate_regions if any(region in metrics.get(method, {}) for method in method_names)]
+    plot_metric_summary(metrics, args.output_dir, active_regions, method_names)
     if raw_for_matrix is not None:
-        plot_cut_based_vs_evenet(raw_for_matrix, args.output_dir, args.regions)
+        cut_based_regions = [region for region in active_regions if not is_background_like_region(region)]
+        if cut_based_regions:
+            plot_cut_based_vs_evenet(raw_for_matrix, args.output_dir, cut_based_regions)
     physics_data_mc_summary = plot_physics_data_mc_comparisons(
         methods=methods,
         output_dir=args.output_dir,
-        regions=args.regions,
+        regions=active_regions,
         data_sample_name=args.data_sample_name,
         mc_sample_names=list(args.mc_sample_names),
         requested_observables=args.physics_observables,
@@ -892,7 +908,7 @@ def main() -> None:
     audit = build_audit_summary(
         methods=methods,
         metrics=metrics,
-        regions=args.regions,
+        regions=active_regions,
         sample_name=args.sample_name,
         output_dir=args.output_dir,
         raw_matrix_available=raw_for_matrix is not None,

@@ -26,6 +26,7 @@ from ml_pipeline_config import parse_evenet_config
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "plots" / "prediction_summary"
 DEFAULT_CLASS_NAME = "unselected"
+DEFAULT_FLOAT = -99.0
 MAX_NEUTRINO_SCATTER_POINTS = 50000
 OKABE_ITO = [
     "#0072B2",
@@ -191,6 +192,23 @@ def latex_labels(names: list[str]) -> list[str]:
     return [latex_process_label(name) for name in names]
 
 
+def is_background_like_channel(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        name == DEFAULT_CLASS_NAME
+        or lowered in {"zll", "zqq"}
+        or lowered.endswith("_others")
+        or lowered == "others"
+        or "background" in lowered
+    )
+
+
+def summary_channel_order(class_names: list[str]) -> list[str]:
+    top_channels = [name for name in class_names if is_background_like_channel(name)]
+    signal_channels = [name for name in class_names if name not in set(top_channels)]
+    return top_channels + signal_channels
+
+
 def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     output = ak.to_numpy(values, allow_missing=False)
     if dtype is not None:
@@ -272,6 +290,13 @@ def finite_mask(*arrays: np.ndarray) -> np.ndarray:
     mask = np.ones_like(arrays[0], dtype=bool)
     for arr in arrays:
         mask &= np.isfinite(arr)
+    return mask
+
+
+def valid_physics_values(*arrays: np.ndarray) -> np.ndarray:
+    mask = finite_mask(*arrays)
+    for arr in arrays:
+        mask &= ~np.isclose(arr, DEFAULT_FLOAT)
     return mask
 
 
@@ -407,12 +432,17 @@ def extract_leg_components(events: ak.Array) -> dict[str, dict[str, np.ndarray]]
         if direct.issubset(fields):
             valid_field = f"{prefix}_valid"
             valid = to_numpy(events[valid_field], bool) if valid_field in fields else np.ones(len(events), dtype=bool)
+            energy = to_numpy(events[f"{prefix}_E"], np.float64)
+            px = to_numpy(events[f"{prefix}_px"], np.float64)
+            py = to_numpy(events[f"{prefix}_py"], np.float64)
+            pz = to_numpy(events[f"{prefix}_pz"], np.float64)
+            valid &= valid_physics_values(energy, px, py, pz)
             return {
                 "valid": valid,
-                "E": to_numpy(events[f"{prefix}_E"], np.float64),
-                "px": to_numpy(events[f"{prefix}_px"], np.float64),
-                "py": to_numpy(events[f"{prefix}_py"], np.float64),
-                "pz": to_numpy(events[f"{prefix}_pz"], np.float64),
+                "E": energy,
+                "px": px,
+                "py": py,
+                "pz": pz,
             }
 
         energy_field = f"{prefix}_energy"
@@ -426,6 +456,7 @@ def extract_leg_components(events: ak.Array) -> dict[str, dict[str, np.ndarray]]
             pt = to_numpy(events[pt_field], np.float64)
             eta = to_numpy(events[eta_field], np.float64)
             phi = to_numpy(events[phi_field], np.float64)
+            valid &= valid_physics_values(energy, pt, eta, phi)
             return {
                 "valid": valid,
                 "E": energy,
@@ -441,10 +472,13 @@ def extract_leg_components(events: ak.Array) -> dict[str, dict[str, np.ndarray]]
         if {log_energy_field, log_pt_field, eta_field, phi_field}.issubset(fields):
             valid_field = f"{prefix}_valid"
             valid = to_numpy(events[valid_field], bool) if valid_field in fields else np.ones(len(events), dtype=bool)
-            energy = np.expm1(to_numpy(events[log_energy_field], np.float64))
-            pt = np.expm1(to_numpy(events[log_pt_field], np.float64))
+            log_energy = to_numpy(events[log_energy_field], np.float64)
+            log_pt = to_numpy(events[log_pt_field], np.float64)
+            energy = np.expm1(log_energy)
+            pt = np.expm1(log_pt)
             eta = to_numpy(events[eta_field], np.float64)
             phi = to_numpy(events[phi_field], np.float64)
+            valid &= valid_physics_values(log_energy, log_pt, eta, phi)
             return {
                 "valid": valid,
                 "E": energy,
@@ -488,12 +522,17 @@ def values_for_prefix(events: ak.Array, prefix: str) -> dict[str, np.ndarray] | 
     if direct.issubset(fields):
         valid_field = f"{prefix}_valid"
         valid = to_numpy(events[valid_field], bool) if valid_field in fields else np.ones(len(events), dtype=bool)
+        energy = to_numpy(events[f"{prefix}_E"], np.float64)
+        px = to_numpy(events[f"{prefix}_px"], np.float64)
+        py = to_numpy(events[f"{prefix}_py"], np.float64)
+        pz = to_numpy(events[f"{prefix}_pz"], np.float64)
+        valid &= valid_physics_values(energy, px, py, pz)
         return {
             "valid": valid,
-            "E": to_numpy(events[f"{prefix}_E"], np.float64),
-            "px": to_numpy(events[f"{prefix}_px"], np.float64),
-            "py": to_numpy(events[f"{prefix}_py"], np.float64),
-            "pz": to_numpy(events[f"{prefix}_pz"], np.float64),
+            "E": energy,
+            "px": px,
+            "py": py,
+            "pz": pz,
         }
 
     energy_field = f"{prefix}_energy"
@@ -507,6 +546,7 @@ def values_for_prefix(events: ak.Array, prefix: str) -> dict[str, np.ndarray] | 
         pt = to_numpy(events[pt_field], np.float64)
         eta = to_numpy(events[eta_field], np.float64)
         phi = to_numpy(events[phi_field], np.float64)
+        valid &= valid_physics_values(energy, pt, eta, phi)
         return {
             "valid": valid,
             "E": energy,
@@ -520,10 +560,13 @@ def values_for_prefix(events: ak.Array, prefix: str) -> dict[str, np.ndarray] | 
     if {log_energy_field, log_pt_field, eta_field, phi_field}.issubset(fields):
         valid_field = f"{prefix}_valid"
         valid = to_numpy(events[valid_field], bool) if valid_field in fields else np.ones(len(events), dtype=bool)
-        energy = np.expm1(to_numpy(events[log_energy_field], np.float64))
-        pt = np.expm1(to_numpy(events[log_pt_field], np.float64))
+        log_energy = to_numpy(events[log_energy_field], np.float64)
+        log_pt = to_numpy(events[log_pt_field], np.float64)
+        energy = np.expm1(log_energy)
+        pt = np.expm1(log_pt)
         eta = to_numpy(events[eta_field], np.float64)
         phi = to_numpy(events[phi_field], np.float64)
+        valid &= valid_physics_values(log_energy, log_pt, eta, phi)
         return {
             "valid": valid,
             "E": energy,
@@ -1252,7 +1295,8 @@ def plot_region_kinematics(
         if key == "z_mass":
             mc_pred_values = mc_kin["pred_pair"]["mass"]
             mc_truth_values = mc_kin["truth_pair"]["mass"]
-            mc_valid = mc_kin["pred_pair"]["valid"] & mc_kin["truth_pair"]["valid"]
+            mc_reco_valid = mc_kin["pred_pair"]["valid"]
+            mc_truth_valid = mc_kin["truth_pair"]["valid"]
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_pair"]["mass"] if data_kin is not None else None
             data_valid = data_kin["pred_pair"]["valid"] if data_kin is not None else None
@@ -1260,7 +1304,8 @@ def plot_region_kinematics(
         elif key == "delta_eta":
             mc_pred_values = mc_kin["pred_pair"]["delta_eta"]
             mc_truth_values = mc_kin["truth_pair"]["delta_eta"]
-            mc_valid = mc_kin["pred_pair"]["valid"] & mc_kin["truth_pair"]["valid"]
+            mc_reco_valid = mc_kin["pred_pair"]["valid"]
+            mc_truth_valid = mc_kin["truth_pair"]["valid"]
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_pair"]["delta_eta"] if data_kin is not None else None
             data_valid = data_kin["pred_pair"]["valid"] if data_kin is not None else None
@@ -1268,7 +1313,8 @@ def plot_region_kinematics(
         elif key == "delta_phi":
             mc_pred_values = mc_kin["pred_pair"]["delta_phi"]
             mc_truth_values = mc_kin["truth_pair"]["delta_phi"]
-            mc_valid = mc_kin["pred_pair"]["valid"] & mc_kin["truth_pair"]["valid"]
+            mc_reco_valid = mc_kin["pred_pair"]["valid"]
+            mc_truth_valid = mc_kin["truth_pair"]["valid"]
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_pair"]["delta_phi"] if data_kin is not None else None
             data_valid = data_kin["pred_pair"]["valid"] if data_kin is not None else None
@@ -1276,7 +1322,8 @@ def plot_region_kinematics(
         elif key == "vis_delta_eta":
             mc_pred_values = mc_kin["visible_pair"]["delta_eta"]
             mc_truth_values = mc_kin["visible_pair"]["delta_eta"]
-            mc_valid = mc_kin["visible_pair"]["valid"]
+            mc_reco_valid = mc_kin["visible_pair"]["valid"]
+            mc_truth_valid = mc_kin["visible_pair"]["valid"]
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["visible_pair"]["delta_eta"] if data_kin is not None else None
             data_valid = data_kin["visible_pair"]["valid"] if data_kin is not None else None
@@ -1284,7 +1331,8 @@ def plot_region_kinematics(
         elif key == "vis_delta_phi":
             mc_pred_values = mc_kin["visible_pair"]["delta_phi"]
             mc_truth_values = mc_kin["visible_pair"]["delta_phi"]
-            mc_valid = mc_kin["visible_pair"]["valid"]
+            mc_reco_valid = mc_kin["visible_pair"]["valid"]
+            mc_truth_valid = mc_kin["visible_pair"]["valid"]
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["visible_pair"]["delta_phi"] if data_kin is not None else None
             data_valid = data_kin["visible_pair"]["valid"] if data_kin is not None else None
@@ -1292,7 +1340,8 @@ def plot_region_kinematics(
         elif key == "invis_delta_eta":
             mc_pred_values = mc_kin["pred_invisible_pair"]["delta_eta"]
             mc_truth_values = mc_kin["truth_invisible_pair"]["delta_eta"]
-            mc_valid = mc_kin["pred_invisible_pair"]["valid"] & mc_kin["truth_invisible_pair"]["valid"]
+            mc_reco_valid = mc_kin["pred_invisible_pair"]["valid"]
+            mc_truth_valid = mc_kin["truth_invisible_pair"]["valid"]
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_invisible_pair"]["delta_eta"] if data_kin is not None else None
             data_valid = data_kin["pred_invisible_pair"]["valid"] if data_kin is not None else None
@@ -1300,7 +1349,8 @@ def plot_region_kinematics(
         elif key == "invis_delta_phi":
             mc_pred_values = mc_kin["pred_invisible_pair"]["delta_phi"]
             mc_truth_values = mc_kin["truth_invisible_pair"]["delta_phi"]
-            mc_valid = mc_kin["pred_invisible_pair"]["valid"] & mc_kin["truth_invisible_pair"]["valid"]
+            mc_reco_valid = mc_kin["pred_invisible_pair"]["valid"]
+            mc_truth_valid = mc_kin["truth_invisible_pair"]["valid"]
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_invisible_pair"]["delta_phi"] if data_kin is not None else None
             data_valid = data_kin["pred_invisible_pair"]["valid"] if data_kin is not None else None
@@ -1309,9 +1359,13 @@ def plot_region_kinematics(
             component = key.split("_", 1)[1]
             mc_pred_values = np.concatenate([mc_kin["pred_tau"][0][component], mc_kin["pred_tau"][1][component]])
             mc_truth_values = np.concatenate([mc_kin["truth_tau"][0][component], mc_kin["truth_tau"][1][component]])
-            mc_valid = np.concatenate([
-                mc_kin["pred_tau"][0]["valid"] & mc_kin["truth_tau"][0]["valid"],
-                mc_kin["pred_tau"][1]["valid"] & mc_kin["truth_tau"][1]["valid"],
+            mc_reco_valid = np.concatenate([
+                mc_kin["pred_tau"][0]["valid"],
+                mc_kin["pred_tau"][1]["valid"],
+            ])
+            mc_truth_valid = np.concatenate([
+                mc_kin["truth_tau"][0]["valid"],
+                mc_kin["truth_tau"][1]["valid"],
             ])
             if data_kin is not None:
                 data_values = np.concatenate([data_kin["pred_tau"][0][component], data_kin["pred_tau"][1][component]])
@@ -1321,10 +1375,11 @@ def plot_region_kinematics(
                 data_valid = None
             symmetric = component in {"px", "py", "pz"}
             mc_weights_for_hist = np.concatenate([base_mc_weights, base_mc_weights])
-        mc_finite = mc_valid & finite_mask(mc_pred_values, mc_truth_values, mc_weights_for_hist)
+        mc_reco_finite = mc_reco_valid & finite_mask(mc_pred_values, mc_weights_for_hist)
+        mc_truth_finite = mc_truth_valid & finite_mask(mc_truth_values, mc_weights_for_hist)
         combined_for_bins = np.concatenate([
-            mc_pred_values[mc_finite],
-            mc_truth_values[mc_finite],
+            mc_pred_values[mc_reco_finite],
+            mc_truth_values[mc_truth_finite],
             data_values[data_valid] if data_values is not None and data_valid is not None and np.any(data_valid) else np.array([], dtype=np.float64),
         ])
         bins = choose_hist_bins(combined_for_bins, symmetric=symmetric)
@@ -1334,14 +1389,14 @@ def plot_region_kinematics(
             expanded_truth_names = np.concatenate([truth_names_mc, truth_names_mc])
             expanded_weights = mc_weights_for_hist
             for process_name in truth_processes:
-                process_mask = (expanded_truth_names == process_name) & mc_finite
+                process_mask = (expanded_truth_names == process_name) & mc_reco_finite
                 mc_stack[process_name] = make_weighted_hist(mc_pred_values[process_mask], expanded_weights[process_mask], bins)
-            truth_hist = make_weighted_hist(mc_truth_values[mc_finite], expanded_weights[mc_finite], bins)
+            truth_hist = make_weighted_hist(mc_truth_values[mc_truth_finite], expanded_weights[mc_truth_finite], bins)
         else:
             for process_name in truth_processes:
-                process_mask = (truth_names_mc == process_name) & mc_finite
+                process_mask = (truth_names_mc == process_name) & mc_reco_finite
                 mc_stack[process_name] = make_weighted_hist(mc_pred_values[process_mask], mc_weights_for_hist[process_mask], bins)
-            truth_hist = make_weighted_hist(mc_truth_values[mc_finite], mc_weights_for_hist[mc_finite], bins)
+            truth_hist = make_weighted_hist(mc_truth_values[mc_truth_finite], mc_weights_for_hist[mc_truth_finite], bins)
 
         data_hist = data_err = None
         data_note = None
@@ -1393,6 +1448,9 @@ def gather_region_kinematics_plots(
     use_weighted: bool,
 ) -> dict[str, Any]:
     predicted_names = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
+    if data_events is not None:
+        data_predicted_names = np.asarray(ak.to_list(data_events["evenet_pred_class_name"]), dtype=object)
+        predicted_names = np.concatenate([predicted_names, data_predicted_names])
     region_names = [name for name in class_names if np.any(predicted_names == name)]
     if max_processes is not None:
         region_names = region_names[:max_processes]
@@ -1422,6 +1480,7 @@ def main() -> None:
     use_weighted = not args.unweighted
 
     class_names = build_class_names_from_analysis(args.analysis_config.resolve(), args.evenet_config.resolve())
+    summary_class_names = summary_channel_order(class_names)
 
     truth_idx = to_numpy(mc_events["evenet_truth_class_index"], np.int64)
     pred_idx = to_numpy(mc_events["evenet_pred_class_index"], np.int64)
@@ -1451,21 +1510,21 @@ def main() -> None:
         plot_predicted_class_comparison(
             mc_events=mc_events,
             data_events=data_events,
-            class_names=class_names,
+            class_names=summary_class_names,
             output_path=output_dir / "predicted_class_data_vs_mc.png",
             use_weighted=use_weighted,
         )
     purity_metrics = plot_predicted_channel_purity(
         mc_events=mc_events,
         data_events=data_events,
-        class_names=class_names,
+        class_names=summary_class_names,
         output_path=output_dir / "predicted_channel_purity.png",
         use_weighted=use_weighted,
     )
     region_kinematics_metrics = gather_region_kinematics_plots(
         mc_events=mc_events,
         data_events=data_events,
-        class_names=class_names,
+        class_names=summary_class_names,
         output_dir=output_dir,
         max_processes=args.max_processes,
         use_weighted=use_weighted,
@@ -1478,6 +1537,7 @@ def main() -> None:
             "analysis_config": str(args.analysis_config.resolve()),
             "evenet_config": str(args.evenet_config.resolve()),
             "use_weighted": use_weighted,
+            "summary_channel_order": summary_class_names,
         },
         "classification": confusion_metrics,
         "purity": purity_metrics,
