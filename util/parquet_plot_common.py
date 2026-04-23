@@ -5,6 +5,46 @@ from pathlib import Path
 import awkward as ak
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import MultipleLocator
+
+
+PROCESS_LATEX_LABELS = {
+    "data94": "Data",
+    "data": "Data",
+    "Ztautau": r"$Z\to\tau\tau$",
+    "Ztautau_pipi": r"$\tau\tau\to\pi\pi$",
+    "Ztautau_pirho": r"$\tau\tau\to\pi\rho$",
+    "Ztautau_pie": r"$\tau\tau\to\pi e$",
+    "Ztautau_pimu": r"$\tau\tau\to\pi\mu$",
+    "Ztautau_rhoe": r"$\tau\tau\to\rho e$",
+    "Ztautau_rhomu": r"$\tau\tau\to\rho\mu$",
+    "Ztautau_rhorho": r"$\tau\tau\to\rho\rho$",
+    "Ztautau_ee": r"$\tau\tau\to ee$",
+    "Ztautau_mumu": r"$\tau\tau\to\mu\mu$",
+    "Ztautau_emu": r"$\tau\tau\to e\mu$",
+    "Ztautau_mue": r"$\tau\tau\to\mu e$",
+    "Ztautau_piother": r"$\tau\tau\to\pi+\mathrm{other}$",
+    "Ztautau_others": r"$Z\to\tau\tau$ other",
+    "Zll": r"$Z\to\ell\ell$",
+    "Zqq": r"$Z\to q\bar{q}$",
+}
+
+
+def process_latex_label(sample_name: str) -> str:
+    return PROCESS_LATEX_LABELS.get(sample_name, sample_name.replace("_", r"\_"))
+
+
+def process_yield_label(sample_name: str, yield_value: float | None = None) -> str:
+    label = process_latex_label(sample_name)
+    if yield_value is None:
+        return label
+    if abs(yield_value) >= 100:
+        yield_text = f"{yield_value:.0f}"
+    elif abs(yield_value) >= 10:
+        yield_text = f"{yield_value:.1f}"
+    else:
+        yield_text = f"{yield_value:.2g}"
+    return f"{label} [{yield_text}]"
 
 
 def get_initial_total_num_events(events: ak.Array) -> int:
@@ -117,6 +157,7 @@ def plot_from_histograms(
         for index, sample_name in enumerate(hist_mc):
             hist = hist_mc[sample_name].astype(float)
             err2 = hist_mc_err2[sample_name].astype(float)
+            raw_yield = float(np.sum(hist))
             if use_normalize:
                 hist = hist / sum_mc_yields
                 err2 = err2 / (sum_mc_yields ** 2)
@@ -127,7 +168,7 @@ def plot_from_histograms(
                 bottom=total_mc,
                 width=np.diff(bin_edges),
                 align="edge",
-                label=sample_name,
+                label=process_yield_label(sample_name, raw_yield),
                 color=colors[index % len(colors)],
                 alpha=0.75,
                 edgecolor="black",
@@ -188,7 +229,11 @@ def plot_from_histograms(
             ax_ratio.axhline(1.0, color="gray", linestyle=":")
             ax_ratio.set_ylabel("Data/MC")
             ax_ratio.set_xlabel(x_label)
-            ax_ratio.set_ylim(0.5, 1.5)
+            ax_ratio.set_ylim(0.9, 1.1)
+            ax_ratio.set_yticks(np.arange(0.9, 1.1001, 0.05))
+            ax_ratio.yaxis.set_minor_locator(MultipleLocator(0.01))
+            ax_ratio.grid(axis="y", which="major", alpha=0.45)
+            ax_ratio.grid(axis="y", which="minor", alpha=0.18)
 
         ax.legend(loc="best")
 

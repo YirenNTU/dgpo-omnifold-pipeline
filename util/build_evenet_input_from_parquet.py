@@ -222,6 +222,43 @@ def flatten_global_feature(values: ak.Array) -> ak.Array:
     return ak.values_astype(filled, np.float32)[..., np.newaxis]
 
 
+def _p4_component(p4: ak.Array, component: str) -> ak.Array:
+    fields = set(p4.fields)
+    if component == "px":
+        return p4["px"] if "px" in fields else p4["x"]
+    if component == "py":
+        return p4["py"] if "py" in fields else p4["y"]
+    if component == "pz":
+        return p4["pz"] if "pz" in fields else p4["z"]
+    if component in {"E", "energy"}:
+        return p4["E"] if "E" in fields else p4["t"]
+    raise ValueError(f"Unsupported p4 component '{component}'.")
+
+
+def resolve_global_feature(events: ak.Array, field_name: str) -> ak.Array:
+    if field_name in events.fields:
+        return events[field_name]
+
+    if "missing_p4" in events.fields:
+        missing_p4 = events["missing_p4"]
+        if field_name == "missing_px":
+            return _p4_component(missing_p4, "px")
+        if field_name == "missing_py":
+            return _p4_component(missing_p4, "py")
+        if field_name == "missing_pz":
+            return _p4_component(missing_p4, "pz")
+        if field_name in {"missing_E", "missing_energy"}:
+            return _p4_component(missing_p4, "E")
+        if field_name == "missing_pt":
+            px = _p4_component(missing_p4, "px")
+            py = _p4_component(missing_p4, "py")
+            return np.sqrt(px * px + py * py)
+
+    preview = ", ".join(events.fields[:25])
+    suffix = " ..." if len(events.fields) > 25 else ""
+    raise KeyError(f"Global feature '{field_name}' is missing. Available fields include: {preview}{suffix}")
+
+
 def build_point_cloud(events: ak.Array, max_particles: int, feature_config: FeatureConfig):
     valid_part_mask = part_energy_mask(events)
     part_p4 = filter_part_values(events, build_momentum4d(
@@ -266,7 +303,7 @@ def build_global_conditions(events: ak.Array, feature_config: FeatureConfig):
     feature_names: list[str] = []
 
     for field_name in feature_config.global_fields:
-        flattened = flatten_global_feature(events[field_name])
+        flattened = flatten_global_feature(resolve_global_feature(events, field_name))
         features.append(flattened)
         feature_names.append(field_name)
 
@@ -578,16 +615,15 @@ def write_monitoring_plots(
 
     for field_name in feature_config.global_fields:
         values_by_sample = {
-            sample.name: sanitize_hist_values(ak.to_numpy(events[field_name], allow_missing=False))
+            sample.name: sanitize_hist_values(ak.to_numpy(resolve_global_feature(events, field_name), allow_missing=False))
             for sample, events in expanded_samples
-            if field_name in events.fields
         }
         if not values_by_sample:
             continue
         bins = choose_bins(values_by_sample)
         write_monitor_plot(
-            expanded_samples=[(sample, events) for sample, events in expanded_samples if field_name in events.fields],
-            extractor=lambda events, field_name=field_name: ak.to_numpy(events[field_name], allow_missing=False),
+            expanded_samples=expanded_samples,
+            extractor=lambda events, field_name=field_name: ak.to_numpy(resolve_global_feature(events, field_name), allow_missing=False),
             bins=bins,
             title=field_name,
             xlabel=field_name,
