@@ -330,6 +330,22 @@ For current prediction parquets, the central/QI export reads `evenet_weight` fro
 
 `--num-workers` parallelizes the config-driven export over parent samples and prints progress bars such as `mc export [####----] 1/3 Ztautau`. Keep it at `1` if memory pressure is high.
 
+For the ML-based QIProcessor configs in the repository, write the export directly to the method-specific root:
+
+```bash
+python3 util/export_evenet_prediction_to_qi.py \
+  --analysis-config config/analysis.yaml \
+  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/test__evenet_pred.parquet \
+  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/data__evenet_pred.parquet \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain \
+  --qi-method-label qi-export \
+  --num-workers 4
+```
+
+This produces files under `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/{sample}/`. The scratch method uses the same pattern with `predict-scratch`.
+
+The export writes both central cut-based files such as `filtered___hadhad.parquet` and ML dedicated files such as `filtered___Ztautau_pirho.parquet`. The ML dedicated files are selected by `evenet_pred_class_name`, while central files are selected by their original central cut flags.
+
 The export preserves central fields such as:
 
 - `lead_a_visible_p4`
@@ -386,8 +402,11 @@ python3 util/plot_qi_method_comparison.py \
   --sample-name Ztautau \
   --data-sample-name data94 \
   --mc-sample-names Ztautau Zll Zqq \
+  --metric-grouping evenet-channel \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison
 ```
+
+Use `--metric-grouping evenet-channel` to make the final metric summary y-axis follow the actual EveNet predicted classes such as `Ztautau_pipi`, `Ztautau_pirho`, `Ztautau_pie`, and `Ztautau_others`. Use `--metric-grouping region` if you intentionally want central cut-based files such as `hadhad`, `ee`, `mumu`, and `emu`.
 
 Outputs:
 
@@ -395,7 +414,7 @@ Outputs:
 - `physics_data_mc_<method>/<region>_<observable>.png`, data-vs-stacked-MC physics distributions
 - `physics_data_mc_<method>/<region>_<observable>_log.png`, log-y companion plots
 - `neutrino_truth_vs_pred_<region>.png`
-- `cut_based_vs_evenet_region_matrix.png`, when the raw parquet contains EveNet predicted class labels
+- `cut_based_vs_evenet_region_matrix.png`, comparing central cut-based regions against EveNet fine predicted channels when the raw parquet contains EveNet predicted class labels
 - `qi_method_comparison_metrics.json`
 - `qi_method_comparison_audit.json`
 - `qi_method_comparison_report.md`

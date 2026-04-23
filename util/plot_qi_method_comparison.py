@@ -77,6 +77,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--regions", nargs="+", default=["hadhad", "ee", "mumu", "emu"], help="Regions to compare.")
     parser.add_argument(
+        "--metric-grouping",
+        choices=["region", "evenet-channel"],
+        default="region",
+        help=(
+            "Grouping for final metric summary plots. 'region' reads filtered___<region>.parquet. "
+            "'evenet-channel' groups filtered___raw.parquet by evenet_pred_class_name."
+        ),
+    )
+    parser.add_argument(
         "--physics-observables",
         nargs="+",
         default=None,
@@ -323,17 +332,35 @@ def summary_region_order(regions: list[str]) -> list[str]:
     return top_regions + signal_regions
 
 
-def classify_evenet_region(class_name: str) -> str:
-    name = str(class_name)
-    if name in {"Ztautau_pipi", "Ztautau_pirho", "Ztautau_rhorho"}:
-        return "hadhad"
-    if name == "Ztautau_ee":
-        return "ee"
-    if name == "Ztautau_mumu":
-        return "mumu"
-    if name in {"Ztautau_emu", "Ztautau_mue"}:
-        return "emu"
-    return "other"
+def is_background_like_channel(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in {"zll", "zqq", "other", "others", "background", "unpredicted"} or lowered.endswith("_others")
+
+
+def predicted_channel_order(names: list[str]) -> list[str]:
+    unique_names = list(dict.fromkeys(names))
+
+    def priority(name: str) -> int:
+        lowered = name.lower()
+        if lowered in {"ztautau_others", "tautau_others"} or lowered.endswith("_others"):
+            return 0
+        if is_background_like_channel(name):
+            return 1
+        return 2
+
+    return [
+        name
+        for _, name in sorted(
+            enumerate(unique_names),
+            key=lambda indexed_name: (priority(indexed_name[1]), indexed_name[0]),
+        )
+    ]
+
+
+def channel_label(name: str) -> str:
+    if name.startswith("Ztautau_"):
+        return name.removeprefix("Ztautau_")
+    return name
 
 
 def cms_label(ax, text: str = "Work in progress") -> None:
@@ -594,8 +621,10 @@ def plot_neutrino_truth_scatter(
 def plot_cut_based_vs_evenet(events: ak.Array, output_dir: Path, regions: list[str]) -> None:
     if "evenet_pred_class_name" not in events.fields:
         return
-    pred_regions = np.array([classify_evenet_region(name) for name in ak.to_list(events["evenet_pred_class_name"])], dtype=object)
-    labels = list(regions) + ["other"]
+    pred_channels = np.array([str(name) for name in ak.to_list(events["evenet_pred_class_name"])], dtype=object)
+    labels = predicted_channel_order(pred_channels.tolist())
+    if not labels:
+        return
     matrix = np.zeros((len(regions), len(labels)), dtype=np.float64)
     weights = event_weights(events)
     for i, region in enumerate(regions):
@@ -603,16 +632,17 @@ def plot_cut_based_vs_evenet(events: ak.Array, output_dir: Path, regions: list[s
         if cut_field not in events.fields:
             continue
         cut_mask = to_numpy(events[cut_field], bool)
-        for j, pred_region in enumerate(labels):
-            matrix[i, j] = np.sum(weights[cut_mask & (pred_regions == pred_region)])
+        for j, pred_channel in enumerate(labels):
+            matrix[i, j] = np.sum(weights[cut_mask & (pred_channels == pred_channel)])
 
-    fig, ax = plt.subplots(figsize=(7.5, 5.8), dpi=180)
+    fig_width = max(8.5, 0.78 * len(labels) + 3.5)
+    fig, ax = plt.subplots(figsize=(fig_width, 5.8), dpi=180)
     image = ax.imshow(matrix, cmap="Blues")
     ax.set_xticks(np.arange(len(labels)))
-    ax.set_xticklabels(labels, rotation=35, ha="right")
+    ax.set_xticklabels([channel_label(label) for label in labels], rotation=45, ha="right")
     ax.set_yticks(np.arange(len(regions)))
     ax.set_yticklabels(regions)
-    ax.set_xlabel("EveNet predicted broad region")
+    ax.set_xlabel("EveNet predicted fine channel")
     ax.set_ylabel("Central cut-based region")
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
@@ -629,6 +659,70 @@ def load_optional_region(root: Path, sample_name: str, region: str) -> ak.Array 
     if not path.exists():
         return None
     return load_events(path)
+
+
+def metric_groups_from_regions(
+    methods: dict[str, Path],
+    sample_name: str,
+    regions: list[str],
+    output_dir: Path,
+    max_scatter_points: int,
+) -> tuple[dict[str, dict[str, dict[str, Any]]], list[str]]:
+    method_names = list(methods)
+    metrics: dict[str, dict[str, dict[str, Any]]] = {method: {} for method in method_names}
+    for region in regions:
+        region_events: dict[str, ak.Array] = {}
+        for method, root in methods.items():
+            path = parquet_for(root, sample_name, region)
+            if not path.exists():
+                continue
+            events = load_events(path)
+            region_events[method] = events
+            metrics[method][region] = method_region_metrics(events)
+
+        if len(region_events) >= 2:
+            plot_neutrino_truth_scatter(region_events, output_dir, region, max_scatter_points)
+    active_regions = [region for region in regions if any(region in metrics.get(method, {}) for method in method_names)]
+    return metrics, active_regions
+
+
+def metric_groups_from_evenet_channels(
+    methods: dict[str, Path],
+    sample_name: str,
+    output_dir: Path,
+    max_scatter_points: int,
+) -> tuple[dict[str, dict[str, dict[str, Any]]], list[str]]:
+    method_names = list(methods)
+    metrics: dict[str, dict[str, dict[str, Any]]] = {method: {} for method in method_names}
+    raw_events_by_method: dict[str, ak.Array] = {}
+    all_channels: list[str] = []
+
+    for method, root in methods.items():
+        raw_path = parquet_for(root, sample_name, "raw")
+        if not raw_path.exists():
+            continue
+        events = load_events(raw_path)
+        if "evenet_pred_class_name" not in events.fields:
+            continue
+        raw_events_by_method[method] = events
+        all_channels.extend(str(name) for name in ak.to_list(events["evenet_pred_class_name"]))
+
+    channels = predicted_channel_order(all_channels)
+    for channel in channels:
+        channel_events: dict[str, ak.Array] = {}
+        for method, events in raw_events_by_method.items():
+            pred_channels = np.array([str(name) for name in ak.to_list(events["evenet_pred_class_name"])], dtype=object)
+            subset = events[pred_channels == channel]
+            if len(subset) == 0:
+                continue
+            channel_events[method] = subset
+            metrics[method][channel] = method_region_metrics(subset)
+
+        if len(channel_events) >= 2:
+            plot_neutrino_truth_scatter(channel_events, output_dir, sanitize_filename(channel), max_scatter_points)
+
+    active_channels = [channel for channel in channels if any(channel in metrics.get(method, {}) for method in method_names)]
+    return metrics, active_channels
 
 
 def weighted_hist_and_err2(values: np.ndarray, weights: np.ndarray, bins: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -749,13 +843,14 @@ def build_audit_summary(
     output_dir: Path,
     raw_matrix_available: bool,
     physics_data_mc_summary: dict[str, Any],
+    metric_grouping: str,
 ) -> dict[str, Any]:
     generated_plots = sorted(str(path.relative_to(output_dir)) for path in output_dir.rglob("*.png"))
     method_summary: dict[str, Any] = {}
     for method, root in methods.items():
         channel_summary: dict[str, Any] = {}
         for region in regions:
-            parquet_path = parquet_for(root, sample_name, region)
+            parquet_path = parquet_for(root, sample_name, "raw" if metric_grouping == "evenet-channel" else region)
             region_metrics = metrics.get(method, {}).get(region, {})
             channel_summary[region] = {
                 "parquet": str(parquet_path),
@@ -777,6 +872,7 @@ def build_audit_summary(
     return {
         "methods": method_summary,
         "regions": regions,
+        "metric_grouping": metric_grouping,
         "sample_name": sample_name,
         "generated_plots": generated_plots,
         "physics_data_mc": physics_data_mc_summary,
@@ -867,7 +963,6 @@ def main() -> None:
     method_names = list(methods)
     candidate_regions = summary_region_order(["other", *args.regions])
 
-    metrics: dict[str, dict[str, dict[str, Any]]] = {method: {} for method in method_names}
     raw_for_matrix = None
     for method, root in methods.items():
         raw_path = parquet_for(root, args.sample_name, "raw")
@@ -877,29 +972,33 @@ def main() -> None:
                 raw_for_matrix = raw_events
                 break
 
-    for region in candidate_regions:
-        region_events: dict[str, ak.Array] = {}
-        for method, root in methods.items():
-            path = parquet_for(root, args.sample_name, region)
-            if not path.exists():
-                continue
-            events = load_events(path)
-            region_events[method] = events
-            metrics[method][region] = method_region_metrics(events)
+    if args.metric_grouping == "evenet-channel":
+        metrics, active_regions = metric_groups_from_evenet_channels(
+            methods=methods,
+            sample_name=args.sample_name,
+            output_dir=args.output_dir,
+            max_scatter_points=args.max_scatter_points,
+        )
+        physics_regions = candidate_regions
+    else:
+        metrics, active_regions = metric_groups_from_regions(
+            methods=methods,
+            sample_name=args.sample_name,
+            regions=candidate_regions,
+            output_dir=args.output_dir,
+            max_scatter_points=args.max_scatter_points,
+        )
+        physics_regions = active_regions
 
-        if len(region_events) >= 2:
-            plot_neutrino_truth_scatter(region_events, args.output_dir, region, args.max_scatter_points)
-
-    active_regions = [region for region in candidate_regions if any(region in metrics.get(method, {}) for method in method_names)]
     plot_metric_summary(metrics, args.output_dir, active_regions, method_names)
     if raw_for_matrix is not None:
-        cut_based_regions = [region for region in active_regions if not is_background_like_region(region)]
+        cut_based_regions = [region for region in args.regions if not is_background_like_region(region)]
         if cut_based_regions:
             plot_cut_based_vs_evenet(raw_for_matrix, args.output_dir, cut_based_regions)
     physics_data_mc_summary = plot_physics_data_mc_comparisons(
         methods=methods,
         output_dir=args.output_dir,
-        regions=active_regions,
+        regions=physics_regions,
         data_sample_name=args.data_sample_name,
         mc_sample_names=list(args.mc_sample_names),
         requested_observables=args.physics_observables,
@@ -913,6 +1012,7 @@ def main() -> None:
         output_dir=args.output_dir,
         raw_matrix_available=raw_for_matrix is not None,
         physics_data_mc_summary=physics_data_mc_summary,
+        metric_grouping=args.metric_grouping,
     )
     with (args.output_dir / "qi_method_comparison_audit.json").open("w") as handle:
         json.dump(json_safe(audit), handle, indent=2, sort_keys=True)

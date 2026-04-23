@@ -578,9 +578,27 @@ def mark_baseline_method(events: ak.Array) -> ak.Array:
     return output
 
 
+def add_evenet_region_cut_fields(events: ak.Array, regions: list[str]) -> ak.Array:
+    output = events
+    if "evenet_pred_class_name" not in output.fields:
+        return output
+    pred_class = np.asarray(ak.to_list(output["evenet_pred_class_name"]), dtype=object)
+    flags_valid = (
+        ak.to_numpy(output["flags_valid"], allow_missing=False).astype(bool)
+        if "flags_valid" in output.fields
+        else np.ones(len(output), dtype=bool)
+    )
+    for region in regions:
+        if not region.startswith("Ztautau_"):
+            continue
+        output[f"{region}_cut"] = (pred_class == region) & flags_valid
+    return output
+
+
 def write_qi_tree(events: ak.Array, output_root: Path, sample_name: str, regions: list[str]) -> dict[str, int]:
     sample_dir = output_root / sample_name
     sample_dir.mkdir(parents=True, exist_ok=True)
+    events = add_evenet_region_cut_fields(events, regions)
 
     counts: dict[str, int] = {"raw": int(len(events))}
     ak.to_parquet(events, sample_dir / "filtered___raw.parquet", compression="snappy")
