@@ -208,7 +208,7 @@ def plot_from_histograms(
                 yerr=data_err,
                 fmt="o",
                 color="black",
-                label="Data",
+                label=process_yield_label("data", data_total),
             )
 
             with np.errstate(divide="ignore", invalid="ignore"):

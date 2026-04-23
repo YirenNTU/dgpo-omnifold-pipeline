@@ -649,6 +649,10 @@ def write_monitoring_plots(
         ("tau_vis_rho_eta", lambda events: extract_visible_tau_observable(events, "rho", "eta"), False, False, False),
         ("tau_vis_rho_phi", lambda events: extract_visible_tau_observable(events, "rho", "phi"), False, False, False),
         ("tau_vis_rho_mass", lambda events: extract_visible_tau_observable(events, "rho", "mass"), False, False, False),
+        ("target_invisible_E", lambda events: extract_target_invisible_observable(events, "E"), True, True, True),
+        ("target_invisible_px", lambda events: extract_target_invisible_observable(events, "px"), True, False, True),
+        ("target_invisible_py", lambda events: extract_target_invisible_observable(events, "py"), True, False, True),
+        ("target_invisible_pz", lambda events: extract_target_invisible_observable(events, "pz"), True, False, True),
         ("target_invisible_energy", lambda events: extract_target_invisible_observable(events, "energy"), True, True, True),
         ("target_invisible_pt", lambda events: extract_target_invisible_observable(events, "pt"), True, True, True),
         ("target_invisible_eta", lambda events: extract_target_invisible_observable(events, "eta"), True, False, True),
@@ -660,6 +664,8 @@ def write_monitoring_plots(
             if not (mc_only and sample.is_data) and not (signal_only and not sample_uses_invisible_target(sample))
         }
         if not any(values.size > 0 for values in values_by_sample.values()):
+            if plot_name.startswith("target_invisible"):
+                console.print(f"  [yellow]Skipped monitor[/yellow] [white]{plot_name}[/white]: no target invisible entries")
             continue
         bins = choose_bins(values_by_sample)
         write_monitor_plot(
