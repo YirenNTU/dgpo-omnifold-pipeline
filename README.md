@@ -407,8 +407,8 @@ Then run QIProcessor from the repository root, not from `ml_pipeline`:
 
 ```bash
 cd /path/to/lep_tree_ana
-python3 bin/tree_ana -c config/config_qi_evenet_pretrain.yaml
-python3 bin/tree_ana -c config/config_qi_evenet_scratch.yaml
+PYTHONPATH=$PWD python3 bin/tree_ana -c config/config_qi_evenet_pretrain.yaml
+PYTHONPATH=$PWD python3 bin/tree_ana -c config/config_qi_evenet_scratch.yaml
 ```
 
 Expected QIProcessor outputs:
