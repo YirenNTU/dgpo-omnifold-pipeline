@@ -5,15 +5,18 @@ Samples:
     is_signal: false
     lumi: 46.3 # pb^-1
     input_files:
-      - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/data94/filtered___tautau.parquet"
-
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/data94/filtered___baseline.parquet"
+    raw_files:
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/data94/filtered___raw.parquet"
   Ztautau:
     name: "Ztautau"
     is_data: false
     is_signal: true
     norm_factor: 1458.9 # pb
     input_files:
-      - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Ztautau/filtered___tautau.parquet"
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau/filtered___baseline.parquet"
+    raw_files:
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau/filtered___raw.parquet"
 
   Zll:
     name: "Zll"
@@ -21,7 +24,9 @@ Samples:
     is_signal: false
     norm_factor:  2844.4 # pb
     input_files:
-      - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Zll/filtered___tautau.parquet"
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Zll/filtered___baseline.parquet"
+    raw_files:
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Zll/filtered___raw.parquet"
 
   Zqq:
     name: "Zqq"
@@ -29,7 +34,26 @@ Samples:
     is_signal: false
     norm_factor: 30511.2 # pb
     input_files:
-      - "/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260212-pion-channel/Zqq/filtered___tautau.parquet"
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Zqq/filtered___baseline.parquet"
+    raw_files:
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Zqq/filtered___raw.parquet"
+
+EveNetPrediction:
+  # Optional workflow defaults used by util/predict_evenet_from_raw_parquet.py
+  # and util/export_evenet_prediction_to_qi.py. Command-line arguments override these.
+  converted_parquets: []
+  predict_output_dir: null
+  mc_parquet: null
+  data_parquet: null
+  qi_output_dir: null
+  qi_method_label: evenet
+  mc_split_fraction: null
+  regions:
+    - baseline
+    - hadhad
+    - ee
+    - mumu
+    - emu
 
 Inputs:
   Part:

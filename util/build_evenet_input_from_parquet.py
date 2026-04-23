@@ -307,6 +307,13 @@ def to_numpy_array(values, dtype=None) -> np.ndarray:
     return values
 
 
+def source_event_key_array(events: ak.Array) -> np.ndarray:
+    for key in ("evtNumber", "Event_evtNumber"):
+        if key in events.fields:
+            return to_numpy_array(events[key], np.int64)
+    return np.arange(len(events), dtype=np.int64)
+
+
 def build_dataset(
     expanded_samples: list[tuple[Sample, ak.Array]],
     max_particles: int,
@@ -321,7 +328,7 @@ def build_dataset(
     point_cloud_feature_names: list[str] | None = None
     global_feature_names: list[str] | None = None
 
-    for sample, events in expanded_samples:
+    for source_sample_index, (sample, events) in enumerate(expanded_samples):
         console.print(f"[bold cyan]Converting[/bold cyan] [white]{sample.name}[/white]")
 
         x, x_mask, num_sequential_vectors, point_cloud_names = build_point_cloud(events, max_particles, feature_config)
@@ -377,6 +384,11 @@ def build_dataset(
             "tau_vis_rho_mask": to_numpy_array(tau_vis_rho_mask, bool),
             "tau_vis_target": to_numpy_array(tau_vis_target, np.float32),
             "tau_vis_target_mask": to_numpy_array(tau_vis_target_mask, bool),
+            # Source identifiers are carried through preprocessing shuffles/splits
+            # so downstream prediction can be merged back into central parquet safely.
+            "source_sample_index": np.full(len(events), source_sample_index, dtype=np.int64),
+            "source_event_index": np.arange(len(events), dtype=np.int64),
+            "source_event_key": source_event_key_array(events),
         }
         if include_classification:
             batch["classification"] = np.full(len(events), class_index[sample.name], dtype=np.int64)

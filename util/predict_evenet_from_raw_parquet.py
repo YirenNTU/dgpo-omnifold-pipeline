@@ -95,14 +95,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        required=True,
-        help="Directory where augmented parquet outputs are written.",
+        default=None,
+        help=(
+            "Directory where augmented parquet outputs are written. If omitted, uses "
+            "EveNetPrediction.predict_output_dir or EveNetPrediction.output_dir from analysis.yaml."
+        ),
     )
     parser.add_argument(
         "--converted-parquet",
         nargs="+",
-        required=True,
-        help="EveNet-converted parquet files to run prediction on.",
+        default=None,
+        help=(
+            "EveNet-converted parquet files to run prediction on. If omitted, uses "
+            "EveNetPrediction.converted_parquets from analysis.yaml."
+        ),
     )
     parser.add_argument(
         "--shape-metadata",
@@ -148,6 +154,42 @@ def parse_args() -> argparse.Namespace:
         help="If set, write evenet_weight=1 for all events instead of physics-normalized MC weights.",
     )
     return parser.parse_args()
+
+
+def prediction_config_from_analysis(analysis_config_path: Path) -> dict[str, Any]:
+    return read_yaml(analysis_config_path).get("EveNetPrediction", {})
+
+
+def resolve_prediction_output_dir(args: argparse.Namespace, pred_cfg: dict[str, Any]) -> Path:
+    output_dir = args.output_dir or pred_cfg.get("predict_output_dir") or pred_cfg.get("output_dir")
+    if output_dir is None:
+        raise ValueError("Pass --output-dir or set EveNetPrediction.predict_output_dir in analysis.yaml.")
+    return Path(output_dir).expanduser().resolve()
+
+
+def resolve_converted_parquets(args: argparse.Namespace, pred_cfg: dict[str, Any]) -> list[str]:
+    converted = args.converted_parquet or pred_cfg.get("converted_parquets")
+    if converted is None:
+        values = []
+        for key in ("mc_converted_parquet", "test_converted_parquet", "data_converted_parquet"):
+            value = pred_cfg.get(key)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                values.extend(value)
+            else:
+                values.append(value)
+        converted = values
+    if not converted:
+        raise ValueError("Pass --converted-parquet or set EveNetPrediction.converted_parquets in analysis.yaml.")
+    return [str(Path(path).expanduser()) for path in converted]
+
+
+def resolve_converted_split_fraction(args: argparse.Namespace, pred_cfg: dict[str, Any]) -> float | None:
+    if args.converted_split_fraction is not None:
+        return args.converted_split_fraction
+    value = pred_cfg.get("mc_split_fraction") or pred_cfg.get("converted_split_fraction")
+    return float(value) if value is not None else None
 
 
 def resolve_default_paths(config_path: Path, config_data: dict[str, Any]) -> dict[str, Any]:
@@ -765,6 +807,10 @@ def augment_converted_parquet_task(
         "evenet_weight": outputs["physics_weight"],
     }
 
+    for source_key in ("source_sample_index", "source_event_index", "source_event_key"):
+        if source_key in batch_np:
+            output_columns[source_key] = batch_np[source_key].astype(np.int64)
+
     if "tau_vis_prong" in batch_np:
         tau_vis_prong = batch_np["tau_vis_prong"].astype(np.float32)
         tau_vis_prong_mask = batch_np.get(
@@ -887,7 +933,10 @@ def worker_main(
 
 def main() -> None:
     args = parse_args()
-    output_dir = args.output_dir.resolve()
+    pred_cfg = prediction_config_from_analysis(args.analysis_config.resolve())
+    output_dir = resolve_prediction_output_dir(args, pred_cfg)
+    converted_parquets = resolve_converted_parquets(args, pred_cfg)
+    converted_split_fraction = resolve_converted_split_fraction(args, pred_cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     runtime_train_config = prepare_runtime_train_config(
@@ -913,7 +962,7 @@ def main() -> None:
         analysis_feature_config,
     )
     loaded_class_names = runtime_class_names(Path(runtime_train_config))
-    tasks = build_converted_tasks(args.converted_parquet, output_dir, num_chunks_per_file=max(1, num_workers))
+    tasks = build_converted_tasks(converted_parquets, output_dir, num_chunks_per_file=max(1, num_workers))
     if not tasks:
         raise ValueError("No converted parquet tasks were found.")
 
@@ -935,10 +984,10 @@ def main() -> None:
                 "checkpoint": str(checkpoint_path),
                 "num_tasks": len(tasks),
                 "signal_classes": sorted(signal_class_names),
-                "converted_parquet": [str(Path(path).resolve()) for path in args.converted_parquet],
+                "converted_parquet": [str(Path(path).resolve()) for path in converted_parquets],
                 "shape_metadata": str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
                 "class_weight_map": class_weight_map,
-                "converted_split_fraction": args.converted_split_fraction,
+                "converted_split_fraction": converted_split_fraction,
                 "disable_ema": bool(args.disable_ema),
                 "use_weighted_output": not bool(args.unweighted_output),
             },
@@ -959,7 +1008,7 @@ def main() -> None:
             use_weighted_output=not args.unweighted_output,
             shape_metadata_path=str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
             class_weight_map=class_weight_map,
-            converted_split_fraction=args.converted_split_fraction,
+            converted_split_fraction=converted_split_fraction,
         )
         merge_converted_chunk_outputs(tasks)
         return
@@ -977,7 +1026,7 @@ def main() -> None:
             not args.unweighted_output,
             str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
             class_weight_map,
-            args.converted_split_fraction,
+            converted_split_fraction,
         ),
         nprocs=num_workers,
         join=True,

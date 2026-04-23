@@ -359,6 +359,29 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --num-gpus 4
 ```
 
+You can also put the routine paths in `analysis.yaml`:
+
+```yaml
+EveNetPrediction:
+  converted_parquets:
+    - /path/to/test.parquet
+    - /path/to/data.parquet
+  predict_output_dir: /path/to/predict_output
+  mc_split_fraction: 0.5
+```
+
+Then the prediction command can be shorter:
+
+```bash
+cd ml_pipeline
+python3 util/predict_evenet_from_raw_parquet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train.yaml \
+  --checkpoint /path/to/last.ckpt \
+  --batch-size 1024 \
+  --num-gpus 4
+```
+
 Notes:
 
 - `--num-gpus` is now event-chunk parallel for converted parquet mode, so a single large parquet can be split across multiple GPUs.
@@ -366,6 +389,7 @@ Notes:
 - `--unweighted-output` forces `evenet_weight = 1` for all events, which is useful when you want predictor output closer to unweighted training/validation comparisons.
 - `--converted-split-fraction` is used to rescale MC `evenet_weight` back to the full-sample normalization for data-vs-MC plots.
   - Example: if `test.parquet` corresponds to half of the original MC sample, pass `0.5`, so MC gets `x2` in the output plotting weight.
+- If `--converted-split-fraction` is omitted, the predictor uses `EveNetPrediction.mc_split_fraction` or `EveNetPrediction.converted_split_fraction` from `analysis.yaml` when present.
 - Data is not assigned MC truth labels and keeps `evenet_weight = 1`.
 
 ### Prediction parquet contents
@@ -380,6 +404,9 @@ The converted-mode prediction output is intentionally self-contained for downstr
 - `flags_valid`
 - `event_weight`
 - `evenet_weight`
+- `source_sample_index`
+- `source_event_index`
+- `source_event_key`
 - `pred_invisible_slot{0,1}_*`
 - `target_invisible_slot{0,1}_*`
 - `tau_vis_prong_slot{0,1}_energy`
@@ -460,3 +487,130 @@ When comparing standalone test-time prediction to the validation plots logged du
 - The standalone summary plots use `evenet_weight`, while training loss uses `apply_event_weight: false` in the current local config.
 
 So a visible degradation from validation to standalone test does not automatically imply a broken prediction pipeline; some of the difference can come from these intentionally different evaluation conditions.
+
+## Central QI / Unfolding Integration
+
+The central QI/unfolding framework should stay untouched. To compare EveNet against the traditional MMC/algebraic baseline, use an adapter layer that rewrites EveNet predictions into the same parquet schema the central processors already expect:
+
+- [util/export_evenet_prediction_to_qi.py](util/export_evenet_prediction_to_qi.py)
+
+The important convention is that central QI uses `lead_a` / `lead_b` as the tau+ / tau- analysis legs, while EveNet converted tensors use a canonical visible-slot ordering. The adapter therefore reads a full central/DataLoader raw parquet as the source of truth for event weights, cuts, truth fields, and `lead_a` / `lead_b`, then matches EveNet slots to those legs by visible-object `deltaR`.
+
+The output keeps the full raw event universe. Events that were not sent through EveNet, such as events outside the `nprong == 2` EveNet preselection, are still written to the output with `flags_valid = false` and default invalid reconstruction. This is required for the RooUnfold response matrix, because truth-region events that fail the analysis-side reconstruction must remain available as missed events.
+
+### Export EveNet To Central Schema
+
+Example:
+
+```bash
+cd ml_pipeline
+python3 util/export_evenet_prediction_to_qi.py \
+  --analysis-config config/analysis.yaml \
+  --mc-pred-parquet /path/to/test__evenet_pred.parquet \
+  --data-pred-parquet /path/to/data__evenet_pred.parquet \
+  --prediction-split-fraction 0.5 \
+  --output-dir /path/to/qi_evenet_input
+```
+
+`analysis.yaml` controls the central event universes:
+
+- `Samples.<sample>.input_files`: the selected/input parquet universe used to build EveNet inputs.
+- `Samples.<sample>.raw_files`: the full raw parquet universe used for QI/unfolding export.
+- Optional `EveNetPrediction.mc_parquet`, `EveNetPrediction.data_parquet`, `EveNetPrediction.mc_split_fraction`, and `EveNetPrediction.qi_output_dir` can replace the command-line prediction/output arguments.
+- `EveNetPrediction.qi_method_label` controls the output subdirectory name and defaults to `evenet`.
+
+This writes:
+
+- `/path/to/qi_evenet_input/evenet/<sample>/filtered___raw.parquet`
+- `/path/to/qi_evenet_input/evenet/<sample>/filtered___<cut_region>.parquet`
+
+MC and data predictions are written into the same `evenet/` tree, so central data/MC plotting can see `data94`, `Ztautau`, `Zll`, and `Zqq` together when those prediction files are provided.
+
+The older low-level `--central-parquet/--prediction-central-parquet/--evenet-pred-parquet` mode is still available for debugging one file by hand, but the config-driven mode above is preferred.
+
+Important: prediction parquet must contain `source_sample_index` and `source_event_key`. These columns are now written by the ml_pipeline builder/predictor so EveNet preprocessing shuffles and train/test splits can be mapped back to `analysis.yaml` safely. If an older prediction parquet does not have these fields, regenerate the EveNet input and rerun prediction.
+
+The EveNet export replaces only the central reconstruction-facing fields:
+
+- `lead_a_missing_p4`
+- `lead_b_missing_p4`
+- `reco_tau_a_p4`
+- `reco_tau_b_p4`
+- `flags_valid`
+- `mmc_likelihood`
+- QI observables such as `theta_cm` and `cos_theta_A_*`
+
+For events without EveNet prediction, these reconstruction-facing fields are filled with defaults and `flags_valid = false`. The export preserves central fields such as:
+
+- `lead_a_visible_p4`
+- `lead_b_visible_p4`
+- region cuts like `hadhad_cut`, `ee_cut`, `mumu_cut`, `emu_cut`
+- `event_category`
+- `weight`
+- MC truth QI fields, if present
+
+It also adds alignment diagnostics:
+
+- `central_weight`
+- `evenet_qi_weight_scale`
+- `evenet_has_prediction`
+- `evenet_slot_for_a`
+- `evenet_slot_for_b`
+- `evenet_leg_match_deltaR_a`
+- `evenet_leg_match_deltaR_b`
+- `neutrino_method`
+
+The output summary JSON reports raw event count, prediction coverage, valid fraction, slot-swap fraction, and median/p95 leg-matching `deltaR`.
+
+If EveNet prediction was run on a train/test split, pass `--prediction-split-fraction`. For example, use `0.5` when the prediction parquet is the test half. The adapter then scales only rows with `evenet_has_prediction = true` by `1 / fraction` in the central `weight` field. Rows without EveNet prediction keep their original central weight. The original central weight is stored in `central_weight`, and the applied per-row factor is stored in `evenet_qi_weight_scale`.
+
+### Running The Central Framework
+
+Point the central config `GlobalConfigs.default_output_dir` at the exported tree, or run the central processor with an output directory that contains the exported sample directories. For EveNet:
+
+```text
+default_output_dir: /path/to/qi_evenet_input/evenet
+```
+
+The region files written here follow the central cut flags if they exist, but EveNet's own predicted class regions do not need to be forced to match cut-based regions. Use standalone summary plots for predicted-class regions, and use central QI only where the central framework expects cut-based region parquets.
+
+### EveNet Vs Baseline Summary Plots
+
+After exporting both trees, a lightweight comparison script can make method-level summary plots before or after the central QI run:
+
+- [util/plot_qi_method_comparison.py](util/plot_qi_method_comparison.py)
+
+Example:
+
+```bash
+cd ml_pipeline
+python3 util/plot_qi_method_comparison.py \
+  --evenet-dir /path/to/qi_evenet_input/evenet \
+  --baseline-dir /path/to/qi_evenet_input/baseline \
+  --sample-name Ztautau \
+  --output-dir /path/to/qi_evenet_input/comparison_summary
+```
+
+Current outputs include:
+
+- `qi_method_metric_summary.png`
+- `neutrino_truth_vs_pred_<region>.png`
+- `cut_based_vs_evenet_region_matrix.png`
+- `qi_method_comparison_metrics.json`
+
+The metric summary uses event weights and shows uncertainty bars for valid fraction, QI acceptance, and representative neutrino residual metrics. The neutrino plots compare central-compatible predicted missing p4 against MC truth missing p4 for both EveNet and the baseline.
+
+### Baseline Meaning
+
+The central baseline is already implemented upstream:
+
+- `ee`, `mumu`, and `emu` use MMC.
+- non-MMC regions use the algebraic neutrino solution.
+
+The adapter does not recompute the baseline. To compare to MMC/algebraic inside the central framework, run the existing central pipeline normally on its own output directory, then compare that baseline directory against the EveNet-exported directory.
+
+### Alignment Requirements
+
+`analysis.yaml` should provide both selected inputs and raw inputs. The exporter uses `source_sample_index/source_event_key` from the prediction parquet to find the corresponding row in `Samples.*.input_files`, then maps that event into `Samples.*.raw_files`. This avoids relying on local `event_index`, which is only the row index of the converted/preprocessed parquet.
+
+Avoid double scaling: `--converted-split-fraction` in the standalone predictor affects `evenet_weight` for standalone plots, but the central QI framework reads `weight`. For QI export, use `--prediction-split-fraction` on this adapter so the central `weight` is scaled only for the predicted subset.
