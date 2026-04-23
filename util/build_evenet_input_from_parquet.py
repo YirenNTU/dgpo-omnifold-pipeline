@@ -12,6 +12,7 @@ import numpy as np
 import yaml
 from evenet_parquet_common import (
     FOUR_VECTOR_FEATURES,
+    build_central_leg_slot_indices,
     build_tau_targets,
     build_visible_tau_assumptions,
     build_momentum4d,
@@ -373,6 +374,7 @@ def build_dataset(
         num_vectors = compute_event_totals(num_sequential_vectors, conditions_mask)
 
         tau_vis_prong_p4, tau_vis_prong_mask, tau_vis_rho_p4, tau_vis_rho_mask = build_visible_tau_assumptions(events)
+        slot_for_a, slot_for_b = build_central_leg_slot_indices(events)
         x_invisible_p4, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target_p4, tau_vis_target_mask = build_tau_targets(
             events,
             tau_vis_prong_p4,
@@ -421,6 +423,8 @@ def build_dataset(
             "tau_vis_rho_mask": to_numpy_array(tau_vis_rho_mask, bool),
             "tau_vis_target": to_numpy_array(tau_vis_target, np.float32),
             "tau_vis_target_mask": to_numpy_array(tau_vis_target_mask, bool),
+            "source_slot_for_a": slot_for_a,
+            "source_slot_for_b": slot_for_b,
             # Source identifiers are carried through preprocessing shuffles/splits
             # so downstream prediction can be merged back into central parquet safely.
             "source_sample_index": np.full(len(events), source_sample_index, dtype=np.int64),

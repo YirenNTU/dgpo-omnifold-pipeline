@@ -301,46 +301,14 @@ def safe_delta_r(first: ak.Array, second: ak.Array) -> np.ndarray:
     return np.where(np.isfinite(values), values, 1.0e9)
 
 
-def infer_slot_to_central_leg(
-    central_events: ak.Array,
-    visible_slot0: ak.Array,
-    visible_slot1: ak.Array,
-    valid_slot0: np.ndarray,
-    valid_slot1: np.ndarray,
-) -> dict[str, Any]:
-    if "lead_a_visible_p4" not in central_events.fields or "lead_b_visible_p4" not in central_events.fields:
-        raise ValueError(
-            "Cannot export EveNet slots back to the central a/b convention without "
-            "lead_a_visible_p4 and lead_b_visible_p4 in the central source parquet."
-        )
-
-    lead_a = rebuild_vector(central_events["lead_a_visible_p4"])
-    lead_b = rebuild_vector(central_events["lead_b_visible_p4"])
-
-    score_direct = safe_delta_r(visible_slot0, lead_a) + safe_delta_r(visible_slot1, lead_b)
-    score_swapped = safe_delta_r(visible_slot1, lead_a) + safe_delta_r(visible_slot0, lead_b)
-    both_valid = valid_slot0 & valid_slot1 & finite_p4_mask(lead_a) & finite_p4_mask(lead_b)
-    use_slot1_for_a = (score_swapped < score_direct) & both_valid
-
-    delta_r_a = np.where(
-        use_slot1_for_a,
-        safe_delta_r(visible_slot1, lead_a),
-        safe_delta_r(visible_slot0, lead_a),
-    ).astype(np.float32)
-    delta_r_b = np.where(
-        use_slot1_for_a,
-        safe_delta_r(visible_slot0, lead_b),
-        safe_delta_r(visible_slot1, lead_b),
-    ).astype(np.float32)
-    delta_r_a = np.where(both_valid, delta_r_a, np.nan).astype(np.float32)
-    delta_r_b = np.where(both_valid, delta_r_b, np.nan).astype(np.float32)
-
-    return {
-        "use_slot1_for_a": use_slot1_for_a,
-        "delta_r_a": delta_r_a,
-        "delta_r_b": delta_r_b,
-        "aligned_by": "visible_deltaR_minimization",
-    }
+def prediction_selection_mask(full_events: ak.Array) -> np.ndarray:
+    fields = set(full_events.fields)
+    mask = np.ones(len(full_events), dtype=bool)
+    if "baseline_cut" in fields:
+        mask &= ak.to_numpy(full_events["baseline_cut"], allow_missing=False).astype(bool)
+    if "nprong" in fields:
+        mask &= ak.to_numpy(full_events["nprong"], allow_missing=False).astype(np.int64) == 2
+    return mask
 
 
 def build_predicted_reconstruction(
@@ -352,35 +320,43 @@ def build_predicted_reconstruction(
     pred_missing0, pred_missing0_valid = p4_from_components(pred_events, "pred_invisible", 0)
     pred_missing1, pred_missing1_valid = p4_from_components(pred_events, "pred_invisible", 1)
 
-    alignment = infer_slot_to_central_leg(
-        central_pred_events,
-        visible0,
-        visible1,
-        visible0_valid,
-        visible1_valid,
+    del central_pred_events
+
+    if "source_slot_for_a" not in pred_events.fields or "source_slot_for_b" not in pred_events.fields:
+        raise ValueError(
+            "Prediction parquet is missing source_slot_for_a/source_slot_for_b. "
+            "Rebuild the EveNet input and rerun prediction so export can restore the central a/b definition "
+            "without reading visible tau p4 from raw parquet."
+        )
+    slot_for_a = ak.to_numpy(pred_events["source_slot_for_a"], allow_missing=False).astype(np.int64)
+    slot_for_b = ak.to_numpy(pred_events["source_slot_for_b"], allow_missing=False).astype(np.int64)
+    if np.any((slot_for_a < 0) | (slot_for_a > 1) | (slot_for_b < 0) | (slot_for_b > 1)):
+        raise ValueError("source_slot_for_a/source_slot_for_b must be 0 or 1 for every prediction row.")
+
+    choose_slot1_for_a = slot_for_a == 1
+    choose_slot1_for_b = slot_for_b == 1
+
+    lead_a_visible = choose_by_slot(visible0, visible1, choose_slot1_for_a)
+    lead_b_visible = choose_by_slot(visible0, visible1, choose_slot1_for_b)
+    lead_a_missing = choose_by_slot(pred_missing0, pred_missing1, choose_slot1_for_a)
+    lead_b_missing = choose_by_slot(pred_missing0, pred_missing1, choose_slot1_for_b)
+    pred_valid_a = np.where(choose_slot1_for_a, pred_missing1_valid, pred_missing0_valid)
+    pred_valid_b = np.where(choose_slot1_for_b, pred_missing1_valid, pred_missing0_valid)
+    vis_valid_a = np.where(choose_slot1_for_a, visible1_valid, visible0_valid)
+    vis_valid_b = np.where(choose_slot1_for_b, visible1_valid, visible0_valid)
+    reco_tau_a = lead_a_visible + lead_a_missing
+    reco_tau_b = lead_b_visible + lead_b_missing
+
+    flags_valid = (
+        vis_valid_a
+        & vis_valid_b
+        & pred_valid_a
+        & pred_valid_b
+        & finite_p4_mask(lead_a_visible)
+        & finite_p4_mask(lead_b_visible)
+        & finite_p4_mask(reco_tau_a)
+        & finite_p4_mask(reco_tau_b)
     )
-    use_slot1_for_a = alignment["use_slot1_for_a"]
-    use_slot1_for_b = ~use_slot1_for_a
-
-    evenet_visible_a = choose_by_slot(visible0, visible1, use_slot1_for_a)
-    evenet_visible_b = choose_by_slot(visible0, visible1, use_slot1_for_b)
-    evenet_missing_a_raw = choose_by_slot(pred_missing0, pred_missing1, use_slot1_for_a)
-    evenet_missing_b_raw = choose_by_slot(pred_missing0, pred_missing1, use_slot1_for_b)
-    pred_valid_a = np.where(use_slot1_for_a, pred_missing1_valid, pred_missing0_valid)
-    pred_valid_b = np.where(use_slot1_for_a, pred_missing0_valid, pred_missing1_valid)
-
-    lead_a_visible = rebuild_vector(central_pred_events["lead_a_visible_p4"])
-    lead_b_visible = rebuild_vector(central_pred_events["lead_b_visible_p4"])
-
-    # EveNet slots are ordered by visible-particle kind, not by central a/b.
-    # Restore the central convention here: lead_a is tau+ and lead_b is tau-.
-    reco_tau_a = evenet_visible_a + evenet_missing_a_raw
-    reco_tau_b = evenet_visible_b + evenet_missing_b_raw
-    lead_a_missing = reco_tau_a - lead_a_visible
-    lead_b_missing = reco_tau_b - lead_b_visible
-
-    alignment_valid = np.isfinite(alignment["delta_r_a"]) & np.isfinite(alignment["delta_r_b"])
-    flags_valid = pred_valid_a & pred_valid_b & alignment_valid & finite_p4_mask(reco_tau_a) & finite_p4_mask(reco_tau_b)
     observables = build_observables(
         tau_a_p4=reco_tau_a,
         tau_b_p4=reco_tau_b,
@@ -399,27 +375,33 @@ def build_predicted_reconstruction(
         "mmc_likelihood": np.zeros(len(central_pred_events), dtype=np.float32),
         "neutrino_method": ak.Array(["EveNet"] * len(central_pred_events)),
         "evenet_has_prediction": np.ones(len(central_pred_events), dtype=bool),
-        "evenet_slot_for_a": np.where(use_slot1_for_a, 1, 0).astype(np.int8),
-        "evenet_slot_for_b": np.where(use_slot1_for_a, 0, 1).astype(np.int8),
-        "evenet_leg_match_deltaR_a": alignment["delta_r_a"],
-        "evenet_leg_match_deltaR_b": alignment["delta_r_b"],
+        "evenet_slot_for_a": slot_for_a.astype(np.int8),
+        "evenet_slot_for_b": slot_for_b.astype(np.int8),
+        "evenet_leg_match_deltaR_a": np.full(len(central_pred_events), np.nan, dtype=np.float32),
+        "evenet_leg_match_deltaR_b": np.full(len(central_pred_events), np.nan, dtype=np.float32),
     }
     for obs_name, obs_values in observables.items():
         values[obs_name] = ak.where(flags_valid, obs_values, np.nan)
     for field in pred_events.fields:
-        if field.startswith("evenet_") or field.startswith("pred_invisible_") or field.startswith("target_invisible_"):
+        if (
+            field.startswith("evenet_")
+            or field.startswith("pred_invisible_")
+            or field.startswith("target_invisible_")
+            or field.startswith("tau_vis_prong_")
+            or field.startswith("tau_vis_target_")
+        ):
             values[field] = pred_events[field]
 
     metrics = {
         "num_predicted_events": int(len(central_pred_events)),
         "valid_predicted_events": int(np.sum(flags_valid)),
         "valid_predicted_fraction": float(np.mean(flags_valid)) if len(flags_valid) else 0.0,
-        "slot_alignment": alignment["aligned_by"],
-        "slot_swap_fraction": float(np.mean(use_slot1_for_a)) if len(central_pred_events) else 0.0,
-        "median_deltaR_a": finite_median(alignment["delta_r_a"]),
-        "median_deltaR_b": finite_median(alignment["delta_r_b"]),
-        "p95_deltaR_a": finite_percentile(alignment["delta_r_a"], 95),
-        "p95_deltaR_b": finite_percentile(alignment["delta_r_b"], 95),
+        "slot_alignment": "prediction_metadata_source_slot_for_a",
+        "slot_swap_fraction": float(np.mean(slot_for_a == 0)) if len(slot_for_a) else 0.0,
+        "median_deltaR_a": None,
+        "median_deltaR_b": None,
+        "p95_deltaR_a": None,
+        "p95_deltaR_b": None,
     }
     return values, metrics
 
@@ -427,12 +409,8 @@ def build_predicted_reconstruction(
 def default_evenet_columns(full_events: ak.Array, pred_values: dict[str, Any]) -> dict[str, Any]:
     num_events = len(full_events)
     defaults: dict[str, Any] = {
-        "lead_a_visible_p4": rebuild_vector(full_events["lead_a_visible_p4"])
-        if "lead_a_visible_p4" in full_events.fields
-        else zero_p4(num_events),
-        "lead_b_visible_p4": rebuild_vector(full_events["lead_b_visible_p4"])
-        if "lead_b_visible_p4" in full_events.fields
-        else zero_p4(num_events),
+        "lead_a_visible_p4": zero_p4(num_events),
+        "lead_b_visible_p4": zero_p4(num_events),
         "lead_a_missing_p4": zero_p4(num_events),
         "lead_b_missing_p4": zero_p4(num_events),
         "reco_tau_a_p4": zero_p4(num_events),
@@ -918,8 +896,12 @@ def export_config_group(
     print(f"[export-evenet-to-qi] worker {os.getpid()} start {parent_name}", flush=True)
     raw_files = sample_raw_files(analysis_cfg, group["parent_key"], parent_name)
     full_events = load_concat_events(raw_files)
+    selected_mask = prediction_selection_mask(full_events)
+    selected_full_raw_indices = np.flatnonzero(selected_mask).astype(np.int64)
+    selected_full_events = full_events[selected_mask]
     print(
-        f"[export-evenet-to-qi] worker {os.getpid()} loaded {parent_name} raw_events={len(full_events)}",
+        f"[export-evenet-to-qi] worker {os.getpid()} loaded {parent_name} raw_events={len(full_events)} "
+        f"selected_for_prediction={len(selected_full_events)}",
         flush=True,
     )
     pred_group = ak.concatenate(group["pred_parts"], axis=0) if len(group["pred_parts"]) > 1 else group["pred_parts"][0]
@@ -927,21 +909,16 @@ def export_config_group(
     split_fraction = None if group["is_data"] else prediction_split_fraction
 
     full_index_parts = []
-    selected_full_index_parts = []
     for source_info, selected_indices in zip(group["source_infos"], group["selected_index_parts"]):
         selected_to_full = map_subset_rows_to_full(
-            full_events=full_events,
+            full_events=selected_full_events,
             subset_events=source_info["events"],
-            context=f"{source_info['expanded_name']} selected rows",
+            context=f"{source_info['expanded_name']} selected rows inside raw baseline+nprong==2",
         )
-        selected_full_index_parts.append(selected_to_full)
-        full_index_parts.append(selected_to_full[selected_indices])
+        selected_to_full_raw = selected_full_raw_indices[selected_to_full]
+        full_index_parts.append(selected_to_full_raw[selected_indices])
     full_indices = np.concatenate(full_index_parts).astype(np.int64) if full_index_parts else np.array([], dtype=np.int64)
-    selected_full_indices = (
-        np.unique(np.concatenate(selected_full_index_parts).astype(np.int64))
-        if selected_full_index_parts
-        else np.array([], dtype=np.int64)
-    )
+    selected_full_indices = selected_full_raw_indices
     print(
         f"[export-evenet-to-qi] worker {os.getpid()} mapped {parent_name} predictions={len(full_indices)}",
         flush=True,

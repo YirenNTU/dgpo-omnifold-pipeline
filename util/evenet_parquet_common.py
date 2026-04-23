@@ -471,6 +471,14 @@ def build_prong_only_visible_tau_p4(events: ak.Array):
     return _build_visible_tau_layout(events, include_nearby_photons=False)
 
 
+def build_central_leg_slot_indices(events: ak.Array) -> tuple[np.ndarray, np.ndarray]:
+    _, _, slot_swap_mask = _build_visible_tau_layout(events)
+    swap = ak.to_numpy(slot_swap_mask, allow_missing=False).astype(bool)
+    slot_for_a = np.where(swap, 0, 1).astype(np.int8)
+    slot_for_b = np.where(swap, 1, 0).astype(np.int8)
+    return slot_for_a, slot_for_b
+
+
 def truth_feature(values: ak.Array | None):
     if values is None:
         return ak.Array([])

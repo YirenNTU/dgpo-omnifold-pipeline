@@ -814,7 +814,13 @@ def augment_converted_parquet_task(
         "evenet_weight": outputs["physics_weight"],
     }
 
-    for source_key in ("source_sample_index", "source_event_index", "source_event_key"):
+    for source_key in (
+        "source_sample_index",
+        "source_event_index",
+        "source_event_key",
+        "source_slot_for_a",
+        "source_slot_for_b",
+    ):
         if source_key in batch_np:
             output_columns[source_key] = batch_np[source_key].astype(np.int64)
 
