@@ -1,27 +1,29 @@
 # LEP EveNet ml_pipeline
 
-這個目錄是 LEP tau-pair 分析的 ML 側 pipeline。原則是：
+This directory contains the ML-side EveNet workflow for the LEP tau-pair analysis.
 
-- 不修改 central analysis / unfolding framework。
-- EveNet 只在 `ml_pipeline` 內完成 input building、training、prediction、plotting。
-- 要接回 central/QI/unfolding 時，用 adapter 把 EveNet prediction 寫成 central parquet schema。
-- 預設執行位置是這個目錄：`cd ml_pipeline`。
+Project rules:
 
-## 目錄角色
+- Do not modify the central analysis or unfolding framework for EveNet-specific logic.
+- Keep EveNet input building, training, prediction, diagnostics, and adapters inside `ml_pipeline`.
+- When integrating with central QI or unfolding, export EveNet predictions into the central parquet schema.
+- The default working directory for commands in this document is `ml_pipeline`.
 
-- `config/analysis.yaml`: ML pipeline 的主控設定。包含 sample input/raw parquet、feature list、normalisation、prediction/export 預設路徑。
-- `config/evenet_schema.yaml`: EveNet process topology、classification class、truth-generation schema。
-- `config/preprocess_config.yaml`: EveNet preprocessing wrapper，指向 generated event info。
-- `config/train.yaml`: EveNet scratch training config。
-- `config/train_pretrain.yaml`: EveNet pretrain finetuning config。
-- `util/build_evenet_input_from_parquet.py`: central/DataLoader parquet -> EveNet `.npz`，並產生 monitoring plots。
-- `util/predict_evenet_from_raw_parquet.py`: standalone EveNet inference。檔名是 legacy，現在只吃 EveNet converted parquet。
-- `util/plot_evenet_prediction_summary.py`: standalone EveNet prediction summary plots。
-- `util/export_evenet_prediction_to_qi.py`: EveNet prediction -> central/QI parquet schema。
-- `util/plot_qi_method_comparison.py`: Baseline、EveNet-Pretrain、EveNet-Scratch 等多方法比較。
-- `util/evenet_parquet_common.py`: visible tau、truth invisible target、source-event matching 共用邏輯。
+## Directory Roles
 
-## 核心資料流
+- `config/analysis.yaml`: Main ML pipeline configuration. It defines sample input and raw parquet paths, feature lists, normalization rules, and optional prediction/export defaults.
+- `config/evenet_schema.yaml`: EveNet process topology, classification labels, and truth-generation schema.
+- `config/preprocess_config.yaml`: EveNet preprocessing wrapper that points to the generated event info.
+- `config/train.yaml`: EveNet scratch training config.
+- `config/train_pretrain.yaml`: EveNet pretrain finetuning config.
+- `util/build_evenet_input_from_parquet.py`: Converts central/DataLoader parquet files into EveNet `.npz` input and monitoring plots.
+- `util/predict_evenet_from_raw_parquet.py`: Standalone EveNet inference. The filename is legacy; the current script only consumes EveNet converted parquet files.
+- `util/plot_evenet_prediction_summary.py`: Standalone EveNet prediction summary plots.
+- `util/export_evenet_prediction_to_qi.py`: Converts EveNet prediction parquet files back into the central/QI parquet schema.
+- `util/plot_qi_method_comparison.py`: Compares multiple central-schema methods such as Baseline, EveNet-Pretrain, and EveNet-Scratch.
+- `util/evenet_parquet_common.py`: Shared visible tau, truth invisible target, and source-event matching utilities.
+
+## Workflow Overview
 
 ```text
 central tree_ana
@@ -48,9 +50,9 @@ central/QI evaluation or ml_pipeline summary plots
   -> Baseline vs EveNet-Pretrain vs EveNet-Scratch comparison
 ```
 
-## 0. 先產生 central baseline parquet
+## 0. Produce Central Baseline Parquet
 
-這一步在 repo root 跑 central framework，不在 `ml_pipeline` 裡改 central code。
+Run the central framework from the repository root. This step should not add EveNet-specific logic to the central code.
 
 ```bash
 cd /path/to/lep_tree_ana
@@ -59,7 +61,7 @@ python3 bin/tree_ana \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline
 ```
 
-之後 `ml_pipeline/config/analysis.yaml` 要指到這些輸出：
+Then point `ml_pipeline/config/analysis.yaml` at the central outputs:
 
 ```yaml
 Samples:
@@ -70,9 +72,9 @@ Samples:
       - /pscratch/.../baseline/Ztautau/filtered___raw.parquet
 ```
 
-`input_files` 是 EveNet input universe，通常是已通過 central baseline/preselection 的 events。`raw_files` 是 full raw universe，用於最後接回 central/QI/unfolding，沒有 EveNet prediction 的 event 也會保留下來並填 default invalid value。
+`input_files` are the selected event universe used for EveNet input conversion. `raw_files` are the full raw event universe used when exporting back to central/QI/unfolding. Events without EveNet predictions are kept in the exported raw tree with invalid default reconstruction fields.
 
-## 1. 建 EveNet input
+## 1. Build EveNet Input
 
 ```bash
 cd /path/to/lep_tree_ana/ml_pipeline
@@ -82,51 +84,51 @@ python3 util/build_evenet_input_from_parquet.py \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset
 ```
 
-主要輸出：
+Main outputs:
 
 - `/pscratch/.../dataset/evenet_input.npz`
 - `/pscratch/.../dataset/evenet_input_metadata.json`
 - `config/generated_event_info.yaml`
-- monitoring plots under the output directory
+- Monitoring plots under the output directory
 
-目前 EveNet target invisible 的定義是：
+Current target invisible definition:
 
-- selected visible tau = prong + `dR < 0.3` photon。
-- `x_invisible = truth_tau - selected_visible_tau`。
-- target features 是 `energy, pt, eta, phi`。
-- `energy` 和 `pt` 在 invisible normalisation 使用 linear `normalize`，不是 `log_normalize`，所以可處理 negative mass / unusual kinematics debug case。
-- truth tau naming 會依序讀新的 central `truth_tau_a_p4/truth_tau_b_p4`、raw `GenPart_*` tau、最後才 fallback 到舊的 `truth_tau_*` component 欄位。
+- Selected visible tau is prong plus photons within `dR < 0.3`.
+- `x_invisible = truth_tau - selected_visible_tau`.
+- Target features are `energy, pt, eta, phi`.
+- Invisible `energy` and `pt` use linear `normalize`, not `log_normalize`, so unusual negative-mass debug cases are not blocked by log scaling.
+- Truth tau naming is resolved in this order: central `truth_tau_a_p4/truth_tau_b_p4`, raw `GenPart_*` tau branches, then legacy `truth_tau_*` component fields.
 
-builder 也會寫 source provenance：
+The builder also writes source provenance:
 
 - `source_sample_index`
 - `source_event_index`
 - `source_event_key`
 
-這些欄位非常重要，因為 preprocessing 可能 shuffle/split；後面 export 回 raw event universe 時不能靠 local row index。
+These fields are required because EveNet preprocessing can shuffle and split events. Downstream export must not rely on a local converted-parquet row index.
 
-### Slot convention
+### Slot Convention
 
-EveNet training 的兩個 visible/invisible slots 不是 central `lead_a/lead_b`。ML 端會先用 tau charge 找到 tau- / tau+，再依 visible-particle kind canonicalize slot order：
+EveNet training slots are not central `lead_a/lead_b` slots. The ML input first identifies tau- and tau+ using tau charge, then canonicalizes the two visible/invisible slots by visible-particle kind:
 
 ```text
 electron -> muon -> pion -> rho -> other
 ```
 
-所以 `x_invisible[:, 0]` / `x_invisible[:, 1]` 的語意是「particle-kind slot」，不是固定 tau+ / tau-。這樣 `e rho`、`mu pi`、`pi rho` 這類 channel 的 target 才是穩定的。
+Therefore `x_invisible[:, 0]` and `x_invisible[:, 1]` are particle-kind slots, not fixed tau+ or tau- slots. This gives stable targets for channels such as `e rho`, `mu pi`, and `pi rho`.
 
-回到 central/QI/unfolding 時，`export_evenet_prediction_to_qi.py` 會用 prediction parquet 裡的 `tau_vis_prong_slot*` 和 central parquet 裡的 `lead_a_visible_p4/lead_b_visible_p4` 做 visible-p4 `deltaR` matching，重新寫回 central convention：
+When exporting back to central/QI/unfolding, `export_evenet_prediction_to_qi.py` uses `tau_vis_prong_slot*` from the prediction parquet and `lead_a_visible_p4/lead_b_visible_p4` from the central parquet to perform visible-p4 `deltaR` matching. It then restores the central convention:
 
 ```text
 lead_a = tau+
 lead_b = tau-
 ```
 
-如果 central source parquet 缺少 `lead_a_visible_p4` 或 `lead_b_visible_p4`，export 會直接停止，而不是 fallback 到 EveNet slot order。
+If the central source parquet lacks `lead_a_visible_p4` or `lead_b_visible_p4`, export fails instead of silently using EveNet slot order.
 
-## 2. EveNet preprocessing
+## 2. EveNet Preprocessing
 
-常用 split 模式：
+Common split mode:
 
 ```bash
 cd /path/to/lep_tree_ana/ml_pipeline
@@ -137,7 +139,7 @@ python3 EveNet-Full/preprocessing/preprocess.py \
   --store_dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert
 ```
 
-輸出：
+Outputs:
 
 - `train.parquet`
 - `val.parquet`
@@ -145,7 +147,7 @@ python3 EveNet-Full/preprocessing/preprocess.py \
 - `normalization.pt`
 - `shape_metadata.json`
 
-如果只是在 data inference 需要把 `data.npz` 轉成 parquet，可以用 train/test workaround：
+For data-only inference conversion, a practical workaround is:
 
 ```bash
 python3 EveNet-Full/preprocessing/preprocess.py \
@@ -155,9 +157,9 @@ python3 EveNet-Full/preprocessing/preprocess.py \
   --store_dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_data
 ```
 
-這只是 inference conversion workaround；不要把它當正式 train/test split。
+Use this only as an inference conversion workaround. Do not treat it as a formal train/test split.
 
-## 3. Train Scratch 或 Pretrain
+## 3. Train Scratch or Pretrain
 
 Scratch:
 
@@ -166,21 +168,21 @@ cd /path/to/lep_tree_ana/ml_pipeline
 python3 EveNet-Full/scripts/train.py config/train.yaml
 ```
 
-Pretrain finetune:
+Pretrain finetuning:
 
 ```bash
 cd /path/to/lep_tree_ana/ml_pipeline
 python3 EveNet-Full/scripts/train.py config/train_pretrain.yaml
 ```
 
-請確認 config 裡的路徑：
+Check these paths before launching:
 
 - `platform.data_parquet_dir`
 - `options.Dataset.normalization_file`
 - `options.Training.model_checkpoint_save_path`
-- `options.Training.pretrain_model_load_path`，只對 pretrain config 需要。
+- `options.Training.pretrain_model_load_path`, only for the pretrain config
 
-目前 prediction 預設會使用 EMA 權重，只要 training config 中：
+Prediction uses EMA weights by default when the training config has:
 
 ```yaml
 EMA:
@@ -188,11 +190,11 @@ EMA:
   replace_model_after_load: true
 ```
 
-如果要強制不用 EMA，prediction 時加 `--disable-ema`。
+Pass `--disable-ema` during prediction if non-EMA weights are needed.
 
-## 4. EveNet standalone prediction
+## 4. Standalone EveNet Prediction
 
-`util/predict_evenet_from_raw_parquet.py` 現在只吃 converted parquet，例如 `test.parquet` 或 `data.parquet`。它不再讀 raw parquet，也不再在 prediction 階段重做 selection。
+`util/predict_evenet_from_raw_parquet.py` currently consumes converted parquet files such as `test.parquet` or `data.parquet`. It no longer reads raw parquet files or reruns raw-side selection during prediction.
 
 Scratch example:
 
@@ -227,30 +229,28 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --num-gpus 4
 ```
 
-`--num-gpus` 是 batch/event-chunk parallel。單一大 parquet 會被切 chunk 分到多張 GPU。
+`--num-gpus` is batch/event-chunk parallel. A single large parquet can be split across multiple GPUs.
 
-`--converted-split-fraction` 只影響 prediction parquet 內的 `evenet_weight`，用於 standalone data/MC plots。例子：如果 `test.parquet` 是 MC 的 50%，傳 `0.5` 會讓 MC `evenet_weight` 乘以 2。Data 不做這個 MC split reweighting。
+`--converted-split-fraction` only affects `evenet_weight` in the prediction parquet, which is used by standalone data/MC plots. For example, if `test.parquet` represents 50 percent of the MC sample, pass `0.5` so MC `evenet_weight` is scaled by 2. Data is not split-reweighted.
 
-如果你要比較 training/validation alignment，可以加：
+For training/validation alignment checks, use:
 
 ```bash
 --unweighted-output
 ```
 
-但做 physics data/MC comparison 時通常不要加，因為那會把 MC event weight 全部設成 1。
+Do not use this for physics data/MC comparisons unless unit-weight MC is explicitly intended.
 
-prediction parquet 會自帶後續 plot/export 所需資訊：
+Prediction parquet files are self-contained for downstream plotting and export. They include:
 
-- classification prediction/truth
-- predicted neutrino slots
-- target invisible truth slots
-- visible tau slots
-- `event_weight` / `evenet_weight`
-- `source_sample_index` / `source_event_index` / `source_event_key`
+- Classification prediction and truth labels
+- Predicted invisible slots
+- Target invisible truth slots
+- Visible tau slots
+- `event_weight` and `evenet_weight`
+- `source_sample_index`, `source_event_index`, and `source_event_key`
 
-所以 summary plot 不需要再讀 converted parquet。
-
-## 5. Standalone EveNet summary plot
+## 5. Standalone EveNet Summary Plots
 
 ```bash
 cd /path/to/lep_tree_ana/ml_pipeline
@@ -263,25 +263,25 @@ python3 util/plot_evenet_prediction_summary.py \
   --unblind
 ```
 
-常見輸出：
+Typical outputs:
 
-- weighted classification confusion matrix
-- row-normalized confusion matrix
-- predicted-channel purity stacked yield
-- data/MC predicted-channel comparison
-- neutrino truth vs prediction in `E, px, py, pz`
-- neutrino truth vs prediction in `energy, pt, eta, phi`
-- region kinematics plots with reconstructed tau, visible tau, invisible tau
+- Weighted classification confusion matrix
+- Row-normalized confusion matrix
+- Predicted-channel purity stacked yield plot
+- Data/MC predicted-channel comparison
+- Neutrino truth vs prediction in `E, px, py, pz`
+- Neutrino truth vs prediction in `energy, pt, eta, phi`
+- Region kinematics plots with reconstructed tau, visible tau, and invisible tau
 - `summary_metrics.yaml`
 
-這個 summary 是 EveNet standalone diagnostic。它的 region 可以用 EveNet predicted class 來看，不要求跟 central cut-based regions 完全一致。
+This summary is an EveNet standalone diagnostic. Its regions can be based on EveNet predicted class and do not need to match central cut-based regions.
 
-## 6. Export EveNet prediction 到 central/QI schema
+## 6. Export EveNet Prediction to Central/QI Schema
 
-這一步是把 EveNet prediction 放回 full raw event universe，讓 central/QI/unfolding 可以直接吃。沒有通過 EveNet input selection 或沒有 prediction 的 event 會被保留，填：
+This step maps EveNet predictions back into the full raw event universe so central/QI/unfolding can consume them directly. Events outside the EveNet input selection, or events without a prediction, are preserved with:
 
 - `flags_valid = false`
-- invalid/default missing p4
+- Invalid/default missing p4
 - `mmc_likelihood = 0`
 
 Scratch export:
@@ -309,7 +309,7 @@ python3 util/export_evenet_prediction_to_qi.py \
   --qi-method-label evenet_pretrain
 ```
 
-輸出結構：
+Output structure:
 
 ```text
 /pscratch/.../qi-evenet-export/
@@ -322,18 +322,18 @@ python3 util/export_evenet_prediction_to_qi.py \
     ...
 ```
 
-`--prediction-split-fraction` 是給 central/QI parquet 的 `weight` 用。例子：prediction 只跑 test half，就傳 `0.5`，adapter 只會把有 EveNet prediction 的 MC rows 權重乘以 2。沒有 prediction 的 raw-only rows 保持原本 central weight。
+`--prediction-split-fraction` affects the central/QI export `weight` field. For example, if prediction only ran on the test half, pass `0.5`. The adapter scales only MC rows with EveNet predictions by `1 / fraction`. Raw-only rows without EveNet predictions keep their original central weight.
 
-export 會保留 central 欄位，例如：
+The export preserves central fields such as:
 
 - `lead_a_visible_p4`
 - `lead_b_visible_p4`
-- region cut flags
+- Region cut flags
 - `event_category`
 - `weight`
 - MC truth QI fields
 
-export 會替換或新增 reconstruction-facing 欄位：
+The export replaces or adds reconstruction-facing fields:
 
 - `lead_a_missing_p4`
 - `lead_b_missing_p4`
@@ -349,27 +349,27 @@ export 會替換或新增 reconstruction-facing 欄位：
 - `evenet_leg_match_deltaR_b`
 - `neutrino_method`
 
-EveNet converted slots 不等於 central `lead_a/lead_b`。adapter 會用 visible-object matching 把 EveNet predicted neutrino slots 對到 central tau legs，避免 tau+ / tau- 語意錯位。
+EveNet converted slots are not central `lead_a/lead_b`. The adapter uses visible-object matching to map EveNet neutrino slots to central tau legs and avoid a tau+ / tau- semantic swap.
 
-## 7. 用 central/QI framework evaluation
+## 7. Central/QI Evaluation
 
-如果要讓 central QI/unfolding framework 跑 EveNet output，讓 central config 的 output/input 指到 export method tree。例如：
+To run the central QI/unfolding framework on EveNet output, point the central config input/output tree at the exported method directory. For example:
 
 ```text
 default_output_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export/evenet_scratch
 ```
 
-Baseline 則直接用 central 原本輸出的 baseline tree：
+The baseline tree is the normal central output:
 
 ```text
 /pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline
 ```
 
-這樣 central framework 不需要知道 neutrino 是 MMC、algebraic、EveNet-Pretrain、還是 EveNet-Scratch；它只看到一致的 parquet schema。
+With this layout, the central framework does not need to know whether neutrinos came from MMC, the algebraic solution, EveNet-Pretrain, or EveNet-Scratch. It only sees a consistent parquet schema.
 
-## 8. Baseline vs EveNet-Pretrain vs EveNet-Scratch 比較
+## 8. Baseline vs EveNet-Pretrain vs EveNet-Scratch
 
-`plot_qi_method_comparison.py` 支援多個 method，只要每個 method 都是 central-schema tree：
+`plot_qi_method_comparison.py` supports multiple central-schema method trees:
 
 ```bash
 cd /path/to/lep_tree_ana/ml_pipeline
@@ -381,60 +381,60 @@ python3 util/plot_qi_method_comparison.py \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison
 ```
 
-輸出：
+Outputs:
 
 - `qi_method_metric_summary.png`
 - `neutrino_truth_vs_pred_<region>.png`
-- `cut_based_vs_evenet_region_matrix.png`，如果 raw parquet 內有 EveNet predicted class。
+- `cut_based_vs_evenet_region_matrix.png`, when the raw parquet contains EveNet predicted class labels
 - `qi_method_comparison_metrics.json`
 
-這裡的 Baseline 是 central 已有的 traditional reconstruction：
+Baseline means the central traditional reconstruction:
 
-- `ee`, `mumu`, `emu` 使用 MMC。
-- 其他 non-MMC regions 使用 central algebraic neutrino solution。
+- `ee`, `mumu`, and `emu` use MMC.
+- Other non-MMC regions use the central algebraic neutrino solution.
 
-EveNet methods 則來自 `export_evenet_prediction_to_qi.py` 的 method tree。
+EveNet methods come from `export_evenet_prediction_to_qi.py` method trees.
 
-## 權重規則
+## Weighting Rules
 
-不要把兩種權重修正混在一起：
+Do not mix the two split-weight corrections:
 
-- `predict_evenet_from_raw_parquet.py --converted-split-fraction`: 只寫進 prediction parquet 的 `evenet_weight`，給 standalone EveNet plots 用。
-- `export_evenet_prediction_to_qi.py --prediction-split-fraction`: 只改 central/QI export 裡的 `weight`，給 central/QI/unfolding 用。
-- Data 不做 MC split reweighting。
-- 如果 MC test split 是 0.5，data/MC comparison 需要乘回 full MC yield，所以 fraction 設 `0.5`。
-- 沒有 EveNet prediction 的 raw-only rows 不乘 split factor，保留原本 central weight。
+- `predict_evenet_from_raw_parquet.py --converted-split-fraction`: writes `evenet_weight` in the prediction parquet for standalone EveNet plots.
+- `export_evenet_prediction_to_qi.py --prediction-split-fraction`: writes the central/QI export `weight` for central/QI/unfolding.
+- Data is never MC split-reweighted.
+- If the MC test split is 0.5, use fraction `0.5` to recover full MC yield in data/MC comparisons.
+- Raw-only rows without EveNet predictions do not receive the split factor.
 
-## Alignment checklist
+## Alignment Checklist
 
-如果發現 validation plots 和 standalone prediction 差很多，先檢查：
+If standalone prediction looks worse than training validation plots, check:
 
-- prediction 是否用了正確的 checkpoint 和 config。
-- EMA 是否符合預期；預設會用 EMA，除非加 `--disable-ema`。
-- standalone neutrino prediction 是 conditional on predicted class；training validation monitoring 可能是 conditional on truth class。
-- prediction parquet 是否是新的，且包含 `source_sample_index/source_event_key`。
-- `analysis.yaml` 的 `input_files` 和 `raw_files` 是否來自同一批 central production。
-- `--converted-split-fraction` 和 `--prediction-split-fraction` 是否只用在各自該用的地方。
-- comparison 是否在同一個 sample、同一個 central schema、同一個 luminosity normalization 下做。
+- The prediction command used the intended checkpoint and config.
+- EMA usage matches the intended evaluation. Prediction uses EMA by default unless `--disable-ema` is passed.
+- Standalone neutrino prediction is conditioned on predicted class. Training validation monitoring may be conditioned on truth class.
+- The prediction parquet is regenerated and includes `source_sample_index/source_event_key`.
+- `analysis.yaml` `input_files` and `raw_files` come from the same central production.
+- `--converted-split-fraction` and `--prediction-split-fraction` are only used in their intended steps.
+- The comparison uses the same sample, central schema, and luminosity normalization.
 
-## 常見問題
+## FAQ
 
-### 為什麼 old prediction parquet 不能直接 export？
+### Why can old prediction parquet files fail export?
 
-如果它沒有 `source_sample_index` 和 `source_event_key`，train/test split 或 preprocessing shuffle 後無法安全 map 回 raw parquet。請重跑 input builder、preprocess、prediction。
+They may not contain `source_sample_index` and `source_event_key`. After preprocessing shuffle or train/test splitting, those fields are required to map predictions safely back to raw parquet. Regenerate the EveNet input, preprocess outputs, and prediction parquet.
 
-### data 沒有 truth 會不會壞？
+### Does data without truth fail?
 
-不會。prediction parquet 和 export 都允許 data 沒有 truth。truth metrics 只會在 MC 上算。
+No. Prediction and export allow data without truth fields. Truth metrics are computed only for MC.
 
-### raw event 沒有通過 EveNet selection 怎麼辦？
+### What happens to raw events outside EveNet selection?
 
-export 會保留它，填 invalid default。這對 unfolding 很重要，因為 truth-region event failed reconstruction 仍要能作為 missed event 進 response matrix。
+The export keeps them with invalid defaults. This is important for unfolding, because truth-region events that fail reconstruction still need to enter the response matrix as missed events.
 
-### region 要跟 cut-based 完全一致嗎？
+### Do EveNet regions need to match cut-based regions?
 
-central/QI export 的 `filtered___{region}.parquet` 會使用 central cut flags。EveNet standalone summary 可以另外用 predicted class 看 region，不需要硬對齊 cut-based region。
+No. Central/QI export `filtered___{region}.parquet` files use central cut flags. Standalone EveNet summaries can use predicted class regions separately.
 
-### 可以同時比較 Pretrain、Scratch、Baseline 嗎？
+### Can Pretrain, Scratch, and Baseline be compared together?
 
-可以。分別 export 成不同 `--qi-method-label`，再用 `plot_qi_method_comparison.py --method Label:path` 一次丟進去。
+Yes. Export each EveNet run with a different `--qi-method-label`, then pass each central-schema tree to `plot_qi_method_comparison.py --method Label:path`.

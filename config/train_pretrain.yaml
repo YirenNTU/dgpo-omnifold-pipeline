@@ -1,5 +1,5 @@
 platform:
-  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert
+  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train
   number_of_workers: 4
   resources_per_worker: {
     "CPU": 20,
@@ -27,7 +27,7 @@ options:
   Training:
     total_epochs: 50
     epochs: 50
-    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint
+    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/checkpoint-pretrain
     model_checkpoint_load_path: null
     pretrain_model_load_path: /global/homes/t/tihsu/CMSOpenData_GridStudy/pretrain-weights/checkpoints.20M.a4.last.ckpt
     freeze_modules: []
