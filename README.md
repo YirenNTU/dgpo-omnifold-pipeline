@@ -325,7 +325,12 @@ Output structure:
     Zqq/filtered___raw.parquet
 ```
 
-For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the central `weight` field for rows with EveNet predictions. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw-only rows without EveNet predictions keep their original central weight.
+For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the central `weight` field for rows with EveNet predictions. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw rows outside the EveNet selected-source universe keep their original central weight.
+
+For config-driven MC export with a non-null split fraction, the exporter also zeroes the weights of
+selected-source MC rows that belong to the held-out train half and were not part of the current
+prediction parquet. This avoids double counting when predicted rows already carry the `1/split_fraction`
+normalization back to the full selected-event yield.
 
 `--num-workers` parallelizes the config-driven export over parent samples and prints progress bars such as `mc export [####----] 1/3 Ztautau`. The default backend is thread-based so large awkward arrays are shared instead of copied into subprocesses. Keep it at `1` if memory pressure is high. Use `--worker-backend process` only when enough memory is available.
 

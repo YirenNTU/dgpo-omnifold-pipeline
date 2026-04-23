@@ -512,6 +512,8 @@ def with_evenet_reconstruction(
     pred_events: ak.Array,
     full_indices: np.ndarray,
     prediction_split_fraction: float | None,
+    selected_full_indices: np.ndarray | None = None,
+    zero_unpredicted_selected_mc: bool = False,
 ) -> tuple[ak.Array, dict[str, Any]]:
     pred_values, metrics = build_predicted_reconstruction(central_pred_events, pred_events)
     output = full_events
@@ -556,6 +558,23 @@ def with_evenet_reconstruction(
         else:
             metrics["prediction_weight_source"] = "central_weight"
             metrics["prediction_split_fraction_applied_in_export"] = None
+
+        if zero_unpredicted_selected_mc and selected_full_indices is not None and len(selected_full_indices) > 0:
+            selected_mask = np.zeros(len(output), dtype=bool)
+            selected_mask[selected_full_indices] = True
+            predicted_mask = np.zeros(len(output), dtype=bool)
+            predicted_mask[full_indices] = True
+            selected_unpredicted_mask = selected_mask & ~predicted_mask
+            if np.any(selected_unpredicted_mask):
+                export_weight[selected_unpredicted_mask] = 0.0
+                weight_scale[selected_unpredicted_mask] = 0.0
+            metrics["selected_source_rows"] = int(np.sum(selected_mask))
+            metrics["selected_source_rows_with_prediction"] = int(np.sum(predicted_mask & selected_mask))
+            metrics["selected_source_rows_zero_weighted"] = int(np.sum(selected_unpredicted_mask))
+        else:
+            metrics["selected_source_rows"] = 0
+            metrics["selected_source_rows_with_prediction"] = 0
+            metrics["selected_source_rows_zero_weighted"] = 0
         output["evenet_qi_weight_scale"] = weight_scale
         output["weight"] = export_weight.astype(np.float32)
 
@@ -908,14 +927,21 @@ def export_config_group(
     split_fraction = None if group["is_data"] else prediction_split_fraction
 
     full_index_parts = []
+    selected_full_index_parts = []
     for source_info, selected_indices in zip(group["source_infos"], group["selected_index_parts"]):
         selected_to_full = map_subset_rows_to_full(
             full_events=full_events,
             subset_events=source_info["events"],
             context=f"{source_info['expanded_name']} selected rows",
         )
+        selected_full_index_parts.append(selected_to_full)
         full_index_parts.append(selected_to_full[selected_indices])
     full_indices = np.concatenate(full_index_parts).astype(np.int64) if full_index_parts else np.array([], dtype=np.int64)
+    selected_full_indices = (
+        np.unique(np.concatenate(selected_full_index_parts).astype(np.int64))
+        if selected_full_index_parts
+        else np.array([], dtype=np.int64)
+    )
     print(
         f"[export-evenet-to-qi] worker {os.getpid()} mapped {parent_name} predictions={len(full_indices)}",
         flush=True,
@@ -927,6 +953,8 @@ def export_config_group(
         pred_events=pred_group,
         full_indices=full_indices,
         prediction_split_fraction=split_fraction,
+        selected_full_indices=selected_full_indices,
+        zero_unpredicted_selected_mc=bool((not group["is_data"]) and split_fraction is not None),
     )
     sample_output_root = output_root / output_label
     counts = write_qi_tree(evenet_events, sample_output_root, parent_name, regions)
