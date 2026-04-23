@@ -235,6 +235,12 @@ def process_stack_color(process_name: str, index: int) -> str:
     return STACK_COLORS[index % len(STACK_COLORS)]
 
 
+def stack_draw_order(process_names: list[str]) -> list[str]:
+    signal_names = [name for name in process_names if not is_background_like_channel(name)]
+    background_names = [name for name in process_names if is_background_like_channel(name)]
+    return signal_names + background_names
+
+
 def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     output = ak.to_numpy(values, allow_missing=False)
     if dtype is not None:
@@ -1063,7 +1069,8 @@ def plot_predicted_channel_purity(
     y = np.arange(len(class_names))
     left = np.zeros(len(class_names), dtype=np.float64)
 
-    for truth_idx, truth_name in enumerate(truth_processes):
+    for draw_idx, truth_name in enumerate(stack_draw_order(truth_processes)):
+        truth_idx = truth_index[truth_name]
         values = stack_matrix[:, truth_idx]
         if not np.any(values > 0):
             continue
@@ -1072,7 +1079,7 @@ def plot_predicted_channel_purity(
             values,
             left=left,
             height=0.75,
-            color=process_stack_color(truth_name, truth_idx),
+            color=process_stack_color(truth_name, draw_idx),
             edgecolor="white",
             linewidth=0.5,
             label=latex_process_label(truth_name),
@@ -1221,7 +1228,8 @@ def plot_region_histogram_panel(
     widths = np.diff(bins)
     bottom = np.zeros_like(centers, dtype=np.float64)
 
-    for index, (process_name, hist) in enumerate(mc_stack.items()):
+    for index, process_name in enumerate(stack_draw_order(list(mc_stack))):
+        hist = mc_stack[process_name]
         if np.sum(hist) <= 0:
             continue
         ax.bar(
