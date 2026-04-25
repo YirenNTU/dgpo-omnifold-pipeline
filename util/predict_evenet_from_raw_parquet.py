@@ -52,6 +52,17 @@ vector.register_awkward()
 DEFAULT_FLOAT = -99.0
 DEFAULT_CLASS_NAME = "unselected"
 PROGRESS_PRINT_EVERY = 10
+PREDICTION_PASSTHROUGH_EXACT_FIELDS = {
+    "event_category",
+    "truth_QI_region",
+    "analyzing_power_a",
+    "analyzing_power_b",
+    "analyzing_power",
+    "initial_total_num_events",
+    "central_weight",
+}
+PREDICTION_PASSTHROUGH_SUFFIXES = ("_cut",)
+PREDICTION_PASSTHROUGH_PREFIXES = ("truth_",)
 
 
 @dataclass(frozen=True)
@@ -558,6 +569,20 @@ def ensure_converted_batch_fields(
     return output
 
 
+def prediction_passthrough_columns(batch_np: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    output: dict[str, np.ndarray] = {}
+    for field, values in batch_np.items():
+        if field not in PREDICTION_PASSTHROUGH_EXACT_FIELDS and not field.endswith(PREDICTION_PASSTHROUGH_SUFFIXES) and not field.startswith(PREDICTION_PASSTHROUGH_PREFIXES):
+            continue
+        array = np.asarray(values)
+        if array.ndim != 1:
+            continue
+        if array.dtype.kind not in {"b", "i", "u", "f"}:
+            continue
+        output[field] = array
+    return output
+
+
 def resolve_shape_metadata_path(input_path: Path, override: Path | None) -> Path:
     if override is not None:
         return override.expanduser().resolve()
@@ -823,6 +848,7 @@ def augment_converted_parquet_task(
     ):
         if source_key in batch_np:
             output_columns[source_key] = batch_np[source_key].astype(np.int64)
+    output_columns.update(prediction_passthrough_columns(batch_np))
 
     if "tau_vis_prong" in batch_np:
         tau_vis_prong = batch_np["tau_vis_prong"].astype(np.float32)

@@ -22,6 +22,15 @@ Training:
       weight_decay: 0.01
       decoupled_weight_decay: true
 
+    InvisibleInputProjector:
+      learning_rate: 0.001
+      optimizer_group: "projector"
+      optimizer_type: "lion"
+      warm_up: true
+      weight_decay: 0.01
+      decoupled_weight_decay: true
+
+
     Classification:
       include: true
 

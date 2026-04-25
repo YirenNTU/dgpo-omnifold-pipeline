@@ -41,6 +41,17 @@ console = Console()
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 GENERATED_EVENT_INFO_PATH = CONFIG_DIR / "generated_event_info.yaml"
 
+PREDICTION_PASSTHROUGH_EXACT_FIELDS = {
+    "event_category",
+    "truth_QI_region",
+    "analyzing_power_a",
+    "analyzing_power_b",
+    "analyzing_power",
+    "initial_total_num_events",
+}
+PREDICTION_PASSTHROUGH_SUFFIXES = ("_cut",)
+PREDICTION_PASSTHROUGH_PREFIXES = ("truth_",)
+
 @dataclass(frozen=True)
 class Sample:
     key: str
@@ -352,6 +363,28 @@ def source_event_key_array(events: ak.Array) -> np.ndarray:
     return np.arange(len(events), dtype=np.int64)
 
 
+def passthrough_prediction_fields(events: ak.Array) -> dict[str, np.ndarray]:
+    output: dict[str, np.ndarray] = {}
+    if "weight" in events.fields:
+        output["central_weight"] = to_numpy_array(events["weight"], np.float32)
+
+    for field in events.fields:
+        if field == "weight":
+            continue
+        if field not in PREDICTION_PASSTHROUGH_EXACT_FIELDS and not field.endswith(PREDICTION_PASSTHROUGH_SUFFIXES) and not field.startswith(PREDICTION_PASSTHROUGH_PREFIXES):
+            continue
+        values = events[field]
+        if hasattr(values, "fields"):
+            continue
+        array = to_numpy_array(values)
+        if array.ndim != 1:
+            continue
+        if array.dtype.kind not in {"b", "i", "u", "f"}:
+            continue
+        output[field] = array
+    return output
+
+
 def build_dataset(
     expanded_samples: list[tuple[Sample, ak.Array]],
     max_particles: int,
@@ -431,6 +464,7 @@ def build_dataset(
             "source_event_index": np.arange(len(events), dtype=np.int64),
             "source_event_key": source_event_key_array(events),
         }
+        batch.update(passthrough_prediction_fields(events))
         if include_classification:
             batch["classification"] = np.full(len(events), class_index[sample.name], dtype=np.int64)
             batch["event_weight"] = np.ones(len(events), dtype=np.float32)

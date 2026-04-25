@@ -19,15 +19,37 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from quantum.observables_builder import build_observables
+from quantum.observables_builder import build_observables, get_observable_names
 from utils.common_functions import rebuild_p4
-from build_evenet_input_from_parquet import expand_samples, parse_config, read_yaml, source_event_key_array
+from build_evenet_input_from_parquet import apply_preselection, expand_samples, parse_config, read_yaml
 
 
 vector.register_awkward()
 
 DEFAULT_FLOAT = -99.0
 DEFAULT_REGIONS = ("baseline", "hadhad", "ee", "mumu", "emu")
+EXPORT_PASSTHROUGH_EXACT_FIELDS = {
+    "event_category",
+    "truth_QI_region",
+    "analyzing_power_a",
+    "analyzing_power_b",
+    "analyzing_power",
+    "initial_total_num_events",
+    "weight",
+    "central_weight",
+    "event_weight",
+    "evenet_weight",
+    "source_sample_index",
+    "source_slot_for_a",
+    "source_slot_for_b",
+    "evenet_pred_class_index",
+    "evenet_pred_class_prob",
+    "evenet_pred_class_name",
+    "evenet_truth_class_index",
+    "evenet_truth_class_name",
+}
+EXPORT_PASSTHROUGH_PREFIXES = ("truth_", "pred_invisible_", "target_invisible_", "tau_vis_prong_", "tau_vis_target_", "evenet_")
+EXPORT_PASSTHROUGH_SUFFIXES = ("_cut",)
 
 
 def parse_args() -> argparse.Namespace:
@@ -286,6 +308,11 @@ def default_object_array(num_events: int, value: str = "unpredicted") -> ak.Arra
 
 
 def default_field_like(field_values: ak.Array, num_events: int):
+    if hasattr(field_values, "fields") and (
+        {"px", "py", "pz", "E"}.issubset(set(field_values.fields))
+        or {"x", "y", "z", "t"}.issubset(set(field_values.fields))
+    ):
+        return zero_p4(num_events)
     array = ak.to_numpy(field_values, allow_missing=False)
     if array.dtype == np.bool_:
         return np.zeros(num_events, dtype=bool)
@@ -294,6 +321,51 @@ def default_field_like(field_values: ak.Array, num_events: int):
     if np.issubdtype(array.dtype, np.floating):
         return default_float_array(num_events, dtype=array.dtype)
     return default_object_array(num_events)
+
+
+def should_passthrough_export_field(field: str) -> bool:
+    return (
+        field in EXPORT_PASSTHROUGH_EXACT_FIELDS
+        or field.startswith(EXPORT_PASSTHROUGH_PREFIXES)
+        or field.endswith(EXPORT_PASSTHROUGH_SUFFIXES)
+    )
+
+
+def compact_export_fields(events: ak.Array) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for field in events.fields:
+        if not should_passthrough_export_field(field):
+            continue
+        values = events[field]
+        if hasattr(values, "fields"):
+            continue
+        try:
+            array = ak.to_numpy(values, allow_missing=False)
+        except Exception:
+            continue
+        if array.ndim != 1:
+            continue
+        if array.dtype.kind in {"b", "i", "u", "f", "U", "S", "O"}:
+            output[field] = values
+    return output
+
+
+def align_fields_for_concat(arrays: list[ak.Array]) -> list[ak.Array]:
+    if not arrays:
+        return arrays
+    template_by_field: dict[str, Any] = {}
+    for events in arrays:
+        for field in events.fields:
+            template_by_field.setdefault(field, events[field])
+
+    aligned: list[ak.Array] = []
+    for events in arrays:
+        output = events
+        for field, template in template_by_field.items():
+            if field not in output.fields:
+                output[field] = default_field_like(template, len(output))
+        aligned.append(output)
+    return aligned
 
 
 def safe_delta_r(first: ak.Array, second: ak.Array) -> np.ndarray:
@@ -315,12 +387,11 @@ def build_predicted_reconstruction(
     central_pred_events: ak.Array,
     pred_events: ak.Array,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    num_predicted_rows = len(pred_events)
     visible0, visible0_valid = p4_from_components(pred_events, "tau_vis_prong", 0)
     visible1, visible1_valid = p4_from_components(pred_events, "tau_vis_prong", 1)
     pred_missing0, pred_missing0_valid = p4_from_components(pred_events, "pred_invisible", 0)
     pred_missing1, pred_missing1_valid = p4_from_components(pred_events, "pred_invisible", 1)
-
-    del central_pred_events
 
     if "source_slot_for_a" not in pred_events.fields or "source_slot_for_b" not in pred_events.fields:
         raise ValueError(
@@ -347,6 +418,10 @@ def build_predicted_reconstruction(
     reco_tau_a = lead_a_visible + lead_a_missing
     reco_tau_b = lead_b_visible + lead_b_missing
 
+    del central_pred_events
+    delta_r_a = np.full(num_predicted_rows, np.nan, dtype=np.float32)
+    delta_r_b = np.full(num_predicted_rows, np.nan, dtype=np.float32)
+
     flags_valid = (
         vis_valid_a
         & vis_valid_b
@@ -372,13 +447,13 @@ def build_predicted_reconstruction(
         "reco_tau_a_p4": reco_tau_a,
         "reco_tau_b_p4": reco_tau_b,
         "flags_valid": flags_valid,
-        "mmc_likelihood": np.zeros(len(central_pred_events), dtype=np.float32),
-        "neutrino_method": ak.Array(["EveNet"] * len(central_pred_events)),
-        "evenet_has_prediction": np.ones(len(central_pred_events), dtype=bool),
+        "mmc_likelihood": np.zeros(num_predicted_rows, dtype=np.float32),
+        "neutrino_method": ak.Array(["EveNet"] * num_predicted_rows),
+        "evenet_has_prediction": np.ones(num_predicted_rows, dtype=bool),
         "evenet_slot_for_a": slot_for_a.astype(np.int8),
         "evenet_slot_for_b": slot_for_b.astype(np.int8),
-        "evenet_leg_match_deltaR_a": np.full(len(central_pred_events), np.nan, dtype=np.float32),
-        "evenet_leg_match_deltaR_b": np.full(len(central_pred_events), np.nan, dtype=np.float32),
+        "evenet_leg_match_deltaR_a": delta_r_a,
+        "evenet_leg_match_deltaR_b": delta_r_b,
     }
     for obs_name, obs_values in observables.items():
         values[obs_name] = ak.where(flags_valid, obs_values, np.nan)
@@ -393,15 +468,15 @@ def build_predicted_reconstruction(
             values[field] = pred_events[field]
 
     metrics = {
-        "num_predicted_events": int(len(central_pred_events)),
+        "num_predicted_events": int(num_predicted_rows),
         "valid_predicted_events": int(np.sum(flags_valid)),
         "valid_predicted_fraction": float(np.mean(flags_valid)) if len(flags_valid) else 0.0,
         "slot_alignment": "prediction_metadata_source_slot_for_a",
         "slot_swap_fraction": float(np.mean(slot_for_a == 0)) if len(slot_for_a) else 0.0,
-        "median_deltaR_a": None,
-        "median_deltaR_b": None,
-        "p95_deltaR_a": None,
-        "p95_deltaR_b": None,
+        "median_deltaR_a": finite_median(delta_r_a),
+        "median_deltaR_b": finite_median(delta_r_b),
+        "p95_deltaR_a": finite_percentile(delta_r_a, 95.0),
+        "p95_deltaR_b": finite_percentile(delta_r_b, 95.0),
     }
     return values, metrics
 
@@ -770,13 +845,20 @@ def sample_raw_files(analysis_cfg: dict, sample_key: str, sample_name: str) -> l
 
 def build_source_mapping(expanded_entries) -> dict[int, dict[str, Any]]:
     mapping: dict[int, dict[str, Any]] = {}
-    for source_index, (expanded_sample, events, parent_sample) in enumerate(expanded_entries):
+    for source_index, entry in enumerate(expanded_entries):
+        if isinstance(entry, tuple):
+            expanded_sample, _source_events, parent_sample = entry
+            entry = {
+                "expanded_name": expanded_sample.name,
+                "parent_key": expanded_sample.key,
+                "parent_name": parent_sample.name,
+                "is_data": bool(parent_sample.is_data),
+            }
         mapping[source_index] = {
-            "expanded_name": expanded_sample.name,
-            "parent_key": expanded_sample.key,
-            "parent_name": parent_sample.name,
-            "is_data": bool(parent_sample.is_data),
-            "events": events,
+            "expanded_name": entry["expanded_name"],
+            "parent_key": entry["parent_key"],
+            "parent_name": entry["parent_name"],
+            "is_data": bool(entry["is_data"]),
         }
     return mapping
 
@@ -785,13 +867,13 @@ def selected_events_by_source_index(analysis_config_path: Path) -> tuple[dict[st
     analysis_cfg = read_yaml(analysis_config_path)
     samples, subcategories, _ = parse_config(analysis_config_path)
     selected_events = {
-        sample_key: load_concat_events(expand_paths(sample.input_files))
+        sample_key: apply_preselection(load_concat_events(expand_paths(sample.input_files)))
         for sample_key, sample in samples.items()
     }
-    expanded = expand_samples(samples, selected_events, subcategories)
+    expanded_samples = expand_samples(samples, selected_events, subcategories)
     mc_entries = []
     data_entries = []
-    for expanded_sample, events in expanded:
+    for expanded_sample, events in expanded_samples:
         parent_sample = samples[expanded_sample.key]
         entry = (expanded_sample, events, parent_sample)
         if parent_sample.is_data:
@@ -804,19 +886,14 @@ def selected_events_by_source_index(analysis_config_path: Path) -> tuple[dict[st
 def require_source_columns(pred_events: ak.Array, pred_path: Path) -> None:
     missing = [
         field
-        for field in ("source_sample_index", "source_event_key")
+        for field in ("source_sample_index",)
         if field not in pred_events.fields
     ]
     if missing:
         raise ValueError(
-            f"{pred_path} is missing source id columns {missing}. Rebuild the EveNet input and rerun "
-            "prediction with the updated ml_pipeline scripts so preprocessing shuffles/splits can be "
-            "merged back to analysis.yaml raw_files safely."
+            f"{pred_path} is missing source columns {missing}. Rebuild the EveNet input and rerun "
+            "prediction with the updated ml_pipeline scripts so rows can be grouped by sample safely."
         )
-
-
-def event_keys(events: ak.Array) -> np.ndarray:
-    return source_event_key_array(events)
 
 
 def config_prediction_paths(args: argparse.Namespace, analysis_cfg: dict) -> tuple[Path | None, Path | None]:
@@ -884,6 +961,78 @@ def merge_prediction_group(
     )
 
 
+def build_compact_base_events(events: ak.Array, fallback_weight: np.ndarray | None = None) -> ak.Array:
+    columns = compact_export_fields(events)
+    num_events = len(events)
+    if "weight" not in columns:
+        if fallback_weight is not None:
+            columns["weight"] = np.asarray(fallback_weight, dtype=np.float32)
+        else:
+            columns["weight"] = np.ones(num_events, dtype=np.float32)
+    if "central_weight" not in columns and "weight" in columns:
+        columns["central_weight"] = ak.to_numpy(columns["weight"], allow_missing=False).astype(np.float32)
+    return ak.Array(columns)
+
+
+def require_concat_prediction_columns(pred_events: ak.Array, is_data: bool) -> None:
+    required = {"initial_total_num_events", "source_slot_for_a", "source_slot_for_b", "tau_vis_prong_slot0_valid"}
+    if not is_data:
+        required.update({"event_category", "truth_QI_region", "analyzing_power_a", "analyzing_power_b"})
+        required.update({f"truth_{name}" for name in get_observable_names()})
+    missing = sorted(field for field in required if field not in pred_events.fields)
+    if missing:
+        raise ValueError(
+            "Prediction parquet is missing fields required for concat-based unfolding export: "
+            f"{missing[:10]}. Rebuild the EveNet input, preprocess parquet, and prediction parquet "
+            "with the updated ml_pipeline scripts so the selected-source rows carry the needed central truth/cut metadata."
+        )
+
+
+def build_concat_prediction_rows(
+    pred_events: ak.Array,
+    prediction_split_fraction: float | None,
+    is_data: bool,
+) -> tuple[ak.Array, dict[str, Any]]:
+    if len(pred_events) == 0:
+        raise ValueError("Prediction parquet group is empty; cannot build concat rows.")
+    require_concat_prediction_columns(pred_events, is_data=is_data)
+
+    fallback_weight = (
+        ak.to_numpy(pred_events["central_weight"], allow_missing=False).astype(np.float32)
+        if "central_weight" in pred_events.fields
+        else ak.to_numpy(pred_events["event_weight"], allow_missing=False).astype(np.float32)
+        if "event_weight" in pred_events.fields
+        else np.ones(len(pred_events), dtype=np.float32)
+    )
+    base_events = build_compact_base_events(pred_events, fallback_weight=fallback_weight)
+    full_indices = np.arange(len(base_events), dtype=np.int64)
+    return with_evenet_reconstruction(
+        full_events=base_events,
+        central_pred_events=base_events,
+        pred_events=pred_events,
+        full_indices=full_indices,
+        prediction_split_fraction=prediction_split_fraction,
+        selected_full_indices=full_indices,
+        zero_unpredicted_selected_mc=False,
+    )
+
+
+def build_concat_raw_complement_rows(
+    raw_events: ak.Array,
+    pred_template_events: ak.Array,
+) -> tuple[ak.Array, dict[str, Any]]:
+    compact_raw = build_compact_base_events(raw_events)
+    return with_evenet_reconstruction(
+        full_events=compact_raw,
+        central_pred_events=pred_template_events[:0],
+        pred_events=pred_template_events[:0],
+        full_indices=np.array([], dtype=np.int64),
+        prediction_split_fraction=None,
+        selected_full_indices=None,
+        zero_unpredicted_selected_mc=False,
+    )
+
+
 def export_config_group(
     parent_name: str,
     group: dict[str, Any],
@@ -897,41 +1046,39 @@ def export_config_group(
     raw_files = sample_raw_files(analysis_cfg, group["parent_key"], parent_name)
     full_events = load_concat_events(raw_files)
     selected_mask = prediction_selection_mask(full_events)
-    selected_full_raw_indices = np.flatnonzero(selected_mask).astype(np.int64)
-    selected_full_events = full_events[selected_mask]
+    outside_selected_events = full_events[~selected_mask]
     print(
         f"[export-evenet-to-qi] worker {os.getpid()} loaded {parent_name} raw_events={len(full_events)} "
-        f"selected_for_prediction={len(selected_full_events)}",
+        f"selected_for_prediction={int(np.sum(selected_mask))} outside_selected={len(outside_selected_events)}",
         flush=True,
     )
-    pred_group = ak.concatenate(group["pred_parts"], axis=0) if len(group["pred_parts"]) > 1 else group["pred_parts"][0]
-    source_group = ak.concatenate(group["source_parts"], axis=0) if len(group["source_parts"]) > 1 else group["source_parts"][0]
     split_fraction = None if group["is_data"] else prediction_split_fraction
-
-    full_index_parts = []
-    for source_info, selected_indices in zip(group["source_infos"], group["selected_index_parts"]):
-        selected_to_full = map_subset_rows_to_full(
-            full_events=selected_full_events,
-            subset_events=source_info["events"],
-            context=f"{source_info['expanded_name']} selected rows inside raw baseline+nprong==2",
-        )
-        selected_to_full_raw = selected_full_raw_indices[selected_to_full]
-        full_index_parts.append(selected_to_full_raw[selected_indices])
-    full_indices = np.concatenate(full_index_parts).astype(np.int64) if full_index_parts else np.array([], dtype=np.int64)
-    selected_full_indices = selected_full_raw_indices
-    print(
-        f"[export-evenet-to-qi] worker {os.getpid()} mapped {parent_name} predictions={len(full_indices)}",
-        flush=True,
-    )
-
-    evenet_events, metrics = with_evenet_reconstruction(
-        full_events=full_events,
-        central_pred_events=source_group,
+    pred_group = ak.concatenate(group["pred_parts"], axis=0) if len(group["pred_parts"]) > 1 else group["pred_parts"][0]
+    predicted_events, predicted_metrics = build_concat_prediction_rows(
         pred_events=pred_group,
-        full_indices=full_indices,
         prediction_split_fraction=split_fraction,
-        selected_full_indices=selected_full_indices,
-        zero_unpredicted_selected_mc=bool((not group["is_data"]) and split_fraction is not None),
+        is_data=group["is_data"],
+    )
+    outside_events, outside_metrics = build_concat_raw_complement_rows(
+        raw_events=outside_selected_events,
+        pred_template_events=pred_group,
+    )
+    outside_events, predicted_events = align_fields_for_concat([outside_events, predicted_events])
+    evenet_events = ak.concatenate([outside_events, predicted_events], axis=0)
+    metrics = {
+        "num_raw_events": int(len(full_events)),
+        "num_raw_outside_selected": int(len(outside_events)),
+        "num_predicted_events": int(len(predicted_events)),
+        "prediction_split_fraction": split_fraction,
+        "prediction_parquet_rows": int(len(pred_group)),
+        "concat_mode": "raw_outside_selected_plus_prediction_rows",
+        "prediction_metrics": predicted_metrics,
+        "outside_selected_metrics": outside_metrics,
+    }
+    print(
+        f"[export-evenet-to-qi] worker {os.getpid()} concat {parent_name} raw_outside={len(outside_events)} "
+        f"predicted={len(predicted_events)} total={len(evenet_events)}",
+        flush=True,
     )
     sample_output_root = output_root / output_label
     counts = write_qi_tree(evenet_events, sample_output_root, parent_name, regions)
@@ -981,23 +1128,6 @@ def export_config_prediction(
         parent_key = source_info["parent_key"]
         row_mask = source_indices == int(source_index)
         pred_subset = pred_events[row_mask]
-        selected_subset = source_info["events"]
-        if "source_event_index" in pred_subset.fields:
-            selected_indices = ak.to_numpy(pred_subset["source_event_index"], allow_missing=False).astype(np.int64)
-            if np.any(selected_indices < 0) or np.any(selected_indices >= len(selected_subset)):
-                raise ValueError(
-                    f"{pred_path} has source_event_index outside the selected source range for "
-                    f"{source_info['expanded_name']}."
-                )
-        else:
-            pred_keys = ak.to_numpy(pred_subset["source_event_key"], allow_missing=False)
-            selected_keys = event_keys(selected_subset)
-            selected_indices = map_by_event_key_occurrence(
-                full_keys=selected_keys,
-                subset_keys=pred_keys,
-                context=f"{source_info['expanded_name']} prediction source rows",
-            )
-        selected_pred_source = selected_subset[selected_indices]
 
         group = grouped.setdefault(
             parent_name,
@@ -1006,16 +1136,12 @@ def export_config_prediction(
                 "parent_name": parent_name,
                 "is_data": source_info["is_data"],
                 "pred_parts": [],
-                "source_parts": [],
                 "source_infos": [],
-                "selected_index_parts": [],
                 "expanded_samples": [],
             },
         )
         group["pred_parts"].append(pred_subset)
-        group["source_parts"].append(selected_pred_source)
         group["source_infos"].append(source_info)
-        group["selected_index_parts"].append(selected_indices)
         group["expanded_samples"].append(source_info["expanded_name"])
 
     group_items = list(grouped.items())

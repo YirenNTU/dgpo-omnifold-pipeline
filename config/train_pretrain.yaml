@@ -40,6 +40,11 @@ options:
     learning_rate_body: &lr_body 0.0001
 
     Components:
+      InvisibleInputProjector:
+        learning_rate: *lr
+        optimizer_group: "projector"
+        optimizer_type: "adamW"
+      
       GroupedSequentialEmbedding:
         learning_rate: *lr
         optimizer_group: "projector"

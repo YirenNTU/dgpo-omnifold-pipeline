@@ -105,7 +105,7 @@ The builder also writes source provenance:
 - `source_event_index`
 - `source_event_key`
 
-These fields are required because EveNet preprocessing can shuffle and split events. Downstream export must not rely on a local converted-parquet row index.
+These fields are carried through preprocessing so prediction outputs can still be traced back to the selected-source universe. In the current no-matching concat workflow, config-mode export groups rows by `source_sample_index` and then concatenates predicted selected rows with raw rows outside the EveNet selection.
 
 ### Slot Convention
 
@@ -117,14 +117,14 @@ electron -> muon -> pion -> rho -> other
 
 Therefore `x_invisible[:, 0]` and `x_invisible[:, 1]` are particle-kind slots, not fixed tau+ or tau- slots. This gives stable targets for channels such as `e rho`, `mu pi`, and `pi rho`.
 
-When exporting back to central/QI/unfolding, `export_evenet_prediction_to_qi.py` uses `tau_vis_prong_slot*` from the prediction parquet and `lead_a_visible_p4/lead_b_visible_p4` from the central parquet to perform visible-p4 `deltaR` matching. It then restores the central convention:
+When exporting back to central/QI/unfolding, `export_evenet_prediction_to_qi.py` restores the central leg convention directly from the prediction parquet slot metadata:
 
 ```text
 lead_a = tau+
 lead_b = tau-
 ```
 
-If the central source parquet lacks `lead_a_visible_p4` or `lead_b_visible_p4`, export fails instead of silently using EveNet slot order.
+No event-id matching or visible-p4 `deltaR` matching is performed in this workflow. The contract is that the prediction parquet is already the self-contained representation of the EveNet-selected universe.
 
 ## 2. EveNet Preprocessing
 
@@ -251,6 +251,7 @@ Prediction parquet files are self-contained for downstream plotting and export. 
 - Predicted invisible slots
 - Target invisible truth slots
 - Visible tau slots
+- Central truth / cut metadata needed by unfolding export
 - `event_weight` and `evenet_weight`
 - `source_sample_index`, `source_event_index`, and `source_event_key`
 
@@ -282,7 +283,15 @@ This summary is an EveNet standalone diagnostic. Its regions can be based on Eve
 
 ## 6. Export EveNet Prediction to Central/QI Schema
 
-This step maps EveNet predictions back into the full raw event universe so central/QI/unfolding can consume them directly. Events outside the EveNet input selection, or events without a prediction, are preserved with:
+This step uses the no-matching concat workflow for central/QI/unfolding:
+
+- Start from full central `filtered___raw.parquet`
+- Define the EveNet-selected universe with `baseline_cut && nprong == 2`
+- Keep the raw complement `raw[~selected_mask]`
+- Build predicted rows directly from the self-contained prediction parquet
+- Concatenate `raw outside selected + predicted selected rows`
+
+The exporter does not map predictions back onto full-raw row identities. Instead, the prediction parquet is treated as the authoritative representation of the selected universe, and raw rows outside the EveNet selection are preserved with:
 
 - `flags_valid = false`
 - Invalid/default missing p4
@@ -325,12 +334,7 @@ Output structure:
     Zqq/filtered___raw.parquet
 ```
 
-For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the central `weight` field for rows with EveNet predictions. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw rows outside the EveNet selected-source universe keep their original central weight.
-
-For config-driven MC export with a non-null split fraction, the exporter also zeroes the weights of
-selected-source MC rows that belong to the held-out train half and were not part of the current
-prediction parquet. This avoids double counting when predicted rows already carry the `1/split_fraction`
-normalization back to the full selected-event yield.
+For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the exported `weight` field for predicted rows. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw rows outside the EveNet selected universe keep their original central weight.
 
 `--num-workers` parallelizes the config-driven export over parent samples and prints progress bars such as `mc export [####----] 1/3 Ztautau`. The default backend is thread-based so large awkward arrays are shared instead of copied into subprocesses. Keep it at `1` if memory pressure is high. Use `--worker-backend process` only when enough memory is available.
 
@@ -529,7 +533,7 @@ If standalone prediction looks worse than training validation plots, check:
 - The prediction command used the intended checkpoint and config.
 - EMA usage matches the intended evaluation. The documented workflow uses `--disable-ema`; omit it only for an explicit EMA prediction.
 - Standalone neutrino prediction is conditioned on predicted class. Training validation monitoring may be conditioned on truth class.
-- The prediction parquet is regenerated and includes `source_sample_index/source_event_key`.
+- The prediction parquet is regenerated and includes the self-contained truth/cut metadata required by export.
 - `analysis.yaml` `input_files` and `raw_files` come from the same central production.
 - `--converted-split-fraction` and `--prediction-split-fraction` are only used in their intended steps.
 - The comparison uses the same sample, central schema, and luminosity normalization.
@@ -538,7 +542,7 @@ If standalone prediction looks worse than training validation plots, check:
 
 ### Why can old prediction parquet files fail export?
 
-They may not contain `source_sample_index` and `source_event_key`. After preprocessing shuffle or train/test splitting, those fields are required to map predictions safely back to raw parquet. Regenerate the EveNet input, preprocess outputs, and prediction parquet.
+They may not contain the self-contained metadata required by concat export, such as `source_sample_index`, visible tau slots, or unfolding truth/cut fields. Regenerate the EveNet input, preprocess outputs, and prediction parquet with the updated `ml_pipeline` scripts.
 
 ### Does data without truth fail?
 
