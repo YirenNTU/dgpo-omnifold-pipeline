@@ -295,6 +295,12 @@ def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Arr
 
     # convert
     if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("energy", "pt", "eta", "phi")):
+        print(
+            "pt", component("pt"),
+            "eta", component("eta"),
+            "phi", component("phi"),
+            "energy", component("energy"),
+        )
         pt = component("pt")
         eta = component("eta")
         phi = component("phi")
