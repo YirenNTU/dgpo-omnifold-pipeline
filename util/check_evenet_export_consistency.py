@@ -216,10 +216,18 @@ def build_expected_ab_fields(pred_events: ak.Array) -> dict[str, np.ndarray]:
         "expected_lead_b_visible_eta": choose("tau_vis_prong", slot_for_b, "eta"),
         "expected_lead_b_visible_phi": choose("tau_vis_prong", slot_for_b, "phi"),
         "expected_lead_a_missing_E": choose("pred_invisible", slot_for_a, "E"),
+        "expected_lead_a_missing_energy": choose("pred_invisible", slot_for_a, "energy"),
+        "expected_lead_a_missing_pt": choose("pred_invisible", slot_for_a, "pt"),
+        "expected_lead_a_missing_eta": choose("pred_invisible", slot_for_a, "eta"),
+        "expected_lead_a_missing_phi": choose("pred_invisible", slot_for_a, "phi"),
         "expected_lead_a_missing_px": choose("pred_invisible", slot_for_a, "px"),
         "expected_lead_a_missing_py": choose("pred_invisible", slot_for_a, "py"),
         "expected_lead_a_missing_pz": choose("pred_invisible", slot_for_a, "pz"),
         "expected_lead_b_missing_E": choose("pred_invisible", slot_for_b, "E"),
+        "expected_lead_b_missing_energy": choose("pred_invisible", slot_for_b, "energy"),
+        "expected_lead_b_missing_pt": choose("pred_invisible", slot_for_b, "pt"),
+        "expected_lead_b_missing_eta": choose("pred_invisible", slot_for_b, "eta"),
+        "expected_lead_b_missing_phi": choose("pred_invisible", slot_for_b, "phi"),
         "expected_lead_b_missing_px": choose("pred_invisible", slot_for_b, "px"),
         "expected_lead_b_missing_py": choose("pred_invisible", slot_for_b, "py"),
         "expected_lead_b_missing_pz": choose("pred_invisible", slot_for_b, "pz"),
@@ -321,6 +329,54 @@ def main() -> None:
         fig.tight_layout()
         fig.savefig(args.output_dir / "ab_remap_consistency.png", bbox_inches="tight")
         plt.close(fig)
+
+        ab_invisible_kinematics_fields = [
+            ("expected_lead_a_missing_energy", "lead_a_missing_p4", "lead_a missing energy", "energy"),
+            ("expected_lead_a_missing_pt", "lead_a_missing_p4", "lead_a missing pt", "pt"),
+            ("expected_lead_a_missing_eta", "lead_a_missing_p4", "lead_a missing eta", "eta"),
+            ("expected_lead_a_missing_phi", "lead_a_missing_p4", "lead_a missing phi", "phi"),
+            ("expected_lead_b_missing_energy", "lead_b_missing_p4", "lead_b missing energy", "energy"),
+            ("expected_lead_b_missing_pt", "lead_b_missing_p4", "lead_b missing pt", "pt"),
+            ("expected_lead_b_missing_eta", "lead_b_missing_p4", "lead_b missing eta", "eta"),
+            ("expected_lead_b_missing_phi", "lead_b_missing_p4", "lead_b missing phi", "phi"),
+        ]
+        fig_kin, axes_kin = plt.subplots(2, 4, figsize=(16, 8), dpi=220)
+        ab_invisible_kinematics_summary: dict[str, Any] = {}
+        for axis, (pred_field, export_field, label, component) in zip(axes_kin.flat, ab_invisible_kinematics_fields):
+            if component in {"energy", "pt", "eta", "phi"}:
+                export_values = to_numpy(getattr(aligned_export[export_field], component), np.float64)
+            else:
+                export_values = to_numpy(aligned_export[export_field][component], np.float64)
+            pred_values = to_numpy(ab_pred[pred_field], np.float64)
+            valid = np.isfinite(pred_values) & np.isfinite(export_values)
+            valid &= ~np.isclose(pred_values, DEFAULT_FLOAT)
+            valid &= ~np.isclose(export_values, DEFAULT_FLOAT)
+            if not np.any(valid):
+                axis.set_visible(False)
+                ab_invisible_kinematics_summary[label] = {"status": "no_valid_entries"}
+                continue
+            pred_values = pred_values[valid]
+            export_values = export_values[valid]
+            sampled = choose_sample_indices(len(pred_values), args.max_scatter)
+            axis.scatter(pred_values[sampled], export_values[sampled], s=4, alpha=0.25, color=OKABE_ITO[2], linewidths=0)
+            low = float(min(np.min(pred_values), np.min(export_values)))
+            high = float(max(np.max(pred_values), np.max(export_values)))
+            axis.plot([low, high], [low, high], linestyle="--", color=OKABE_ITO[3], linewidth=1.2)
+            axis.set_title(label)
+            axis.set_xlabel("Prediction + slot_for_a/b")
+            axis.set_ylabel("Export a/b field")
+            axis.grid(alpha=0.2)
+            ab_invisible_kinematics_summary[label] = {
+                "status": "ok",
+                "num_valid_entries": int(len(pred_values)),
+                "max_abs_diff": float(np.max(np.abs(export_values - pred_values))),
+                "mean_abs_diff": float(np.mean(np.abs(export_values - pred_values))),
+            }
+        fig_kin.suptitle("Central a/b invisible kinematics consistency")
+        fig_kin.tight_layout()
+        fig_kin.savefig(args.output_dir / "ab_invisible_kinematics_consistency.png", bbox_inches="tight")
+        plt.close(fig_kin)
+        ab_summary["invisible_kinematics"] = ab_invisible_kinematics_summary
 
     with (args.output_dir / "export_consistency_summary.json").open("w") as handle:
         json.dump(
