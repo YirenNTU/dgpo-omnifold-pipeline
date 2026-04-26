@@ -231,15 +231,31 @@ def rebuild_vector(values: ak.Array) -> ak.Array:
     return values
 
 
-def build_momentum4d(px, py, pz, energy):
-    # energy from px, py, pz, tau_mass
-    tau_mass = 1.777
+TAU_MASS = 1.777  # GeV
+
+def build_momentum4d_with_mass(obj, mass):
+    px = obj.px
+    py = obj.py
+    pz = obj.pz
+    energy = np.sqrt(px**2 + py**2 + pz**2 + mass**2)
     return ak.zip(
         {
             "px": px,
             "py": py,
             "pz": pz,
-            "E": np.sqrt(px*px + py*py + pz*pz + tau_mass*tau_mass),
+            "E": energy,
+        },
+        with_name="Momentum4D",
+    )
+
+def build_momentum4d(px, py, pz, energy):
+    # energy from px, py, pz, tau_mass
+    return ak.zip(
+        {
+            "px": px,
+            "py": py,
+            "pz": pz,
+            "E": energy,
         },
         with_name="Momentum4D",
     )
@@ -549,6 +565,8 @@ def build_predicted_reconstruction(
     lead_b_missing, pred_valid_b = build_remapped_p4(pred_events, "pred_invisible", slot_for_b)
     reco_tau_a = lead_a_visible + lead_a_missing
     reco_tau_b = lead_b_visible + lead_b_missing
+    reco_tau_a = build_momentum4d_with_mass(reco_tau_a, mass=TAU_MASS)
+    reco_tau_b = build_momentum4d_with_mass(reco_tau_b, mass=TAU_MASS)
 
     del central_pred_events
     delta_r_a = np.full(num_predicted_rows, np.nan, dtype=np.float32)
