@@ -449,6 +449,7 @@ def plot_truth_vs_reco_by_method_and_region(
     observable_specs: list[tuple[str, str]],
     output_dir: Path,
     normalize: bool,
+    reco_observable_source: str,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     truth_dir = output_dir / "truth_vs_reco"
@@ -484,7 +485,7 @@ def plot_truth_vs_reco_by_method_and_region(
                 reco_values_full = truth_reco_observable_values(
                     events,
                     observable,
-                    source_mode=args.reco_observable_source,
+                    source_mode=reco_observable_source,
                 )
                 truth_values_full = truth_observable_values(events, observable)
                 if reco_values_full is None or truth_values_full is None:
@@ -910,6 +911,7 @@ def main() -> None:
         observable_specs=observable_specs,
         output_dir=args.output_dir,
         normalize=args.normalize_truth_reco,
+        reco_observable_source=args.reco_observable_source,
     )
     print(f"[preunfolding] finished truth-vs-reco methods={list(truth_summary)}", flush=True)
     truth_metric_summary = plot_truth_metric_summary(
