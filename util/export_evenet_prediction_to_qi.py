@@ -231,14 +231,24 @@ def rebuild_vector(values: ak.Array) -> ak.Array:
     return values
 
 
-def canonicalize_p4(p4: ak.Array) -> ak.Array:
-    return vector.zip(
+def build_momentum4d(px, py, pz, energy):
+    return ak.zip(
         {
-            "px": ak.to_numpy(p4.px, allow_missing=False).astype(np.float64),
-            "py": ak.to_numpy(p4.py, allow_missing=False).astype(np.float64),
-            "pz": ak.to_numpy(p4.pz, allow_missing=False).astype(np.float64),
-            "E": ak.to_numpy(p4.E, allow_missing=False).astype(np.float64),
-        }
+            "px": px,
+            "py": py,
+            "pz": pz,
+            "E": energy,
+        },
+        with_name="Momentum4D",
+    )
+
+
+def canonicalize_p4(p4: ak.Array) -> ak.Array:
+    return build_momentum4d(
+        ak.to_numpy(p4.px, allow_missing=False).astype(np.float64),
+        ak.to_numpy(p4.py, allow_missing=False).astype(np.float64),
+        ak.to_numpy(p4.pz, allow_missing=False).astype(np.float64),
+        ak.to_numpy(p4.E, allow_missing=False).astype(np.float64),
     )
 
 
@@ -265,24 +275,28 @@ def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Arr
 
     # convert
     if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("energy", "pt", "eta", "phi")):
-        p4 = vector.zip(
-            {
-                "pt": component("pt"),
-                "eta": component("eta"),
-                "phi": component("phi"),
-                "E": component("energy"),
-            }
+        pt = component("pt")
+        eta = component("eta")
+        phi = component("phi")
+        energy = component("energy")
+        p4 = build_momentum4d(
+            pt * np.cos(phi),
+            pt * np.sin(phi),
+            pt * np.sinh(eta),
+            energy,
         )
         return canonicalize_p4(p4), valid
 
     if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("log_energy", "log_pt", "eta", "phi")):
-        p4 = vector.zip(
-            {
-                "pt": np.expm1(component("log_pt")),
-                "eta": component("eta"),
-                "phi": component("phi"),
-                "E": np.expm1(component("log_energy")),
-            }
+        pt = np.expm1(component("log_pt"))
+        eta = component("eta")
+        phi = component("phi")
+        energy = np.expm1(component("log_energy"))
+        p4 = build_momentum4d(
+            pt * np.cos(phi),
+            pt * np.sin(phi),
+            pt * np.sinh(eta),
+            energy,
         )
         return canonicalize_p4(p4), valid
 
@@ -308,7 +322,7 @@ def finite_p4_mask(p4: ak.Array) -> np.ndarray:
 
 def zero_p4(num_events: int) -> ak.Array:
     nan_values = np.full(num_events, np.nan, dtype=np.float64)
-    return vector.zip({"px": nan_values, "py": nan_values, "pz": nan_values, "E": nan_values})
+    return build_momentum4d(nan_values, nan_values, nan_values, nan_values)
 
 
 def default_float_array(num_events: int, dtype=np.float32) -> np.ndarray:
@@ -542,7 +556,7 @@ def assign_at_indices(base_values: Any, indices: np.ndarray, pred_values: Any):
         py[indices] = ak.to_numpy(pred_p4.py, allow_missing=False)
         pz[indices] = ak.to_numpy(pred_p4.pz, allow_missing=False)
         energy[indices] = ak.to_numpy(pred_p4.E, allow_missing=False)
-        return vector.zip({"px": px, "py": py, "pz": pz, "E": energy})
+        return build_momentum4d(px, py, pz, energy)
 
     if isinstance(base_values, ak.Array):
         try:
