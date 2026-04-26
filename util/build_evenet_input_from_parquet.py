@@ -385,6 +385,40 @@ def passthrough_prediction_fields(events: ak.Array) -> dict[str, np.ndarray]:
     return output
 
 
+def expected_passthrough_output_fields(events: ak.Array) -> set[str]:
+    expected: set[str] = set()
+    if "weight" in events.fields:
+        expected.add("central_weight")
+
+    for field in events.fields:
+        if field == "weight":
+            continue
+        if field not in PREDICTION_PASSTHROUGH_EXACT_FIELDS and not field.endswith(PREDICTION_PASSTHROUGH_SUFFIXES) and not field.startswith(PREDICTION_PASSTHROUGH_PREFIXES):
+            continue
+        values = events[field]
+        if hasattr(values, "fields"):
+            continue
+        array = to_numpy_array(values)
+        if array.ndim != 1:
+            continue
+        if array.dtype.kind not in {"b", "i", "u", "f"}:
+            continue
+        expected.add(field)
+    return expected
+
+
+def validate_batch_passthrough_fields(batch: dict[str, np.ndarray], events: ak.Array, sample_name: str) -> set[str]:
+    expected = expected_passthrough_output_fields(events)
+    missing = sorted(expected - set(batch))
+    if missing:
+        raise ValueError(
+            "EveNet builder failed to propagate required passthrough fields into the in-memory dataset batch for "
+            f"sample '{sample_name}'. missing_fields={missing[:20]}. This usually means the builder logic and the "
+            "selected-source parquet schema are out of sync."
+        )
+    return expected
+
+
 def build_dataset(
     expanded_samples: list[tuple[Sample, ak.Array]],
     max_particles: int,
@@ -396,6 +430,8 @@ def build_dataset(
     class_index = {label: index for index, label in enumerate(class_labels)}
 
     batches = []
+    batch_sample_names: list[str] = []
+    batch_expected_passthrough: list[set[str]] = []
     point_cloud_feature_names: list[str] | None = None
     global_feature_names: list[str] | None = None
 
@@ -469,17 +505,37 @@ def build_dataset(
             batch["classification"] = np.full(len(events), class_index[sample.name], dtype=np.int64)
             batch["event_weight"] = np.ones(len(events), dtype=np.float32)
 
+        batch_expected_passthrough.append(validate_batch_passthrough_fields(batch, events, sample.name))
         batches.append(batch)
+        batch_sample_names.append(sample.name)
 
         if point_cloud_feature_names is None:
             point_cloud_feature_names = point_cloud_names
         if global_feature_names is None:
             global_feature_names = condition_names
 
+    all_keys = sorted(set().union(*(batch.keys() for batch in batches)))
+    for sample_name, batch in zip(batch_sample_names, batches):
+        missing = sorted(set(all_keys) - set(batch))
+        if missing:
+            raise ValueError(
+                "EveNet builder found inconsistent batch keys across samples before NPZ writing. "
+                f"sample='{sample_name}' is missing keys {missing[:20]}. "
+                "This would silently drop later-sample fields during concatenation."
+            )
+
     dataset = {
         key: np.concatenate([batch[key] for batch in batches], axis=0)
-        for key in batches[0]
+        for key in all_keys
     }
+
+    expected_passthrough_union = sorted(set().union(*batch_expected_passthrough))
+    missing_dataset_passthrough = sorted(set(expected_passthrough_union) - set(dataset))
+    if missing_dataset_passthrough:
+        raise ValueError(
+            "EveNet builder dropped passthrough fields while constructing the final dataset. "
+            f"missing_fields={missing_dataset_passthrough[:20]}."
+        )
 
     metadata = {
         "point_cloud_features": point_cloud_feature_names,
@@ -489,6 +545,7 @@ def build_dataset(
         "max_particles": max_particles,
         "num_events": int(dataset["x"].shape[0]),
         "source_samples": [sample.name for sample, _ in expanded_samples],
+        "passthrough_fields": expected_passthrough_union,
     }
     if include_classification:
         metadata["class_labels"] = class_labels
@@ -796,6 +853,17 @@ def write_outputs(
 
     np.savez_compressed(npz_path, **dataset)
     metadata_path.write_text(json.dumps(metadata, indent=2))
+
+    with np.load(npz_path, allow_pickle=False) as saved_npz:
+        saved_keys = set(saved_npz.files)
+    expected_keys = set(dataset)
+    missing_saved_keys = sorted(expected_keys - saved_keys)
+    extra_saved_keys = sorted(saved_keys - expected_keys)
+    if missing_saved_keys or extra_saved_keys:
+        raise ValueError(
+            f"Saved NPZ key verification failed for {npz_path}. "
+            f"missing_keys={missing_saved_keys[:20]}, extra_keys={extra_saved_keys[:20]}."
+        )
 
     console.print(f"[green]Wrote[/green] [white]{npz_path}[/white]")
     console.print(f"[green]Wrote[/green] [white]{metadata_path}[/white]")
