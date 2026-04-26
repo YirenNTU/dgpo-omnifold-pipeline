@@ -23,7 +23,6 @@ if str(UTIL_ROOT) not in sys.path:
 
 from parquet_plot_common import choose_bins
 from plot_qi_method_comparison import (
-    cms_label,
     event_weights,
     is_background_like_region,
     json_safe,
@@ -35,7 +34,7 @@ from plot_qi_method_comparison import (
     plot_physics_data_mc_comparisons,
     sanitize_filename,
 )
-from quantum.observables_builder import get_observable_names
+from quantum.observables_builder import build_observables, get_observable_names
 
 
 DEFAULT_FLOAT = -99.0
@@ -120,8 +119,56 @@ def parse_method_specs(args: argparse.Namespace) -> dict[str, Path]:
 
 def truth_observable_specs(requested: list[str] | None) -> list[tuple[str, str]]:
     names = requested or list(get_observable_names())
-    labels = {"theta_cm": r"$\theta_{CM}$"}
-    return [(name, labels.get(name, name.replace("_", " "))) for name in names]
+    return [(name, observable_latex_label(name)) for name in names]
+
+
+def observable_latex_label(name: str) -> str:
+    if name == "theta_cm":
+        return r"$\theta_{\mathrm{CM}}$"
+    if name.startswith("cos_theta_A_") and "_times_" not in name:
+        axis = name.removeprefix("cos_theta_A_")
+        return rf"$\cos\theta_{{A,{axis}}}$"
+    if name.startswith("cos_theta_B_") and "_times_" not in name:
+        axis = name.removeprefix("cos_theta_B_")
+        return rf"$\cos\theta_{{B,{axis}}}$"
+    if "_times_" in name and name.startswith("cos_theta_A_"):
+        left, right = name.split("_times_")
+        axis_a = left.removeprefix("cos_theta_A_")
+        axis_b = right.removeprefix("cos_theta_B_")
+        return rf"$\cos\theta_{{A,{axis_a}}}\times\cos\theta_{{B,{axis_b}}}$"
+    return name.replace("_", " ")
+
+
+def channel_latex_label(name: str) -> str:
+    mapping = {
+        "hadhad": r"$\tau_{\mathrm{had}}\tau_{\mathrm{had}}$",
+        "ee": r"$ee$",
+        "mumu": r"$\mu\mu$",
+        "emu": r"$e\mu$",
+        "baseline": "baseline",
+    }
+    if name in mapping:
+        return mapping[name]
+    if name.startswith("Ztautau_"):
+        suffix = name.removeprefix("Ztautau_")
+        token_map = {"rho": r"\rho", "pi": r"\pi", "e": "e", "mu": r"\mu"}
+        tokens: list[str] = []
+        index = 0
+        ordered_keys = sorted(token_map, key=len, reverse=True)
+        while index < len(suffix):
+            matched = False
+            for key in ordered_keys:
+                if suffix.startswith(key, index):
+                    tokens.append(token_map[key])
+                    index += len(key)
+                    matched = True
+                    break
+            if not matched:
+                tokens.append(suffix[index])
+                index += 1
+        if tokens:
+            return r"$\tau\tau\to " + " ".join(tokens) + "$"
+    return name.replace("_", " ")
 
 
 def to_numpy(values: Any, dtype=np.float64) -> np.ndarray:
@@ -298,16 +345,17 @@ def plot_truth_vs_reco_by_method_and_region(
 
             for observable, xlabel in observable_specs:
                 truth_field = f"truth_{observable}"
-                if observable not in events.fields or truth_field not in events.fields:
+                reco_values_full = truth_reco_observable_values(events, observable)
+                if reco_values_full is None or truth_field not in events.fields:
                     print(
                         f"    [skip] method={method} region={region} observable={observable} "
-                        f"missing_fields={[field for field in (observable, truth_field) if field not in events.fields]}",
+                        f"missing_fields={[field for field in ([truth_field] if truth_field not in events.fields else [])]} "
+                        f"reco_source={'missing' if reco_values_full is None else 'available'}",
                         flush=True,
                     )
                     continue
 
                 truth_values_full = to_numpy(events[truth_field], np.float64)
-                reco_values_full = to_numpy(events[observable], np.float64)
                 weights_full = event_weights(events)
                 truth_mask = valid_truth_reco_mask(truth_values_full, truth_values_full, weights_full)
                 valid_mask = valid_truth_reco_mask(truth_values_full, reco_values_full, weights_full)
@@ -350,9 +398,8 @@ def plot_truth_vs_reco_by_method_and_region(
 
                 ax.set_xlabel(xlabel)
                 ax.set_ylabel("Normalized yield" if normalize else "Weighted yield")
-                ax.set_title(f"{method_display_name(method)} {region}: {observable}")
+                ax.set_title(f"{method_display_name(method)} {channel_latex_label(region)}: {xlabel}")
                 ax.grid(alpha=0.25)
-                cms_label(ax)
                 ax.legend(frameon=False)
                 fig.tight_layout()
 
@@ -386,6 +433,23 @@ def plot_truth_vs_reco_by_method_and_region(
             summary[method] = method_summary
 
     return summary
+
+
+def truth_reco_observable_values(events: ak.Array, observable: str) -> np.ndarray | None:
+    if observable in events.fields:
+        return to_numpy(events[observable], np.float64)
+    required_fields = {"reco_tau_a_p4", "reco_tau_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"}
+    if not required_fields.issubset(set(events.fields)):
+        return None
+    observables = build_observables(
+        events["reco_tau_a_p4"],
+        events["reco_tau_b_p4"],
+        events["lead_a_visible_p4"],
+        events["lead_b_visible_p4"],
+    )
+    if observable not in observables:
+        return None
+    return to_numpy(observables[observable], np.float64)
 
 
 def metric_value_and_uncertainty(metrics: dict[str, Any], metric: str) -> tuple[float, float]:
@@ -472,7 +536,14 @@ def plot_truth_metric_summary(
         if not rows:
             continue
 
-        active_regions = [region for region in unique_regions if any(row["region"] == region for row in rows)]
+        active_regions = [
+            region
+            for region in unique_regions
+            if region != "baseline" and any(row["region"] == region for row in rows)
+        ]
+        rows = [row for row in rows if row["region"] in set(active_regions)]
+        if not rows:
+            continue
         fig_height = max(4.0, 0.7 * len(active_regions) + 1.8)
         fig, ax = plt.subplots(figsize=(10.6, fig_height), dpi=200)
         y_base = np.arange(len(active_regions), dtype=np.float64)
@@ -488,8 +559,7 @@ def plot_truth_metric_summary(
             pad += float(np.nanmax(x_unc))
         ax.set_xlim(xmin - pad, xmax + pad)
 
-        x_text_sigma = 1.03
-        x_text_precision = 1.18
+        x_text_value = 1.03
         for region in active_regions:
             region_rows = [row for row in rows if row["region"] == region]
             region_rows.sort(key=lambda row: row["method_index"])
@@ -510,23 +580,14 @@ def plot_truth_metric_summary(
                     markersize=6.5,
                     lw=1.2,
                 )
-                sigma_text = f"{row['uncertainty'] * 100:.2f}" if np.isfinite(row["uncertainty"]) else "n/a"
-                precision_text = f"{row['precision']:.2f}%" if np.isfinite(row["precision"]) else "n/a"
+                if np.isfinite(row["uncertainty"]):
+                    value_text = f"{row['value']:.3f} ± {row['uncertainty']:.3f}"
+                else:
+                    value_text = f"{row['value']:.3f}"
                 ax.text(
-                    x_text_sigma,
+                    x_text_value,
                     y,
-                    sigma_text,
-                    color=color,
-                    fontsize=8,
-                    va="center",
-                    ha="left",
-                    transform=ax.get_yaxis_transform(),
-                    clip_on=False,
-                )
-                ax.text(
-                    x_text_precision,
-                    y,
-                    precision_text,
+                    value_text,
                     color=color,
                     fontsize=8,
                     va="center",
@@ -544,17 +605,17 @@ def plot_truth_metric_summary(
                     va="bottom",
                 )
 
-        ax.text(x_text_sigma, 1.02, r"$\sigma \times 100$", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
-        ax.text(x_text_precision, 1.02, "Precision", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
+        ax.text(x_text_value, 1.02, r"$r \pm \sigma_r$", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
         ax.set_yticks(y_base)
-        ax.set_yticklabels([format_method_region_label(region) for region in active_regions])
+        ax.set_yticklabels([channel_latex_label(region) for region in active_regions])
         ax.invert_yaxis()
         ax.grid(axis="x", alpha=0.22)
         ax.grid(axis="y", alpha=0.18, linestyle=":")
+        for separator in np.arange(len(active_regions) - 1, dtype=np.float64) + 0.5:
+            ax.axhline(separator, color="#D9D9D9", linewidth=0.8, zorder=0)
         ax.set_xlabel(summary_metric_label(metric))
         ax.set_ylabel("Channel / Region")
-        ax.set_title(f"{observable}: reco vs truth summary")
-        cms_label(ax)
+        ax.set_title(f"{observable_latex_label(observable)}: reco vs truth summary")
 
         ax.legend(
             handles=method_handles,
