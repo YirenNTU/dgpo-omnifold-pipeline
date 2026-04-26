@@ -22,7 +22,6 @@ if str(UTIL_ROOT) not in sys.path:
 
 from parquet_plot_common import choose_bins
 from plot_qi_method_comparison import (
-    DEFAULT_CLASS_NAME,
     cms_label,
     event_weights,
     is_background_like_region,
