@@ -77,15 +77,18 @@ def main() -> None:
     post_events = prepare_events_for_parquet(pre_events)
 
     index = int(args.row)
+    pred_event = pred_events[index]
     pre = pre_events[index]
     post = post_events[index]
 
     print(f"file: {args.prediction_parquet}")
     print(f"row={index}")
-    print(f"source_slot_for_a={int(pre['source_slot_for_a'])}")
-    print(f"source_slot_for_b={int(pre['source_slot_for_b'])}")
-    print(f"evenet_pred_class_name={pre['evenet_pred_class_name']}")
-    print(f"evenet_truth_class_name={pre['evenet_truth_class_name']}")
+    print(f"source_slot_for_a={int(pred_event['source_slot_for_a'])}")
+    print(f"source_slot_for_b={int(pred_event['source_slot_for_b'])}")
+    print(f"evenet_slot_for_a={int(pre['evenet_slot_for_a'])}")
+    print(f"evenet_slot_for_b={int(pre['evenet_slot_for_b'])}")
+    print(f"evenet_pred_class_name={pred_event['evenet_pred_class_name']}")
+    print(f"evenet_truth_class_name={pred_event['evenet_truth_class_name']}")
     print(f"flags_valid={bool(pre['flags_valid'])}")
     print()
 
