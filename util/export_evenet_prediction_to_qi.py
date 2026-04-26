@@ -295,12 +295,7 @@ def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Arr
 
     # convert
     if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("energy", "pt", "eta", "phi")):
-        print(
-            "pt", component("pt"),
-            "eta", component("eta"),
-            "phi", component("phi"),
-            "energy", component("energy"),
-        )
+
         pt = component("pt")
         eta = component("eta")
         phi = component("phi")
@@ -412,6 +407,31 @@ def finite_p4_mask(p4: ak.Array) -> np.ndarray:
         & np.isfinite(ak.to_numpy(p4.py, allow_missing=False))
         & np.isfinite(ak.to_numpy(p4.pz, allow_missing=False))
         & np.isfinite(ak.to_numpy(p4.E, allow_missing=False))
+    )
+
+
+def cartesian_components(values: ak.Array) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    fields = set(getattr(values, "fields", []))
+    if {"px", "py", "pz", "E"}.issubset(fields):
+        return (
+            ak.to_numpy(values["px"], allow_missing=False).astype(np.float64),
+            ak.to_numpy(values["py"], allow_missing=False).astype(np.float64),
+            ak.to_numpy(values["pz"], allow_missing=False).astype(np.float64),
+            ak.to_numpy(values["E"], allow_missing=False).astype(np.float64),
+        )
+    if {"x", "y", "z", "t"}.issubset(fields):
+        return (
+            ak.to_numpy(values["x"], allow_missing=False).astype(np.float64),
+            ak.to_numpy(values["y"], allow_missing=False).astype(np.float64),
+            ak.to_numpy(values["z"], allow_missing=False).astype(np.float64),
+            ak.to_numpy(values["t"], allow_missing=False).astype(np.float64),
+        )
+    vector_values = rebuild_vector(values)
+    return (
+        ak.to_numpy(vector_values.px, allow_missing=False).astype(np.float64),
+        ak.to_numpy(vector_values.py, allow_missing=False).astype(np.float64),
+        ak.to_numpy(vector_values.pz, allow_missing=False).astype(np.float64),
+        ak.to_numpy(vector_values.E, allow_missing=False).astype(np.float64),
     )
 
 
@@ -631,15 +651,12 @@ def assign_at_indices(base_values: Any, indices: np.ndarray, pred_values: Any):
             or {"x", "y", "z", "t"}.issubset(set(base_values.fields))
         )
     ):
-        pred_p4 = rebuild_vector(pred_values)
-        px = ak.to_numpy(base_values.px, allow_missing=False)
-        py = ak.to_numpy(base_values.py, allow_missing=False)
-        pz = ak.to_numpy(base_values.pz, allow_missing=False)
-        energy = ak.to_numpy(base_values.E, allow_missing=False)
-        px[indices] = ak.to_numpy(pred_p4.px, allow_missing=False)
-        py[indices] = ak.to_numpy(pred_p4.py, allow_missing=False)
-        pz[indices] = ak.to_numpy(pred_p4.pz, allow_missing=False)
-        energy[indices] = ak.to_numpy(pred_p4.E, allow_missing=False)
+        px, py, pz, energy = cartesian_components(base_values)
+        pred_px, pred_py, pred_pz, pred_energy = cartesian_components(pred_values)
+        px[indices] = pred_px
+        py[indices] = pred_py
+        pz[indices] = pred_pz
+        energy[indices] = pred_energy
         return build_momentum4d(px, py, pz, energy)
 
     if isinstance(base_values, ak.Array):
