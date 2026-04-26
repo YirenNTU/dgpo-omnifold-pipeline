@@ -22,7 +22,7 @@ logger:
     version: "v1"
 
 options:
-  default: ../EveNet-Full/share/options/options.yaml
+  default: options.yaml
 
   Training:
     total_epochs: 50
