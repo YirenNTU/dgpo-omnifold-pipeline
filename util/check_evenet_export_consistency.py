@@ -44,32 +44,49 @@ def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
 
 def export_vector_component(values: ak.Array, component: str) -> np.ndarray:
     fields = set(getattr(values, "fields", []))
+    px = None
+    py = None
+    pz = None
+    energy = None
+    if "px" in fields:
+        px = to_numpy(values["px"], np.float64)
+    elif "x" in fields:
+        px = to_numpy(values["x"], np.float64)
+    if "py" in fields:
+        py = to_numpy(values["py"], np.float64)
+    elif "y" in fields:
+        py = to_numpy(values["y"], np.float64)
+    if "pz" in fields:
+        pz = to_numpy(values["pz"], np.float64)
+    elif "z" in fields:
+        pz = to_numpy(values["z"], np.float64)
+    if "E" in fields:
+        energy = to_numpy(values["E"], np.float64)
+    elif "t" in fields:
+        energy = to_numpy(values["t"], np.float64)
+
     if component == "E":
-        if "E" in fields:
-            return to_numpy(values["E"], np.float64)
-        if "t" in fields:
-            return to_numpy(values["t"], np.float64)
+        if energy is not None:
+            return energy
     if component == "px":
-        if "px" in fields:
-            return to_numpy(values["px"], np.float64)
-        if "x" in fields:
-            return to_numpy(values["x"], np.float64)
+        if px is not None:
+            return px
     if component == "py":
-        if "py" in fields:
-            return to_numpy(values["py"], np.float64)
-        if "y" in fields:
-            return to_numpy(values["y"], np.float64)
+        if py is not None:
+            return py
     if component == "pz":
-        if "pz" in fields:
-            return to_numpy(values["pz"], np.float64)
-        if "z" in fields:
-            return to_numpy(values["z"], np.float64)
+        if pz is not None:
+            return pz
     if component == "energy":
-        if hasattr(values, "energy"):
-            return to_numpy(values.energy, np.float64)
-        return export_vector_component(values, "E")
-    if component in {"pt", "eta", "phi"} and hasattr(values, component):
-        return to_numpy(getattr(values, component), np.float64)
+        if energy is not None:
+            return energy
+    if component == "pt" and px is not None and py is not None:
+        return np.sqrt(px ** 2 + py ** 2)
+    if component == "eta" and px is not None and py is not None and pz is not None:
+        pt = np.sqrt(px ** 2 + py ** 2)
+        return np.arcsinh(np.divide(pz, np.maximum(pt, 1e-8)))
+    if component == "phi" and px is not None and py is not None:
+        return np.arctan2(py, px)
     raise KeyError(f"Unable to extract component '{component}' from vector fields={sorted(fields)}")
 
 
