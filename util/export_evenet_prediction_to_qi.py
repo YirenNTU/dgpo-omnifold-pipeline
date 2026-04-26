@@ -231,6 +231,17 @@ def rebuild_vector(values: ak.Array) -> ak.Array:
     return values
 
 
+def canonicalize_p4(p4: ak.Array) -> ak.Array:
+    return vector.zip(
+        {
+            "px": ak.to_numpy(p4.px, allow_missing=False).astype(np.float64),
+            "py": ak.to_numpy(p4.py, allow_missing=False).astype(np.float64),
+            "pz": ak.to_numpy(p4.pz, allow_missing=False).astype(np.float64),
+            "E": ak.to_numpy(p4.E, allow_missing=False).astype(np.float64),
+        }
+    )
+
+
 def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Array, np.ndarray]:
     valid_field = f"{prefix}_slot{slot}_valid"
     valid = (
@@ -250,7 +261,7 @@ def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Arr
                 "E": component("E"),
             }
         )
-        return p4, valid
+        return canonicalize_p4(p4), valid
 
     if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("energy", "pt", "eta", "phi")):
         p4 = vector.zip(
@@ -261,7 +272,7 @@ def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Arr
                 "E": component("energy"),
             }
         )
-        return p4, valid
+        return canonicalize_p4(p4), valid
 
     if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("log_energy", "log_pt", "eta", "phi")):
         p4 = vector.zip(
@@ -272,7 +283,7 @@ def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Arr
                 "E": np.expm1(component("log_energy")),
             }
         )
-        return p4, valid
+        return canonicalize_p4(p4), valid
 
     available = [field for field in events.fields if field.startswith(f"{prefix}_slot{slot}_")]
     raise KeyError(
