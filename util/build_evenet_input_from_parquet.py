@@ -500,6 +500,49 @@ def apply_default_concat_passthrough_fields(batch: dict[str, np.ndarray], sample
         batch.setdefault(field, values)
 
 
+def default_missing_passthrough_array(field: str, reference: np.ndarray, num_events: int) -> np.ndarray:
+    dtype = reference.dtype
+    if np.issubdtype(dtype, np.bool_):
+        return np.zeros(num_events, dtype=bool)
+    if np.issubdtype(dtype, np.integer):
+        if field == "initial_total_num_events":
+            return np.full(num_events, num_events, dtype=dtype)
+        if field.startswith("truth_num_"):
+            return np.zeros(num_events, dtype=dtype)
+        if field == "event_category":
+            return np.full(num_events, -1, dtype=dtype)
+        return np.full(num_events, -1, dtype=dtype)
+    if np.issubdtype(dtype, np.floating):
+        if field.startswith("analyzing_power"):
+            return np.zeros(num_events, dtype=dtype)
+        return np.full(num_events, DEFAULT_FLOAT, dtype=dtype)
+    raise ValueError(
+        f"Cannot synthesize default passthrough values for field '{field}' with unsupported dtype={dtype}."
+    )
+
+
+def fill_missing_passthrough_batch_keys(
+    batches: list[dict[str, np.ndarray]],
+    batch_sample_names: list[str],
+) -> None:
+    reference_by_key: dict[str, np.ndarray] = {}
+    for batch in batches:
+        for key, values in batch.items():
+            reference_by_key.setdefault(key, values)
+
+    all_keys = sorted(reference_by_key)
+    for sample_name, batch in zip(batch_sample_names, batches):
+        for key in all_keys:
+            if key in batch:
+                continue
+            if not should_passthrough_prediction_field(key):
+                raise ValueError(
+                    "EveNet builder found inconsistent non-passthrough batch keys across samples before NPZ writing. "
+                    f"sample='{sample_name}' is missing key '{key}'."
+                )
+            batch[key] = default_missing_passthrough_array(key, reference_by_key[key], len(next(iter(batch.values()))))
+
+
 def validate_batch_passthrough_fields(
     batch: dict[str, np.ndarray],
     events: ak.Array,
@@ -621,15 +664,8 @@ def build_dataset(
         if global_feature_names is None:
             global_feature_names = condition_names
 
+    fill_missing_passthrough_batch_keys(batches, batch_sample_names)
     all_keys = sorted(set().union(*(batch.keys() for batch in batches)))
-    for sample_name, batch in zip(batch_sample_names, batches):
-        missing = sorted(set(all_keys) - set(batch))
-        if missing:
-            raise ValueError(
-                "EveNet builder found inconsistent batch keys across samples before NPZ writing. "
-                f"sample='{sample_name}' is missing keys {missing[:20]}. "
-                "This would silently drop later-sample fields during concatenation."
-            )
 
     dataset = {
         key: np.concatenate([batch[key] for batch in batches], axis=0)
