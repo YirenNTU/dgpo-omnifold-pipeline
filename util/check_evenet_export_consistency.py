@@ -535,6 +535,76 @@ def build_expected_ab_fields(pred_events: ak.Array) -> dict[str, np.ndarray]:
     return output
 
 
+def plot_export_internal_ab_consistency(
+    export_events: ak.Array,
+    output_dir: Path,
+    max_scatter: int,
+) -> dict[str, Any]:
+    if "evenet_has_prediction" in export_events.fields:
+        export_mask = to_numpy(export_events["evenet_has_prediction"], bool)
+        export_pred = export_events[export_mask]
+    else:
+        export_pred = export_events
+
+    expected_ab = build_expected_ab_fields(export_pred)
+    if not expected_ab:
+        return {"status": "missing_slot_metadata"}
+
+    expected_events = ak.Array(expected_ab)
+    flags_valid = (
+        to_numpy(export_pred["flags_valid"], bool)
+        if "flags_valid" in export_pred.fields
+        else np.ones(len(export_pred), dtype=bool)
+    )
+
+    visible_pairs = []
+    for leg_name in ("a", "b"):
+        for component in ("energy", "pt", "eta", "phi"):
+            visible_pairs.append(
+                (
+                    expected_ab.get(f"expected_lead_{leg_name}_visible_{component}"),
+                    export_vector_component(export_pred[f"lead_{leg_name}_visible_p4"], component),
+                    f"lead_{leg_name} visible {component}",
+                )
+            )
+    visible_summary = scatter_consistency_arrays(
+        visible_pairs,
+        output_dir / "export_internal_ab_visible_consistency.png",
+        max_scatter=max_scatter,
+        title="Export-internal a/b visible kinematics consistency",
+        x_label="Expected from slot_for_a/b",
+        y_label="Stored export a/b field",
+        valid_mask=flags_valid,
+    )
+
+    missing_pairs = []
+    for leg_name in ("a", "b"):
+        for component in ("energy", "pt", "eta", "phi"):
+            missing_pairs.append(
+                (
+                    expected_ab.get(f"expected_lead_{leg_name}_missing_{component}"),
+                    export_vector_component(export_pred[f"lead_{leg_name}_missing_p4"], component),
+                    f"lead_{leg_name} missing {component}",
+                )
+            )
+    missing_summary = scatter_consistency_arrays(
+        missing_pairs,
+        output_dir / "export_internal_ab_invisible_consistency.png",
+        max_scatter=max_scatter,
+        title="Export-internal a/b invisible kinematics consistency",
+        x_label="Expected from slot_for_a/b",
+        y_label="Stored export a/b field",
+        valid_mask=flags_valid,
+    )
+
+    return {
+        "status": "ok",
+        "export_predicted_rows": int(len(export_pred)),
+        "visible": visible_summary,
+        "missing": missing_summary,
+    }
+
+
 def build_ab_truth_pred_fields(pred_events: ak.Array) -> dict[str, np.ndarray]:
     if "source_slot_for_a" not in pred_events.fields or "source_slot_for_b" not in pred_events.fields:
         return {}
@@ -717,6 +787,12 @@ def main() -> None:
         args.max_scatter,
     )
     print(f"[consistency] pred_invisible_slot_roundtrip={pred_roundtrip_summary}", flush=True)
+    export_internal_ab_summary = plot_export_internal_ab_consistency(
+        export_events,
+        args.output_dir,
+        args.max_scatter,
+    )
+    print(f"[consistency] export_internal_ab={export_internal_ab_summary}", flush=True)
     aligned_pred, aligned_export, summary = align_events(pred_events, export_events, export_path=args.export_raw_parquet)
     print(f"[consistency] alignment={summary}", flush=True)
     if summary["matched_rows"] == 0:
@@ -901,6 +977,7 @@ def main() -> None:
                 "ab_remap": ab_summary,
                 "ab_truth_vs_pred": ab_truth_pred_summary,
                 "pred_invisible_slot_roundtrip": pred_roundtrip_summary,
+                "export_internal_ab": export_internal_ab_summary,
                 "prediction_parquet": str(args.prediction_parquet),
                 "export_raw_parquet": str(args.export_raw_parquet),
             },
