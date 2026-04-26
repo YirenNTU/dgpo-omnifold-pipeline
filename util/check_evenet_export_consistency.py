@@ -201,7 +201,10 @@ def scatter_consistency_plot(
 
     for axis, (pred_field, export_field, label) in zip(axes.flat, field_pairs):
         if pred_field not in pred_events.fields or export_field not in export_events.fields:
-            axis.set_visible(False)
+            axis.text(0.5, 0.5, "missing", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_title(label)
+            axis.set_xticks([])
+            axis.set_yticks([])
             metrics[label] = {"status": "missing"}
             continue
 
@@ -211,7 +214,10 @@ def scatter_consistency_plot(
         valid &= ~np.isclose(pred_values, DEFAULT_FLOAT)
         valid &= ~np.isclose(export_values, DEFAULT_FLOAT)
         if not np.any(valid):
-            axis.set_visible(False)
+            axis.text(0.5, 0.5, "no valid entries", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_title(label)
+            axis.set_xticks([])
+            axis.set_yticks([])
             metrics[label] = {"status": "no_valid_entries"}
             continue
 
@@ -300,6 +306,7 @@ def main() -> None:
     pred_events = ak.from_parquet(args.prediction_parquet)
     export_events = ak.from_parquet(args.export_raw_parquet)
     aligned_pred, aligned_export, summary = align_events(pred_events, export_events)
+    print(f"[consistency] alignment={summary}", flush=True)
 
     class_yield_summary = plot_class_yields(
         aligned_pred,
@@ -325,6 +332,7 @@ def main() -> None:
         max_scatter=args.max_scatter,
         title="Visible tau slot consistency",
     )
+    print(f"[consistency] visible_tau={visible_summary}", flush=True)
 
     invisible_fields = [
         ("pred_invisible_slot0_E", "pred_invisible_slot0_E", "slot0 E"),
@@ -344,6 +352,7 @@ def main() -> None:
         max_scatter=args.max_scatter,
         title="Predicted invisible slot consistency",
     )
+    print(f"[consistency] pred_invisible={invisible_summary}", flush=True)
 
     expected_ab = build_expected_ab_fields(aligned_pred)
     ab_summary: dict[str, Any] = {"status": "missing_slot_metadata"}
@@ -365,7 +374,10 @@ def main() -> None:
             valid &= ~np.isclose(pred_values, DEFAULT_FLOAT)
             valid &= ~np.isclose(export_values, DEFAULT_FLOAT)
             if not np.any(valid):
-                axis.set_visible(False)
+                axis.text(0.5, 0.5, "no valid entries", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+                axis.set_title(label)
+                axis.set_xticks([])
+                axis.set_yticks([])
                 ab_summary[label] = {"status": "no_valid_entries"}
                 continue
             pred_values = pred_values[valid]
@@ -386,11 +398,14 @@ def main() -> None:
                 "mean_abs_diff": float(np.mean(np.abs(export_values - pred_values))),
             }
         for axis in axes.flat[len(ab_fields):]:
-            axis.set_visible(False)
+            axis.text(0.5, 0.5, "not requested", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_xticks([])
+            axis.set_yticks([])
         fig.suptitle("Central a/b remapping consistency")
         fig.tight_layout()
         fig.savefig(args.output_dir / "ab_remap_consistency.png", bbox_inches="tight")
         plt.close(fig)
+        print(f"[consistency] ab_remap={ab_summary}", flush=True)
 
         ab_invisible_kinematics_fields_all = [
             ("expected_lead_a_missing_energy", "lead_a_missing_p4", "lead_a missing energy", "energy"),
@@ -414,7 +429,10 @@ def main() -> None:
             valid &= ~np.isclose(pred_values, DEFAULT_FLOAT)
             valid &= ~np.isclose(export_values, DEFAULT_FLOAT)
             if not np.any(valid):
-                axis.set_visible(False)
+                axis.text(0.5, 0.5, "no valid entries", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+                axis.set_title(label)
+                axis.set_xticks([])
+                axis.set_yticks([])
                 ab_invisible_kinematics_summary[label] = {"status": "no_valid_entries"}
                 continue
             pred_values = pred_values[valid]
@@ -435,12 +453,15 @@ def main() -> None:
                 "mean_abs_diff": float(np.mean(np.abs(export_values - pred_values))),
             }
         for axis in axes_kin.flat[len(ab_invisible_kinematics_fields):]:
-            axis.set_visible(False)
+            axis.text(0.5, 0.5, "not requested", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_xticks([])
+            axis.set_yticks([])
         fig_kin.suptitle("Central a/b invisible kinematics consistency")
         fig_kin.tight_layout()
         fig_kin.savefig(args.output_dir / "ab_invisible_kinematics_consistency.png", bbox_inches="tight")
         plt.close(fig_kin)
         ab_summary["invisible_kinematics"] = ab_invisible_kinematics_summary
+        print(f"[consistency] ab_invisible_kinematics={ab_invisible_kinematics_summary}", flush=True)
 
     with (args.output_dir / "export_consistency_summary.json").open("w") as handle:
         json.dump(
