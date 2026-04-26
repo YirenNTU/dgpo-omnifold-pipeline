@@ -232,12 +232,14 @@ def rebuild_vector(values: ak.Array) -> ak.Array:
 
 
 def build_momentum4d(px, py, pz, energy):
+    # energy from px, py, pz, tau_mass
+    tau_mass = 1.777
     return ak.zip(
         {
             "px": px,
             "py": py,
             "pz": pz,
-            "E": energy,
+            "E": np.sqrt(px*px + py*py + pz*pz + tau_mass*tau_mass),
         },
         with_name="Momentum4D",
     )
