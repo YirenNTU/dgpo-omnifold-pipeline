@@ -184,6 +184,43 @@ def align_events(
     sample_mask = prediction_sample_mask(pred_events, sample_name)
     region_mask = prediction_region_mask(pred_events, region_name)
     pred_subset = pred_events[sample_mask & region_mask]
+    if "source_sample_index" in pred_subset.fields and "source_sample_index" in export_pred.fields:
+        pred_source = to_numpy(pred_subset["source_sample_index"], np.int64)
+        export_source = to_numpy(export_pred["source_sample_index"], np.int64)
+        shared = sorted(set(pred_source.tolist()) & set(export_source.tolist()))
+        pred_parts = []
+        export_parts = []
+        per_source: dict[str, Any] = {}
+        for source_index in shared:
+            pred_part = pred_subset[pred_source == source_index]
+            export_part = export_pred[export_source == source_index]
+            row_count = min(len(pred_part), len(export_part))
+            if row_count <= 0:
+                continue
+            pred_parts.append(pred_part[:row_count])
+            export_parts.append(export_part[:row_count])
+            per_source[str(int(source_index))] = {
+                "prediction_rows": int(len(pred_part)),
+                "export_rows": int(len(export_part)),
+                "matched_rows": int(row_count),
+            }
+
+        if pred_parts and export_parts:
+            aligned_pred = pred_parts[0] if len(pred_parts) == 1 else ak.concatenate(pred_parts, axis=0)
+            aligned_export = export_parts[0] if len(export_parts) == 1 else ak.concatenate(export_parts, axis=0)
+            summary = {
+                "mode": "source_sample_index_region_order_fallback",
+                "prediction_rows": int(len(pred_events)),
+                "export_predicted_rows": int(len(export_pred)),
+                "sample_name": sample_name,
+                "region_name": region_name,
+                "prediction_subset_rows": int(len(pred_subset)),
+                "matched_rows": int(len(aligned_pred)),
+                "missing_prediction_rows_in_export": int(len(pred_subset) - len(aligned_pred)),
+                "extra_export_rows": int(len(export_pred) - len(aligned_export)),
+                "per_source_sample_index": per_source,
+            }
+            return aligned_pred, aligned_export, summary
 
     row_count = min(len(pred_subset), len(export_pred))
     aligned_pred = pred_subset[:row_count]
