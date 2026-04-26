@@ -318,6 +318,12 @@ def valid_truth_reco_mask(truth: np.ndarray, reco: np.ndarray, weights: np.ndarr
     return mask
 
 
+def valid_reco_event_mask(events: ak.Array) -> np.ndarray | None:
+    if "flags_valid" not in events.fields:
+        return None
+    return to_numpy(events["flags_valid"], np.bool_)
+
+
 def observable_bins(observable: str, values_by_name: dict[str, np.ndarray]) -> np.ndarray:
     if observable == "theta_cm":
         return np.linspace(0.0, np.pi, 41)
@@ -456,6 +462,10 @@ def plot_truth_vs_reco_by_method_and_region(
                 weights_full = event_weights(events)
                 truth_mask = valid_truth_reco_mask(truth_values_full, truth_values_full, weights_full)
                 valid_mask = valid_truth_reco_mask(truth_values_full, reco_values_full, weights_full)
+                reco_event_mask = valid_reco_event_mask(events)
+                if reco_event_mask is not None:
+                    truth_mask &= reco_event_mask
+                    valid_mask &= reco_event_mask
                 if not np.any(truth_mask):
                     print(f"    [skip] method={method} region={region} observable={observable} truth values are all invalid/default", flush=True)
                     continue
