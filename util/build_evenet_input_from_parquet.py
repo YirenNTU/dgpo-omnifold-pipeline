@@ -52,6 +52,7 @@ PREDICTION_PASSTHROUGH_EXACT_FIELDS = {
 }
 PREDICTION_PASSTHROUGH_SUFFIXES = ("_cut",)
 PREDICTION_PASSTHROUGH_PREFIXES = ("truth_",)
+DEFAULT_FLOAT = -99.0
 REQUIRED_MC_CONCAT_SOURCE_FIELDS = {
     "event_category",
     "truth_QI_region",
@@ -452,45 +453,72 @@ def expected_passthrough_output_fields(events: ak.Array) -> set[str]:
     return expected
 
 
-def required_concat_source_fields(is_data: bool) -> set[str]:
-    return set() if is_data else set(REQUIRED_MC_CONCAT_SOURCE_FIELDS)
+def required_concat_source_fields(sample: Sample) -> set[str]:
+    return set(REQUIRED_MC_CONCAT_SOURCE_FIELDS) if sample_uses_invisible_target(sample) else set()
 
 
-def validate_source_passthrough_contract(events: ak.Array, sample_name: str, is_data: bool) -> set[str]:
-    required = required_concat_source_fields(is_data)
+def validate_source_passthrough_contract(events: ak.Array, sample: Sample) -> set[str]:
+    required = required_concat_source_fields(sample)
     missing = sorted(field for field in required if field not in events.fields)
     if missing:
         truth_like_fields = sorted(field for field in events.fields if field.startswith("truth_"))
         cut_like_fields = sorted(field for field in events.fields if field.endswith("_cut"))
         raise ValueError(
             "Selected-source parquet is missing fields required for concat-based unfolding export before EveNet "
-            f"dataset building. sample='{sample_name}', missing_fields={missing[:20]}, "
+            f"dataset building. sample='{sample.name}', missing_fields={missing[:20]}, "
             f"available_truth_fields={truth_like_fields[:20]}, available_cut_fields={cut_like_fields[:20]}. "
             "Check the exact parquet path in analysis.yaml and inspect its top-level keys."
         )
     return required
 
 
+def default_concat_passthrough_fields(sample: Sample, num_events: int) -> dict[str, np.ndarray]:
+    if sample.is_data:
+        return {}
+
+    defaults: dict[str, np.ndarray] = {
+        "event_category": np.full(num_events, -1, dtype=np.int64),
+        "initial_total_num_events": np.full(num_events, num_events, dtype=np.int64),
+        "truth_QI_region": np.zeros(num_events, dtype=bool),
+        "analyzing_power": np.zeros(num_events, dtype=np.float32),
+        "analyzing_power_a": np.zeros(num_events, dtype=np.float32),
+        "analyzing_power_b": np.zeros(num_events, dtype=np.float32),
+        "truth_theta_cm": np.full(num_events, DEFAULT_FLOAT, dtype=np.float32),
+    }
+    for axis in ("n", "r", "k"):
+        defaults[f"truth_cos_theta_A_{axis}"] = np.full(num_events, DEFAULT_FLOAT, dtype=np.float32)
+        defaults[f"truth_cos_theta_B_{axis}"] = np.full(num_events, DEFAULT_FLOAT, dtype=np.float32)
+    for axis_a, axis_b in product(("n", "r", "k"), repeat=2):
+        defaults[f"truth_cos_theta_A_{axis_a}_times_cos_theta_B_{axis_b}"] = np.full(
+            num_events, DEFAULT_FLOAT, dtype=np.float32
+        )
+    return defaults
+
+
+def apply_default_concat_passthrough_fields(batch: dict[str, np.ndarray], sample: Sample, num_events: int) -> None:
+    for field, values in default_concat_passthrough_fields(sample, num_events).items():
+        batch.setdefault(field, values)
+
+
 def validate_batch_passthrough_fields(
     batch: dict[str, np.ndarray],
     events: ak.Array,
-    sample_name: str,
-    is_data: bool,
+    sample: Sample,
 ) -> set[str]:
-    required = validate_source_passthrough_contract(events, sample_name, is_data)
+    required = validate_source_passthrough_contract(events, sample)
     expected = expected_passthrough_output_fields(events)
     missing_required = sorted(required - set(batch))
     if missing_required:
         raise ValueError(
             "EveNet builder found required concat-export fields in the selected-source parquet, but they were not "
-            f"written into the in-memory dataset batch for sample '{sample_name}'. "
+            f"written into the in-memory dataset batch for sample '{sample.name}'. "
             f"missing_required_fields={missing_required[:20]}."
         )
     missing_expected = sorted(expected - set(batch))
     if missing_expected:
         raise ValueError(
             "EveNet builder failed to propagate required passthrough fields into the in-memory dataset batch for "
-            f"sample '{sample_name}'. missing_fields={missing_expected[:20]}. This usually means the builder logic "
+            f"sample '{sample.name}'. missing_fields={missing_expected[:20]}. This usually means the builder logic "
             "and the selected-source parquet schema are out of sync."
         )
     return expected
@@ -514,7 +542,7 @@ def build_dataset(
 
     for source_sample_index, (sample, events) in enumerate(expanded_samples):
         console.print(f"[bold cyan]Converting[/bold cyan] [white]{sample.name}[/white]")
-        required_fields = validate_source_passthrough_contract(events, sample.name, sample.is_data)
+        required_fields = validate_source_passthrough_contract(events, sample)
 
         x, x_mask, num_sequential_vectors, point_cloud_names = build_point_cloud(events, max_particles, feature_config)
         conditions, conditions_mask, condition_names = build_global_conditions(events, feature_config)
@@ -579,11 +607,12 @@ def build_dataset(
             "source_event_key": source_event_key_array(events),
         }
         batch.update(passthrough_prediction_fields(events, required_fields=required_fields))
+        apply_default_concat_passthrough_fields(batch, sample, len(events))
         if include_classification:
             batch["classification"] = np.full(len(events), class_index[sample.name], dtype=np.int64)
             batch["event_weight"] = np.ones(len(events), dtype=np.float32)
 
-        batch_expected_passthrough.append(validate_batch_passthrough_fields(batch, events, sample.name, sample.is_data))
+        batch_expected_passthrough.append(validate_batch_passthrough_fields(batch, events, sample))
         batches.append(batch)
         batch_sample_names.append(sample.name)
 
