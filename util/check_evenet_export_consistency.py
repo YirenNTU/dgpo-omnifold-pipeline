@@ -9,6 +9,7 @@ from typing import Any
 import awkward as ak
 import matplotlib.pyplot as plt
 import numpy as np
+import vector
 
 
 DEFAULT_FLOAT = -99.0
@@ -22,6 +23,8 @@ OKABE_ITO = [
     "#F0E442",
     "#000000",
 ]
+
+vector.register_awkward()
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,6 +91,62 @@ def export_vector_component(values: ak.Array, component: str) -> np.ndarray:
     if component == "phi" and px is not None and py is not None:
         return np.arctan2(py, px)
     raise KeyError(f"Unable to extract component '{component}' from vector fields={sorted(fields)}")
+
+
+def prediction_slot_p4(pred_events: ak.Array, prefix: str, slot: int) -> tuple[ak.Array | None, np.ndarray]:
+    valid_field = f"{prefix}_slot{slot}_valid"
+    valid = (
+        to_numpy(pred_events[valid_field], bool)
+        if valid_field in pred_events.fields
+        else np.ones(len(pred_events), dtype=bool)
+    )
+    fields = set(pred_events.fields)
+
+    def component(name: str) -> np.ndarray:
+        return to_numpy(pred_events[f"{prefix}_slot{slot}_{name}"], np.float64)
+
+    if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("E", "px", "py", "pz")):
+        return vector.zip({"px": component("px"), "py": component("py"), "pz": component("pz"), "E": component("E")}), valid
+
+    if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("energy", "pt", "eta", "phi")):
+        return vector.zip(
+            {
+                "pt": component("pt"),
+                "eta": component("eta"),
+                "phi": component("phi"),
+                "E": component("energy"),
+            }
+        ), valid
+
+    if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("log_energy", "log_pt", "eta", "phi")):
+        return vector.zip(
+            {
+                "pt": np.expm1(component("log_pt")),
+                "eta": component("eta"),
+                "phi": component("phi"),
+                "E": np.expm1(component("log_energy")),
+            }
+        ), valid
+
+    return None, valid
+
+
+def p4_component(p4: ak.Array, component: str) -> np.ndarray:
+    if component in {"E", "energy"}:
+        return to_numpy(p4.E, np.float64)
+    if component == "px":
+        return to_numpy(p4.px, np.float64)
+    if component == "py":
+        return to_numpy(p4.py, np.float64)
+    if component == "pz":
+        return to_numpy(p4.pz, np.float64)
+    if component == "pt":
+        return to_numpy(p4.pt, np.float64)
+    if component == "eta":
+        return to_numpy(p4.eta, np.float64)
+    if component == "phi":
+        return to_numpy(p4.phi, np.float64)
+    raise KeyError(f"Unsupported p4 component '{component}'")
 
 
 def composite_key(events: ak.Array) -> np.ndarray:
@@ -359,6 +418,73 @@ def scatter_consistency_plot(
     return metrics
 
 
+def scatter_consistency_arrays(
+    array_pairs: list[tuple[np.ndarray | None, np.ndarray | None, str]],
+    output_path: Path,
+    max_scatter: int,
+    title: str,
+    x_label: str,
+    y_label: str,
+    valid_mask: np.ndarray | None = None,
+) -> dict[str, Any]:
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8), dpi=220)
+    metrics: dict[str, Any] = {}
+
+    for axis, (x_values, y_values, label) in zip(axes.flat, array_pairs):
+        if x_values is None or y_values is None:
+            axis.text(0.5, 0.5, "missing", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_title(label)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            metrics[label] = {"status": "missing"}
+            continue
+
+        valid = np.isfinite(x_values) & np.isfinite(y_values)
+        valid &= ~np.isclose(x_values, DEFAULT_FLOAT)
+        valid &= ~np.isclose(y_values, DEFAULT_FLOAT)
+        if valid_mask is not None:
+            valid &= valid_mask
+        if not np.any(valid):
+            axis.text(0.5, 0.5, "no valid entries", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_title(label)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            metrics[label] = {"status": "no_valid_entries"}
+            continue
+
+        x_valid = x_values[valid]
+        y_valid = y_values[valid]
+        sampled = choose_sample_indices(len(x_valid), max_scatter)
+        axis.scatter(x_valid[sampled], y_valid[sampled], s=4, alpha=0.25, color=OKABE_ITO[0], linewidths=0)
+
+        low = float(min(np.min(x_valid), np.min(y_valid)))
+        high = float(max(np.max(x_valid), np.max(y_valid)))
+        if np.isfinite(low) and np.isfinite(high):
+            axis.plot([low, high], [low, high], linestyle="--", color=OKABE_ITO[3], linewidth=1.2)
+
+        axis.set_title(label)
+        axis.set_xlabel(x_label)
+        axis.set_ylabel(y_label)
+        axis.grid(alpha=0.2)
+        metrics[label] = {
+            "status": "ok",
+            "num_valid_entries": int(len(x_valid)),
+            "max_abs_diff": float(np.max(np.abs(y_valid - x_valid))),
+            "mean_abs_diff": float(np.mean(np.abs(y_valid - x_valid))),
+        }
+
+    for axis in axes.flat[len(array_pairs):]:
+        axis.text(0.5, 0.5, "not requested", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+        axis.set_xticks([])
+        axis.set_yticks([])
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    return metrics
+
+
 def build_expected_ab_fields(pred_events: ak.Array) -> dict[str, np.ndarray]:
     if "source_slot_for_a" not in pred_events.fields or "source_slot_for_b" not in pred_events.fields:
         return {}
@@ -504,6 +630,73 @@ def plot_ab_truth_vs_pred(
     return metrics
 
 
+def plot_prediction_slot_roundtrip(
+    pred_events: ak.Array,
+    prefix: str,
+    output_path: Path,
+    max_scatter: int,
+) -> dict[str, Any]:
+    array_pairs: list[tuple[np.ndarray | None, np.ndarray | None, str]] = []
+    valid_masks: list[np.ndarray] = []
+    for slot in (0, 1):
+        p4, slot_valid = prediction_slot_p4(pred_events, prefix, slot)
+        for component in ("energy", "pt", "eta", "phi"):
+            stored = prediction_field_component(pred_events, prefix, slot, component)
+            rebuilt = p4_component(p4, component) if p4 is not None else None
+            array_pairs.append((stored, rebuilt, f"slot{slot} {component}"))
+            valid_masks.append(slot_valid)
+
+    combined_valid = np.ones(len(pred_events), dtype=bool)
+    if "flags_valid" in pred_events.fields:
+        combined_valid &= to_numpy(pred_events["flags_valid"], bool)
+
+    metrics: dict[str, Any] = {}
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8), dpi=220)
+    for axis, (stored, rebuilt, label), slot_valid in zip(axes.flat, array_pairs, valid_masks):
+        if stored is None or rebuilt is None:
+            axis.text(0.5, 0.5, "missing", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_title(label)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            metrics[label] = {"status": "missing"}
+            continue
+
+        valid = np.isfinite(stored) & np.isfinite(rebuilt) & combined_valid & slot_valid
+        valid &= ~np.isclose(stored, DEFAULT_FLOAT)
+        valid &= ~np.isclose(rebuilt, DEFAULT_FLOAT)
+        if not np.any(valid):
+            axis.text(0.5, 0.5, "no valid entries", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_title(label)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            metrics[label] = {"status": "no_valid_entries"}
+            continue
+
+        stored_valid = stored[valid]
+        rebuilt_valid = rebuilt[valid]
+        sampled = choose_sample_indices(len(stored_valid), max_scatter)
+        axis.scatter(stored_valid[sampled], rebuilt_valid[sampled], s=4, alpha=0.25, color=OKABE_ITO[5], linewidths=0)
+        low = float(min(np.min(stored_valid), np.min(rebuilt_valid)))
+        high = float(max(np.max(stored_valid), np.max(rebuilt_valid)))
+        axis.plot([low, high], [low, high], linestyle="--", color=OKABE_ITO[3], linewidth=1.2)
+        axis.set_title(label)
+        axis.set_xlabel("Stored slot kinematics")
+        axis.set_ylabel("Rebuilt from p4")
+        axis.grid(alpha=0.2)
+        metrics[label] = {
+            "status": "ok",
+            "num_valid_entries": int(len(stored_valid)),
+            "max_abs_diff": float(np.max(np.abs(rebuilt_valid - stored_valid))),
+            "mean_abs_diff": float(np.mean(np.abs(rebuilt_valid - stored_valid))),
+        }
+
+    fig.suptitle(f"{prefix} slot kinematics round-trip")
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    return metrics
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -517,6 +710,13 @@ def main() -> None:
         args.max_scatter,
     )
     print(f"[consistency] ab_truth_vs_pred={ab_truth_pred_summary}", flush=True)
+    pred_roundtrip_summary = plot_prediction_slot_roundtrip(
+        pred_region_subset,
+        "pred_invisible",
+        args.output_dir / "pred_invisible_slot_roundtrip.png",
+        args.max_scatter,
+    )
+    print(f"[consistency] pred_invisible_slot_roundtrip={pred_roundtrip_summary}", flush=True)
     aligned_pred, aligned_export, summary = align_events(pred_events, export_events, export_path=args.export_raw_parquet)
     print(f"[consistency] alignment={summary}", flush=True)
     if summary["matched_rows"] == 0:
@@ -565,16 +765,13 @@ def main() -> None:
     )
     print(f"[consistency] visible_tau={visible_summary}", flush=True)
 
-    invisible_fields = [
-        ("pred_invisible_slot0_E", "pred_invisible_slot0_E", "slot0 E"),
-        ("pred_invisible_slot0_px", "pred_invisible_slot0_px", "slot0 px"),
-        ("pred_invisible_slot0_py", "pred_invisible_slot0_py", "slot0 py"),
-        ("pred_invisible_slot0_pz", "pred_invisible_slot0_pz", "slot0 pz"),
-        ("pred_invisible_slot1_E", "pred_invisible_slot1_E", "slot1 E"),
-        ("pred_invisible_slot1_px", "pred_invisible_slot1_px", "slot1 px"),
-        ("pred_invisible_slot1_py", "pred_invisible_slot1_py", "slot1 py"),
-        ("pred_invisible_slot1_pz", "pred_invisible_slot1_pz", "slot1 pz"),
-    ]
+    invisible_fields = []
+    for slot in (0, 1):
+        for component, label_component in (("energy", "energy"), ("pt", "pt"), ("eta", "eta"), ("phi", "phi"), ("E", "E"), ("px", "px"), ("py", "py"), ("pz", "pz")):
+            pred_field = f"pred_invisible_slot{slot}_{component}"
+            export_field = pred_field
+            if pred_field in aligned_pred.fields and export_field in aligned_export.fields:
+                invisible_fields.append((pred_field, export_field, f"slot{slot} {label_component}"))
     invisible_summary = scatter_consistency_plot(
         aligned_pred,
         aligned_export,
@@ -703,6 +900,7 @@ def main() -> None:
                 "pred_invisible": invisible_summary,
                 "ab_remap": ab_summary,
                 "ab_truth_vs_pred": ab_truth_pred_summary,
+                "pred_invisible_slot_roundtrip": pred_roundtrip_summary,
                 "prediction_parquet": str(args.prediction_parquet),
                 "export_raw_parquet": str(args.export_raw_parquet),
             },
