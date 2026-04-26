@@ -9,6 +9,7 @@ import awkward as ak
 
 from export_evenet_prediction_to_qi import (
     build_predicted_reconstruction,
+    build_concat_prediction_rows,
     prepare_events_for_parquet,
 )
 import numpy as np
@@ -33,6 +34,14 @@ def parse_args() -> argparse.Namespace:
         "--require-valid",
         action="store_true",
         help="If set, only inspect rows with flags_valid=True after reconstruction.",
+    )
+    parser.add_argument(
+        "--through-concat",
+        action="store_true",
+        help=(
+            "Run the full concat export path (build_compact_base_events -> with_evenet_reconstruction) "
+            "instead of only build_predicted_reconstruction."
+        ),
     )
     return parser.parse_args()
 
@@ -84,8 +93,15 @@ def format_block(label: str, values: dict[str, float]) -> str:
 def main() -> None:
     args = parse_args()
     pred_events = ak.from_parquet(args.prediction_parquet)
-    pred_values, _ = build_predicted_reconstruction(pred_events, pred_events)
-    pre_events = ak.Array(pred_values)
+    if args.through_concat:
+        pre_events, _ = build_concat_prediction_rows(
+            pred_events=pred_events,
+            prediction_split_fraction=None,
+            is_data=False,
+        )
+    else:
+        pred_values, _ = build_predicted_reconstruction(pred_events, pred_events)
+        pre_events = ak.Array(pred_values)
     post_events = prepare_events_for_parquet(pre_events)
 
     if args.pred_class_name is not None or args.require_valid:
@@ -116,6 +132,7 @@ def main() -> None:
             f"selection: pred_class_name={args.pred_class_name!r}, "
             f"require_valid={args.require_valid}, selected_match_index={args.row}"
         )
+    print(f"through_concat={args.through_concat}")
     print(f"source_slot_for_a={int(pred_event['source_slot_for_a'])}")
     print(f"source_slot_for_b={int(pred_event['source_slot_for_b'])}")
     print(f"evenet_slot_for_a={int(pre['evenet_slot_for_a'])}")
