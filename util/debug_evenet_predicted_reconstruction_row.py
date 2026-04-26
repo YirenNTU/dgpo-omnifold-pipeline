@@ -11,6 +11,7 @@ from export_evenet_prediction_to_qi import (
     build_predicted_reconstruction,
     prepare_events_for_parquet,
 )
+import numpy as np
 
 
 def parse_args() -> argparse.Namespace:
