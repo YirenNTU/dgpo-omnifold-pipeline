@@ -22,6 +22,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prediction-parquet", type=Path, required=True)
     parser.add_argument("--row", type=int, default=0)
+    parser.add_argument(
+        "--pred-class-name",
+        type=str,
+        default=None,
+        help="Optional evenet_pred_class_name filter, e.g. Ztautau_pipi.",
+    )
+    parser.add_argument(
+        "--require-valid",
+        action="store_true",
+        help="If set, only inspect rows with flags_valid=True after reconstruction.",
+    )
     return parser.parse_args()
 
 
@@ -76,13 +87,34 @@ def main() -> None:
     pre_events = ak.Array(pred_values)
     post_events = prepare_events_for_parquet(pre_events)
 
-    index = int(args.row)
+    if args.pred_class_name is not None or args.require_valid:
+        mask = np.ones(len(pred_events), dtype=bool)
+        if args.pred_class_name is not None:
+            class_names = np.asarray(ak.to_list(pred_events["evenet_pred_class_name"]), dtype=object)
+            mask &= class_names == args.pred_class_name
+        if args.require_valid:
+            mask &= ak.to_numpy(pre_events["flags_valid"], allow_missing=False).astype(bool)
+        matching_indices = np.flatnonzero(mask)
+        if int(args.row) < 0 or int(args.row) >= len(matching_indices):
+            raise IndexError(
+                f"Requested row={args.row}, but only {len(matching_indices)} rows match "
+                f"pred_class_name={args.pred_class_name!r}, require_valid={args.require_valid}."
+            )
+        index = int(matching_indices[int(args.row)])
+    else:
+        index = int(args.row)
+
     pred_event = pred_events[index]
     pre = pre_events[index]
     post = post_events[index]
 
     print(f"file: {args.prediction_parquet}")
     print(f"row={index}")
+    if args.pred_class_name is not None or args.require_valid:
+        print(
+            f"selection: pred_class_name={args.pred_class_name!r}, "
+            f"require_valid={args.require_valid}, selected_match_index={args.row}"
+        )
     print(f"source_slot_for_a={int(pred_event['source_slot_for_a'])}")
     print(f"source_slot_for_b={int(pred_event['source_slot_for_b'])}")
     print(f"evenet_slot_for_a={int(pre['evenet_slot_for_a'])}")
