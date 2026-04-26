@@ -110,14 +110,24 @@ def export_vector_component(values: ak.Array, component: str) -> np.ndarray:
     raise KeyError(f"Unable to extract component '{component}' from vector fields={sorted(fields)}")
 
 
-def canonicalize_p4(p4: ak.Array) -> ak.Array:
-    return vector.zip(
+def build_momentum4d(px, py, pz, energy):
+    return ak.zip(
         {
-            "px": to_numpy(p4.px, np.float64),
-            "py": to_numpy(p4.py, np.float64),
-            "pz": to_numpy(p4.pz, np.float64),
-            "E": to_numpy(p4.E, np.float64),
-        }
+            "px": px,
+            "py": py,
+            "pz": pz,
+            "E": energy,
+        },
+        with_name="Momentum4D",
+    )
+
+
+def canonicalize_p4(p4: ak.Array) -> ak.Array:
+    return build_momentum4d(
+        to_numpy(p4.px, np.float64),
+        to_numpy(p4.py, np.float64),
+        to_numpy(p4.pz, np.float64),
+        to_numpy(p4.E, np.float64),
     )
 
 
@@ -135,30 +145,34 @@ def prediction_slot_p4(pred_events: ak.Array, prefix: str, slot: int) -> tuple[a
 
     if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("E", "px", "py", "pz")):
         return canonicalize_p4(
-            vector.zip({"px": component("px"), "py": component("py"), "pz": component("pz"), "E": component("E")})
+            build_momentum4d(component("px"), component("py"), component("pz"), component("E"))
         ), valid
 
     if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("energy", "pt", "eta", "phi")):
+        pt = component("pt")
+        eta = component("eta")
+        phi = component("phi")
+        energy = component("energy")
         return canonicalize_p4(
-            vector.zip(
-                {
-                    "pt": component("pt"),
-                    "eta": component("eta"),
-                    "phi": component("phi"),
-                    "E": component("energy"),
-                }
+            build_momentum4d(
+                pt * np.cos(phi),
+                pt * np.sin(phi),
+                pt * np.sinh(eta),
+                energy,
             )
         ), valid
 
     if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("log_energy", "log_pt", "eta", "phi")):
+        pt = np.expm1(component("log_pt"))
+        eta = component("eta")
+        phi = component("phi")
+        energy = np.expm1(component("log_energy"))
         return canonicalize_p4(
-            vector.zip(
-                {
-                    "pt": np.expm1(component("log_pt")),
-                    "eta": component("eta"),
-                    "phi": component("phi"),
-                    "E": np.expm1(component("log_energy")),
-                }
+            build_momentum4d(
+                pt * np.cos(phi),
+                pt * np.sin(phi),
+                pt * np.sinh(eta),
+                energy,
             )
         ), valid
 
