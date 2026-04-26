@@ -117,6 +117,18 @@ def parse_method_specs(args: argparse.Namespace) -> dict[str, Path]:
     return methods
 
 
+def baseline_neutrino_reco_path(root: Path, sample_name: str, region: str) -> Path:
+    return root / "neutrino_reco" / region / f"{sample_name}_reconstructed_neutrinos.parquet"
+
+
+def method_parquet_path(root: Path, method: str, sample_name: str, region: str) -> Path:
+    baseline_candidate = baseline_neutrino_reco_path(root, sample_name, region)
+    export_candidate = parquet_for(root, sample_name, region)
+    if baseline_candidate.exists():
+        return baseline_candidate
+    return export_candidate
+
+
 def truth_observable_specs(requested: list[str] | None) -> list[tuple[str, str]]:
     names = requested or list(get_observable_names())
     return [(name, observable_latex_label(name)) for name in names]
@@ -293,16 +305,23 @@ def method_marker(method: str, index: int) -> str:
 
 
 def discover_method_regions(root: Path, sample_name: str, preferred_regions: list[str] | None = None) -> list[str]:
-    sample_dir = root / sample_name
-    if not sample_dir.exists():
-        return []
-
     discovered: list[str] = []
-    for path in sorted(sample_dir.glob("filtered___*.parquet")):
-        region = path.stem.removeprefix("filtered___")
-        if region == "raw":
-            continue
-        discovered.append(region)
+    sample_dir = root / sample_name
+    if sample_dir.exists():
+        for path in sorted(sample_dir.glob("filtered___*.parquet")):
+            region = path.stem.removeprefix("filtered___")
+            if region == "raw":
+                continue
+            discovered.append(region)
+
+    neutrino_reco_dir = root / "neutrino_reco"
+    if neutrino_reco_dir.exists():
+        for region_dir in sorted(path for path in neutrino_reco_dir.iterdir() if path.is_dir()):
+            candidate = region_dir / f"{sample_name}_reconstructed_neutrinos.parquet"
+            if candidate.exists():
+                discovered.append(region_dir.name)
+
+    discovered = list(dict.fromkeys(discovered))
 
     if preferred_regions is None:
         return discovered
@@ -333,7 +352,7 @@ def plot_truth_vs_reco_by_method_and_region(
 
         for region in regions:
             print(f"  [region] method={method} region={region}", flush=True)
-            path = parquet_for(root, signal_sample_name, region)
+            path = method_parquet_path(root, method, signal_sample_name, region)
             if not path.exists():
                 print(f"    [skip] missing signal parquet path={path}", flush=True)
                 continue
@@ -755,15 +774,19 @@ def main() -> None:
             print(f"[preunfolding] skip control plots method={method} no native regions discovered", flush=True)
             control_summary[method] = {}
             continue
-        method_control_summary = plot_physics_data_mc_comparisons(
-            methods={method: root},
-            output_dir=args.output_dir,
-            regions=native_regions,
-            data_sample_name=args.data_sample_name,
-            mc_sample_names=list(args.mc_sample_names),
-            requested_observables=args.control_observables,
-        )
-        control_summary[method] = method_control_summary.get(method, {})
+        if (root / "neutrino_reco").exists():
+            print(f"[preunfolding] skip control plots method={method} baseline neutrino_reco layout is not yet wired into data/MC control helper", flush=True)
+            control_summary[method] = {}
+        else:
+            method_control_summary = plot_physics_data_mc_comparisons(
+                methods={method: root},
+                output_dir=args.output_dir,
+                regions=native_regions,
+                data_sample_name=args.data_sample_name,
+                mc_sample_names=list(args.mc_sample_names),
+                requested_observables=args.control_observables,
+            )
+            control_summary[method] = method_control_summary.get(method, {})
     control_count = sum(len(region_info.get("plots", [])) for method_info in control_summary.values() for region_info in method_info.values())
     print(f"[preunfolding] finished control plots count={control_count}", flush=True)
 
