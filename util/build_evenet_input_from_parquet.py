@@ -1017,27 +1017,6 @@ def main() -> None:
     raw_expanded_samples = expand_samples(samples, raw_sample_events, subcategories)
     expanded_samples = expand_samples(samples, sample_events, subcategories)
 
-    resolved_luminosity = infer_luminosity(samples, None)
-    normalize = resolved_luminosity is None
-    console.print(
-        f"[bold]Monitoring normalization[/bold] "
-        f"{'shape-only' if normalize else 'absolute-yield'}"
-        + (
-            f" (luminosity={resolved_luminosity} pb^-1)"
-            if resolved_luminosity is not None
-            else ""
-        )
-    )
-
-    write_monitoring_plots(
-        raw_expanded_samples=raw_expanded_samples,
-        expanded_samples=expanded_samples,
-        output_dir=args.output_dir,
-        luminosity=resolved_luminosity,
-        normalize=normalize,
-        feature_config=feature_config,
-    )
-
     training_samples = select_training_samples(expanded_samples)
     data_samples = select_data_samples(expanded_samples)
 
@@ -1101,6 +1080,27 @@ def main() -> None:
         )
     else:
         console.print("[yellow]Skipped dataw[/yellow] no data samples configured")
+
+    resolved_luminosity = infer_luminosity(samples, None)
+    normalize = resolved_luminosity is None
+    console.print(
+        f"[bold]Monitoring normalization[/bold] "
+        f"{'shape-only' if normalize else 'absolute-yield'}"
+        + (
+            f" (luminosity={resolved_luminosity} pb^-1)"
+            if resolved_luminosity is not None
+            else ""
+        )
+    )
+
+    write_monitoring_plots(
+        raw_expanded_samples=raw_expanded_samples,
+        expanded_samples=expanded_samples,
+        output_dir=args.output_dir,
+        luminosity=resolved_luminosity,
+        normalize=normalize,
+        feature_config=feature_config,
+    )
 
 
 if __name__ == "__main__":
