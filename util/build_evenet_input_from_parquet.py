@@ -381,23 +381,55 @@ def source_event_key_array(events: ak.Array) -> np.ndarray:
     return np.arange(len(events), dtype=np.int64)
 
 
-def passthrough_prediction_fields(events: ak.Array) -> dict[str, np.ndarray]:
+def should_passthrough_prediction_field(field: str) -> bool:
+    return (
+        field in PREDICTION_PASSTHROUGH_EXACT_FIELDS
+        or field.endswith(PREDICTION_PASSTHROUGH_SUFFIXES)
+        or field.startswith(PREDICTION_PASSTHROUGH_PREFIXES)
+    )
+
+
+def convert_passthrough_field(values, field: str, required: bool) -> np.ndarray | None:
+    nested_fields = list(getattr(values, "fields", []))
+    if nested_fields:
+        if required:
+            raise ValueError(
+                f"Required passthrough field '{field}' is a nested record/struct with subfields={nested_fields[:20]}; "
+                "concat-based export requires a flat 1D scalar column."
+            )
+        return None
+
+    array = to_numpy_array(values)
+    if array.ndim != 1:
+        if required:
+            raise ValueError(
+                f"Required passthrough field '{field}' has ndim={array.ndim}, shape={array.shape}; "
+                "concat-based export requires a flat 1D scalar column."
+            )
+        return None
+    if array.dtype.kind not in {"b", "i", "u", "f"}:
+        if required:
+            raise ValueError(
+                f"Required passthrough field '{field}' has unsupported dtype={array.dtype}; "
+                "concat-based export requires a bool/int/uint/float 1D scalar column."
+            )
+        return None
+    return array
+
+
+def passthrough_prediction_fields(events: ak.Array, required_fields: set[str] | None = None) -> dict[str, np.ndarray]:
     output: dict[str, np.ndarray] = {}
+    required_fields = required_fields or set()
     if "weight" in events.fields:
         output["central_weight"] = to_numpy_array(events["weight"], np.float32)
 
     for field in events.fields:
         if field == "weight":
             continue
-        if field not in PREDICTION_PASSTHROUGH_EXACT_FIELDS and not field.endswith(PREDICTION_PASSTHROUGH_SUFFIXES) and not field.startswith(PREDICTION_PASSTHROUGH_PREFIXES):
+        if not should_passthrough_prediction_field(field):
             continue
-        values = events[field]
-        if len(getattr(values, "fields", [])) > 0:
-            continue
-        array = to_numpy_array(values)
-        if array.ndim != 1:
-            continue
-        if array.dtype.kind not in {"b", "i", "u", "f"}:
+        array = convert_passthrough_field(events[field], field, required=field in required_fields)
+        if array is None:
             continue
         output[field] = array
     return output
@@ -411,15 +443,10 @@ def expected_passthrough_output_fields(events: ak.Array) -> set[str]:
     for field in events.fields:
         if field == "weight":
             continue
-        if field not in PREDICTION_PASSTHROUGH_EXACT_FIELDS and not field.endswith(PREDICTION_PASSTHROUGH_SUFFIXES) and not field.startswith(PREDICTION_PASSTHROUGH_PREFIXES):
+        if not should_passthrough_prediction_field(field):
             continue
-        values = events[field]
-        if len(getattr(values, "fields", [])) > 0:
-            continue
-        array = to_numpy_array(values)
-        if array.ndim != 1:
-            continue
-        if array.dtype.kind not in {"b", "i", "u", "f"}:
+        array = convert_passthrough_field(events[field], field, required=False)
+        if array is None:
             continue
         expected.add(field)
     return expected
@@ -487,6 +514,7 @@ def build_dataset(
 
     for source_sample_index, (sample, events) in enumerate(expanded_samples):
         console.print(f"[bold cyan]Converting[/bold cyan] [white]{sample.name}[/white]")
+        required_fields = validate_source_passthrough_contract(events, sample.name, sample.is_data)
 
         x, x_mask, num_sequential_vectors, point_cloud_names = build_point_cloud(events, max_particles, feature_config)
         conditions, conditions_mask, condition_names = build_global_conditions(events, feature_config)
@@ -550,7 +578,7 @@ def build_dataset(
             "source_event_index": np.arange(len(events), dtype=np.int64),
             "source_event_key": source_event_key_array(events),
         }
-        batch.update(passthrough_prediction_fields(events))
+        batch.update(passthrough_prediction_fields(events, required_fields=required_fields))
         if include_classification:
             batch["classification"] = np.full(len(events), class_index[sample.name], dtype=np.int64)
             batch["event_weight"] = np.ones(len(events), dtype=np.float32)
