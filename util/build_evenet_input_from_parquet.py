@@ -392,7 +392,7 @@ def passthrough_prediction_fields(events: ak.Array) -> dict[str, np.ndarray]:
         if field not in PREDICTION_PASSTHROUGH_EXACT_FIELDS and not field.endswith(PREDICTION_PASSTHROUGH_SUFFIXES) and not field.startswith(PREDICTION_PASSTHROUGH_PREFIXES):
             continue
         values = events[field]
-        if hasattr(values, "fields"):
+        if len(getattr(values, "fields", [])) > 0:
             continue
         array = to_numpy_array(values)
         if array.ndim != 1:
@@ -414,7 +414,7 @@ def expected_passthrough_output_fields(events: ak.Array) -> set[str]:
         if field not in PREDICTION_PASSTHROUGH_EXACT_FIELDS and not field.endswith(PREDICTION_PASSTHROUGH_SUFFIXES) and not field.startswith(PREDICTION_PASSTHROUGH_PREFIXES):
             continue
         values = events[field]
-        if hasattr(values, "fields"):
+        if len(getattr(values, "fields", [])) > 0:
             continue
         array = to_numpy_array(values)
         if array.ndim != 1:
