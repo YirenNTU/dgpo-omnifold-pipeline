@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import sys
@@ -39,6 +40,19 @@ from quantum.observables_builder import build_observables, get_observable_names
 
 DEFAULT_FLOAT = -99.0
 OKABE_ITO_BLACK = "#000000"
+BASELINE_HADHAD_FINE_CHANNELS = (
+    "Ztautau_pipi",
+    "Ztautau_pirho",
+    "Ztautau_rhorho",
+)
+BASELINE_FINE_REGION_TO_PARENT = {
+    "ee": ("ee", "Ztautau_ee"),
+    "emu": ("emu", "Ztautau_emu"),
+    "mumu": ("mumu", "Ztautau_mumu"),
+    "Ztautau_pipi": ("hadhad", "Ztautau_pipi"),
+    "Ztautau_pirho": ("hadhad", "Ztautau_pirho"),
+    "Ztautau_rhorho": ("hadhad", "Ztautau_rhorho"),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,12 +135,54 @@ def baseline_neutrino_reco_path(root: Path, sample_name: str, region: str) -> Pa
     return root / "neutrino_reco" / region / f"{sample_name}_reconstructed_neutrinos.parquet"
 
 
-def method_parquet_path(root: Path, method: str, sample_name: str, region: str) -> Path:
-    baseline_candidate = baseline_neutrino_reco_path(root, sample_name, region)
+def neutrino_reco_root(root: Path) -> Path | None:
+    if root.name == "neutrino_reco" and root.exists():
+        return root
+    candidate = root / "neutrino_reco"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def reconstructed_neutrino_paths(root: Path, sample_name: str, region: str) -> list[Path]:
+    reco_root = neutrino_reco_root(root)
+    if reco_root is None:
+        return []
+    if sample_name == "Ztautau":
+        if region in BASELINE_FINE_REGION_TO_PARENT:
+            parent_region, signal_name = BASELINE_FINE_REGION_TO_PARENT[region]
+            candidate = reco_root / parent_region / f"{signal_name}_reconstructed_neutrinos.parquet"
+            return [candidate] if candidate.exists() else []
+
+    region_dir = reco_root / region
+    if not region_dir.exists():
+        return []
+
+    exact = region_dir / f"{sample_name}_reconstructed_neutrinos.parquet"
+    if exact.exists():
+        return [exact]
+
+    matched = sorted(Path(path) for path in glob.glob(str(region_dir / f"{sample_name}*_reconstructed_neutrinos.parquet")))
+    return matched
+
+
+def method_event_paths(root: Path, sample_name: str, region: str) -> list[Path]:
+    baseline_candidates = reconstructed_neutrino_paths(root, sample_name, region)
+    if baseline_candidates:
+        return baseline_candidates
+
     export_candidate = parquet_for(root, sample_name, region)
-    if baseline_candidate.exists():
-        return baseline_candidate
-    return export_candidate
+    if export_candidate.exists():
+        return [export_candidate]
+    return []
+
+
+def load_method_events(root: Path, sample_name: str, region: str) -> ak.Array | None:
+    paths = method_event_paths(root, sample_name, region)
+    if not paths:
+        return None
+    arrays = [load_events(path) for path in paths]
+    return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
 
 
 def truth_observable_specs(requested: list[str] | None) -> list[tuple[str, str]]:
@@ -314,12 +370,16 @@ def discover_method_regions(root: Path, sample_name: str, preferred_regions: lis
                 continue
             discovered.append(region)
 
-    neutrino_reco_dir = root / "neutrino_reco"
-    if neutrino_reco_dir.exists():
-        for region_dir in sorted(path for path in neutrino_reco_dir.iterdir() if path.is_dir()):
-            candidate = region_dir / f"{sample_name}_reconstructed_neutrinos.parquet"
-            if candidate.exists():
-                discovered.append(region_dir.name)
+    reco_root = neutrino_reco_root(root)
+    if reco_root is not None:
+        if sample_name == "Ztautau":
+            for fine_region in ("ee", "emu", "mumu", *BASELINE_HADHAD_FINE_CHANNELS):
+                if reconstructed_neutrino_paths(root, sample_name, fine_region):
+                    discovered.append(fine_region)
+        else:
+            for region_dir in sorted(path for path in reco_root.iterdir() if path.is_dir()):
+                if reconstructed_neutrino_paths(root, sample_name, region_dir.name):
+                    discovered.append(region_dir.name)
 
     discovered = list(dict.fromkeys(discovered))
 
@@ -352,12 +412,19 @@ def plot_truth_vs_reco_by_method_and_region(
 
         for region in regions:
             print(f"  [region] method={method} region={region}", flush=True)
-            path = method_parquet_path(root, method, signal_sample_name, region)
-            if not path.exists():
-                print(f"    [skip] missing signal parquet path={path}", flush=True)
+            paths = method_event_paths(root, signal_sample_name, region)
+            if not paths:
+                print(f"    [skip] missing signal parquet paths for method={method} region={region}", flush=True)
                 continue
-            print(f"    [load] method={method} sample={signal_sample_name} region={region} path={path}", flush=True)
-            events = load_events(path)
+            print(
+                f"    [load] method={method} sample={signal_sample_name} region={region} "
+                f"paths={[str(path) for path in paths]}",
+                flush=True,
+            )
+            events = load_method_events(root, signal_sample_name, region)
+            if events is None:
+                print(f"    [skip] failed to load events after path resolution method={method} region={region}", flush=True)
+                continue
             region_dir = method_dir / sanitize_filename(region)
             region_dir.mkdir(parents=True, exist_ok=True)
             region_summary: dict[str, Any] = {}
@@ -774,10 +841,7 @@ def main() -> None:
             print(f"[preunfolding] skip control plots method={method} no native regions discovered", flush=True)
             control_summary[method] = {}
             continue
-        if (root / "neutrino_reco").exists():
-            print(f"[preunfolding] skip control plots method={method} baseline neutrino_reco layout is not yet wired into data/MC control helper", flush=True)
-            control_summary[method] = {}
-        else:
+        if neutrino_reco_root(root) is None:
             method_control_summary = plot_physics_data_mc_comparisons(
                 methods={method: root},
                 output_dir=args.output_dir,
@@ -787,6 +851,9 @@ def main() -> None:
                 requested_observables=args.control_observables,
             )
             control_summary[method] = method_control_summary.get(method, {})
+        else:
+            print(f"[preunfolding] skip control plots method={method} baseline neutrino_reco layout is not yet wired into data/MC control helper", flush=True)
+            control_summary[method] = {}
     control_count = sum(len(region_info.get("plots", [])) for method_info in control_summary.values() for region_info in method_info.values())
     print(f"[preunfolding] finished control plots count={control_count}", flush=True)
 

@@ -295,8 +295,8 @@ def finite_p4_mask(p4: ak.Array) -> np.ndarray:
 
 
 def zero_p4(num_events: int) -> ak.Array:
-    zeros = np.zeros(num_events, dtype=np.float64)
-    return vector.zip({"px": zeros, "py": zeros, "pz": zeros, "E": zeros})
+    nan_values = np.full(num_events, np.nan, dtype=np.float64)
+    return vector.zip({"px": nan_values, "py": nan_values, "pz": nan_values, "E": nan_values})
 
 
 def default_float_array(num_events: int, dtype=np.float32) -> np.ndarray:
