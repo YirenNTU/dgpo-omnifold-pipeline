@@ -207,6 +207,10 @@ def observable_latex_label(name: str) -> str:
     return name.replace("_", " ")
 
 
+def is_spin_observable(name: str) -> bool:
+    return name == "theta_cm" or name.startswith("cos_theta_")
+
+
 def channel_latex_label(name: str) -> str:
     mapping = {
         "hadhad": r"$\tau_{\mathrm{had}}\tau_{\mathrm{had}}$",
@@ -320,6 +324,14 @@ def observable_bins(observable: str, values_by_name: dict[str, np.ndarray]) -> n
     if observable.startswith("cos_theta_"):
         return np.linspace(-1.0, 1.0, 41)
     return choose_bins(values_by_name, num_bins=40)
+
+
+def observable_2d_limits(observable: str) -> tuple[float, float]:
+    if observable == "theta_cm":
+        return 0.0, float(np.pi)
+    if observable.startswith("cos_theta_"):
+        return -1.0, 1.0
+    raise ValueError(f"Observable '{observable}' is not configured for 2D truth-vs-reco limits.")
 
 
 def weighted_hist(values: np.ndarray, weights: np.ndarray, bins: np.ndarray, normalize: bool) -> np.ndarray:
@@ -491,6 +503,30 @@ def plot_truth_vs_reco_by_method_and_region(
                 plot_path = region_dir / f"{sanitize_filename(observable)}.png"
                 fig.savefig(plot_path)
                 plt.close(fig)
+
+                plot_path_2d = None
+                if is_spin_observable(observable):
+                    low, high = observable_2d_limits(observable)
+                    fig2d, ax2d = plt.subplots(figsize=(6.2, 5.8), dpi=180)
+                    hist2d = ax2d.hist2d(
+                        truth_valid,
+                        reco_valid,
+                        bins=[np.linspace(low, high, 51), np.linspace(low, high, 51)],
+                        weights=weight_valid,
+                        cmap="Blues",
+                    )
+                    ax2d.plot([low, high], [low, high], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.2)
+                    ax2d.set_xlim(low, high)
+                    ax2d.set_ylim(low, high)
+                    ax2d.set_xlabel(f"Truth {xlabel}")
+                    ax2d.set_ylabel(f"Reco {xlabel}")
+                    ax2d.set_title(f"{method_display_name(method)} {channel_latex_label(region)}")
+                    fig2d.colorbar(hist2d[3], ax=ax2d, label="Weighted yield")
+                    fig2d.tight_layout()
+                    plot_path_2d = region_dir / f"{sanitize_filename(observable)}_2d.png"
+                    fig2d.savefig(plot_path_2d)
+                    plt.close(fig2d)
+
                 print(
                     f"    [write] method={method} region={region} observable={observable} plot={plot_path}",
                     flush=True,
@@ -498,6 +534,7 @@ def plot_truth_vs_reco_by_method_and_region(
 
                 region_summary[observable] = {
                     "plot": str(plot_path.relative_to(output_dir)),
+                    "plot_2d": str(plot_path_2d.relative_to(output_dir)) if plot_path_2d is not None else None,
                     "normalize": normalize,
                     "num_events": int(np.count_nonzero(valid_mask)),
                     "weight_sum": float(np.sum(weight_valid)),
@@ -834,6 +871,11 @@ def main() -> None:
         f"mc_samples={list(args.mc_sample_names)} control_observables={args.control_observables or 'default'}",
         flush=True,
     )
+    control_observables = None
+    if args.control_observables is not None:
+        control_observables = [observable for observable in args.control_observables if not is_spin_observable(observable)]
+    else:
+        control_observables = [name for name, _, _ in physics_observable_specs(None) if not is_spin_observable(name)]
     control_summary: dict[str, Any] = {}
     for method, root in methods.items():
         native_regions = method_regions.get(method, [])
@@ -848,7 +890,7 @@ def main() -> None:
                 regions=native_regions,
                 data_sample_name=args.data_sample_name,
                 mc_sample_names=list(args.mc_sample_names),
-                requested_observables=args.control_observables,
+                requested_observables=control_observables,
             )
             control_summary[method] = method_control_summary.get(method, {})
         else:
@@ -865,7 +907,7 @@ def main() -> None:
         "truth_vs_reco": truth_summary,
         "truth_metric_summary": truth_metric_summary,
         "data_mc_control": control_summary,
-        "control_observable_defaults": [name for name, _, _ in physics_observable_specs(args.control_observables)],
+        "control_observable_defaults": control_observables,
     }
     with (args.output_dir / "preunfolding_validation_summary.json").open("w") as handle:
         json.dump(json_safe(summary), handle, indent=2, sort_keys=True)
