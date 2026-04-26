@@ -243,6 +243,27 @@ def build_momentum4d(px, py, pz, energy):
     )
 
 
+def materialize_p4_for_parquet(values: ak.Array) -> ak.Array:
+    vector_values = rebuild_vector(values)
+    return ak.zip(
+        {
+            "x": vector_values.px,
+            "y": vector_values.py,
+            "z": vector_values.pz,
+            "t": vector_values.E,
+        },
+        with_name="Momentum4D",
+    )
+
+
+def prepare_events_for_parquet(events: ak.Array) -> ak.Array:
+    output = events
+    for field in output.fields:
+        if field.endswith("_p4"):
+            output[field] = materialize_p4_for_parquet(output[field])
+    return output
+
+
 def canonicalize_p4(p4: ak.Array) -> ak.Array:
     return build_momentum4d(
         ak.to_numpy(p4.px, allow_missing=False).astype(np.float64),
@@ -772,17 +793,18 @@ def write_qi_tree(events: ak.Array, output_root: Path, sample_name: str, regions
     sample_dir = output_root / sample_name
     sample_dir.mkdir(parents=True, exist_ok=True)
     events = add_evenet_region_cut_fields(events, regions)
+    parquet_events = prepare_events_for_parquet(events)
 
-    counts: dict[str, int] = {"raw": int(len(events))}
-    ak.to_parquet(events, sample_dir / "filtered___raw.parquet", compression="snappy")
+    counts: dict[str, int] = {"raw": int(len(parquet_events))}
+    ak.to_parquet(parquet_events, sample_dir / "filtered___raw.parquet", compression="snappy")
 
     for region in regions:
         if region == "raw":
             continue
         cut_field = f"{region}_cut"
-        if cut_field not in events.fields:
+        if cut_field not in parquet_events.fields:
             continue
-        region_events = events[events[cut_field] == 1]
+        region_events = parquet_events[parquet_events[cut_field] == 1]
         counts[region] = int(len(region_events))
         ak.to_parquet(region_events, sample_dir / f"filtered___{region}.parquet", compression="snappy")
     return counts
