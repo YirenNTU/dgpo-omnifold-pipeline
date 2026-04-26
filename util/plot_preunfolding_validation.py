@@ -243,6 +243,28 @@ def channel_latex_label(name: str) -> str:
     return name.replace("_", " ")
 
 
+def canonical_summary_region(region: str) -> str:
+    mapping = {
+        "Ztautau_ee": "ee",
+        "Ztautau_emu": "emu",
+        "Ztautau_mue": "emu",
+        "Ztautau_mumu": "mumu",
+        "Ztautau_pipi": "Ztautau_pipi",
+        "Ztautau_pirho": "Ztautau_pirho",
+        "Ztautau_rhorho": "Ztautau_rhorho",
+    }
+    return mapping.get(region, region)
+
+
+def summary_region_latex_label(region: str) -> str:
+    mapping = {
+        "ee": channel_latex_label("Ztautau_ee"),
+        "emu": channel_latex_label("Ztautau_emu"),
+        "mumu": channel_latex_label("Ztautau_mumu"),
+    }
+    return mapping.get(region, channel_latex_label(region))
+
+
 def to_numpy(values: Any, dtype=np.float64) -> np.ndarray:
     return ak.to_numpy(values, allow_missing=False).astype(dtype)
 
@@ -648,7 +670,7 @@ def plot_truth_metric_summary(
 
     all_regions = []
     for method_info in truth_summary.values():
-        all_regions.extend(method_info.keys())
+        all_regions.extend(canonical_summary_region(region) for region in method_info.keys())
     unique_regions = list(dict.fromkeys(all_regions))
     method_handles = [
         Line2D(
@@ -675,11 +697,13 @@ def plot_truth_metric_summary(
                 value, uncertainty = metric_value_and_uncertainty(metrics, metric)
                 if not np.isfinite(value):
                     continue
+                summary_region = canonical_summary_region(region)
                 rows.append(
                     {
                         "method": method,
                         "method_index": method_index,
                         "region": region,
+                        "summary_region": summary_region,
                         "value": value,
                         "uncertainty": uncertainty,
                         "precision": metric_precision(value, uncertainty),
@@ -693,9 +717,9 @@ def plot_truth_metric_summary(
         active_regions = [
             region
             for region in unique_regions
-            if region != "baseline" and any(row["region"] == region for row in rows)
+            if region != "baseline" and any(row["summary_region"] == region for row in rows)
         ]
-        rows = [row for row in rows if row["region"] in set(active_regions)]
+        rows = [row for row in rows if row["summary_region"] in set(active_regions)]
         if not rows:
             continue
         fig_height = max(4.0, 0.7 * len(active_regions) + 1.8)
@@ -715,7 +739,7 @@ def plot_truth_metric_summary(
 
         x_text_value = 1.03
         for region in active_regions:
-            region_rows = [row for row in rows if row["region"] == region]
+            region_rows = [row for row in rows if row["summary_region"] == region]
             region_rows.sort(key=lambda row: row["method_index"])
             offsets = np.linspace(-0.24, 0.24, len(region_rows)) if len(region_rows) > 1 else np.array([0.0])
             for offset, row in zip(offsets, region_rows):
@@ -752,7 +776,7 @@ def plot_truth_metric_summary(
 
         ax.text(x_text_value, 1.02, r"$r \pm \sigma_r$", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
         ax.set_yticks(y_base)
-        ax.set_yticklabels([channel_latex_label(region) for region in active_regions])
+        ax.set_yticklabels([summary_region_latex_label(region) for region in active_regions])
         ax.invert_yaxis()
         ax.grid(axis="y", alpha=0.18, linestyle=":")
         for separator in np.arange(len(active_regions) - 1, dtype=np.float64) + 0.5:
@@ -779,7 +803,7 @@ def plot_truth_metric_summary(
             "metric": metric,
             "num_points": len(rows),
             "methods": sorted({row["method"] for row in rows}),
-            "regions": sorted({row["region"] for row in rows}),
+            "regions": sorted({row["summary_region"] for row in rows}),
         }
         print(f"[preunfolding] wrote truth-summary observable={observable} metric={metric} plot={plot_path}", flush=True)
 
