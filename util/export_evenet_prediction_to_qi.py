@@ -311,6 +311,75 @@ def choose_by_slot(slot0, slot1, choose_slot1: np.ndarray):
     return ak.where(ak.Array(choose_slot1), slot1, slot0)
 
 
+def choose_component_by_slot(events: ak.Array, prefix: str, slot_indices: np.ndarray, component: str) -> np.ndarray | None:
+    slot0_name = f"{prefix}_slot0_{component}"
+    slot1_name = f"{prefix}_slot1_{component}"
+    fields = set(events.fields)
+    if slot0_name not in fields or slot1_name not in fields:
+        return None
+    slot0 = ak.to_numpy(events[slot0_name], allow_missing=False).astype(np.float64)
+    slot1 = ak.to_numpy(events[slot1_name], allow_missing=False).astype(np.float64)
+    return np.where(slot_indices == 0, slot0, slot1)
+
+
+def choose_valid_by_slot(events: ak.Array, prefix: str, slot_indices: np.ndarray) -> np.ndarray:
+    valid_field0 = f"{prefix}_slot0_valid"
+    valid_field1 = f"{prefix}_slot1_valid"
+    fields = set(events.fields)
+    valid0 = (
+        ak.to_numpy(events[valid_field0], allow_missing=False).astype(bool)
+        if valid_field0 in fields
+        else np.ones(len(events), dtype=bool)
+    )
+    valid1 = (
+        ak.to_numpy(events[valid_field1], allow_missing=False).astype(bool)
+        if valid_field1 in fields
+        else np.ones(len(events), dtype=bool)
+    )
+    return np.where(slot_indices == 0, valid0, valid1)
+
+
+def build_remapped_p4(events: ak.Array, prefix: str, slot_indices: np.ndarray) -> tuple[ak.Array, np.ndarray]:
+    px = choose_component_by_slot(events, prefix, slot_indices, "px")
+    py = choose_component_by_slot(events, prefix, slot_indices, "py")
+    pz = choose_component_by_slot(events, prefix, slot_indices, "pz")
+    energy = choose_component_by_slot(events, prefix, slot_indices, "E")
+    if px is not None and py is not None and pz is not None and energy is not None:
+        return build_momentum4d(px, py, pz, energy), choose_valid_by_slot(events, prefix, slot_indices)
+
+    energy = choose_component_by_slot(events, prefix, slot_indices, "energy")
+    pt = choose_component_by_slot(events, prefix, slot_indices, "pt")
+    eta = choose_component_by_slot(events, prefix, slot_indices, "eta")
+    phi = choose_component_by_slot(events, prefix, slot_indices, "phi")
+    if energy is not None and pt is not None and eta is not None and phi is not None:
+        return build_momentum4d(
+            pt * np.cos(phi),
+            pt * np.sin(phi),
+            pt * np.sinh(eta),
+            energy,
+        ), choose_valid_by_slot(events, prefix, slot_indices)
+
+    log_energy = choose_component_by_slot(events, prefix, slot_indices, "log_energy")
+    log_pt = choose_component_by_slot(events, prefix, slot_indices, "log_pt")
+    eta = choose_component_by_slot(events, prefix, slot_indices, "eta")
+    phi = choose_component_by_slot(events, prefix, slot_indices, "phi")
+    if log_energy is not None and log_pt is not None and eta is not None and phi is not None:
+        pt = np.expm1(log_pt)
+        energy = np.expm1(log_energy)
+        return build_momentum4d(
+            pt * np.cos(phi),
+            pt * np.sin(phi),
+            pt * np.sinh(eta),
+            energy,
+        ), choose_valid_by_slot(events, prefix, slot_indices)
+
+    available = [field for field in events.fields if field.startswith(f"{prefix}_slot")]
+    raise KeyError(
+        f"Cannot build remapped p4 for prefix={prefix}. Need slot-wise E/px/py/pz, energy/pt/eta/phi, "
+        f"or log_energy/log_pt/eta/phi. Available: {available}"
+    )
+
+
 def finite_p4_mask(p4: ak.Array) -> np.ndarray:
     return (
         np.isfinite(ak.to_numpy(p4.px, allow_missing=False))
@@ -414,10 +483,6 @@ def build_predicted_reconstruction(
     pred_events: ak.Array,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     num_predicted_rows = len(pred_events)
-    visible0, visible0_valid = p4_from_components(pred_events, "tau_vis_prong", 0)
-    visible1, visible1_valid = p4_from_components(pred_events, "tau_vis_prong", 1)
-    pred_missing0, pred_missing0_valid = p4_from_components(pred_events, "pred_invisible", 0)
-    pred_missing1, pred_missing1_valid = p4_from_components(pred_events, "pred_invisible", 1)
 
     if "source_slot_for_a" not in pred_events.fields or "source_slot_for_b" not in pred_events.fields:
         raise ValueError(
@@ -430,17 +495,10 @@ def build_predicted_reconstruction(
     if np.any((slot_for_a < 0) | (slot_for_a > 1) | (slot_for_b < 0) | (slot_for_b > 1)):
         raise ValueError("source_slot_for_a/source_slot_for_b must be 0 or 1 for every prediction row.")
 
-    choose_slot1_for_a = slot_for_a == 1
-    choose_slot1_for_b = slot_for_b == 1
-
-    lead_a_visible = choose_by_slot(visible0, visible1, choose_slot1_for_a)
-    lead_b_visible = choose_by_slot(visible0, visible1, choose_slot1_for_b)
-    lead_a_missing = choose_by_slot(pred_missing0, pred_missing1, choose_slot1_for_a)
-    lead_b_missing = choose_by_slot(pred_missing0, pred_missing1, choose_slot1_for_b)
-    pred_valid_a = np.where(choose_slot1_for_a, pred_missing1_valid, pred_missing0_valid)
-    pred_valid_b = np.where(choose_slot1_for_b, pred_missing1_valid, pred_missing0_valid)
-    vis_valid_a = np.where(choose_slot1_for_a, visible1_valid, visible0_valid)
-    vis_valid_b = np.where(choose_slot1_for_b, visible1_valid, visible0_valid)
+    lead_a_visible, vis_valid_a = build_remapped_p4(pred_events, "tau_vis_prong", slot_for_a)
+    lead_b_visible, vis_valid_b = build_remapped_p4(pred_events, "tau_vis_prong", slot_for_b)
+    lead_a_missing, pred_valid_a = build_remapped_p4(pred_events, "pred_invisible", slot_for_a)
+    lead_b_missing, pred_valid_b = build_remapped_p4(pred_events, "pred_invisible", slot_for_b)
     reco_tau_a = lead_a_visible + lead_a_missing
     reco_tau_b = lead_b_visible + lead_b_missing
 
