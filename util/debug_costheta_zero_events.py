@@ -110,6 +110,30 @@ def p4_dict(p4: Any) -> dict[str, float]:
     }
 
 
+def one_event_vector_array(event: ak.Record, field: str) -> ak.Array:
+    p4 = event[field]
+    fields = set(getattr(p4, "fields", []))
+    if {"px", "py", "pz", "E"}.issubset(fields):
+        return vector.zip(
+            {
+                "px": ak.Array([float(p4["px"])]),
+                "py": ak.Array([float(p4["py"])]),
+                "pz": ak.Array([float(p4["pz"])]),
+                "E": ak.Array([float(p4["E"])]),
+            }
+        )
+    if {"x", "y", "z", "t"}.issubset(fields):
+        return vector.zip(
+            {
+                "px": ak.Array([float(p4["x"])]),
+                "py": ak.Array([float(p4["y"])]),
+                "pz": ak.Array([float(p4["z"])]),
+                "E": ak.Array([float(p4["t"])]),
+            }
+        )
+    raise KeyError(f"{field} has unsupported p4 fields: {sorted(fields)}")
+
+
 def vec3_dict(v: Any) -> dict[str, float]:
     return {
         "x": float(v.x),
@@ -240,10 +264,10 @@ def print_event(event: ak.Record, index: int, observable: str, source: str) -> N
         print(f"dot_B_{axis}={geom['dots_b'][axis]: .8f}")
 
     observables = build_observables(
-        ak.Array([event["reco_tau_a_p4"]]),
-        ak.Array([event["reco_tau_b_p4"]]),
-        ak.Array([event["lead_a_visible_p4"]]),
-        ak.Array([event["lead_b_visible_p4"]]),
+        one_event_vector_array(event, "reco_tau_a_p4"),
+        one_event_vector_array(event, "reco_tau_b_p4"),
+        one_event_vector_array(event, "lead_a_visible_p4"),
+        one_event_vector_array(event, "lead_b_visible_p4"),
     )
     print(f"recomputed_{observable}={float(ak.to_numpy(observables[observable], allow_missing=False)[0]): .8f}")
 
