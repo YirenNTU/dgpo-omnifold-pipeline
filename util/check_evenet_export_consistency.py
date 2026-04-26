@@ -46,6 +46,23 @@ def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
 
 
 def export_vector_component(values: ak.Array, component: str) -> np.ndarray:
+    property_aliases = {
+        "E": ("E", "energy"),
+        "energy": ("energy", "E"),
+        "px": ("px",),
+        "py": ("py",),
+        "pz": ("pz",),
+        "pt": ("pt",),
+        "eta": ("eta",),
+        "phi": ("phi",),
+    }
+    for attr in property_aliases.get(component, (component,)):
+        try:
+            attr_values = getattr(values, attr)
+            return to_numpy(attr_values, np.float64)
+        except Exception:
+            pass
+
     fields = set(getattr(values, "fields", []))
     px = None
     py = None
