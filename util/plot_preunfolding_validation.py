@@ -105,6 +105,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Normalize truth-vs-reco distributions to unit area instead of plotting absolute weighted yields.",
     )
+    parser.add_argument(
+        "--reco-observable-source",
+        choices=["auto", "stored", "recompute"],
+        default="auto",
+        help=(
+            "How to obtain reco truth-vs-reco observables. "
+            "'auto' prefers stored parquet columns and falls back to recomputing from p4; "
+            "'stored' requires the parquet column; "
+            "'recompute' always rebuilds theta_cm/cos_theta_* from reco/visible p4."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -470,7 +481,11 @@ def plot_truth_vs_reco_by_method_and_region(
             region_summary: dict[str, Any] = {}
 
             for observable, xlabel in observable_specs:
-                reco_values_full = truth_reco_observable_values(events, observable)
+                reco_values_full = truth_reco_observable_values(
+                    events,
+                    observable,
+                    source_mode=args.reco_observable_source,
+                )
                 truth_values_full = truth_observable_values(events, observable)
                 if reco_values_full is None or truth_values_full is None:
                     print(
@@ -589,9 +604,14 @@ def plot_truth_vs_reco_by_method_and_region(
     return summary
 
 
-def truth_reco_observable_values(events: ak.Array, observable: str) -> np.ndarray | None:
-    if observable in events.fields:
+def truth_reco_observable_values(events: ak.Array, observable: str, source_mode: str = "auto") -> np.ndarray | None:
+    if source_mode not in {"auto", "stored", "recompute"}:
+        raise ValueError(f"Unsupported reco observable source mode '{source_mode}'.")
+
+    if source_mode in {"auto", "stored"} and observable in events.fields:
         return to_numpy(events[observable], np.float64)
+    if source_mode == "stored":
+        return None
     required_fields = {"reco_tau_a_p4", "reco_tau_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"}
     if not required_fields.issubset(set(events.fields)):
         return None
@@ -872,6 +892,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[preunfolding] output_dir={args.output_dir}", flush=True)
     print(f"[preunfolding] methods={ {label: str(path) for label, path in methods.items()} }", flush=True)
+    print(f"[preunfolding] reco_observable_source={args.reco_observable_source}", flush=True)
 
     method_regions = {
         method: discover_method_regions(root, args.signal_sample_name, args.regions)
