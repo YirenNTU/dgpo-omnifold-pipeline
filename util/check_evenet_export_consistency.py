@@ -42,6 +42,37 @@ def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     return output
 
 
+def export_vector_component(values: ak.Array, component: str) -> np.ndarray:
+    fields = set(getattr(values, "fields", []))
+    if component == "E":
+        if "E" in fields:
+            return to_numpy(values["E"], np.float64)
+        if "t" in fields:
+            return to_numpy(values["t"], np.float64)
+    if component == "px":
+        if "px" in fields:
+            return to_numpy(values["px"], np.float64)
+        if "x" in fields:
+            return to_numpy(values["x"], np.float64)
+    if component == "py":
+        if "py" in fields:
+            return to_numpy(values["py"], np.float64)
+        if "y" in fields:
+            return to_numpy(values["y"], np.float64)
+    if component == "pz":
+        if "pz" in fields:
+            return to_numpy(values["pz"], np.float64)
+        if "z" in fields:
+            return to_numpy(values["z"], np.float64)
+    if component == "energy":
+        if hasattr(values, "energy"):
+            return to_numpy(values.energy, np.float64)
+        return export_vector_component(values, "E")
+    if component in {"pt", "eta", "phi"} and hasattr(values, component):
+        return to_numpy(getattr(values, component), np.float64)
+    raise KeyError(f"Unable to extract component '{component}' from vector fields={sorted(fields)}")
+
+
 def composite_key(events: ak.Array) -> np.ndarray:
     fields = set(events.fields)
     key_parts: list[np.ndarray] = []
@@ -311,7 +342,7 @@ def main() -> None:
         fig, axes = plt.subplots(2, 2, figsize=(10, 10), dpi=220)
         ab_summary = {}
         for axis, (pred_field, export_field, label, component) in zip(axes.flat, ab_fields):
-            export_values = to_numpy(aligned_export[export_field][component], np.float64)
+            export_values = export_vector_component(aligned_export[export_field], component)
             pred_values = to_numpy(ab_pred[pred_field], np.float64)
             valid = np.isfinite(pred_values) & np.isfinite(export_values)
             valid &= ~np.isclose(pred_values, DEFAULT_FLOAT)
@@ -360,10 +391,7 @@ def main() -> None:
         fig_kin, axes_kin = plt.subplots(2, 4, figsize=(16, 8), dpi=220)
         ab_invisible_kinematics_summary: dict[str, Any] = {}
         for axis, (pred_field, export_field, label, component) in zip(axes_kin.flat, ab_invisible_kinematics_fields):
-            if component in {"energy", "pt", "eta", "phi"}:
-                export_values = to_numpy(getattr(aligned_export[export_field], component), np.float64)
-            else:
-                export_values = to_numpy(aligned_export[export_field][component], np.float64)
+            export_values = export_vector_component(aligned_export[export_field], component)
             pred_values = to_numpy(ab_pred[pred_field], np.float64)
             valid = np.isfinite(pred_values) & np.isfinite(export_values)
             valid &= ~np.isclose(pred_values, DEFAULT_FLOAT)
