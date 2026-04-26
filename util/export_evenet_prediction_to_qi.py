@@ -337,7 +337,7 @@ def compact_export_fields(events: ak.Array) -> dict[str, Any]:
         if not should_passthrough_export_field(field):
             continue
         values = events[field]
-        if hasattr(values, "fields"):
+        if len(getattr(values, "fields", [])) > 0:
             continue
         try:
             array = ak.to_numpy(values, allow_missing=False)
