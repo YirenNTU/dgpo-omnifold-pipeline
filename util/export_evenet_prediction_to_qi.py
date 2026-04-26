@@ -251,8 +251,7 @@ def materialize_p4_for_parquet(values: ak.Array) -> ak.Array:
             "y": vector_values.py,
             "z": vector_values.pz,
             "t": vector_values.E,
-        },
-        with_name="Momentum4D",
+        }
     )
 
 
