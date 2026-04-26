@@ -263,6 +263,7 @@ def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Arr
         )
         return canonicalize_p4(p4), valid
 
+    # convert
     if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("energy", "pt", "eta", "phi")):
         p4 = vector.zip(
             {
