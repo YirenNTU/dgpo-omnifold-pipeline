@@ -110,6 +110,17 @@ def export_vector_component(values: ak.Array, component: str) -> np.ndarray:
     raise KeyError(f"Unable to extract component '{component}' from vector fields={sorted(fields)}")
 
 
+def canonicalize_p4(p4: ak.Array) -> ak.Array:
+    return vector.zip(
+        {
+            "px": to_numpy(p4.px, np.float64),
+            "py": to_numpy(p4.py, np.float64),
+            "pz": to_numpy(p4.pz, np.float64),
+            "E": to_numpy(p4.E, np.float64),
+        }
+    )
+
+
 def prediction_slot_p4(pred_events: ak.Array, prefix: str, slot: int) -> tuple[ak.Array | None, np.ndarray]:
     valid_field = f"{prefix}_slot{slot}_valid"
     valid = (
@@ -123,26 +134,32 @@ def prediction_slot_p4(pred_events: ak.Array, prefix: str, slot: int) -> tuple[a
         return to_numpy(pred_events[f"{prefix}_slot{slot}_{name}"], np.float64)
 
     if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("E", "px", "py", "pz")):
-        return vector.zip({"px": component("px"), "py": component("py"), "pz": component("pz"), "E": component("E")}), valid
+        return canonicalize_p4(
+            vector.zip({"px": component("px"), "py": component("py"), "pz": component("pz"), "E": component("E")})
+        ), valid
 
     if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("energy", "pt", "eta", "phi")):
-        return vector.zip(
-            {
-                "pt": component("pt"),
-                "eta": component("eta"),
-                "phi": component("phi"),
-                "E": component("energy"),
-            }
+        return canonicalize_p4(
+            vector.zip(
+                {
+                    "pt": component("pt"),
+                    "eta": component("eta"),
+                    "phi": component("phi"),
+                    "E": component("energy"),
+                }
+            )
         ), valid
 
     if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("log_energy", "log_pt", "eta", "phi")):
-        return vector.zip(
-            {
-                "pt": np.expm1(component("log_pt")),
-                "eta": component("eta"),
-                "phi": component("phi"),
-                "E": np.expm1(component("log_energy")),
-            }
+        return canonicalize_p4(
+            vector.zip(
+                {
+                    "pt": np.expm1(component("log_pt")),
+                    "eta": component("eta"),
+                    "phi": component("phi"),
+                    "E": np.expm1(component("log_energy")),
+                }
+            )
         ), valid
 
     return None, valid
