@@ -107,7 +107,50 @@ def composite_key(events: ak.Array) -> np.ndarray:
     return output.astype(object)
 
 
-def align_events(pred_events: ak.Array, export_events: ak.Array) -> tuple[ak.Array, ak.Array, dict[str, Any]]:
+def infer_sample_and_region_from_export_path(export_path: Path) -> tuple[str | None, str | None]:
+    sample_name = export_path.parent.name if export_path.parent is not None else None
+    region_name = None
+    stem = export_path.stem
+    if stem.startswith("filtered___"):
+        region_name = stem.removeprefix("filtered___")
+    return sample_name, region_name
+
+
+def prediction_sample_mask(pred_events: ak.Array, sample_name: str | None) -> np.ndarray:
+    if sample_name is None or "evenet_truth_class_name" not in pred_events.fields:
+        return np.ones(len(pred_events), dtype=bool)
+    truth_name = np.asarray(ak.to_list(pred_events["evenet_truth_class_name"]), dtype=object)
+    if sample_name == "Ztautau":
+        return np.char.startswith(truth_name.astype(str), "Ztautau_")
+    return truth_name.astype(str) == sample_name
+
+
+def prediction_region_mask(pred_events: ak.Array, region_name: str | None) -> np.ndarray:
+    if region_name is None:
+        return np.ones(len(pred_events), dtype=bool)
+    if f"{region_name}_cut" in pred_events.fields:
+        return to_numpy(pred_events[f"{region_name}_cut"], bool)
+    if "evenet_pred_class_name" in pred_events.fields and region_name.startswith("Ztautau_"):
+        pred_name = np.asarray(ak.to_list(pred_events["evenet_pred_class_name"]), dtype=object).astype(str)
+        valid = to_numpy(pred_events["flags_valid"], bool) if "flags_valid" in pred_events.fields else np.ones(len(pred_events), dtype=bool)
+        return (pred_name == region_name) & valid
+    return np.ones(len(pred_events), dtype=bool)
+
+
+def prediction_subset_for_export_region(pred_events: ak.Array, export_path: Path | None) -> ak.Array:
+    if export_path is None:
+        return pred_events
+    sample_name, region_name = infer_sample_and_region_from_export_path(export_path)
+    sample_mask = prediction_sample_mask(pred_events, sample_name)
+    region_mask = prediction_region_mask(pred_events, region_name)
+    return pred_events[sample_mask & region_mask]
+
+
+def align_events(
+    pred_events: ak.Array,
+    export_events: ak.Array,
+    export_path: Path | None = None,
+) -> tuple[ak.Array, ak.Array, dict[str, Any]]:
     export_mask = (
         to_numpy(export_events["evenet_has_prediction"], bool)
         if "evenet_has_prediction" in export_events.fields
@@ -127,11 +170,34 @@ def align_events(pred_events: ak.Array, export_events: ak.Array) -> tuple[ak.Arr
     aligned_pred = pred_events[matched_mask]
     aligned_export = export_pred[matched_export_indices[matched_mask]]
     summary = {
+        "mode": "key_match",
         "prediction_rows": int(len(pred_events)),
         "export_predicted_rows": int(len(export_pred)),
         "matched_rows": int(len(aligned_pred)),
         "missing_prediction_rows_in_export": missing_pred,
         "extra_export_rows": extra_export,
+    }
+    if len(aligned_pred) > 0 or export_path is None:
+        return aligned_pred, aligned_export, summary
+
+    sample_name, region_name = infer_sample_and_region_from_export_path(export_path)
+    sample_mask = prediction_sample_mask(pred_events, sample_name)
+    region_mask = prediction_region_mask(pred_events, region_name)
+    pred_subset = pred_events[sample_mask & region_mask]
+
+    row_count = min(len(pred_subset), len(export_pred))
+    aligned_pred = pred_subset[:row_count]
+    aligned_export = export_pred[:row_count]
+    summary = {
+        "mode": "region_order_fallback",
+        "prediction_rows": int(len(pred_events)),
+        "export_predicted_rows": int(len(export_pred)),
+        "sample_name": sample_name,
+        "region_name": region_name,
+        "prediction_subset_rows": int(len(pred_subset)),
+        "matched_rows": int(row_count),
+        "missing_prediction_rows_in_export": int(max(len(pred_subset) - row_count, 0)),
+        "extra_export_rows": int(max(len(export_pred) - row_count, 0)),
     }
     return aligned_pred, aligned_export, summary
 
@@ -186,6 +252,13 @@ def choose_sample_indices(num_points: int, max_points: int) -> np.ndarray:
     if num_points <= max_points:
         return np.arange(num_points, dtype=np.int64)
     return np.linspace(0, num_points - 1, max_points, dtype=np.int64)
+
+
+def prediction_field_component(pred_events: ak.Array, prefix: str, slot: int, component: str) -> np.ndarray | None:
+    field_name = f"{prefix}_slot{slot}_{component}"
+    if field_name not in pred_events.fields:
+        return None
+    return to_numpy(pred_events[field_name], np.float64)
 
 
 def scatter_consistency_plot(
@@ -299,14 +372,135 @@ def build_expected_ab_fields(pred_events: ak.Array) -> dict[str, np.ndarray]:
     return output
 
 
+def build_ab_truth_pred_fields(pred_events: ak.Array) -> dict[str, np.ndarray]:
+    if "source_slot_for_a" not in pred_events.fields or "source_slot_for_b" not in pred_events.fields:
+        return {}
+    slot_for_a = to_numpy(pred_events["source_slot_for_a"], np.int64)
+    slot_for_b = to_numpy(pred_events["source_slot_for_b"], np.int64)
+
+    def choose(prefix: str, slot_indices: np.ndarray, component: str) -> np.ndarray | None:
+        slot0 = prediction_field_component(pred_events, prefix, 0, component)
+        slot1 = prediction_field_component(pred_events, prefix, 1, component)
+        if slot0 is None or slot1 is None:
+            return None
+        return np.where(slot_indices == 0, slot0, slot1)
+
+    output: dict[str, np.ndarray] = {}
+    for leg_name, slot_indices in (("a", slot_for_a), ("b", slot_for_b)):
+        for component in ("energy", "pt", "eta", "phi"):
+            pred_values = choose("pred_invisible", slot_indices, component)
+            truth_values = choose("target_invisible", slot_indices, component)
+            if pred_values is not None:
+                output[f"pred_lead_{leg_name}_missing_{component}"] = pred_values
+            if truth_values is not None:
+                output[f"truth_lead_{leg_name}_missing_{component}"] = truth_values
+    return output
+
+
+def plot_ab_truth_vs_pred(
+    pred_events: ak.Array,
+    output_path: Path,
+    max_scatter: int,
+) -> dict[str, Any]:
+    remapped = build_ab_truth_pred_fields(pred_events)
+    panel_specs = [
+        ("a", "energy"),
+        ("a", "pt"),
+        ("a", "eta"),
+        ("a", "phi"),
+        ("b", "energy"),
+        ("b", "pt"),
+        ("b", "eta"),
+        ("b", "phi"),
+    ]
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8), dpi=220)
+    metrics: dict[str, Any] = {}
+    weights = to_numpy(pred_events["event_weight"], np.float64) if "event_weight" in pred_events.fields else np.ones(len(pred_events), dtype=np.float64)
+    flags_valid = to_numpy(pred_events["flags_valid"], bool) if "flags_valid" in pred_events.fields else np.ones(len(pred_events), dtype=bool)
+
+    for axis, (leg_name, component) in zip(axes.flat, panel_specs):
+        truth_key = f"truth_lead_{leg_name}_missing_{component}"
+        pred_key = f"pred_lead_{leg_name}_missing_{component}"
+        label = f"lead_{leg_name} missing {component}"
+        if truth_key not in remapped or pred_key not in remapped:
+            axis.text(0.5, 0.5, "missing", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_title(label)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            metrics[label] = {"status": "missing"}
+            continue
+        truth_values = remapped[truth_key]
+        pred_values = remapped[pred_key]
+        valid = np.isfinite(truth_values) & np.isfinite(pred_values) & np.isfinite(weights) & (weights > 0) & flags_valid
+        valid &= ~np.isclose(truth_values, DEFAULT_FLOAT)
+        valid &= ~np.isclose(pred_values, DEFAULT_FLOAT)
+        if not np.any(valid):
+            axis.text(0.5, 0.5, "no valid entries", ha="center", va="center", fontsize=10, transform=axis.transAxes)
+            axis.set_title(label)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            metrics[label] = {"status": "no_valid_entries"}
+            continue
+        truth_valid = truth_values[valid]
+        pred_valid = pred_values[valid]
+        sampled = choose_sample_indices(len(truth_valid), max_scatter)
+        axis.scatter(truth_valid[sampled], pred_valid[sampled], s=4, alpha=0.25, color=OKABE_ITO[0], linewidths=0)
+        low = float(min(np.min(truth_valid), np.min(pred_valid)))
+        high = float(max(np.max(truth_valid), np.max(pred_valid)))
+        axis.plot([low, high], [low, high], linestyle="--", color=OKABE_ITO[3], linewidth=1.2)
+        axis.set_title(label)
+        axis.set_xlabel("Truth")
+        axis.set_ylabel("Pred")
+        axis.grid(alpha=0.2)
+        corr = np.corrcoef(truth_valid, pred_valid)[0, 1] if len(truth_valid) > 1 else float("nan")
+        metrics[label] = {
+            "status": "ok",
+            "num_valid_entries": int(len(truth_valid)),
+            "pearson": float(corr) if np.isfinite(corr) else float("nan"),
+            "mean_abs_diff": float(np.mean(np.abs(pred_valid - truth_valid))),
+        }
+
+    fig.suptitle("A/B-basis neutrino truth vs prediction")
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    return metrics
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     pred_events = ak.from_parquet(args.prediction_parquet)
     export_events = ak.from_parquet(args.export_raw_parquet)
-    aligned_pred, aligned_export, summary = align_events(pred_events, export_events)
+    pred_region_subset = prediction_subset_for_export_region(pred_events, args.export_raw_parquet)
+    ab_truth_pred_summary = plot_ab_truth_vs_pred(
+        pred_region_subset,
+        args.output_dir / "ab_truth_vs_pred.png",
+        args.max_scatter,
+    )
+    print(f"[consistency] ab_truth_vs_pred={ab_truth_pred_summary}", flush=True)
+    aligned_pred, aligned_export, summary = align_events(pred_events, export_events, export_path=args.export_raw_parquet)
     print(f"[consistency] alignment={summary}", flush=True)
+    if summary["matched_rows"] == 0:
+        raise ValueError(
+            "Unable to align any prediction rows with the chosen export parquet. "
+            f"alignment={summary}"
+        )
+    if summary["export_predicted_rows"] == 0:
+        export_name = args.export_raw_parquet.name
+        hint = ""
+        if export_name in {"filtered___ee.parquet", "filtered___emu.parquet", "filtered___mumu.parquet", "filtered___hadhad.parquet"}:
+            hint = (
+                " This looks like a common central region parquet. For signal-process sanity checks, compare against "
+                "the fine exported signal region that actually contains EveNet predicted rows, e.g. "
+                "`filtered___Ztautau_ee.parquet`, `filtered___Ztautau_emu.parquet`, `filtered___Ztautau_mumu.parquet`, "
+                "`filtered___Ztautau_pipi.parquet`, `filtered___Ztautau_pirho.parquet`, or `filtered___Ztautau_rhorho.parquet`."
+            )
+        raise ValueError(
+            "The chosen export parquet contains zero rows with `evenet_has_prediction=True`, so there is nothing to "
+            "align against the prediction parquet." + hint
+        )
 
     class_yield_summary = plot_class_yields(
         aligned_pred,
@@ -471,6 +665,7 @@ def main() -> None:
                 "visible_tau": visible_summary,
                 "pred_invisible": invisible_summary,
                 "ab_remap": ab_summary,
+                "ab_truth_vs_pred": ab_truth_pred_summary,
                 "prediction_parquet": str(args.prediction_parquet),
                 "export_raw_parquet": str(args.export_raw_parquet),
             },
