@@ -22,7 +22,7 @@ logger:
     version: "v1"
 
 options:
-  default: options.yaml
+  default: ../EveNet-Full/share/options/options.yaml
 
   Training:
     total_epochs: 50
@@ -119,6 +119,21 @@ options:
       update_every_n_steps: 1
       replace_model_after_load: true
       replace_model_at_end: false
+
+    ProgressiveTraining:
+      stages:
+        - name: "neutrino_only"
+          epoch_ratio: 0.2
+          transition_ratio: 0.0
+          loss_weights:
+            generation-truth: [2.0, 2.0]
+            classification: [0.0, 0.0]
+        - name: "combined"
+          epoch_ratio: 0.8
+          transition_ratio: 0.05
+          loss_weights:
+            generation-truth: [2.0, 2.0]
+            classification: [0.0, 1.0]
 
   Dataset:
     dataset_limit: 1.0
