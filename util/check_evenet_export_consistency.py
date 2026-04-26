@@ -200,38 +200,49 @@ def build_expected_ab_fields(pred_events: ak.Array) -> dict[str, np.ndarray]:
         return {}
     slot_for_a = to_numpy(pred_events["source_slot_for_a"], np.int64)
     slot_for_b = to_numpy(pred_events["source_slot_for_b"], np.int64)
+    fields = set(pred_events.fields)
 
-    def choose(prefix: str, slot_indices: np.ndarray, component: str) -> np.ndarray:
-        slot0 = to_numpy(pred_events[f"{prefix}_slot0_{component}"], np.float64)
-        slot1 = to_numpy(pred_events[f"{prefix}_slot1_{component}"], np.float64)
+    def choose(prefix: str, slot_indices: np.ndarray, component: str) -> np.ndarray | None:
+        slot0_name = f"{prefix}_slot0_{component}"
+        slot1_name = f"{prefix}_slot1_{component}"
+        if slot0_name not in fields or slot1_name not in fields:
+            return None
+        slot0 = to_numpy(pred_events[slot0_name], np.float64)
+        slot1 = to_numpy(pred_events[slot1_name], np.float64)
         return np.where(slot_indices == 0, slot0, slot1)
 
-    return {
-        "expected_lead_a_visible_energy": choose("tau_vis_prong", slot_for_a, "energy"),
-        "expected_lead_a_visible_pt": choose("tau_vis_prong", slot_for_a, "pt"),
-        "expected_lead_a_visible_eta": choose("tau_vis_prong", slot_for_a, "eta"),
-        "expected_lead_a_visible_phi": choose("tau_vis_prong", slot_for_a, "phi"),
-        "expected_lead_b_visible_energy": choose("tau_vis_prong", slot_for_b, "energy"),
-        "expected_lead_b_visible_pt": choose("tau_vis_prong", slot_for_b, "pt"),
-        "expected_lead_b_visible_eta": choose("tau_vis_prong", slot_for_b, "eta"),
-        "expected_lead_b_visible_phi": choose("tau_vis_prong", slot_for_b, "phi"),
-        "expected_lead_a_missing_E": choose("pred_invisible", slot_for_a, "E"),
-        "expected_lead_a_missing_energy": choose("pred_invisible", slot_for_a, "energy"),
-        "expected_lead_a_missing_pt": choose("pred_invisible", slot_for_a, "pt"),
-        "expected_lead_a_missing_eta": choose("pred_invisible", slot_for_a, "eta"),
-        "expected_lead_a_missing_phi": choose("pred_invisible", slot_for_a, "phi"),
-        "expected_lead_a_missing_px": choose("pred_invisible", slot_for_a, "px"),
-        "expected_lead_a_missing_py": choose("pred_invisible", slot_for_a, "py"),
-        "expected_lead_a_missing_pz": choose("pred_invisible", slot_for_a, "pz"),
-        "expected_lead_b_missing_E": choose("pred_invisible", slot_for_b, "E"),
-        "expected_lead_b_missing_energy": choose("pred_invisible", slot_for_b, "energy"),
-        "expected_lead_b_missing_pt": choose("pred_invisible", slot_for_b, "pt"),
-        "expected_lead_b_missing_eta": choose("pred_invisible", slot_for_b, "eta"),
-        "expected_lead_b_missing_phi": choose("pred_invisible", slot_for_b, "phi"),
-        "expected_lead_b_missing_px": choose("pred_invisible", slot_for_b, "px"),
-        "expected_lead_b_missing_py": choose("pred_invisible", slot_for_b, "py"),
-        "expected_lead_b_missing_pz": choose("pred_invisible", slot_for_b, "pz"),
+    candidates = {
+        "expected_lead_a_visible_energy": ("tau_vis_prong", slot_for_a, "energy"),
+        "expected_lead_a_visible_pt": ("tau_vis_prong", slot_for_a, "pt"),
+        "expected_lead_a_visible_eta": ("tau_vis_prong", slot_for_a, "eta"),
+        "expected_lead_a_visible_phi": ("tau_vis_prong", slot_for_a, "phi"),
+        "expected_lead_b_visible_energy": ("tau_vis_prong", slot_for_b, "energy"),
+        "expected_lead_b_visible_pt": ("tau_vis_prong", slot_for_b, "pt"),
+        "expected_lead_b_visible_eta": ("tau_vis_prong", slot_for_b, "eta"),
+        "expected_lead_b_visible_phi": ("tau_vis_prong", slot_for_b, "phi"),
+        "expected_lead_a_missing_E": ("pred_invisible", slot_for_a, "E"),
+        "expected_lead_a_missing_energy": ("pred_invisible", slot_for_a, "energy"),
+        "expected_lead_a_missing_pt": ("pred_invisible", slot_for_a, "pt"),
+        "expected_lead_a_missing_eta": ("pred_invisible", slot_for_a, "eta"),
+        "expected_lead_a_missing_phi": ("pred_invisible", slot_for_a, "phi"),
+        "expected_lead_a_missing_px": ("pred_invisible", slot_for_a, "px"),
+        "expected_lead_a_missing_py": ("pred_invisible", slot_for_a, "py"),
+        "expected_lead_a_missing_pz": ("pred_invisible", slot_for_a, "pz"),
+        "expected_lead_b_missing_E": ("pred_invisible", slot_for_b, "E"),
+        "expected_lead_b_missing_energy": ("pred_invisible", slot_for_b, "energy"),
+        "expected_lead_b_missing_pt": ("pred_invisible", slot_for_b, "pt"),
+        "expected_lead_b_missing_eta": ("pred_invisible", slot_for_b, "eta"),
+        "expected_lead_b_missing_phi": ("pred_invisible", slot_for_b, "phi"),
+        "expected_lead_b_missing_px": ("pred_invisible", slot_for_b, "px"),
+        "expected_lead_b_missing_py": ("pred_invisible", slot_for_b, "py"),
+        "expected_lead_b_missing_pz": ("pred_invisible", slot_for_b, "pz"),
     }
+    output: dict[str, np.ndarray] = {}
+    for output_name, (prefix, slot_indices, component) in candidates.items():
+        values = choose(prefix, slot_indices, component)
+        if values is not None:
+            output[output_name] = values
+    return output
 
 
 def main() -> None:
@@ -290,12 +301,13 @@ def main() -> None:
     ab_summary: dict[str, Any] = {"status": "missing_slot_metadata"}
     if expected_ab:
         ab_pred = ak.Array(expected_ab)
-        ab_fields = [
+        ab_fields_all = [
             ("expected_lead_a_visible_energy", "lead_a_visible_p4", "lead_a visible energy", "E"),
             ("expected_lead_a_missing_E", "lead_a_missing_p4", "lead_a missing E", "E"),
             ("expected_lead_b_visible_energy", "lead_b_visible_p4", "lead_b visible energy", "E"),
             ("expected_lead_b_missing_E", "lead_b_missing_p4", "lead_b missing E", "E"),
         ]
+        ab_fields = [field_info for field_info in ab_fields_all if field_info[0] in expected_ab]
         fig, axes = plt.subplots(2, 2, figsize=(10, 10), dpi=220)
         ab_summary = {}
         for axis, (pred_field, export_field, label, component) in zip(axes.flat, ab_fields):
@@ -325,12 +337,14 @@ def main() -> None:
                 "max_abs_diff": float(np.max(np.abs(export_values - pred_values))),
                 "mean_abs_diff": float(np.mean(np.abs(export_values - pred_values))),
             }
+        for axis in axes.flat[len(ab_fields):]:
+            axis.set_visible(False)
         fig.suptitle("Central a/b remapping consistency")
         fig.tight_layout()
         fig.savefig(args.output_dir / "ab_remap_consistency.png", bbox_inches="tight")
         plt.close(fig)
 
-        ab_invisible_kinematics_fields = [
+        ab_invisible_kinematics_fields_all = [
             ("expected_lead_a_missing_energy", "lead_a_missing_p4", "lead_a missing energy", "energy"),
             ("expected_lead_a_missing_pt", "lead_a_missing_p4", "lead_a missing pt", "pt"),
             ("expected_lead_a_missing_eta", "lead_a_missing_p4", "lead_a missing eta", "eta"),
@@ -339,6 +353,9 @@ def main() -> None:
             ("expected_lead_b_missing_pt", "lead_b_missing_p4", "lead_b missing pt", "pt"),
             ("expected_lead_b_missing_eta", "lead_b_missing_p4", "lead_b missing eta", "eta"),
             ("expected_lead_b_missing_phi", "lead_b_missing_p4", "lead_b missing phi", "phi"),
+        ]
+        ab_invisible_kinematics_fields = [
+            field_info for field_info in ab_invisible_kinematics_fields_all if field_info[0] in expected_ab
         ]
         fig_kin, axes_kin = plt.subplots(2, 4, figsize=(16, 8), dpi=220)
         ab_invisible_kinematics_summary: dict[str, Any] = {}
@@ -372,6 +389,8 @@ def main() -> None:
                 "max_abs_diff": float(np.max(np.abs(export_values - pred_values))),
                 "mean_abs_diff": float(np.mean(np.abs(export_values - pred_values))),
             }
+        for axis in axes_kin.flat[len(ab_invisible_kinematics_fields):]:
+            axis.set_visible(False)
         fig_kin.suptitle("Central a/b invisible kinematics consistency")
         fig_kin.tight_layout()
         fig_kin.savefig(args.output_dir / "ab_invisible_kinematics_consistency.png", bbox_inches="tight")
