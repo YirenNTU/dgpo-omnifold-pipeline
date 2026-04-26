@@ -344,18 +344,17 @@ def plot_truth_vs_reco_by_method_and_region(
             region_summary: dict[str, Any] = {}
 
             for observable, xlabel in observable_specs:
-                truth_field = f"truth_{observable}"
                 reco_values_full = truth_reco_observable_values(events, observable)
-                if reco_values_full is None or truth_field not in events.fields:
+                truth_values_full = truth_observable_values(events, observable)
+                if reco_values_full is None or truth_values_full is None:
                     print(
                         f"    [skip] method={method} region={region} observable={observable} "
-                        f"missing_fields={[field for field in ([truth_field] if truth_field not in events.fields else [])]} "
-                        f"reco_source={'missing' if reco_values_full is None else 'available'}",
+                        f"reco_source={'missing' if reco_values_full is None else 'available'} "
+                        f"truth_source={'missing' if truth_values_full is None else 'available'}",
                         flush=True,
                     )
                     continue
 
-                truth_values_full = to_numpy(events[truth_field], np.float64)
                 weights_full = event_weights(events)
                 truth_mask = valid_truth_reco_mask(truth_values_full, truth_values_full, weights_full)
                 valid_mask = valid_truth_reco_mask(truth_values_full, reco_values_full, weights_full)
@@ -444,6 +443,28 @@ def truth_reco_observable_values(events: ak.Array, observable: str) -> np.ndarra
     observables = build_observables(
         events["reco_tau_a_p4"],
         events["reco_tau_b_p4"],
+        events["lead_a_visible_p4"],
+        events["lead_b_visible_p4"],
+    )
+    if observable not in observables:
+        return None
+    return to_numpy(observables[observable], np.float64)
+
+
+def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | None:
+    truth_field = f"truth_{observable}"
+    if truth_field in events.fields:
+        return to_numpy(events[truth_field], np.float64)
+
+    required_fields = {"truth_missing_a_p4", "truth_missing_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"}
+    if not required_fields.issubset(set(events.fields)):
+        return None
+
+    truth_tau_a = events["truth_missing_a_p4"] + events["lead_a_visible_p4"]
+    truth_tau_b = events["truth_missing_b_p4"] + events["lead_b_visible_p4"]
+    observables = build_observables(
+        truth_tau_a,
+        truth_tau_b,
         events["lead_a_visible_p4"],
         events["lead_b_visible_p4"],
     )
@@ -595,21 +616,11 @@ def plot_truth_metric_summary(
                     transform=ax.get_yaxis_transform(),
                     clip_on=False,
                 )
-                ax.text(
-                    row["value"],
-                    y + 0.06,
-                    method_display_name(row["method"]),
-                    color=color,
-                    fontsize=7,
-                    ha="center",
-                    va="bottom",
-                )
 
         ax.text(x_text_value, 1.02, r"$r \pm \sigma_r$", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
         ax.set_yticks(y_base)
         ax.set_yticklabels([channel_latex_label(region) for region in active_regions])
         ax.invert_yaxis()
-        ax.grid(axis="x", alpha=0.22)
         ax.grid(axis="y", alpha=0.18, linestyle=":")
         for separator in np.arange(len(active_regions) - 1, dtype=np.float64) + 0.5:
             ax.axhline(separator, color="#D9D9D9", linewidth=0.8, zorder=0)
