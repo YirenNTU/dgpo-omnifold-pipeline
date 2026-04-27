@@ -12,6 +12,7 @@ from typing import Any
 import awkward as ak
 import matplotlib.pyplot as plt
 import numpy as np
+import vector
 from matplotlib.lines import Line2D
 
 
@@ -36,6 +37,9 @@ from plot_qi_method_comparison import (
     sanitize_filename,
 )
 from quantum.observables_builder import build_observables, get_observable_names
+
+
+vector.register_awkward()
 
 
 DEFAULT_FLOAT = -99.0
@@ -493,6 +497,56 @@ def valid_reco_event_mask(events: ak.Array) -> np.ndarray | None:
     return to_numpy(events["flags_valid"], np.bool_)
 
 
+def build_momentum4d(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.ndarray) -> ak.Array:
+    return ak.zip(
+        {
+            "px": np.asarray(px, dtype=np.float64),
+            "py": np.asarray(py, dtype=np.float64),
+            "pz": np.asarray(pz, dtype=np.float64),
+            "E": np.asarray(energy, dtype=np.float64),
+        },
+        with_name="Momentum4D",
+    )
+
+
+def choose_component_by_slot(events: ak.Array, prefix: str, slot_indices: np.ndarray, component: str) -> np.ndarray | None:
+    slot0_name = f"{prefix}_slot0_{component}"
+    slot1_name = f"{prefix}_slot1_{component}"
+    fields = set(events.fields)
+    if slot0_name not in fields or slot1_name not in fields:
+        return None
+    slot0 = ak.to_numpy(events[slot0_name], allow_missing=False).astype(np.float64)
+    slot1 = ak.to_numpy(events[slot1_name], allow_missing=False).astype(np.float64)
+    return np.where(slot_indices == 0, slot0, slot1)
+
+
+def remapped_slot_p4(events: ak.Array, prefix: str, leg: str) -> ak.Array | None:
+    slot_field = f"source_slot_for_{leg}"
+    if slot_field not in events.fields:
+        return None
+    slot_indices = ak.to_numpy(events[slot_field], allow_missing=False).astype(np.int64)
+
+    px = choose_component_by_slot(events, prefix, slot_indices, "px")
+    py = choose_component_by_slot(events, prefix, slot_indices, "py")
+    pz = choose_component_by_slot(events, prefix, slot_indices, "pz")
+    energy = choose_component_by_slot(events, prefix, slot_indices, "E")
+    if px is not None and py is not None and pz is not None and energy is not None:
+        return build_momentum4d(px, py, pz, energy)
+
+    energy = choose_component_by_slot(events, prefix, slot_indices, "energy")
+    pt = choose_component_by_slot(events, prefix, slot_indices, "pt")
+    eta = choose_component_by_slot(events, prefix, slot_indices, "eta")
+    phi = choose_component_by_slot(events, prefix, slot_indices, "phi")
+    if energy is not None and pt is not None and eta is not None and phi is not None:
+        return build_momentum4d(
+            pt * np.cos(phi),
+            pt * np.sin(phi),
+            pt * np.sinh(eta),
+            energy,
+        )
+    return None
+
+
 def observable_bins(observable: str, values_by_name: dict[str, np.ndarray]) -> np.ndarray:
     if observable == "theta_cm":
         return np.linspace(0.0, np.pi, 41)
@@ -851,6 +905,9 @@ def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | N
             field = f"truth_missing_{leg}_p4"
             if field in events.fields:
                 return missing_p4_component_values(events[field], component)
+            remapped = remapped_slot_p4(events, "target_invisible", leg)
+            if remapped is not None:
+                return missing_p4_component_values(remapped, component)
         return None
     if observable.startswith("reco_tau_"):
         parts = observable.split("_")
@@ -865,14 +922,24 @@ def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | N
             if truth_missing_field in events.fields and visible_field in events.fields:
                 truth_tau = events[truth_missing_field] + events[visible_field]
                 return missing_p4_component_values(truth_tau, component)
+            remapped = remapped_slot_p4(events, "target_invisible", leg)
+            if remapped is not None and visible_field in events.fields:
+                truth_tau = remapped + events[visible_field]
+                return missing_p4_component_values(truth_tau, component)
         return None
 
     required_fields = {"truth_missing_a_p4", "truth_missing_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"}
-    if not required_fields.issubset(set(events.fields)):
-        return None
-
-    truth_tau_a = events["truth_missing_a_p4"] + events["lead_a_visible_p4"]
-    truth_tau_b = events["truth_missing_b_p4"] + events["lead_b_visible_p4"]
+    fields = set(events.fields)
+    if required_fields.issubset(fields):
+        truth_tau_a = events["truth_missing_a_p4"] + events["lead_a_visible_p4"]
+        truth_tau_b = events["truth_missing_b_p4"] + events["lead_b_visible_p4"]
+    else:
+        truth_tau_a = remapped_slot_p4(events, "target_invisible", "a")
+        truth_tau_b = remapped_slot_p4(events, "target_invisible", "b")
+        if truth_tau_a is None or truth_tau_b is None or "lead_a_visible_p4" not in fields or "lead_b_visible_p4" not in fields:
+            return None
+        truth_tau_a = truth_tau_a + events["lead_a_visible_p4"]
+        truth_tau_b = truth_tau_b + events["lead_b_visible_p4"]
     observables = build_observables(
         truth_tau_a,
         truth_tau_b,
@@ -919,7 +986,17 @@ def truth_observable_requirements(events: ak.Array, observable: str) -> str:
         if len(parts) >= 4:
             leg = parts[1]
             field = f"truth_missing_{leg}_p4"
-            return f"required field '{field}' {'available' if field in fields else 'missing'}"
+            if field in fields:
+                return f"required field '{field}' available"
+            slot_fields = [
+                f"target_invisible_slot0_{component}" for component in ("energy", "pt", "eta", "phi")
+            ] + [
+                f"target_invisible_slot1_{component}" for component in ("energy", "pt", "eta", "phi")
+            ] + [f"source_slot_for_{leg}"]
+            missing = [field_name for field_name in slot_fields if field_name not in fields]
+            if missing:
+                return f"missing truth missing field '{field}' and slot fallback fields {missing}"
+            return f"using slot fallback target_invisible + source_slot_for_{leg}"
     if observable.startswith("reco_tau_"):
         parts = observable.split("_")
         if len(parts) >= 4:
@@ -930,9 +1007,20 @@ def truth_observable_requirements(events: ak.Array, observable: str) -> str:
             if direct_field in fields:
                 return f"truth tau field '{direct_field}' available"
             missing = [field for field in (fallback_missing, fallback_visible) if field not in fields]
-            if missing:
-                return f"missing fallback truth-tau fields {missing}"
-            return f"fallback truth tau fields '{fallback_missing}' + '{fallback_visible}' available"
+            if not missing:
+                return f"fallback truth tau fields '{fallback_missing}' + '{fallback_visible}' available"
+            slot_fields = [
+                f"target_invisible_slot0_{component}" for component in ("energy", "pt", "eta", "phi")
+            ] + [
+                f"target_invisible_slot1_{component}" for component in ("energy", "pt", "eta", "phi")
+            ] + [f"source_slot_for_{leg}", fallback_visible]
+            slot_missing = [field_name for field_name in slot_fields if field_name not in fields]
+            if not slot_missing:
+                return f"using slot fallback target_invisible + '{fallback_visible}'"
+            return (
+                f"missing direct truth tau field '{direct_field}', missing fallback truth-tau fields {missing}, "
+                f"and slot fallback fields {slot_missing}"
+            )
     required = ["truth_missing_a_p4", "truth_missing_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"]
     missing = [field for field in required if field not in fields]
     if missing:
