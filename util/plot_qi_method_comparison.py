@@ -233,6 +233,17 @@ def extract_physics_observable(events: ak.Array, observable: str) -> np.ndarray:
             if values:
                 return np.concatenate(values)
 
+    if observable.startswith("visible_tau_"):
+        component = observable.removeprefix("visible_tau_")
+        if component in {"E", "px", "py", "pz", "pt", "eta", "phi"}:
+            values = []
+            for leg in ("a", "b"):
+                field = f"lead_{leg}_visible_p4"
+                if field in events.fields:
+                    values.append(p4_component(rebuild_vector(events[field]), component))
+            if values:
+                return np.concatenate(values)
+
     if observable in {"visible_tau_pair_mass", "visible_tau_pair_pt"}:
         if "lead_a_visible_p4" not in events.fields or "lead_b_visible_p4" not in events.fields:
             return np.array([], dtype=np.float64)
@@ -256,6 +267,13 @@ def physics_observable_specs(requested: list[str] | None) -> list[tuple[str, str
             "reco_tau_px",
             "reco_tau_py",
             "reco_tau_pz",
+            "visible_tau_E",
+            "visible_tau_px",
+            "visible_tau_py",
+            "visible_tau_pz",
+            "visible_tau_pt",
+            "visible_tau_eta",
+            "visible_tau_phi",
             "visible_tau_pair_mass",
             "visible_tau_pair_pt",
             *get_observable_names(),
@@ -270,6 +288,13 @@ def physics_observable_specs(requested: list[str] | None) -> list[tuple[str, str
         "reco_tau_px": r"$p_{x,\tau}^{reco}$ [GeV]",
         "reco_tau_py": r"$p_{y,\tau}^{reco}$ [GeV]",
         "reco_tau_pz": r"$p_{z,\tau}^{reco}$ [GeV]",
+        "visible_tau_E": r"$E_\tau^{vis}$ [GeV]",
+        "visible_tau_px": r"$p_{x,\tau}^{vis}$ [GeV]",
+        "visible_tau_py": r"$p_{y,\tau}^{vis}$ [GeV]",
+        "visible_tau_pz": r"$p_{z,\tau}^{vis}$ [GeV]",
+        "visible_tau_pt": r"$p_{T,\tau}^{vis}$ [GeV]",
+        "visible_tau_eta": r"$\eta_\tau^{vis}$",
+        "visible_tau_phi": r"$\phi_\tau^{vis}$",
         "visible_tau_pair_mass": r"$m_{\tau\tau}^{vis}$ [GeV]",
         "visible_tau_pair_pt": r"$p_{T,\tau\tau}^{vis}$ [GeV]",
         "theta_cm": r"$\theta_{CM}$",

@@ -201,6 +201,22 @@ def truth_observable_specs(requested: list[str] | None) -> list[tuple[str, str]]
     return [(name, observable_latex_label(name)) for name in names]
 
 
+def missing_observable_specs(requested: list[str] | None = None) -> list[tuple[str, str]]:
+    names = requested or [
+        *(f"lead_a_missing_{component}" for component in ("E", "px", "py", "pz", "pt", "eta", "phi")),
+        *(f"lead_b_missing_{component}" for component in ("E", "px", "py", "pz", "pt", "eta", "phi")),
+    ]
+    return [(name, observable_latex_label(name)) for name in names]
+
+
+def reco_tau_observable_specs(requested: list[str] | None = None) -> list[tuple[str, str]]:
+    names = requested or [
+        *(f"reco_tau_a_{component}" for component in ("E", "px", "py", "pz", "pt", "eta", "phi", "mass")),
+        *(f"reco_tau_b_{component}" for component in ("E", "px", "py", "pz", "pt", "eta", "phi", "mass")),
+    ]
+    return [(name, observable_latex_label(name)) for name in names]
+
+
 def observable_latex_label(name: str) -> str:
     if name == "theta_cm":
         return r"$\theta_{\mathrm{CM}}$"
@@ -215,7 +231,48 @@ def observable_latex_label(name: str) -> str:
         axis_a = left.removeprefix("cos_theta_A_")
         axis_b = right.removeprefix("cos_theta_B_")
         return rf"$\cos\theta_{{A,{axis_a}}}\times\cos\theta_{{B,{axis_b}}}$"
+    if name.startswith("lead_a_missing_"):
+        component = name.removeprefix("lead_a_missing_")
+        return missing_component_label("a", component)
+    if name.startswith("lead_b_missing_"):
+        component = name.removeprefix("lead_b_missing_")
+        return missing_component_label("b", component)
+    if name.startswith("reco_tau_a_"):
+        component = name.removeprefix("reco_tau_a_")
+        return reco_tau_component_label("a", component)
+    if name.startswith("reco_tau_b_"):
+        component = name.removeprefix("reco_tau_b_")
+        return reco_tau_component_label("b", component)
     return name.replace("_", " ")
+
+
+def missing_component_label(leg: str, component: str) -> str:
+    label_map = {
+        "E": "E",
+        "px": "p_x",
+        "py": "p_y",
+        "pz": "p_z",
+        "pt": "p_T",
+        "eta": r"\eta",
+        "phi": r"\phi",
+    }
+    rendered = label_map.get(component, component)
+    return rf"${rendered}(\nu_{{{leg}}}^{{reco}})$"
+
+
+def reco_tau_component_label(leg: str, component: str) -> str:
+    label_map = {
+        "E": "E",
+        "px": "p_x",
+        "py": "p_y",
+        "pz": "p_z",
+        "pt": "p_T",
+        "eta": r"\eta",
+        "phi": r"\phi",
+        "mass": "m",
+    }
+    rendered = label_map.get(component, component)
+    return rf"${rendered}(\tau_{{{leg}}}^{{reco}})$"
 
 
 def is_spin_observable(name: str) -> bool:
@@ -265,6 +322,66 @@ def canonical_summary_region(region: str) -> str:
         "Ztautau_rhorho": "Ztautau_rhorho",
     }
     return mapping.get(region, region)
+
+
+def expected_truth_classes_for_region(region: str) -> set[str]:
+    mapping = {
+        "ee": {"Ztautau_ee"},
+        "emu": {"Ztautau_emu", "Ztautau_mue"},
+        "mumu": {"Ztautau_mumu"},
+        "Ztautau_ee": {"Ztautau_ee"},
+        "Ztautau_emu": {"Ztautau_emu"},
+        "Ztautau_mue": {"Ztautau_mue"},
+        "Ztautau_mumu": {"Ztautau_mumu"},
+        "Ztautau_pipi": {"Ztautau_pipi"},
+        "Ztautau_pirho": {"Ztautau_pirho"},
+        "Ztautau_rhorho": {"Ztautau_rhorho"},
+    }
+    return mapping.get(region, set())
+
+
+def select_truth_reco_events(events: ak.Array, region: str) -> tuple[ak.Array, dict[str, Any]]:
+    expected_classes = expected_truth_classes_for_region(region)
+    info = {
+        "input_events": int(len(events)),
+        "expected_truth_classes": sorted(expected_classes),
+        "class_filter_applied": False,
+        "correct_assignment_required": False,
+        "selected_events": int(len(events)),
+    }
+    if not expected_classes:
+        return events, info
+
+    fields = set(events.fields)
+    truth_names = (
+        np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
+        if "evenet_truth_class_name" in fields
+        else None
+    )
+    pred_names = (
+        np.asarray(ak.to_list(events["evenet_pred_class_name"]), dtype=object)
+        if "evenet_pred_class_name" in fields
+        else None
+    )
+
+    if truth_names is None and pred_names is None:
+        return events, info
+
+    mask = np.ones(len(events), dtype=bool)
+    if truth_names is not None:
+        mask &= np.isin(truth_names, list(expected_classes))
+        info["class_filter_applied"] = True
+    if pred_names is not None and truth_names is not None:
+        mask &= pred_names == truth_names
+        info["correct_assignment_required"] = True
+        info["class_filter_applied"] = True
+    elif pred_names is not None:
+        mask &= np.isin(pred_names, list(expected_classes))
+        info["class_filter_applied"] = True
+
+    selected = events[mask]
+    info["selected_events"] = int(len(selected))
+    return selected, info
 
 
 def summary_region_latex_label(region: str) -> str:
@@ -362,15 +479,42 @@ def observable_bins(observable: str, values_by_name: dict[str, np.ndarray]) -> n
         return np.linspace(0.0, np.pi, 41)
     if observable.startswith("cos_theta_"):
         return np.linspace(-1.0, 1.0, 41)
+    if observable.endswith("_phi"):
+        return np.linspace(-np.pi, np.pi, 41)
     return choose_bins(values_by_name, num_bins=40)
 
 
-def observable_2d_limits(observable: str) -> tuple[float, float]:
+def observable_2d_limits(observable: str, truth_values: np.ndarray | None = None, reco_values: np.ndarray | None = None) -> tuple[float, float]:
     if observable == "theta_cm":
         return 0.0, float(np.pi)
     if observable.startswith("cos_theta_"):
         return -1.0, 1.0
-    raise ValueError(f"Observable '{observable}' is not configured for 2D truth-vs-reco limits.")
+    combined = []
+    if truth_values is not None:
+        combined.append(np.asarray(truth_values, dtype=np.float64))
+    if reco_values is not None:
+        combined.append(np.asarray(reco_values, dtype=np.float64))
+    if not combined:
+        raise ValueError(f"Observable '{observable}' is not configured for 2D truth-vs-reco limits.")
+    values = np.concatenate([arr[np.isfinite(arr)] for arr in combined if arr.size > 0])
+    if values.size == 0:
+        return -1.0, 1.0
+    low = float(np.nanmin(values))
+    high = float(np.nanmax(values))
+    if observable.endswith("_phi"):
+        return -float(np.pi), float(np.pi)
+    if observable.endswith("_eta"):
+        bound = max(abs(low), abs(high), 1.0)
+        return -bound, bound
+    if any(observable.endswith(suffix) for suffix in ("_px", "_py", "_pz")):
+        bound = max(abs(low), abs(high), 1.0)
+        return -bound, bound
+    span = high - low
+    if span <= 0:
+        pad = max(abs(high) * 0.1, 1.0)
+        return low - pad, high + pad
+    pad = max(0.08 * span, 1.0e-3)
+    return low - pad, high + pad
 
 
 def weighted_hist(values: np.ndarray, weights: np.ndarray, bins: np.ndarray, normalize: bool) -> np.ndarray:
@@ -450,14 +594,16 @@ def plot_truth_vs_reco_by_method_and_region(
     output_dir: Path,
     normalize: bool,
     reco_observable_source: str,
+    subdir_name: str = "truth_vs_reco",
+    log_label: str = "truth-vs-reco",
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    truth_dir = output_dir / "truth_vs_reco"
+    truth_dir = output_dir / subdir_name
     truth_dir.mkdir(parents=True, exist_ok=True)
 
     for method, root in methods.items():
         regions = method_regions.get(method, [])
-        print(f"[preunfolding] truth-vs-reco method={method} native_regions={regions}", flush=True)
+        print(f"[preunfolding] {log_label} method={method} native_regions={regions}", flush=True)
         method_summary: dict[str, Any] = {}
         method_dir = truth_dir / sanitize_filename(method)
         method_dir.mkdir(parents=True, exist_ok=True)
@@ -476,6 +622,18 @@ def plot_truth_vs_reco_by_method_and_region(
             events = load_method_events(root, signal_sample_name, region)
             if events is None:
                 print(f"    [skip] failed to load events after path resolution method={method} region={region}", flush=True)
+                continue
+            events, selection_info = select_truth_reco_events(events, region)
+            if selection_info["class_filter_applied"]:
+                print(
+                    f"    [class-filter] method={method} region={region} "
+                    f"input={selection_info['input_events']} selected={selection_info['selected_events']} "
+                    f"expected_truth_classes={selection_info['expected_truth_classes']} "
+                    f"correct_assignment_required={selection_info['correct_assignment_required']}",
+                    flush=True,
+                )
+            if len(events) == 0:
+                print(f"    [skip] no events remain after class filter method={method} region={region}", flush=True)
                 continue
             region_dir = method_dir / sanitize_filename(region)
             region_dir.mkdir(parents=True, exist_ok=True)
@@ -553,8 +711,8 @@ def plot_truth_vs_reco_by_method_and_region(
                 plt.close(fig)
 
                 plot_path_2d = None
-                if is_spin_observable(observable):
-                    low, high = observable_2d_limits(observable)
+                if is_spin_observable(observable) or observable.startswith("lead_"):
+                    low, high = observable_2d_limits(observable, truth_valid, reco_valid)
                     fig2d, ax2d = plt.subplots(figsize=(6.2, 5.8), dpi=180)
                     hist2d = ax2d.hist2d(
                         truth_valid,
@@ -614,6 +772,24 @@ def truth_reco_observable_values(events: ak.Array, observable: str, source_mode:
         return to_numpy(events[observable], np.float64)
     if source_mode == "stored":
         return None
+    if observable.startswith("lead_") and "_missing_" in observable:
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[1]
+            component = parts[-1]
+            field = f"lead_{leg}_missing_p4"
+            if field in events.fields:
+                return missing_p4_component_values(events[field], component)
+        return None
+    if observable.startswith("reco_tau_"):
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[2]
+            component = parts[-1]
+            field = f"reco_tau_{leg}_p4"
+            if field in events.fields:
+                return missing_p4_component_values(events[field], component)
+        return None
     required_fields = {"reco_tau_a_p4", "reco_tau_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"}
     if not required_fields.issubset(set(events.fields)):
         return None
@@ -633,6 +809,27 @@ def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | N
     if truth_field in events.fields:
         return to_numpy(events[truth_field], np.float64)
 
+    if observable.startswith("lead_") and "_missing_" in observable:
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[1]
+            component = parts[-1]
+            field = f"truth_missing_{leg}_p4"
+            if field in events.fields:
+                return missing_p4_component_values(events[field], component)
+        return None
+    if observable.startswith("reco_tau_"):
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[2]
+            component = parts[-1]
+            truth_missing_field = f"truth_missing_{leg}_p4"
+            visible_field = f"lead_{leg}_visible_p4"
+            if truth_missing_field in events.fields and visible_field in events.fields:
+                truth_tau = events[truth_missing_field] + events[visible_field]
+                return missing_p4_component_values(truth_tau, component)
+        return None
+
     required_fields = {"truth_missing_a_p4", "truth_missing_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"}
     if not required_fields.issubset(set(events.fields)):
         return None
@@ -648,6 +845,18 @@ def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | N
     if observable not in observables:
         return None
     return to_numpy(observables[observable], np.float64)
+
+
+def missing_p4_component_values(values: ak.Array, component: str) -> np.ndarray:
+    if component == "E":
+        return to_numpy(values.E, np.float64)
+    if component == "pt":
+        return to_numpy(values.pt, np.float64)
+    if component == "eta":
+        return to_numpy(values.eta, np.float64)
+    if component == "phi":
+        return to_numpy(values.phi, np.float64)
+    return to_numpy(getattr(values, component), np.float64)
 
 
 def metric_value_and_uncertainty(metrics: dict[str, Any], metric: str) -> tuple[float, float]:
@@ -684,8 +893,10 @@ def plot_truth_metric_summary(
     observable_specs: list[tuple[str, str]],
     output_dir: Path,
     metric: str = "pearson",
+    subdir_name: str = "truth_vs_reco_summary",
+    log_label: str = "truth-summary",
 ) -> dict[str, Any]:
-    summary_dir = output_dir / "truth_vs_reco_summary"
+    summary_dir = output_dir / subdir_name
     summary_dir.mkdir(parents=True, exist_ok=True)
     plot_summary: dict[str, Any] = {}
     method_names = list(methods)
@@ -827,7 +1038,7 @@ def plot_truth_metric_summary(
             "methods": sorted({row["method"] for row in rows}),
             "regions": sorted({row["summary_region"] for row in rows}),
         }
-        print(f"[preunfolding] wrote truth-summary observable={observable} metric={metric} plot={plot_path}", flush=True)
+        print(f"[preunfolding] wrote {log_label} observable={observable} metric={metric} plot={plot_path}", flush=True)
 
     return plot_summary
 
@@ -837,6 +1048,10 @@ def write_report(
     methods: dict[str, Path],
     truth_summary: dict[str, Any],
     truth_metric_summary: dict[str, Any],
+    missing_summary: dict[str, Any],
+    missing_metric_summary: dict[str, Any],
+    reco_tau_summary: dict[str, Any],
+    reco_tau_metric_summary: dict[str, Any],
     control_summary: dict[str, Any],
     method_regions: dict[str, list[str]],
 ) -> None:
@@ -865,6 +1080,32 @@ def write_report(
         for region, region_info in method_info.items():
             lines.append(f"| {method} | {region} | {len(region_info)} |")
 
+    lines.extend(
+        [
+            "",
+            "## Missing-Neutrino Truth-vs-Reco Coverage",
+            "",
+            "| Method | Region | Observables with plots |",
+            "|---|---|---:|",
+        ]
+    )
+    for method, method_info in missing_summary.items():
+        for region, region_info in method_info.items():
+            lines.append(f"| {method} | {region} | {len(region_info)} |")
+
+    lines.extend(
+        [
+            "",
+            "## Reco-Tau Truth-vs-Reco Coverage",
+            "",
+            "| Method | Region | Observables with plots |",
+            "|---|---|---:|",
+        ]
+    )
+    for method, method_info in reco_tau_summary.items():
+        for region, region_info in method_info.items():
+            lines.append(f"| {method} | {region} | {len(region_info)} |")
+
     control_count = 0
     for method_info in control_summary.values():
         for region_info in method_info.values():
@@ -877,6 +1118,8 @@ def write_report(
             "",
             f"- Data-vs-MC control plots: {control_count}",
             f"- Truth summary plots: {len(truth_metric_summary)}",
+            f"- Missing-neutrino summary plots: {len(missing_metric_summary)}",
+            f"- Reco-tau summary plots: {len(reco_tau_metric_summary)}",
             "",
             "## Generated PNG Files",
             "",
@@ -901,9 +1144,13 @@ def main() -> None:
         for method, root in methods.items()
     }
     observable_specs = truth_observable_specs(args.truth_observables)
+    missing_specs = missing_observable_specs()
+    reco_tau_specs = reco_tau_observable_specs()
     print(f"[preunfolding] signal_sample={args.signal_sample_name}", flush=True)
     print(f"[preunfolding] method_regions={method_regions}", flush=True)
     print(f"[preunfolding] truth_observables={[name for name, _ in observable_specs]}", flush=True)
+    print(f"[preunfolding] missing_observables={[name for name, _ in missing_specs]}", flush=True)
+    print(f"[preunfolding] reco_tau_observables={[name for name, _ in reco_tau_specs]}", flush=True)
 
     truth_summary = plot_truth_vs_reco_by_method_and_region(
         method_regions=method_regions,
@@ -913,6 +1160,8 @@ def main() -> None:
         output_dir=args.output_dir,
         normalize=args.normalize_truth_reco,
         reco_observable_source=args.reco_observable_source,
+        subdir_name="truth_vs_reco",
+        log_label="truth-vs-reco",
     )
     print(f"[preunfolding] finished truth-vs-reco methods={list(truth_summary)}", flush=True)
     truth_metric_summary = plot_truth_metric_summary(
@@ -921,8 +1170,56 @@ def main() -> None:
         observable_specs=observable_specs,
         output_dir=args.output_dir,
         metric="pearson",
+        subdir_name="truth_vs_reco_summary",
+        log_label="truth-summary",
     )
     print(f"[preunfolding] finished truth summary plots observables={list(truth_metric_summary)}", flush=True)
+
+    missing_summary = plot_truth_vs_reco_by_method_and_region(
+        method_regions=method_regions,
+        methods=methods,
+        signal_sample_name=args.signal_sample_name,
+        observable_specs=missing_specs,
+        output_dir=args.output_dir,
+        normalize=args.normalize_truth_reco,
+        reco_observable_source="recompute",
+        subdir_name="missing_truth_vs_reco",
+        log_label="missing-truth-vs-reco",
+    )
+    print(f"[preunfolding] finished missing truth-vs-reco methods={list(missing_summary)}", flush=True)
+    missing_metric_summary = plot_truth_metric_summary(
+        truth_summary=missing_summary,
+        methods=methods,
+        observable_specs=missing_specs,
+        output_dir=args.output_dir,
+        metric="pearson",
+        subdir_name="missing_truth_vs_reco_summary",
+        log_label="missing-summary",
+    )
+    print(f"[preunfolding] finished missing summary plots observables={list(missing_metric_summary)}", flush=True)
+
+    reco_tau_summary = plot_truth_vs_reco_by_method_and_region(
+        method_regions=method_regions,
+        methods=methods,
+        signal_sample_name=args.signal_sample_name,
+        observable_specs=reco_tau_specs,
+        output_dir=args.output_dir,
+        normalize=args.normalize_truth_reco,
+        reco_observable_source="recompute",
+        subdir_name="reco_tau_truth_vs_reco",
+        log_label="reco-tau-truth-vs-reco",
+    )
+    print(f"[preunfolding] finished reco-tau truth-vs-reco methods={list(reco_tau_summary)}", flush=True)
+    reco_tau_metric_summary = plot_truth_metric_summary(
+        truth_summary=reco_tau_summary,
+        methods=methods,
+        observable_specs=reco_tau_specs,
+        output_dir=args.output_dir,
+        metric="pearson",
+        subdir_name="reco_tau_truth_vs_reco_summary",
+        log_label="reco-tau-summary",
+    )
+    print(f"[preunfolding] finished reco-tau summary plots observables={list(reco_tau_metric_summary)}", flush=True)
 
     print(
         f"[preunfolding] control-plot inputs data_sample={args.data_sample_name} "
@@ -962,15 +1259,32 @@ def main() -> None:
         "signal_sample_name": args.signal_sample_name,
         "method_regions": method_regions,
         "truth_observables": [name for name, _ in observable_specs],
+        "missing_observables": [name for name, _ in missing_specs],
+        "reco_tau_observables": [name for name, _ in reco_tau_specs],
         "reco_observable_source": args.reco_observable_source,
         "truth_vs_reco": truth_summary,
         "truth_metric_summary": truth_metric_summary,
+        "missing_truth_vs_reco": missing_summary,
+        "missing_metric_summary": missing_metric_summary,
+        "reco_tau_truth_vs_reco": reco_tau_summary,
+        "reco_tau_metric_summary": reco_tau_metric_summary,
         "data_mc_control": control_summary,
         "control_observable_defaults": control_observables,
     }
     with (args.output_dir / "preunfolding_validation_summary.json").open("w") as handle:
         json.dump(json_safe(summary), handle, indent=2, sort_keys=True)
-    write_report(args.output_dir, methods, truth_summary, truth_metric_summary, control_summary, method_regions)
+    write_report(
+        args.output_dir,
+        methods,
+        truth_summary,
+        truth_metric_summary,
+        missing_summary,
+        missing_metric_summary,
+        reco_tau_summary,
+        reco_tau_metric_summary,
+        control_summary,
+        method_regions,
+    )
     print(f"[preunfolding] wrote summary_json={args.output_dir / 'preunfolding_validation_summary.json'}", flush=True)
     print(f"[preunfolding] wrote report_md={args.output_dir / 'preunfolding_validation_report.md'}", flush=True)
 
