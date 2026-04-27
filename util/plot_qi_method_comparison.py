@@ -823,6 +823,11 @@ def plot_physics_data_mc_comparisons(
                         "reco_tau_delta_phi",
                     }:
                         weights = np.concatenate([weights, weights])
+                    if observable.startswith("visible_tau_") and observable not in {
+                        "visible_tau_pair_mass",
+                        "visible_tau_pair_pt",
+                    }:
+                        weights = np.concatenate([weights, weights])
                     hist_mc[sample_name], hist_mc_err2[sample_name] = weighted_hist_and_err2(values, weights, bins)
 
                 output_path = method_dir / f"{region}_{sanitize_filename(observable)}.png"

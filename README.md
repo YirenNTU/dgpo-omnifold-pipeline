@@ -358,6 +358,69 @@ The export preserves central fields such as:
 
 - `lead_a_visible_p4`
 - `lead_b_visible_p4`
+
+## 7. Pre-Unfolding Validation
+
+Use the exported method trees to make pre-unfolding validation plots:
+
+- MC truth-vs-reco plots for:
+  - `theta_cm` and all `cos_theta_*`
+  - `lead_a/b_missing_{E,px,py,pz,pt,eta,phi}`
+  - `reco_tau_a/b_{E,px,py,pz,pt,eta,phi,mass}`
+- Method-summary Pearson plots for the same truth-vs-reco observables
+- Stacked MC vs data control plots for reco/visible tau observables
+
+The truth-vs-reco comparison now uses only correctly assigned signal events:
+
+- `evenet_truth_class_name` must match the target signal region
+- `evenet_pred_class_name == evenet_truth_class_name`
+
+This keeps the EveNet truth-vs-reco comparison aligned with the Baseline interpretation.
+
+Example command:
+
+```bash
+cd /path/to/lep_tree_ana/ml_pipeline
+python3 util/plot_preunfolding_validation.py \
+  --method Baseline:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/neutrino_reco \
+  --method EveNet-Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export \
+  --method EveNet-Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/qi-export \
+  --signal-sample-name Ztautau \
+  --data-sample-name data94 \
+  --mc-sample-names Ztautau Zll Zqq \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/preunfolding-validation \
+  --reco-observable-source recompute
+```
+
+Useful options:
+
+- `--reco-observable-source stored`
+  - use the scalar `theta_cm/cos_theta_*` already stored in parquet
+- `--reco-observable-source recompute`
+  - force `theta_cm/cos_theta_*` to be rebuilt from stored `reco_tau_a_p4`, `reco_tau_b_p4`, `lead_a_visible_p4`, `lead_b_visible_p4`
+- `--normalize-truth-reco`
+  - normalize truth-vs-reco histograms to unit area
+- `--regions ee emu mumu Ztautau_pipi Ztautau_pirho Ztautau_rhorho`
+  - limit the validation to a subset of native regions/channels
+
+Typical outputs:
+
+- `truth_vs_reco/`
+  - truth-vs-reco plots and 2D truth-vs-reco maps for `theta_cm` and `cos_theta_*`
+- `truth_vs_reco_summary/`
+  - Pearson summary plots for spin observables
+- `missing_truth_vs_reco/`
+  - truth-vs-reco plots for `lead_a/b_missing_*`
+- `missing_truth_vs_reco_summary/`
+  - Pearson summary plots for neutrino-missing observables
+- `reco_tau_truth_vs_reco/`
+  - truth-vs-reco plots for `reco_tau_a/b_*`
+- `reco_tau_truth_vs_reco_summary/`
+  - Pearson summary plots for reconstructed tau observables
+- `physics_data_mc_<method>/`
+  - stacked MC vs data control plots, including visible tau observables
+- `preunfolding_validation_summary.json`
+- `preunfolding_validation_report.md`
 - Region cut flags
 - `event_category`
 - `weight`

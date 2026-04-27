@@ -196,6 +196,25 @@ def load_method_events(root: Path, sample_name: str, region: str) -> ak.Array | 
     return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
 
 
+def truth_reco_event_paths(root: Path, sample_name: str, region: str) -> list[Path]:
+    if neutrino_reco_root(root) is not None:
+        return method_event_paths(root, sample_name, region)
+
+    raw_candidate = parquet_for(root, sample_name, "raw")
+    if raw_candidate.exists() and expected_truth_classes_for_region(region):
+        return [raw_candidate]
+
+    return method_event_paths(root, sample_name, region)
+
+
+def load_truth_reco_method_events(root: Path, sample_name: str, region: str) -> ak.Array | None:
+    paths = truth_reco_event_paths(root, sample_name, region)
+    if not paths:
+        return None
+    arrays = [load_events(path) for path in paths]
+    return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
+
+
 def truth_observable_specs(requested: list[str] | None) -> list[tuple[str, str]]:
     names = requested or list(get_observable_names())
     return [(name, observable_latex_label(name)) for name in names]
@@ -610,7 +629,7 @@ def plot_truth_vs_reco_by_method_and_region(
 
         for region in regions:
             print(f"  [region] method={method} region={region}", flush=True)
-            paths = method_event_paths(root, signal_sample_name, region)
+            paths = truth_reco_event_paths(root, signal_sample_name, region)
             if not paths:
                 print(f"    [skip] missing signal parquet paths for method={method} region={region}", flush=True)
                 continue
@@ -619,7 +638,7 @@ def plot_truth_vs_reco_by_method_and_region(
                 f"paths={[str(path) for path in paths]}",
                 flush=True,
             )
-            events = load_method_events(root, signal_sample_name, region)
+            events = load_truth_reco_method_events(root, signal_sample_name, region)
             if events is None:
                 print(f"    [skip] failed to load events after path resolution method={method} region={region}", flush=True)
                 continue
@@ -650,7 +669,9 @@ def plot_truth_vs_reco_by_method_and_region(
                     print(
                         f"    [skip] method={method} region={region} observable={observable} "
                         f"reco_source={'missing' if reco_values_full is None else 'available'} "
-                        f"truth_source={'missing' if truth_values_full is None else 'available'}",
+                        f"truth_source={'missing' if truth_values_full is None else 'available'} "
+                        f"reco_requirements=\"{reco_observable_requirements(events, observable, reco_observable_source)}\" "
+                        f"truth_requirements=\"{truth_observable_requirements(events, observable)}\"",
                         flush=True,
                     )
                     continue
@@ -663,10 +684,23 @@ def plot_truth_vs_reco_by_method_and_region(
                     truth_mask &= reco_event_mask
                     valid_mask &= reco_event_mask
                 if not np.any(truth_mask):
-                    print(f"    [skip] method={method} region={region} observable={observable} truth values are all invalid/default", flush=True)
+                    print(
+                        f"    [skip] method={method} region={region} observable={observable} "
+                        f"truth values are all invalid/default after masking "
+                        f"(events={len(events)}, truth_finite={int(np.count_nonzero(np.isfinite(truth_values_full)))})",
+                        flush=True,
+                    )
                     continue
                 if not np.any(valid_mask):
-                    print(f"    [skip] method={method} region={region} observable={observable} no valid truth/reco entries", flush=True)
+                    print(
+                        f"    [skip] method={method} region={region} observable={observable} "
+                        f"no valid truth/reco entries after masking "
+                        f"(events={len(events)}, truth_finite={int(np.count_nonzero(np.isfinite(truth_values_full)))}, "
+                        f"reco_finite={int(np.count_nonzero(np.isfinite(reco_values_full)))}, "
+                        f"positive_weight={int(np.count_nonzero(np.isfinite(weights_full) & (weights_full > 0)))}, "
+                        f"flags_valid={int(np.count_nonzero(reco_event_mask)) if reco_event_mask is not None else 'n/a'})",
+                        flush=True,
+                    )
                     continue
 
                 truth_valid = truth_values_full[valid_mask]
@@ -823,6 +857,9 @@ def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | N
         if len(parts) >= 4:
             leg = parts[2]
             component = parts[-1]
+            truth_tau_field = f"truth_tau_{leg}_p4"
+            if truth_tau_field in events.fields:
+                return missing_p4_component_values(events[truth_tau_field], component)
             truth_missing_field = f"truth_missing_{leg}_p4"
             visible_field = f"lead_{leg}_visible_p4"
             if truth_missing_field in events.fields and visible_field in events.fields:
@@ -845,6 +882,62 @@ def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | N
     if observable not in observables:
         return None
     return to_numpy(observables[observable], np.float64)
+
+
+def reco_observable_requirements(events: ak.Array, observable: str, source_mode: str) -> str:
+    fields = set(events.fields)
+    if source_mode in {"auto", "stored"} and observable in fields:
+        return "stored column available"
+    if source_mode == "stored":
+        return f"missing stored column '{observable}'"
+    if observable.startswith("lead_") and "_missing_" in observable:
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[1]
+            field = f"lead_{leg}_missing_p4"
+            return f"required field '{field}' {'available' if field in fields else 'missing'}"
+    if observable.startswith("reco_tau_"):
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[2]
+            field = f"reco_tau_{leg}_p4"
+            return f"required field '{field}' {'available' if field in fields else 'missing'}"
+    required = ["reco_tau_a_p4", "reco_tau_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"]
+    missing = [field for field in required if field not in fields]
+    if missing:
+        return f"missing recompute fields {missing}"
+    return "recompute fields available"
+
+
+def truth_observable_requirements(events: ak.Array, observable: str) -> str:
+    fields = set(events.fields)
+    truth_field = f"truth_{observable}"
+    if truth_field in fields:
+        return f"stored truth column '{truth_field}' available"
+    if observable.startswith("lead_") and "_missing_" in observable:
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[1]
+            field = f"truth_missing_{leg}_p4"
+            return f"required field '{field}' {'available' if field in fields else 'missing'}"
+    if observable.startswith("reco_tau_"):
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[2]
+            direct_field = f"truth_tau_{leg}_p4"
+            fallback_missing = f"truth_missing_{leg}_p4"
+            fallback_visible = f"lead_{leg}_visible_p4"
+            if direct_field in fields:
+                return f"truth tau field '{direct_field}' available"
+            missing = [field for field in (fallback_missing, fallback_visible) if field not in fields]
+            if missing:
+                return f"missing fallback truth-tau fields {missing}"
+            return f"fallback truth tau fields '{fallback_missing}' + '{fallback_visible}' available"
+    required = ["truth_missing_a_p4", "truth_missing_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"]
+    missing = [field for field in required if field not in fields]
+    if missing:
+        return f"missing truth recompute fields {missing}"
+    return "truth recompute fields available"
 
 
 def missing_p4_component_values(values: ak.Array, component: str) -> np.ndarray:
