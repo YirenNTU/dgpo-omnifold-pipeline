@@ -56,6 +56,7 @@ EveNetPrediction:
     - emu
     - Ztautau_pipi
     - Ztautau_pirho
+    - Ztautau_rhopi
     - Ztautau_pie
     - Ztautau_pimu
     - Ztautau_rhoe
@@ -64,6 +65,7 @@ EveNetPrediction:
     - Ztautau_ee
     - Ztautau_mumu
     - Ztautau_emu
+    - Ztautau_mue
 
 EveNetInput:
   # false keeps the historical point-cloud collection.
