@@ -125,7 +125,7 @@ def expand_input_files(patterns: tuple[str, ...]) -> list[str]:
 
 
 def sample_uses_invisible_target(sample: Sample) -> bool:
-    return sample.is_signal and sample.name != "Ztautau_others"
+    return sample.is_signal
 
 
 def load_sample_events(sample: Sample) -> ak.Array:

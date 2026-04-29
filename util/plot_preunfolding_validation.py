@@ -44,6 +44,7 @@ vector.register_awkward()
 
 DEFAULT_FLOAT = -99.0
 OKABE_ITO_BLACK = "#000000"
+TARGET_INVISIBLE_COMPONENTS = ("energy", "pt", "eta", "phi")
 BASELINE_HADHAD_FINE_CHANNELS = (
     "Ztautau_pipi",
     "Ztautau_pirho",
@@ -547,6 +548,95 @@ def remapped_slot_p4(events: ak.Array, prefix: str, leg: str) -> ak.Array | None
     return None
 
 
+def truth_visible_field(fields: set[str], leg: str) -> str:
+    """
+    inputs:
+      fields: set[str], available parquet fields.
+      leg: str, "a" or "b".
+    outputs:
+      str, preferred visible-p4 field name for truth comparisons.
+    goal:
+      Use truth_visible_* when available, otherwise reuse central lead_*_visible_p4.
+    """
+    direct = f"truth_visible_{leg}_p4"
+    return direct if direct in fields else f"lead_{leg}_visible_p4"
+
+
+def target_invisible_slot_fields(leg: str) -> list[str]:
+    """
+    inputs:
+      leg: str, "a" or "b".
+    outputs:
+      list[str], slot-level target invisible fields needed for fallback truth p4.
+    goal:
+      Keep slot-fallback requirements in one place so skip messages and value
+      extraction stay aligned.
+    """
+    return [
+        f"target_invisible_slot{slot}_{component}"
+        for slot in (0, 1)
+        for component in TARGET_INVISIBLE_COMPONENTS
+    ] + [f"source_slot_for_{leg}"]
+
+
+def truth_tau_p4(events: ak.Array, leg: str) -> ak.Array | None:
+    """
+    inputs:
+      events: ak.Array, exported parquet events.
+      leg: str, "a" or "b".
+    outputs:
+      Momentum4D array for truth tau p4, or None if the parquet cannot supply it.
+    goal:
+      Resolve truth tau p4 using the cleanest available source:
+      truth_tau_* first, truth_missing_* + visible second, slot target fallback last.
+    """
+    fields = set(events.fields)
+    direct = f"truth_tau_{leg}_p4"
+    if direct in fields:
+        return events[direct]
+
+    visible = truth_visible_field(fields, leg)
+    missing = f"truth_missing_{leg}_p4"
+    if missing in fields and visible in fields:
+        return events[missing] + events[visible]
+
+    remapped_missing = remapped_slot_p4(events, "target_invisible", leg)
+    if remapped_missing is not None and visible in fields:
+        return remapped_missing + events[visible]
+    return None
+
+
+def truth_tau_requirements(fields: set[str], leg: str) -> str:
+    """
+    inputs:
+      fields: set[str], available parquet fields.
+      leg: str, "a" or "b".
+    outputs:
+      str, human-readable reason describing which truth-tau source is available or missing.
+    goal:
+      Print concise skip/debug messages that mirror truth_tau_p4 resolution.
+    """
+    direct = f"truth_tau_{leg}_p4"
+    if direct in fields:
+        return f"truth tau field '{direct}' available"
+
+    missing = f"truth_missing_{leg}_p4"
+    visible = truth_visible_field(fields, leg)
+    p4_missing = [field for field in (missing, visible) if field not in fields]
+    if not p4_missing:
+        return f"fallback truth tau fields '{missing}' + '{visible}' available"
+
+    slot_missing = [
+        field_name for field_name in target_invisible_slot_fields(leg) + [visible] if field_name not in fields
+    ]
+    if not slot_missing:
+        return f"using slot fallback target_invisible + '{visible}'"
+    return (
+        f"missing direct truth tau field '{direct}', missing fallback truth-tau fields {p4_missing}, "
+        f"and slot fallback fields {slot_missing}"
+    )
+
+
 def observable_bins(observable: str, values_by_name: dict[str, np.ndarray]) -> np.ndarray:
     if observable == "theta_cm":
         return np.linspace(0.0, np.pi, 41)
@@ -799,7 +889,11 @@ def plot_truth_vs_reco_by_method_and_region(
                 plt.close(fig)
 
                 plot_path_2d = None
-                if is_spin_observable(observable) or observable.startswith("lead_"):
+                if (
+                    is_spin_observable(observable)
+                    or observable.startswith("lead_")
+                    or observable.startswith("reco_tau_")
+                ):
                     low, high = observable_2d_limits(observable, truth_valid, reco_valid)
                     fig2d, ax2d = plt.subplots(figsize=(6.2, 5.8), dpi=180)
                     hist2d = ax2d.hist2d(
@@ -914,37 +1008,23 @@ def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | N
         if len(parts) >= 4:
             leg = parts[2]
             component = parts[-1]
-            truth_tau_field = f"truth_tau_{leg}_p4"
-            if truth_tau_field in events.fields:
-                return missing_p4_component_values(events[truth_tau_field], component)
-            truth_missing_field = f"truth_missing_{leg}_p4"
-            visible_field = f"lead_{leg}_visible_p4"
-            if truth_missing_field in events.fields and visible_field in events.fields:
-                truth_tau = events[truth_missing_field] + events[visible_field]
-                return missing_p4_component_values(truth_tau, component)
-            remapped = remapped_slot_p4(events, "target_invisible", leg)
-            if remapped is not None and visible_field in events.fields:
-                truth_tau = remapped + events[visible_field]
+            truth_tau = truth_tau_p4(events, leg)
+            if truth_tau is not None:
                 return missing_p4_component_values(truth_tau, component)
         return None
 
-    required_fields = {"truth_missing_a_p4", "truth_missing_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"}
     fields = set(events.fields)
-    if required_fields.issubset(fields):
-        truth_tau_a = events["truth_missing_a_p4"] + events["lead_a_visible_p4"]
-        truth_tau_b = events["truth_missing_b_p4"] + events["lead_b_visible_p4"]
-    else:
-        truth_tau_a = remapped_slot_p4(events, "target_invisible", "a")
-        truth_tau_b = remapped_slot_p4(events, "target_invisible", "b")
-        if truth_tau_a is None or truth_tau_b is None or "lead_a_visible_p4" not in fields or "lead_b_visible_p4" not in fields:
-            return None
-        truth_tau_a = truth_tau_a + events["lead_a_visible_p4"]
-        truth_tau_b = truth_tau_b + events["lead_b_visible_p4"]
+    truth_vis_a_field = truth_visible_field(fields, "a")
+    truth_vis_b_field = truth_visible_field(fields, "b")
+    truth_tau_a = truth_tau_p4(events, "a")
+    truth_tau_b = truth_tau_p4(events, "b")
+    if truth_tau_a is None or truth_tau_b is None or truth_vis_a_field not in fields or truth_vis_b_field not in fields:
+        return None
     observables = build_observables(
         truth_tau_a,
         truth_tau_b,
-        events["lead_a_visible_p4"],
-        events["lead_b_visible_p4"],
+        events[truth_vis_a_field],
+        events[truth_vis_b_field],
     )
     if observable not in observables:
         return None
@@ -988,12 +1068,7 @@ def truth_observable_requirements(events: ak.Array, observable: str) -> str:
             field = f"truth_missing_{leg}_p4"
             if field in fields:
                 return f"required field '{field}' available"
-            slot_fields = [
-                f"target_invisible_slot0_{component}" for component in ("energy", "pt", "eta", "phi")
-            ] + [
-                f"target_invisible_slot1_{component}" for component in ("energy", "pt", "eta", "phi")
-            ] + [f"source_slot_for_{leg}"]
-            missing = [field_name for field_name in slot_fields if field_name not in fields]
+            missing = [field_name for field_name in target_invisible_slot_fields(leg) if field_name not in fields]
             if missing:
                 return f"missing truth missing field '{field}' and slot fallback fields {missing}"
             return f"using slot fallback target_invisible + source_slot_for_{leg}"
@@ -1001,27 +1076,10 @@ def truth_observable_requirements(events: ak.Array, observable: str) -> str:
         parts = observable.split("_")
         if len(parts) >= 4:
             leg = parts[2]
-            direct_field = f"truth_tau_{leg}_p4"
-            fallback_missing = f"truth_missing_{leg}_p4"
-            fallback_visible = f"lead_{leg}_visible_p4"
-            if direct_field in fields:
-                return f"truth tau field '{direct_field}' available"
-            missing = [field for field in (fallback_missing, fallback_visible) if field not in fields]
-            if not missing:
-                return f"fallback truth tau fields '{fallback_missing}' + '{fallback_visible}' available"
-            slot_fields = [
-                f"target_invisible_slot0_{component}" for component in ("energy", "pt", "eta", "phi")
-            ] + [
-                f"target_invisible_slot1_{component}" for component in ("energy", "pt", "eta", "phi")
-            ] + [f"source_slot_for_{leg}", fallback_visible]
-            slot_missing = [field_name for field_name in slot_fields if field_name not in fields]
-            if not slot_missing:
-                return f"using slot fallback target_invisible + '{fallback_visible}'"
-            return (
-                f"missing direct truth tau field '{direct_field}', missing fallback truth-tau fields {missing}, "
-                f"and slot fallback fields {slot_missing}"
-            )
-    required = ["truth_missing_a_p4", "truth_missing_b_p4", "lead_a_visible_p4", "lead_b_visible_p4"]
+            return truth_tau_requirements(fields, leg)
+    truth_vis_a_field = truth_visible_field(fields, "a")
+    truth_vis_b_field = truth_visible_field(fields, "b")
+    required = ["truth_missing_a_p4", "truth_missing_b_p4", truth_vis_a_field, truth_vis_b_field]
     missing = [field for field in required if field not in fields]
     if missing:
         return f"missing truth recompute fields {missing}"

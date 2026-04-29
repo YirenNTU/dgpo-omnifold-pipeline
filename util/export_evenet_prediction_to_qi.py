@@ -281,75 +281,6 @@ def prepare_events_for_parquet(events: ak.Array) -> ak.Array:
     return output
 
 
-def canonicalize_p4(p4: ak.Array) -> ak.Array:
-    return build_momentum4d(
-        ak.to_numpy(p4.px, allow_missing=False).astype(np.float64),
-        ak.to_numpy(p4.py, allow_missing=False).astype(np.float64),
-        ak.to_numpy(p4.pz, allow_missing=False).astype(np.float64),
-        ak.to_numpy(p4.E, allow_missing=False).astype(np.float64),
-    )
-
-
-def p4_from_components(events: ak.Array, prefix: str, slot: int) -> tuple[ak.Array, np.ndarray]:
-    valid_field = f"{prefix}_slot{slot}_valid"
-    valid = (
-        ak.to_numpy(events[valid_field], allow_missing=False).astype(bool)
-        if valid_field in events.fields
-        else np.ones(len(events), dtype=bool)
-    )
-
-    component = lambda name: ak.to_numpy(events[f"{prefix}_slot{slot}_{name}"], allow_missing=False).astype(np.float64)
-
-    if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("E", "px", "py", "pz")):
-        p4 = vector.zip(
-            {
-                "px": component("px"),
-                "py": component("py"),
-                "pz": component("pz"),
-                "E": component("E"),
-            }
-        )
-        return canonicalize_p4(p4), valid
-
-    # convert
-    if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("energy", "pt", "eta", "phi")):
-
-        pt = component("pt")
-        eta = component("eta")
-        phi = component("phi")
-        energy = component("energy")
-        p4 = build_momentum4d(
-            pt * np.cos(phi),
-            pt * np.sin(phi),
-            pt * np.sinh(eta),
-            energy,
-        )
-        return canonicalize_p4(p4), valid
-
-    if all(f"{prefix}_slot{slot}_{name}" in events.fields for name in ("log_energy", "log_pt", "eta", "phi")):
-        pt = np.expm1(component("log_pt"))
-        eta = component("eta")
-        phi = component("phi")
-        energy = np.expm1(component("log_energy"))
-        p4 = build_momentum4d(
-            pt * np.cos(phi),
-            pt * np.sin(phi),
-            pt * np.sinh(eta),
-            energy,
-        )
-        return canonicalize_p4(p4), valid
-
-    available = [field for field in events.fields if field.startswith(f"{prefix}_slot{slot}_")]
-    raise KeyError(
-        f"Cannot build p4 for {prefix}_slot{slot}. Need E/px/py/pz, energy/pt/eta/phi, "
-        f"or log_energy/log_pt/eta/phi. Available: {available}"
-    )
-
-
-def choose_by_slot(slot0, slot1, choose_slot1: np.ndarray):
-    return ak.where(ak.Array(choose_slot1), slot1, slot0)
-
-
 def choose_component_by_slot(events: ak.Array, prefix: str, slot_indices: np.ndarray, component: str) -> np.ndarray | None:
     slot0_name = f"{prefix}_slot0_{component}"
     slot1_name = f"{prefix}_slot1_{component}"
@@ -527,11 +458,6 @@ def align_fields_for_concat(arrays: list[ak.Array]) -> list[ak.Array]:
     return aligned
 
 
-def safe_delta_r(first: ak.Array, second: ak.Array) -> np.ndarray:
-    values = ak.to_numpy(first.deltaR(second), allow_missing=False).astype(np.float64)
-    return np.where(np.isfinite(values), values, 1.0e9)
-
-
 def prediction_selection_mask(full_events: ak.Array) -> np.ndarray:
     fields = set(full_events.fields)
     mask = np.ones(len(full_events), dtype=bool)
@@ -546,6 +472,18 @@ def build_predicted_reconstruction(
     central_pred_events: ak.Array,
     pred_events: ak.Array,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    inputs:
+      central_pred_events: ak.Array, prediction rows after joining central parquet fields.
+      pred_events: ak.Array, EveNet prediction rows with slot-level invisible p4.
+    outputs:
+      tuple(output_fields, metrics):
+        output_fields: dict[str, Any], central-schema reco p4, QI observables, and EveNet metadata.
+        metrics: dict[str, Any], event counts and source bookkeeping for the export summary.
+    goal:
+      Materialize EveNet predictions into the same a/b-leg reconstruction schema
+      used by central QI/unfolding code.
+    """
     num_predicted_rows = len(pred_events)
 
     if "source_slot_for_a" not in pred_events.fields or "source_slot_for_b" not in pred_events.fields:
@@ -559,8 +497,18 @@ def build_predicted_reconstruction(
     if np.any((slot_for_a < 0) | (slot_for_a > 1) | (slot_for_b < 0) | (slot_for_b > 1)):
         raise ValueError("source_slot_for_a/source_slot_for_b must be 0 or 1 for every prediction row.")
 
-    lead_a_visible, vis_valid_a = build_remapped_p4(pred_events, "tau_vis_prong", slot_for_a)
-    lead_b_visible, vis_valid_b = build_remapped_p4(pred_events, "tau_vis_prong", slot_for_b)
+    # Keep EveNet reconstruction on the same visible-particle definition as central analysis.
+    central_fields = set(central_pred_events.fields)
+    if {"lead_a_visible_p4", "lead_b_visible_p4"}.issubset(central_fields):
+        lead_a_visible = rebuild_vector(central_pred_events["lead_a_visible_p4"])
+        lead_b_visible = rebuild_vector(central_pred_events["lead_b_visible_p4"])
+        vis_valid_a = finite_p4_mask(lead_a_visible)
+        vis_valid_b = finite_p4_mask(lead_b_visible)
+        visible_source = "central_pred_events.lead_a/b_visible_p4"
+    else:
+        lead_a_visible, vis_valid_a = build_remapped_p4(pred_events, "tau_vis_prong", slot_for_a)
+        lead_b_visible, vis_valid_b = build_remapped_p4(pred_events, "tau_vis_prong", slot_for_b)
+        visible_source = "prediction_slots.tau_vis_prong"
     lead_a_missing, pred_valid_a = build_remapped_p4(pred_events, "pred_invisible", slot_for_a)
     lead_b_missing, pred_valid_b = build_remapped_p4(pred_events, "pred_invisible", slot_for_b)
     reco_tau_a = lead_a_visible + lead_a_missing
@@ -622,6 +570,7 @@ def build_predicted_reconstruction(
         "valid_predicted_events": int(np.sum(flags_valid)),
         "valid_predicted_fraction": float(np.mean(flags_valid)) if len(flags_valid) else 0.0,
         "slot_alignment": "prediction_metadata_source_slot_for_a",
+        "visible_source": visible_source,
         "slot_swap_fraction": float(np.mean(slot_for_a == 0)) if len(slot_for_a) else 0.0,
         "median_deltaR_a": finite_median(delta_r_a),
         "median_deltaR_b": finite_median(delta_r_b),

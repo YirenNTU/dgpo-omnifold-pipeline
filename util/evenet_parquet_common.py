@@ -196,6 +196,7 @@ def _truth_component(values: ak.Array) -> ak.Array:
 
 
 def _genpart_tau_p4(events: ak.Array, pdg_id: int):
+    # TODO: How to select multiple tau candidates
     flag = events["GenPart_pdgId"] == pdg_id
     return build_momentum4d(
         _truth_component(ak.firsts(events["GenPart_vector_fCoordinates_fX"][flag][..., ::-1])),
@@ -303,6 +304,182 @@ def _classify_visible_kind_rank(lead_abs_pdg, has_nearby_photon):
     )
 
 
+def _central_visible_kind_rank(events: ak.Array, hemisphere: str) -> ak.Array:
+    """
+    inputs:
+      events: ak.Array, central analysis parquet events.
+      hemisphere: str, either "a" or "b".
+    outputs:
+      ak.Array[int], visible-particle category rank used for EveNet slot sorting.
+    goal:
+      Infer the visible decay kind from central lead flags so central visible p4
+      can follow the same canonical slot ordering as the training input.
+    """
+    fields = set(events.fields)
+    num_photon_field = f"num_photon_near_lead_{hemisphere}"
+    has_nearby_photon = (
+        ak.values_astype(events[num_photon_field] > 0, bool)
+        if num_photon_field in fields
+        else ak.Array(np.zeros(len(events), dtype=bool))
+    )
+
+    electron_field = f"lead_{hemisphere}_is_electron"
+    muon_field = f"lead_{hemisphere}_is_muon"
+    pion_field = f"lead_{hemisphere}_is_pion"
+    lead_abs_pdg = ak.Array(np.zeros(len(events), dtype=np.int64))
+    if pion_field in fields:
+        lead_abs_pdg = ak.where(events[pion_field], 41, lead_abs_pdg)
+    if muon_field in fields:
+        lead_abs_pdg = ak.where(events[muon_field], 6, lead_abs_pdg)
+    if electron_field in fields:
+        lead_abs_pdg = ak.where(events[electron_field], 2, lead_abs_pdg)
+    return _classify_visible_kind_rank(lead_abs_pdg, has_nearby_photon)
+
+
+def _canonicalize_ab_visible_layout(
+    visible_a,
+    visible_b,
+    visible_mask_a,
+    visible_mask_b,
+    kind_rank_a,
+    kind_rank_b,
+    charge_a,
+    charge_b,
+):
+    """
+    inputs:
+      visible_a/visible_b: Momentum4D arrays, visible p4 in central a/b leg basis.
+      visible_mask_a/visible_mask_b: ak.Array[bool], finite/valid visible-p4 masks.
+      kind_rank_a/kind_rank_b: ak.Array[int], visible decay-kind ordering keys.
+      charge_a/charge_b: ak.Array[float], lead charges used to identify tau-/tau+.
+    outputs:
+      tuple(visible_tau, visible_tau_mask, swap_mask), all in EveNet slot order.
+    goal:
+      Convert central a/b legs into the two canonical EveNet visible slots while
+      keeping enough information to map predictions back to central a/b later.
+    """
+    visible_tau_minus, visible_tau_plus, sign_minus_mask, sign_plus_mask = map_hemisphere_to_tau_sign(
+        visible_a,
+        visible_b,
+        charge_a,
+        charge_b,
+    )
+    finite_minus_mask, finite_plus_mask, _, _ = map_hemisphere_to_tau_sign(
+        visible_mask_a,
+        visible_mask_b,
+        charge_a,
+        charge_b,
+    )
+    visible_kind_rank_minus, visible_kind_rank_plus, _, _ = map_hemisphere_to_tau_sign(
+        kind_rank_a,
+        kind_rank_b,
+        charge_a,
+        charge_b,
+    )
+    visible_charge_minus, visible_charge_plus, _, _ = map_hemisphere_to_tau_sign(
+        charge_a,
+        charge_b,
+        charge_a,
+        charge_b,
+    )
+
+    return _canonicalize_visible_slots(
+        visible_tau_minus,
+        visible_tau_plus,
+        sign_minus_mask & finite_minus_mask,
+        sign_plus_mask & finite_plus_mask,
+        visible_kind_rank_minus,
+        visible_kind_rank_plus,
+        visible_charge_minus,
+        visible_charge_plus,
+    )
+
+
+def _build_visible_tau_layout_from_central(events: ak.Array):
+    """
+    inputs:
+      events: ak.Array, central parquet events with lead_a/b_visible_p4 and charges.
+    outputs:
+      tuple(visible_tau, visible_tau_mask, swap_mask) or None when central fields are absent.
+    goal:
+      Prefer the already-materialized central visible-particle definition instead
+      of rebuilding visible p4 from Part_* constituents.
+    """
+    required = {
+        "lead_a_visible_p4",
+        "lead_b_visible_p4",
+        "lead_a_charge",
+        "lead_b_charge",
+    }
+    if not required.issubset(set(events.fields)):
+        return None
+
+    visible_a = rebuild_momentum4d(events["lead_a_visible_p4"])
+    visible_b = rebuild_momentum4d(events["lead_b_visible_p4"])
+    charge_a = ak.values_astype(events["lead_a_charge"], np.float32)
+    charge_b = ak.values_astype(events["lead_b_charge"], np.float32)
+    kind_rank_a = _central_visible_kind_rank(events, "a")
+    kind_rank_b = _central_visible_kind_rank(events, "b")
+
+    return _canonicalize_ab_visible_layout(
+        visible_a,
+        visible_b,
+        p4_is_finite(visible_a),
+        p4_is_finite(visible_b),
+        kind_rank_a,
+        kind_rank_b,
+        charge_a,
+        charge_b,
+    )
+
+
+def _canonicalize_visible_slots(
+    visible_tau_minus,
+    visible_tau_plus,
+    visible_tau_minus_mask,
+    visible_tau_plus_mask,
+    visible_kind_rank_minus,
+    visible_kind_rank_plus,
+    visible_charge_minus,
+    visible_charge_plus,
+):
+    """
+    inputs:
+      visible_tau_minus/visible_tau_plus: Momentum4D arrays in tau-sign basis.
+      visible_tau_minus_mask/visible_tau_plus_mask: ak.Array[bool], valid masks.
+      visible_kind_rank_minus/visible_kind_rank_plus: ak.Array[int], category ranks.
+      visible_charge_minus/visible_charge_plus: ak.Array[float], charge tie-breakers.
+    outputs:
+      tuple(visible_tau, visible_tau_mask, swap_mask), sorted into EveNet slot order.
+    goal:
+      Apply one canonical slot-ordering rule shared by central-visible and
+      constituent-rebuilt visible definitions.
+    """
+    visible_tau = stack_tau_pair(visible_tau_minus, visible_tau_plus)
+    visible_tau_mask = stack_tau_pair_mask(visible_tau_minus_mask, visible_tau_plus_mask)
+    visible_kind_rank = stack_tau_pair(visible_kind_rank_minus, visible_kind_rank_plus)
+    visible_charge = stack_tau_pair(visible_charge_minus, visible_charge_plus)
+
+    visible_kind_rank_0 = ak.to_numpy(visible_kind_rank[:, 0], allow_missing=False)
+    visible_kind_rank_1 = ak.to_numpy(visible_kind_rank[:, 1], allow_missing=False)
+    visible_charge_0 = ak.to_numpy(visible_charge[:, 0], allow_missing=False)
+    visible_charge_1 = ak.to_numpy(visible_charge[:, 1], allow_missing=False)
+    visible_mask_0 = ak.to_numpy(visible_tau_mask[:, 0], allow_missing=False)
+    visible_mask_1 = ak.to_numpy(visible_tau_mask[:, 1], allow_missing=False)
+
+    swap_mask = (~visible_mask_0 & visible_mask_1) | ((
+        visible_mask_0 == visible_mask_1
+    ) & (
+        (visible_kind_rank_0 > visible_kind_rank_1)
+        | (
+            (visible_kind_rank_0 == visible_kind_rank_1)
+            & (visible_charge_0 < visible_charge_1)
+        )
+    ))
+    swap_mask = ak.Array(swap_mask)
+    return reorder_tau_pair(visible_tau, swap_mask), reorder_tau_pair(visible_tau_mask, swap_mask), swap_mask
+
+
 def _build_hemisphere_masks(events: ak.Array, part_p4: ak.Array, charge: ak.Array, energy_valid: ak.Array):
     if "Part_in_hemisphere_a" in events.fields and "Part_in_hemisphere_b" in events.fields:
         return {
@@ -355,8 +532,21 @@ def _build_hemisphere_masks(events: ak.Array, part_p4: ak.Array, charge: ak.Arra
 
 
 def _build_visible_tau_layout(events: ak.Array, include_nearby_photons: bool = True):
-    # ML training slots are canonicalized by visible-particle kind, not central lead_a/lead_b.
-    # Downstream QI export must map these slots back to central legs using visible-p4 matching.
+    """
+    inputs:
+      events: ak.Array, source parquet events.
+      include_nearby_photons: bool, include nearby photons for rho-like visible p4.
+    outputs:
+      tuple(visible_tau, visible_tau_mask, swap_mask), in EveNet slot order.
+    goal:
+      Build EveNet visible tau inputs. Use central lead_a/b_visible_p4 when
+      available, otherwise fall back to reconstructing from Part_* constituents.
+    """
+    # Prefer the central visible-particle definition when the parquet already carries it.
+    central_layout = _build_visible_tau_layout_from_central(events) if include_nearby_photons else None
+    if central_layout is not None:
+        return central_layout
+
     charge = events["Part_charge"]
     pdg_id = abs(events["Part_pdgId"])
     part_p4 = build_part_momentum4d(events)
@@ -405,49 +595,16 @@ def _build_visible_tau_layout(events: ak.Array, include_nearby_photons: bool = T
             has_nearby_photon,
         )
 
-    visible_tau_minus, visible_tau_plus, visible_tau_minus_mask, visible_tau_plus_mask = map_hemisphere_to_tau_sign(
+    return _canonicalize_ab_visible_layout(
         visible_p4_by_hemisphere["a"],
         visible_p4_by_hemisphere["b"],
-        prong_charge_sums["a"],
-        prong_charge_sums["b"],
-    )
-    visible_kind_rank_minus, visible_kind_rank_plus, _, _ = map_hemisphere_to_tau_sign(
+        p4_is_finite(visible_p4_by_hemisphere["a"]),
+        p4_is_finite(visible_p4_by_hemisphere["b"]),
         visible_kind_rank_by_hemisphere["a"],
         visible_kind_rank_by_hemisphere["b"],
         prong_charge_sums["a"],
         prong_charge_sums["b"],
     )
-    visible_charge_minus, visible_charge_plus, _, _ = map_hemisphere_to_tau_sign(
-        prong_charge_sums["a"],
-        prong_charge_sums["b"],
-        prong_charge_sums["a"],
-        prong_charge_sums["b"],
-    )
-
-    visible_tau = stack_tau_pair(visible_tau_minus, visible_tau_plus)
-    visible_tau_mask = stack_tau_pair_mask(visible_tau_minus_mask, visible_tau_plus_mask)
-    visible_kind_rank = stack_tau_pair(visible_kind_rank_minus, visible_kind_rank_plus)
-    visible_charge = stack_tau_pair(visible_charge_minus, visible_charge_plus)
-
-    visible_kind_rank_0 = ak.to_numpy(visible_kind_rank[:, 0], allow_missing=False)
-    visible_kind_rank_1 = ak.to_numpy(visible_kind_rank[:, 1], allow_missing=False)
-    visible_charge_0 = ak.to_numpy(visible_charge[:, 0], allow_missing=False)
-    visible_charge_1 = ak.to_numpy(visible_charge[:, 1], allow_missing=False)
-    visible_mask_0 = ak.to_numpy(visible_tau_mask[:, 0], allow_missing=False)
-    visible_mask_1 = ak.to_numpy(visible_tau_mask[:, 1], allow_missing=False)
-
-    swap_mask = (~visible_mask_0 & visible_mask_1) | (
-        visible_mask_0 == visible_mask_1
-    ) & (
-        (visible_kind_rank_0 > visible_kind_rank_1)
-        | (
-            (visible_kind_rank_0 == visible_kind_rank_1)
-            & (visible_charge_0 < visible_charge_1)
-        )
-    )
-    swap_mask = ak.Array(swap_mask)
-
-    return reorder_tau_pair(visible_tau, swap_mask), reorder_tau_pair(visible_tau_mask, swap_mask), swap_mask
 
 
 def build_visible_tau_assumption_p4(events: ak.Array):
@@ -501,6 +658,7 @@ def build_tau_targets(
     tau_vis_target_p4 = tau_vis_prong_p4
     tau_vis_target_mask = tau_vis_prong_mask
 
+    # a/b basis
     truth_tau_pair, truth_tau_valid_pair, truth_source = resolve_truth_tau_pair(events)
     if truth_source is None:
         return x_invisible_p4, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target_p4, tau_vis_target_mask
@@ -508,6 +666,7 @@ def build_tau_targets(
     if slot_swap_mask is None:
         _, _, slot_swap_mask = _build_visible_tau_layout(events)
 
+    # convert to pdgId basis
     truth_tau_pair = reorder_tau_pair(truth_tau_pair, slot_swap_mask)
     truth_tau_valid_pair = reorder_tau_pair(truth_tau_valid_pair, slot_swap_mask)
     x_invisible_p4 = truth_tau_pair - tau_vis_target_p4
