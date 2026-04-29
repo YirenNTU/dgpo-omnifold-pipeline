@@ -24,6 +24,7 @@ if str(UTIL_ROOT) not in sys.path:
     sys.path.insert(0, str(UTIL_ROOT))
 
 from parquet_plot_common import choose_bins
+from plot_style import channel_latex_label
 from plot_qi_method_comparison import (
     event_weights,
     is_background_like_region,
@@ -314,40 +315,6 @@ def reco_tau_component_label(leg: str, component: str) -> str:
 
 def is_spin_observable(name: str) -> bool:
     return name == "theta_cm" or name.startswith("cos_theta_")
-
-
-def channel_latex_label(name: str) -> str:
-    mapping = {
-        "hadhad": r"$\tau_{\mathrm{had}}\tau_{\mathrm{had}}$",
-        "ee": r"$ee$",
-        "mumu": r"$\mu\mu$",
-        "emu": r"$e\mu$",
-        "baseline": "baseline",
-    }
-    if name in mapping:
-        return mapping[name]
-    if name in {"pipi", "pirho", "rhopi"}:
-        return channel_latex_label(f"Ztautau_{name}")
-    if name.startswith("Ztautau_"):
-        suffix = name.removeprefix("Ztautau_")
-        token_map = {"rho": r"\rho", "pi": r"\pi", "e": "e", "mu": r"\mu"}
-        tokens: list[str] = []
-        index = 0
-        ordered_keys = sorted(token_map, key=len, reverse=True)
-        while index < len(suffix):
-            matched = False
-            for key in ordered_keys:
-                if suffix.startswith(key, index):
-                    tokens.append(token_map[key])
-                    index += len(key)
-                    matched = True
-                    break
-            if not matched:
-                tokens.append(suffix[index])
-                index += 1
-        if tokens:
-            return r"$\tau\tau\to " + " ".join(tokens) + "$"
-    return name.replace("_", " ")
 
 
 def canonical_summary_region(region: str) -> str:

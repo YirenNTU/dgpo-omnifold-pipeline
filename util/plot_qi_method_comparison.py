@@ -26,6 +26,7 @@ from parquet_plot_common import (
     plot_from_histograms,
     summarize_invalid_hist_values,
 )
+from plot_style import channel_latex_label
 
 
 vector.register_awkward()
@@ -364,9 +365,7 @@ def predicted_channel_order(names: list[str]) -> list[str]:
 
 
 def channel_label(name: str) -> str:
-    if name.startswith("Ztautau_"):
-        return name.removeprefix("Ztautau_")
-    return name
+    return channel_latex_label(name)
 
 
 def cms_label(ax, text: str = "Work in progress") -> None:

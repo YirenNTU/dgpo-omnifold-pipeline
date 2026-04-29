@@ -117,6 +117,9 @@ Main outputs:
 Input preselection keeps events with `nprong == 2` and both reconstructed
 `tau_vis_prong` energies below the shared particle-energy sanity threshold
 (`91.25 GeV`).
+The QI export uses the same mask when deciding which raw events belong to the
+EveNet prediction universe, so events failing this selection are not silently
+reintroduced through the raw-complement path.
 
 Current target invisible definition:
 

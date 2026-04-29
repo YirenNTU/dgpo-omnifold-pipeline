@@ -144,20 +144,53 @@ def load_sample_events(sample: Sample) -> ak.Array:
     return events
 
 
+def tau_vis_prong_energy_mask(events: ak.Array) -> np.ndarray:
+    """
+    inputs:
+      events: ak.Array, events after any cheaper event-level preselection.
+    outputs:
+      np.ndarray[bool], true when both visible tau prong energies are valid and below MAX_PART_ENERGY_GEV.
+    goal:
+      Share the same visible-energy sanity cut between EveNet input building and QI export.
+    """
+    if len(events) == 0:
+        return np.zeros(0, dtype=bool)
+    tau_vis_prong_p4, tau_vis_prong_mask, _, _ = build_visible_tau_assumptions(events)
+    energy = ak.to_numpy(tau_vis_prong_p4.E, allow_missing=False)
+    valid = ak.to_numpy(tau_vis_prong_mask, allow_missing=False).astype(bool)
+    return np.all(valid & np.isfinite(energy) & (energy < MAX_PART_ENERGY_GEV), axis=1)
+
+
+def preselection_mask(events: ak.Array) -> np.ndarray:
+    """
+    inputs:
+      events: ak.Array, source events before EveNet input selection.
+    outputs:
+      np.ndarray[bool], selected event mask.
+    goal:
+      Keep build and export aligned on the EveNet prediction universe.
+    """
+    if "nprong" not in events.fields:
+        return np.ones(len(events), dtype=bool)
+
+    nprong_mask = ak.to_numpy(events["nprong"], allow_missing=False).astype(np.int64) == 2
+    mask = np.zeros(len(events), dtype=bool)
+    mask[nprong_mask] = tau_vis_prong_energy_mask(events[nprong_mask])
+    return mask
+
+
 def apply_preselection(events: ak.Array) -> ak.Array:
     if "nprong" not in events.fields:
         return events
 
-    nprong_selected = events[events["nprong"] == 2]
+    nprong_mask = ak.to_numpy(events["nprong"], allow_missing=False).astype(np.int64) == 2
+    nprong_selected = events[nprong_mask]
     console.print(
         f"  [bold cyan]Preselection[/bold cyan] nprong == 2 -> "
         f"[white]{len(nprong_selected)}[/white] / [white]{len(events)}[/white] event(s)"
     )
 
-    tau_vis_prong_p4, tau_vis_prong_mask, _, _ = build_visible_tau_assumptions(nprong_selected)
-    energy = ak.to_numpy(tau_vis_prong_p4.E, allow_missing=False)
-    valid = ak.to_numpy(tau_vis_prong_mask, allow_missing=False).astype(bool)
-    energy_mask = np.all(valid & np.isfinite(energy) & (energy < MAX_PART_ENERGY_GEV), axis=1)
+    energy_mask = tau_vis_prong_energy_mask(nprong_selected)
     selected = nprong_selected[energy_mask]
     console.print(
         f"  [bold cyan]Preselection[/bold cyan] tau_vis_prong_energy < "

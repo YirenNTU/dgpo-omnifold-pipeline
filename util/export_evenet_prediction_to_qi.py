@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from quantum.observables_builder import build_observables, get_observable_names
 from utils.common_functions import rebuild_p4
-from build_evenet_input_from_parquet import apply_preselection, expand_samples, parse_config, read_yaml
+from build_evenet_input_from_parquet import apply_preselection, expand_samples, parse_config, preselection_mask, read_yaml
 
 
 vector.register_awkward()
@@ -463,8 +463,7 @@ def prediction_selection_mask(full_events: ak.Array) -> np.ndarray:
     mask = np.ones(len(full_events), dtype=bool)
     if "baseline_cut" in fields:
         mask &= ak.to_numpy(full_events["baseline_cut"], allow_missing=False).astype(bool)
-    if "nprong" in fields:
-        mask &= ak.to_numpy(full_events["nprong"], allow_missing=False).astype(np.int64) == 2
+    mask &= preselection_mask(full_events)
     return mask
 
 
