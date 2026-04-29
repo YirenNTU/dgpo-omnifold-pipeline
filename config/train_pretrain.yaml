@@ -125,16 +125,16 @@ options:
     ProgressiveTraining:
       stages:
         - name: "neutrino_only"
-          epoch_ratio: 0.3
+          epoch_ratio: 0.5
           transition_ratio: 0.0
           loss_weights:
-            generation-truth: [5.0, 5.0]
+            generation-truth: [6.0, 6.0]
             classification: [0.0, 0.0]
         - name: "combined"
-          epoch_ratio: 0.7
+          epoch_ratio: 0.5
           transition_ratio: 0.2
           loss_weights:
-            generation-truth: [5.0, 5.0]
+            generation-truth: [6.0, 6.0]
             classification: [0.0, 1.0]
 
   Dataset:
