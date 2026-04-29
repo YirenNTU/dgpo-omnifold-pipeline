@@ -12,6 +12,11 @@ Processes:
       - "vis-"
     "tau+":
       - "vis+"
+  Ztautau_rhopi:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_pie:
     "tau-":
       - "vis-"
@@ -53,6 +58,11 @@ Processes:
     "tau+":
       - "vis+"
   Ztautau_emu:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
+  Ztautau_mue:
     "tau-":
       - "vis-"
     "tau+":

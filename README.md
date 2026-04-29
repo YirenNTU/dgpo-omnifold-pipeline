@@ -485,7 +485,7 @@ This step runs the central `QIProcessor` on the EveNet-exported parquet trees. I
 The important convention is:
 
 - Central cut-based regions are still available: `baseline`, `hadhad`, `ee`, `mumu`, `emu`.
-- ML dedicated QI regions are EveNet predicted fine channels: `Ztautau_pipi`, `Ztautau_pirho`, `Ztautau_pie`, `Ztautau_pimu`, `Ztautau_rhoe`, `Ztautau_rhomu`, `Ztautau_rhorho`, `Ztautau_ee`, `Ztautau_mumu`, `Ztautau_emu`.
+- ML dedicated QI regions are EveNet predicted fine channels: `Ztautau_pipi`, `Ztautau_pirho`, `Ztautau_rhopi`, `Ztautau_pie`, `Ztautau_pimu`, `Ztautau_rhoe`, `Ztautau_rhomu`, `Ztautau_rhorho`, `Ztautau_ee`, `Ztautau_mumu`, `Ztautau_emu`, `Ztautau_mue`.
 - The QIProcessor configs in `config/config_qi_evenet_pretrain.yaml` and `config/config_qi_evenet_scratch.yaml` use the ML dedicated regions, not the central broad regions.
 
 First run the Step 6 export for each method. For the QIProcessor configs below, the exported roots must be:
