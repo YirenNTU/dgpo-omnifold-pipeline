@@ -25,8 +25,8 @@ options:
   default: ../EveNet-Full/share/options/options.yaml
 
   Training:
-    total_epochs: 50
-    epochs: 50
+    total_epochs: 80
+    epochs: 80
     model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/checkpoint-pretrain
     model_checkpoint_load_path: null
     pretrain_model_load_path: /global/homes/t/tihsu/CMSOpenData-GridStudy/pretrain-weights/checkpoints.20M.a4.last.ckpt
