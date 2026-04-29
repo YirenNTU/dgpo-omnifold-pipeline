@@ -61,6 +61,7 @@ REQUIRED_MC_CONCAT_SOURCE_FIELDS = {
     "analyzing_power",
     "initial_total_num_events",
     "truth_theta_cm",
+    "truth_mtautau",
 }
 REQUIRED_MC_CONCAT_SOURCE_FIELDS.update({f"truth_cos_theta_A_{axis}" for axis in ("n", "r", "k")})
 REQUIRED_MC_CONCAT_SOURCE_FIELDS.update({f"truth_cos_theta_B_{axis}" for axis in ("n", "r", "k")})
@@ -484,6 +485,7 @@ def default_concat_passthrough_fields(sample: Sample, num_events: int) -> dict[s
         "analyzing_power_a": np.zeros(num_events, dtype=np.float32),
         "analyzing_power_b": np.zeros(num_events, dtype=np.float32),
         "truth_theta_cm": np.full(num_events, DEFAULT_FLOAT, dtype=np.float32),
+        "truth_mtautau": np.full(num_events, DEFAULT_FLOAT, dtype=np.float32),
     }
     for axis in ("n", "r", "k"):
         defaults[f"truth_cos_theta_A_{axis}"] = np.full(num_events, DEFAULT_FLOAT, dtype=np.float32)

@@ -243,7 +243,9 @@ def reco_tau_observable_specs(requested: list[str] | None = None) -> list[tuple[
 
 def observable_latex_label(name: str) -> str:
     if name == "theta_cm":
-        return r"$\theta_{\mathrm{CM}}$"
+        return r"$2\arccos|\cos\theta_{\mathrm{CM}}|/\pi$"
+    if name == "mtautau":
+        return r"$m_{\tau\tau}$ [GeV]"
     if name.startswith("cos_theta_A_") and "_times_" not in name:
         axis = name.removeprefix("cos_theta_A_")
         return rf"$\cos\theta_{{A,{axis}}}$"
@@ -639,7 +641,7 @@ def truth_tau_requirements(fields: set[str], leg: str) -> str:
 
 def observable_bins(observable: str, values_by_name: dict[str, np.ndarray]) -> np.ndarray:
     if observable == "theta_cm":
-        return np.linspace(0.0, np.pi, 41)
+        return np.linspace(0.0, 1.0, 41)
     if observable.startswith("cos_theta_"):
         return np.linspace(-1.0, 1.0, 41)
     if observable.endswith("_phi"):
@@ -649,7 +651,7 @@ def observable_bins(observable: str, values_by_name: dict[str, np.ndarray]) -> n
 
 def observable_2d_limits(observable: str, truth_values: np.ndarray | None = None, reco_values: np.ndarray | None = None) -> tuple[float, float]:
     if observable == "theta_cm":
-        return 0.0, float(np.pi)
+        return 0.0, 1.0
     if observable.startswith("cos_theta_"):
         return -1.0, 1.0
     combined = []

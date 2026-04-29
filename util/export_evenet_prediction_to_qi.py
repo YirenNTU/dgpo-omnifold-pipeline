@@ -608,7 +608,11 @@ def default_evenet_columns(full_events: ak.Array, pred_values: dict[str, Any]) -
 
 
 def get_observable_names_safe(pred_values: dict[str, Any]) -> list[str]:
-    return [field for field in pred_values if field == "theta_cm" or field.startswith("cos_theta_")]
+    return [
+        field
+        for field in pred_values
+        if field in {"theta_cm", "mtautau"} or field.startswith("cos_theta_")
+    ]
 
 
 def assign_at_indices(base_values: Any, indices: np.ndarray, pred_values: Any):

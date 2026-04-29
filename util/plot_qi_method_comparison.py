@@ -297,7 +297,8 @@ def physics_observable_specs(requested: list[str] | None) -> list[tuple[str, str
         "visible_tau_phi": r"$\phi_\tau^{vis}$",
         "visible_tau_pair_mass": r"$m_{\tau\tau}^{vis}$ [GeV]",
         "visible_tau_pair_pt": r"$p_{T,\tau\tau}^{vis}$ [GeV]",
-        "theta_cm": r"$\theta_{CM}$",
+        "theta_cm": r"$2\arccos|\cos\theta_{CM}|/\pi$",
+        "mtautau": r"$m_{\tau\tau}$ [GeV]",
     }
     seen = set()
     specs = []
@@ -325,8 +326,16 @@ def method_region_metrics(events: ak.Array) -> dict[str, Any]:
     metrics["valid_fraction"], metrics["valid_fraction_unc"] = weighted_fraction_and_unc(flags_valid, weights)
 
     if "theta_cm" in events.fields:
-        theta_qi = to_numpy(events["theta_cm"]) * 2.0 / np.pi > 0.6
-        metrics["qi_acceptance"], metrics["qi_acceptance_unc"] = weighted_fraction_and_unc(flags_valid & theta_qi, weights)
+        theta_qi = to_numpy(events["theta_cm"]) > 0.6
+        mass_qi = (
+            to_numpy(events["mtautau"]) > 80.0
+            if "mtautau" in events.fields
+            else np.ones(len(events), dtype=bool)
+        )
+        metrics["qi_acceptance"], metrics["qi_acceptance_unc"] = weighted_fraction_and_unc(
+            flags_valid & theta_qi & mass_qi,
+            weights,
+        )
 
     if truth_missing_available(events):
         for leg in ("a", "b"):

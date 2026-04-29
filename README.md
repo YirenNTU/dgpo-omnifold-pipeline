@@ -364,7 +364,7 @@ The export preserves central fields such as:
 Use the exported method trees to make pre-unfolding validation plots:
 
 - MC truth-vs-reco plots for:
-  - `theta_cm` and all `cos_theta_*`
+  - `theta_cm`, `mtautau`, and all `cos_theta_*`
   - `lead_a/b_missing_{E,px,py,pz,pt,eta,phi}`
   - `reco_tau_a/b_{E,px,py,pz,pt,eta,phi,mass}`
 - Method-summary Pearson plots for the same truth-vs-reco observables
@@ -376,6 +376,9 @@ The truth-vs-reco comparison now uses only correctly assigned signal events:
 - `evenet_pred_class_name == evenet_truth_class_name`
 
 This keeps the EveNet truth-vs-reco comparison aligned with the Baseline interpretation.
+
+`theta_cm` follows the nominal central QI definition from `quantum/observables_builder.py`:
+`theta_cm = 2 * arccos(abs(cos(theta_CM))) / pi`, so its plotting and QI-selection range is `[0, 1]`.
 
 Example command:
 
@@ -395,9 +398,9 @@ python3 util/plot_preunfolding_validation.py \
 Useful options:
 
 - `--reco-observable-source stored`
-  - use the scalar `theta_cm/cos_theta_*` already stored in parquet
+  - use the scalar `theta_cm/mtautau/cos_theta_*` already stored in parquet
 - `--reco-observable-source recompute`
-  - force `theta_cm/cos_theta_*` to be rebuilt from stored `reco_tau_a_p4`, `reco_tau_b_p4`, `lead_a_visible_p4`, `lead_b_visible_p4`
+  - force `theta_cm/mtautau/cos_theta_*` to be rebuilt from stored `reco_tau_a_p4`, `reco_tau_b_p4`, `lead_a_visible_p4`, `lead_b_visible_p4`
 - `--normalize-truth-reco`
   - normalize truth-vs-reco histograms to unit area
 - `--regions ee emu mumu Ztautau_pipi Ztautau_pirho Ztautau_rhorho`
@@ -520,6 +523,41 @@ Expected QIProcessor outputs:
     plots/
     unfolding/
 ```
+
+`results.txt` is the central text output containing the final unfolded `B_i`, `C_ij`,
+and quantum-summary values. To turn it into table files:
+
+```bash
+python3 ml_pipeline/util/extract_qi_final_measurements.py \
+  --results-txt /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/results.txt \
+  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/final_measurements
+```
+
+This writes:
+
+```text
+final_measurements.json
+final_measurements.csv
+final_measurements_summary_plots/
+final_measurements_summary_plots.json
+```
+
+Each row contains `region`, `signal`, `source`, `group`, `parameter`, `value`,
+`err_up`, and `err_down`. By default only the unfolded measurement is kept; add
+`--keep-truth` if you also want the central truth reference rows.
+
+To make final-measurement summary plots in the same style as the pre-unfolding
+summary plots, pass multiple methods:
+
+```bash
+python3 ml_pipeline/util/extract_qi_final_measurements.py \
+  --method Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/results.txt \
+  --method Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/qi-export/QI_analysis/results.txt \
+  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison/final_measurements
+```
+
+The plots group channels/regions on the y-axis, use method-specific markers,
+and annotate the right side with `value ± unc.`.
 
 If you want the central broad-region QIProcessor instead, use the normal central config style and regions such as `hadhad`, `ee`, `mumu`, and `emu`. Do not mix that with the ML dedicated configs unless the comparison explicitly calls for it.
 
