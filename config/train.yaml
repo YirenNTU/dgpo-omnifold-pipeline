@@ -103,7 +103,7 @@ options:
 
 
     EarlyStopping:
-      patience: 10
+      patience: 80
       min_delta: 0.0
       monitor: "val/loss"
       mode: "min"
@@ -115,7 +115,7 @@ options:
 
     EMA:
       enable: true
-      decay: 0.999
+      decay: 0.99
       start_epoch: 0
       update_every_n_steps: 1
       replace_model_after_load: true
