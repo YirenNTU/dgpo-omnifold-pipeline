@@ -624,15 +624,77 @@ def build_visible_tau_assumptions(events: ak.Array):
     return build_visible_tau_assumption_p4(events)
 
 
+def build_truth_tau_slots(events: ak.Array):
+    """
+    inputs:
+      events: ak.Array, source parquet events with truth tau p4.
+    outputs:
+      tuple(truth_tau_pair, truth_tau_mask, truth_source):
+        truth_tau_pair: Momentum4D array with shape [event, slot(2)].
+        truth_tau_mask: ak.Array[bool] with shape [event, slot(2)].
+        truth_source: str | None, source field description.
+    goal:
+      Put truth taus into the same canonical slot basis as EveNet visible tau
+      inputs, so monitor plots can expose leg-flipping mistakes.
+    """
+    truth_tau_pair, truth_tau_mask, truth_source = resolve_truth_tau_pair(events)
+    if truth_source is None:
+        return truth_tau_pair, truth_tau_mask, truth_source
+
+    _, _, slot_swap_mask = _build_visible_tau_layout(events)
+    return (
+        reorder_tau_pair(truth_tau_pair, slot_swap_mask),
+        reorder_tau_pair(truth_tau_mask, slot_swap_mask),
+        truth_source,
+    )
+
+
 def build_prong_only_visible_tau_p4(events: ak.Array):
     return _build_visible_tau_layout(events, include_nearby_photons=False)
 
 
 def build_central_leg_slot_indices(events: ak.Array) -> tuple[np.ndarray, np.ndarray]:
+    """
+    inputs:
+      events: ak.Array, source parquet events with central lead charges.
+    outputs:
+      tuple[np.ndarray, np.ndarray], EveNet slot index for central legs a and b.
+    goal:
+      Preserve the exact map from central a/b legs to canonical EveNet slots so
+      prediction export can reconstruct central a/b p4 without guessing.
+    """
     _, _, slot_swap_mask = _build_visible_tau_layout(events)
     swap = ak.to_numpy(slot_swap_mask, allow_missing=False).astype(bool)
-    slot_for_a = np.where(swap, 0, 1).astype(np.int8)
-    slot_for_b = np.where(swap, 1, 0).astype(np.int8)
+
+    tau_minus_slot = np.where(swap, 1, 0)
+    tau_plus_slot = np.where(swap, 0, 1)
+    fallback_slot_for_a = tau_plus_slot
+    fallback_slot_for_b = tau_minus_slot
+
+    if {"lead_a_charge", "lead_b_charge"}.issubset(set(events.fields)):
+        charge_a = ak.to_numpy(events["lead_a_charge"], allow_missing=False)
+        charge_b = ak.to_numpy(events["lead_b_charge"], allow_missing=False)
+        a_is_tau_minus = (charge_a < 0) & (charge_b > 0)
+        a_is_tau_plus = (charge_a > 0) & (charge_b < 0)
+        b_is_tau_minus = (charge_b < 0) & (charge_a > 0)
+        b_is_tau_plus = (charge_b > 0) & (charge_a < 0)
+
+        slot_for_a = np.where(
+            a_is_tau_minus,
+            tau_minus_slot,
+            np.where(a_is_tau_plus, tau_plus_slot, fallback_slot_for_a),
+        )
+        slot_for_b = np.where(
+            b_is_tau_minus,
+            tau_minus_slot,
+            np.where(b_is_tau_plus, tau_plus_slot, fallback_slot_for_b),
+        )
+    else:
+        slot_for_a = fallback_slot_for_a
+        slot_for_b = fallback_slot_for_b
+
+    slot_for_a = slot_for_a.astype(np.int8)
+    slot_for_b = slot_for_b.astype(np.int8)
     return slot_for_a, slot_for_b
 
 
@@ -648,7 +710,6 @@ def build_tau_targets(
     tau_vis_prong_mask,
     tau_vis_rho_p4,
     tau_vis_rho_mask,
-    slot_swap_mask=None,
 ):
     n_events = len(events)
     x_invisible_p4 = zero_p4((n_events, 2))
@@ -658,17 +719,9 @@ def build_tau_targets(
     tau_vis_target_p4 = tau_vis_prong_p4
     tau_vis_target_mask = tau_vis_prong_mask
 
-    # a/b basis
-    truth_tau_pair, truth_tau_valid_pair, truth_source = resolve_truth_tau_pair(events)
+    truth_tau_pair, truth_tau_valid_pair, truth_source = build_truth_tau_slots(events)
     if truth_source is None:
         return x_invisible_p4, x_invisible_mask, num_invisible_raw, num_invisible_valid, tau_vis_target_p4, tau_vis_target_mask
-
-    if slot_swap_mask is None:
-        _, _, slot_swap_mask = _build_visible_tau_layout(events)
-
-    # convert to pdgId basis
-    truth_tau_pair = reorder_tau_pair(truth_tau_pair, slot_swap_mask)
-    truth_tau_valid_pair = reorder_tau_pair(truth_tau_valid_pair, slot_swap_mask)
     x_invisible_p4 = truth_tau_pair - tau_vis_target_p4
     x_invisible_mask = truth_tau_valid_pair & tau_vis_target_mask
     x_invisible_p4 = mask_p4(x_invisible_p4, x_invisible_mask)

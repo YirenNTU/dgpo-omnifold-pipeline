@@ -9,6 +9,7 @@ from itertools import product
 from pathlib import Path
 
 import awkward as ak
+import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 from evenet_parquet_common import (
@@ -16,6 +17,7 @@ from evenet_parquet_common import (
     MAX_PART_ENERGY_GEV,
     build_central_leg_slot_indices,
     build_tau_targets,
+    build_truth_tau_slots,
     build_visible_tau_assumptions,
     build_momentum4d,
     extract_target_invisible_observable,
@@ -912,6 +914,130 @@ def write_monitor_plot(
     console.print(f"  [green]Wrote monitor[/green] [white]{output_path}[/white]")
 
 
+def p4_component_values(p4, component: str):
+    """
+    inputs:
+      p4: Momentum4D ak.Array, event-level or slot-level four-vectors.
+      component: str, one of energy, pt, eta, phi.
+    outputs:
+      ak.Array, requested component values.
+    goal:
+      Keep monitor plotting code explicit about which four-vector basis is used.
+    """
+    if component == "energy":
+        return p4.E
+    if component == "pt":
+        return p4.pt
+    if component == "eta":
+        return p4.eta
+    if component == "phi":
+        return p4.phi
+    raise ValueError(f"Unsupported p4 component '{component}'.")
+
+
+def visible_truth_tau_pairs(events: ak.Array, component: str) -> tuple[np.ndarray, np.ndarray]:
+    """
+    inputs:
+      events: ak.Array, selected signal events.
+      component: str, visible/truth tau component to compare.
+    outputs:
+      tuple(np.ndarray, np.ndarray), flattened visible and truth tau values.
+    goal:
+      Compare visible tau slots against truth tau slots in the same canonical
+      EveNet basis, exposing possible leg-flipping in step-1 monitoring.
+    """
+    visible_tau, visible_mask, _, _ = build_visible_tau_assumptions(events)
+    truth_tau, truth_mask, truth_source = build_truth_tau_slots(events)
+    if truth_source is None:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+    valid = visible_mask & truth_mask
+    visible_values = ak.flatten(p4_component_values(visible_tau, component)[valid], axis=None)
+    truth_values = ak.flatten(p4_component_values(truth_tau, component)[valid], axis=None)
+    visible_array = ak.to_numpy(visible_values, allow_missing=False).astype(np.float32)
+    truth_array = ak.to_numpy(truth_values, allow_missing=False).astype(np.float32)
+    finite = np.isfinite(visible_array) & np.isfinite(truth_array)
+    return visible_array[finite], truth_array[finite]
+
+
+def common_axis_limits(visible_values: np.ndarray, truth_values: np.ndarray, component: str) -> tuple[float, float]:
+    """
+    inputs:
+      visible_values/truth_values: np.ndarray, values to draw on the same axis.
+      component: str, p4 component name.
+    outputs:
+      tuple(float, float), shared lower/upper axis limits.
+    goal:
+      Put visible-vs-truth tau monitor plots on identical x/y ranges so flips
+      show up visually instead of being hidden by autoscaling.
+    """
+    if component == "phi":
+        return -np.pi, np.pi
+    merged = np.concatenate([visible_values, truth_values])
+    if merged.size == 0:
+        return 0.0, 1.0
+    if component in {"energy", "pt"}:
+        high = float(np.nanpercentile(merged, 99.5))
+        return 0.0, max(high, 1.0)
+    low, high = np.nanpercentile(merged, [0.5, 99.5])
+    if not np.isfinite(low) or not np.isfinite(high) or low == high:
+        return -1.0, 1.0
+    padding = 0.05 * (high - low)
+    return float(low - padding), float(high + padding)
+
+
+def write_visible_truth_tau_2d_plot(sample_name: str, events: ak.Array, output_path: Path) -> None:
+    """
+    inputs:
+      sample_name: str, label used in the monitor title.
+      events: ak.Array, selected signal events.
+      output_path: Path, destination PNG path.
+    outputs:
+      None; writes a 2D monitor plot.
+    goal:
+      Sanity-check whether visible tau slots and truth tau slots are aligned in
+      the same hemisphere/leg basis before training.
+    """
+    components = ["energy", "pt", "eta", "phi"]
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8), dpi=160)
+    wrote_any = False
+
+    for axis, component in zip(axes.ravel(), components):
+        visible_values, truth_values = visible_truth_tau_pairs(events, component)
+        if visible_values.size == 0:
+            axis.set_title(f"{component}: no truth entries")
+            axis.axis("off")
+            continue
+
+        low, high = common_axis_limits(visible_values, truth_values, component)
+        hist = axis.hist2d(
+            truth_values,
+            visible_values,
+            bins=60,
+            range=[[low, high], [low, high]],
+            cmap="Blues",
+            cmin=1,
+        )
+        fig.colorbar(hist[3], ax=axis, label="Entries")
+        axis.plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
+        axis.set_xlim(low, high)
+        axis.set_ylim(low, high)
+        axis.set_xlabel(f"Truth tau {component}")
+        axis.set_ylabel(f"Visible tau {component}")
+        axis.set_title(component)
+        wrote_any = True
+
+    if not wrote_any:
+        plt.close(fig)
+        return
+
+    fig.suptitle(f"Visible tau vs truth tau slot check: {sample_name}")
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    console.print(f"  [green]Wrote monitor[/green] [white]{output_path}[/white]")
+
+
 def write_monitoring_plots(
     raw_expanded_samples: list[tuple[Sample, ak.Array]],
     expanded_samples: list[tuple[Sample, ak.Array]],
@@ -1015,6 +1141,17 @@ def write_monitoring_plots(
             log_scale=log_scale,
             mc_only=mc_only,
             signal_only=signal_only,
+        )
+
+    visible_truth_dir = monitor_dir / "vis_tau_vs_truth_tau"
+    visible_truth_dir.mkdir(parents=True, exist_ok=True)
+    for sample, events in expanded_samples:
+        if not sample_uses_invisible_target(sample):
+            continue
+        write_visible_truth_tau_2d_plot(
+            sample_name=sample.name,
+            events=events,
+            output_path=visible_truth_dir / f"{sample.name}.png",
         )
 
     for observable in FOUR_VECTOR_FEATURES:
