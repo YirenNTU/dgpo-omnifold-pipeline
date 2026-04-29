@@ -45,17 +45,22 @@ vector.register_awkward()
 DEFAULT_FLOAT = -99.0
 OKABE_ITO_BLACK = "#000000"
 TARGET_INVISIBLE_COMPONENTS = ("energy", "pt", "eta", "phi")
+IGNORED_CHANNEL_REGIONS = {"hadhad"}
 BASELINE_HADHAD_FINE_CHANNELS = (
-    "Ztautau_pipi",
-    "Ztautau_pirho",
-    "Ztautau_rhorho",
+    "pipi",
+    "pirho",
+    "rhopi",
 )
 BASELINE_FINE_REGION_TO_PARENT = {
     "ee": ("ee", "Ztautau_ee"),
     "emu": ("emu", "Ztautau_emu"),
     "mumu": ("mumu", "Ztautau_mumu"),
+    "pipi": ("hadhad", "Ztautau_pipi"),
+    "pirho": ("hadhad", "Ztautau_pirho"),
+    "rhopi": ("hadhad", "Ztautau_rhopi"),
     "Ztautau_pipi": ("hadhad", "Ztautau_pipi"),
     "Ztautau_pirho": ("hadhad", "Ztautau_pirho"),
+    "Ztautau_rhopi": ("hadhad", "Ztautau_rhopi"),
     "Ztautau_rhorho": ("hadhad", "Ztautau_rhorho"),
 }
 
@@ -152,11 +157,12 @@ def baseline_neutrino_reco_path(root: Path, sample_name: str, region: str) -> Pa
 
 
 def neutrino_reco_root(root: Path) -> Path | None:
-    if root.name == "neutrino_reco" and root.exists():
+    if root.name in {"neutrino_reco", "neutrino_solutions"} and root.exists():
         return root
-    candidate = root / "neutrino_reco"
-    if candidate.exists():
-        return candidate
+    for dirname in ("neutrino_solutions", "neutrino_reco"):
+        candidate = root / dirname
+        if candidate.exists():
+            return candidate
     return None
 
 
@@ -166,8 +172,9 @@ def reconstructed_neutrino_paths(root: Path, sample_name: str, region: str) -> l
         return []
     if sample_name == "Ztautau":
         if region in BASELINE_FINE_REGION_TO_PARENT:
-            parent_region, signal_name = BASELINE_FINE_REGION_TO_PARENT[region]
-            candidate = reco_root / parent_region / f"{signal_name}_reconstructed_neutrinos.parquet"
+            _, signal_name = BASELINE_FINE_REGION_TO_PARENT[region]
+            region_dir = region.removeprefix("Ztautau_")
+            candidate = reco_root / region_dir / f"{signal_name}_reconstructed_neutrinos.parquet"
             return [candidate] if candidate.exists() else []
 
     region_dir = reco_root / region
@@ -205,11 +212,15 @@ def truth_reco_event_paths(root: Path, sample_name: str, region: str) -> list[Pa
     if neutrino_reco_root(root) is not None:
         return method_event_paths(root, sample_name, region)
 
+    method_paths = method_event_paths(root, sample_name, region)
+    if method_paths and not region.startswith("Ztautau_"):
+        return method_paths
+
     raw_candidate = parquet_for(root, sample_name, "raw")
     if raw_candidate.exists() and expected_truth_classes_for_region(region):
         return [raw_candidate]
 
-    return method_event_paths(root, sample_name, region)
+    return method_paths
 
 
 def load_truth_reco_method_events(root: Path, sample_name: str, region: str) -> ak.Array | None:
@@ -315,6 +326,8 @@ def channel_latex_label(name: str) -> str:
     }
     if name in mapping:
         return mapping[name]
+    if name in {"pipi", "pirho", "rhopi"}:
+        return channel_latex_label(f"Ztautau_{name}")
     if name.startswith("Ztautau_"):
         suffix = name.removeprefix("Ztautau_")
         token_map = {"rho": r"\rho", "pi": r"\pi", "e": "e", "mu": r"\mu"}
@@ -343,8 +356,12 @@ def canonical_summary_region(region: str) -> str:
         "Ztautau_emu": "emu",
         "Ztautau_mue": "emu",
         "Ztautau_mumu": "mumu",
+        "pipi": "Ztautau_pipi",
+        "pirho": "Ztautau_pirho",
+        "rhopi": "Ztautau_rhopi",
         "Ztautau_pipi": "Ztautau_pipi",
         "Ztautau_pirho": "Ztautau_pirho",
+        "Ztautau_rhopi": "Ztautau_rhopi",
         "Ztautau_rhorho": "Ztautau_rhorho",
     }
     return mapping.get(region, region)
@@ -359,8 +376,12 @@ def expected_truth_classes_for_region(region: str) -> set[str]:
         "Ztautau_emu": {"Ztautau_emu"},
         "Ztautau_mue": {"Ztautau_mue"},
         "Ztautau_mumu": {"Ztautau_mumu"},
+        "pipi": {"Ztautau_pipi"},
+        "pirho": {"Ztautau_pirho"},
+        "rhopi": {"Ztautau_rhopi"},
         "Ztautau_pipi": {"Ztautau_pipi"},
         "Ztautau_pirho": {"Ztautau_pirho"},
+        "Ztautau_rhopi": {"Ztautau_rhopi"},
         "Ztautau_rhorho": {"Ztautau_rhorho"},
     }
     return mapping.get(region, set())
@@ -726,7 +747,7 @@ def discover_method_regions(root: Path, sample_name: str, preferred_regions: lis
     if sample_dir.exists():
         for path in sorted(sample_dir.glob("filtered___*.parquet")):
             region = path.stem.removeprefix("filtered___")
-            if region == "raw":
+            if region == "raw" or region in IGNORED_CHANNEL_REGIONS:
                 continue
             discovered.append(region)
 
@@ -1191,7 +1212,9 @@ def plot_truth_metric_summary(
         active_regions = [
             region
             for region in unique_regions
-            if region != "baseline" and any(row["summary_region"] == region for row in rows)
+            if region != "baseline"
+            and region not in IGNORED_CHANNEL_REGIONS
+            and any(row["summary_region"] == region for row in rows)
         ]
         rows = [row for row in rows if row["summary_region"] in set(active_regions)]
         if not rows:

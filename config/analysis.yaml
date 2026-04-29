@@ -65,6 +65,12 @@ EveNetPrediction:
     - Ztautau_mumu
     - Ztautau_emu
 
+EveNetInput:
+  # false keeps the historical point-cloud collection.
+  # true keeps charged particles and photons, dropping other neutral particles
+  # only from the EveNet sequential input tensor.
+  remove_neutral_non_photon: false
+
 Inputs:
   Part:
     Momentum:
@@ -125,7 +131,8 @@ Inputs:
 Subcategories:
   Ztautau:
     Ztautau_pipi: [11]
-    Ztautau_pirho: [12, 21]
+    Ztautau_pirho: [12]
+    Ztautau_rhopi: [21]
     Ztautau_pie: [13, 31]
     Ztautau_pimu: [14, 41]
     Ztautau_rhoe: [23, 32]
@@ -133,7 +140,8 @@ Subcategories:
     Ztautau_rhorho: [22]
     Ztautau_ee: [33]
     Ztautau_mumu: [44]
-    Ztautau_emu: [34, 43]
+    Ztautau_emu: [34]
+    Ztautau_mue: [43]
 #    Ztautau_piother: [15, 51]
 
 Normalization:

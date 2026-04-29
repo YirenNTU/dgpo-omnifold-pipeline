@@ -84,6 +84,29 @@ python3 util/build_evenet_input_from_parquet.py \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset
 ```
 
+Optional point-cloud collection filter:
+
+```bash
+python3 util/build_evenet_input_from_parquet.py \
+  --config config/analysis.yaml \
+  --evenet-config config/evenet_schema.yaml \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset \
+  --remove-neutral-non-photon
+```
+
+Equivalent config setting:
+
+```yaml
+EveNetInput:
+  remove_neutral_non_photon: true
+```
+
+When enabled, only the EveNet sequential input collection is filtered:
+charged particles are kept, photons are kept with `abs(Part_pdgId) == 21`,
+and other neutral particles are removed. The original parquet is not modified,
+and global features, truth targets, visible tau construction, and passthrough
+fields still come from the same selected events.
+
 Main outputs:
 
 - `/pscratch/.../dataset/evenet_input.npz`
@@ -385,7 +408,7 @@ Example command:
 ```bash
 cd /path/to/lep_tree_ana/ml_pipeline
 python3 util/plot_preunfolding_validation.py \
-  --method Baseline:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/neutrino_reco \
+  --method Baseline:/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260427-baseline/neutrino_solutions \
   --method EveNet-Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export \
   --method EveNet-Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/qi-export \
   --signal-sample-name Ztautau \
@@ -403,8 +426,16 @@ Useful options:
   - force `theta_cm/mtautau/cos_theta_*` to be rebuilt from stored `reco_tau_a_p4`, `reco_tau_b_p4`, `lead_a_visible_p4`, `lead_b_visible_p4`
 - `--normalize-truth-reco`
   - normalize truth-vs-reco histograms to unit area
-- `--regions ee emu mumu Ztautau_pipi Ztautau_pirho Ztautau_rhorho`
+- `--regions ee emu mumu pipi pirho rhopi Ztautau_pipi Ztautau_pirho Ztautau_rhopi Ztautau_rhorho`
   - limit the validation to a subset of native regions/channels
+
+For Baseline, the validation helper understands both legacy `neutrino_reco/`
+and current `neutrino_solutions/` layouts. In the current layout, fine channels
+are read directly from paths such as
+`neutrino_solutions/pipi/Ztautau_pipi_reconstructed_neutrinos.parquet`; the
+broad `hadhad` directory is not needed for the summary plots.
+The `pirho` and `rhopi` channels are kept as separate summary rows, matching
+their separate baseline `neutrino_solutions/` directories.
 
 Typical outputs:
 
@@ -551,6 +582,7 @@ summary plots, pass multiple methods:
 
 ```bash
 python3 ml_pipeline/util/extract_qi_final_measurements.py \
+  --method Baseline:/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260427-baseline/QI_analysis/results.txt \
   --method Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/results.txt \
   --method Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/qi-export/QI_analysis/results.txt \
   --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison/final_measurements
@@ -558,6 +590,11 @@ python3 ml_pipeline/util/extract_qi_final_measurements.py \
 
 The plots group channels/regions on the y-axis, use method-specific markers,
 and annotate the right side with `value ± unc.`.
+The broad `hadhad` region is ignored by default so Baseline can use fine
+channels such as `pipi`, `pirho`, and `rhopi`; add `--keep-hadhad` only if you
+intentionally want the broad hadhad result.
+As in the pre-unfolding plots, `pirho` and `rhopi` are kept as separate summary
+rows.
 
 If you want the central broad-region QIProcessor instead, use the normal central config style and regions such as `hadhad`, `ee`, `mumu`, and `emu`. Do not mix that with the ML dedicated configs unless the comparison explicitly calls for it.
 

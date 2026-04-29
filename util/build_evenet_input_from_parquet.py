@@ -18,7 +18,6 @@ from evenet_parquet_common import (
     build_visible_tau_assumptions,
     build_momentum4d,
     extract_target_invisible_observable,
-    filter_part_values,
     extract_part_feature,
     extract_part_momentum_observable,
     extract_visible_tau_observable,
@@ -53,6 +52,7 @@ PREDICTION_PASSTHROUGH_EXACT_FIELDS = {
 PREDICTION_PASSTHROUGH_SUFFIXES = ("_cut",)
 PREDICTION_PASSTHROUGH_PREFIXES = ("truth_",)
 DEFAULT_FLOAT = -99.0
+PHOTON_PDG_ID = 21
 REQUIRED_MC_CONCAT_SOURCE_FIELDS = {
     "event_category",
     "truth_QI_region",
@@ -291,14 +291,50 @@ def resolve_global_feature(events: ak.Array, field_name: str) -> ak.Array:
     raise KeyError(f"Global feature '{field_name}' is missing. Available fields include: {preview}{suffix}")
 
 
-def build_point_cloud(events: ak.Array, max_particles: int, feature_config: FeatureConfig):
-    valid_part_mask = part_energy_mask(events)
-    part_p4 = filter_part_values(events, build_momentum4d(
+def build_input_particle_mask(events: ak.Array, remove_neutral_non_photon: bool) -> ak.Array:
+    """
+    inputs:
+      events: ak.Array, selected central parquet events with Part_* jagged fields.
+      remove_neutral_non_photon: bool, when true keep charged particles and photons only.
+    outputs:
+      ak.Array[bool], jagged per-particle mask aligned with Part_* collections.
+    goal:
+      Define the particle collection that becomes EveNet's sequential input.
+    """
+    mask = part_energy_mask(events)
+    if not remove_neutral_non_photon:
+        return mask
+
+    missing_fields = [field for field in ("Part_charge", "Part_pdgId") if field not in events.fields]
+    if missing_fields:
+        raise KeyError(
+            "Cannot remove neutral non-photon particles because the selected parquet is missing "
+            f"{missing_fields}."
+        )
+
+    charge = events["Part_charge"]
+    abs_pdg_id = abs(events["Part_pdgId"])
+    keep_particle = (charge != 0) | (abs_pdg_id == PHOTON_PDG_ID)
+    return mask & ak.values_astype(keep_particle, bool)
+
+
+def filter_input_part_values(values: ak.Array, input_part_mask: ak.Array) -> ak.Array:
+    return values[input_part_mask]
+
+
+def build_point_cloud(
+    events: ak.Array,
+    max_particles: int,
+    feature_config: FeatureConfig,
+    remove_neutral_non_photon: bool,
+):
+    input_part_mask = build_input_particle_mask(events, remove_neutral_non_photon)
+    part_p4 = filter_input_part_values(build_momentum4d(
         events["Part_fourMomentum_fCoordinates_fX"],
         events["Part_fourMomentum_fCoordinates_fY"],
         events["Part_fourMomentum_fCoordinates_fZ"],
         events["Part_fourMomentum_fCoordinates_fT"],
-    ))
+    ), input_part_mask)
     eta = ak.where(np.isfinite(part_p4.eta), part_p4.eta, 0)
 
     available_momentum_features = {
@@ -316,7 +352,7 @@ def build_point_cloud(events: ak.Array, max_particles: int, feature_config: Feat
         elif feature_name.startswith("Part_") and feature_name[5:] in available_momentum_features:
             values = available_momentum_features[feature_name[5:]]
         else:
-            values = filter_part_values(events, events[feature_name])
+            values = filter_input_part_values(events[feature_name], input_part_mask)
         expanded = pad_and_flatten_part_feature(values, max_particles)
         features.append(expanded)
         feature_names.append(feature_name)
@@ -324,7 +360,7 @@ def build_point_cloud(events: ak.Array, max_particles: int, feature_config: Feat
     # Point-cloud tensor shape: [event, particle slot, feature].
     x = ak.concatenate(features, axis=2)
 
-    num_particles = ak.values_astype(ak.num(events["Part_pdgId"][valid_part_mask], axis=1), np.float32)
+    num_particles = ak.values_astype(ak.num(events["Part_pdgId"][input_part_mask], axis=1), np.float32)
     # Mask shape: [event, particle slot].
     x_mask = ak.Array(np.arange(max_particles)[None, :] < ak.to_numpy(num_particles, allow_missing=False)[:, None])
     return x, x_mask, num_particles, feature_names
@@ -349,10 +385,17 @@ def compute_event_totals(num_sequential_vectors, conditions_mask):
     return num_sequential_vectors + ak.values_astype(conditions_mask[:, 0], np.float32)
 
 
-def infer_max_particles(expanded_samples: list[tuple[Sample, ak.Array]], override: int | None) -> int:
+def infer_max_particles(
+    expanded_samples: list[tuple[Sample, ak.Array]],
+    override: int | None,
+    remove_neutral_non_photon: bool,
+) -> int:
     if override is not None:
         return override
-    return max(int(ak.max(ak.num(events["Part_pdgId"], axis=1))) for _, events in expanded_samples)
+    return max(
+        int(ak.max(ak.num(events["Part_pdgId"][build_input_particle_mask(events, remove_neutral_non_photon)], axis=1)))
+        for _, events in expanded_samples
+    )
 
 
 def select_training_samples(expanded_samples: list[tuple[Sample, ak.Array]]) -> list[tuple[Sample, ak.Array]]:
@@ -575,6 +618,7 @@ def build_dataset(
     feature_config: FeatureConfig,
     evenet_config: EveNetConfig,
     include_classification: bool = True,
+    remove_neutral_non_photon: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict]:
     class_labels = [sample.name for sample, _ in expanded_samples] if include_classification else []
     class_index = {label: index for index, label in enumerate(class_labels)}
@@ -589,7 +633,12 @@ def build_dataset(
         console.print(f"[bold cyan]Converting[/bold cyan] [white]{sample.name}[/white]")
         required_fields = validate_source_passthrough_contract(events, sample)
 
-        x, x_mask, num_sequential_vectors, point_cloud_names = build_point_cloud(events, max_particles, feature_config)
+        x, x_mask, num_sequential_vectors, point_cloud_names = build_point_cloud(
+            events,
+            max_particles,
+            feature_config,
+            remove_neutral_non_photon,
+        )
         conditions, conditions_mask, condition_names = build_global_conditions(events, feature_config)
         num_vectors = compute_event_totals(num_sequential_vectors, conditions_mask)
 
@@ -688,6 +737,7 @@ def build_dataset(
         "invisible_features": list(evenet_config.invisible_features),
         "visible_tau_features": FOUR_VECTOR_FEATURES,
         "max_particles": max_particles,
+        "remove_neutral_non_photon": bool(remove_neutral_non_photon),
         "num_events": int(dataset["x"].shape[0]),
         "source_samples": [sample.name for sample, _ in expanded_samples],
         "passthrough_fields": expected_passthrough_union,
@@ -1057,7 +1107,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional fixed padding size for the point cloud. Defaults to the maximum in the loaded dataset.",
     )
+    parser.add_argument(
+        "--remove-neutral-non-photon",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Build EveNet point-cloud inputs from charged particles plus photons only. "
+            "Use --no-remove-neutral-non-photon to override the config and keep all neutral particles."
+        ),
+    )
     return parser
+
+
+def resolve_remove_neutral_non_photon(args: argparse.Namespace, analysis_config: dict) -> bool:
+    """
+    inputs:
+      args: argparse.Namespace, parsed command-line options.
+      analysis_config: dict, analysis.yaml content.
+    outputs:
+      bool, final particle-collection filtering mode.
+    goal:
+      Let command-line flags override the optional EveNetInput config block.
+    """
+    if args.remove_neutral_non_photon is not None:
+        return bool(args.remove_neutral_non_photon)
+    return bool(analysis_config.get("EveNetInput", {}).get("remove_neutral_non_photon", False))
 
 
 def main() -> None:
@@ -1067,6 +1141,7 @@ def main() -> None:
     console.print(f"[bold]Using config[/bold] [white]{args.config}[/white]")
     console.print(f"[bold]Using EveNet schema[/bold] [white]{args.evenet_config}[/white]")
     analysis_config = read_yaml(args.config)
+    remove_neutral_non_photon = resolve_remove_neutral_non_photon(args, analysis_config)
     evenet_schema_config = read_yaml(args.evenet_config)
     samples, subcategories, feature_config = parse_config(args.config)
     evenet_config = parse_evenet_config(
@@ -1087,8 +1162,16 @@ def main() -> None:
     training_samples = select_training_samples(expanded_samples)
     data_samples = select_data_samples(expanded_samples)
 
-    max_particles = infer_max_particles(training_samples, args.max_particles)
+    max_particles = infer_max_particles(training_samples, args.max_particles, remove_neutral_non_photon)
     console.print(f"[bold]Point-cloud padding[/bold] max_particles=[white]{max_particles}[/white]")
+    console.print(
+        "[bold]Point-cloud particles[/bold] "
+        + (
+            "[white]charged particles + photons only[/white]"
+            if remove_neutral_non_photon
+            else "[white]all particles passing energy sanity mask[/white]"
+        )
+    )
 
     sample_table = Table(title="Expanded Samples")
     sample_table.add_column("Sample")
@@ -1115,6 +1198,7 @@ def main() -> None:
         feature_config,
         evenet_config,
         include_classification=True,
+        remove_neutral_non_photon=remove_neutral_non_photon,
     )
     write_outputs(
         mc_dataset,
@@ -1137,6 +1221,7 @@ def main() -> None:
             feature_config,
             evenet_config,
             include_classification=False,
+            remove_neutral_non_photon=remove_neutral_non_photon,
         )
         write_outputs(
             data_dataset,
