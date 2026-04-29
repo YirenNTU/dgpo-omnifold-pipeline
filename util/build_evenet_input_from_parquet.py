@@ -727,8 +727,7 @@ def build_dataset(
             "conditions_mask": to_numpy_array(conditions_mask, bool),
             "num_vectors": to_numpy_array(num_vectors, np.float32),
             "num_sequential_vectors": to_numpy_array(num_sequential_vectors, np.float32),
-            # Truth/auxiliary targets use two canonical visible slots per event,
-            # not a fixed tau- / tau+ ordering.
+            # Truth/auxiliary targets use the nominal central [a, b] leg order.
             "x_invisible": to_numpy_array(x_invisible, np.float32),
             "x_invisible_mask": to_numpy_array(x_invisible_mask, bool),
             "num_invisible_raw": num_invisible_raw,
@@ -943,8 +942,8 @@ def visible_truth_tau_pairs(events: ak.Array, component: str) -> tuple[np.ndarra
     outputs:
       tuple(np.ndarray, np.ndarray), flattened visible and truth tau values.
     goal:
-      Compare visible tau slots against truth tau slots in the same canonical
-      EveNet basis, exposing possible leg-flipping in step-1 monitoring.
+      Compare visible tau slots against truth tau slots in the same nominal a/b
+      basis, exposing possible leg-flipping in step-1 monitoring.
     """
     visible_tau, visible_mask, _, _ = build_visible_tau_assumptions(events)
     truth_tau, truth_mask, truth_source = build_truth_tau_slots(events)
