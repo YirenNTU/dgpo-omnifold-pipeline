@@ -13,6 +13,7 @@ import numpy as np
 import yaml
 from evenet_parquet_common import (
     FOUR_VECTOR_FEATURES,
+    MAX_PART_ENERGY_GEV,
     build_central_leg_slot_indices,
     build_tau_targets,
     build_visible_tau_assumptions,
@@ -147,10 +148,21 @@ def apply_preselection(events: ak.Array) -> ak.Array:
     if "nprong" not in events.fields:
         return events
 
-    selected = events[events["nprong"] == 2]
+    nprong_selected = events[events["nprong"] == 2]
     console.print(
         f"  [bold cyan]Preselection[/bold cyan] nprong == 2 -> "
-        f"[white]{len(selected)}[/white] / [white]{len(events)}[/white] event(s)"
+        f"[white]{len(nprong_selected)}[/white] / [white]{len(events)}[/white] event(s)"
+    )
+
+    tau_vis_prong_p4, tau_vis_prong_mask, _, _ = build_visible_tau_assumptions(nprong_selected)
+    energy = ak.to_numpy(tau_vis_prong_p4.E, allow_missing=False)
+    valid = ak.to_numpy(tau_vis_prong_mask, allow_missing=False).astype(bool)
+    energy_mask = np.all(valid & np.isfinite(energy) & (energy < MAX_PART_ENERGY_GEV), axis=1)
+    selected = nprong_selected[energy_mask]
+    console.print(
+        f"  [bold cyan]Preselection[/bold cyan] tau_vis_prong_energy < "
+        f"{MAX_PART_ENERGY_GEV:g} GeV -> [white]{len(selected)}[/white] / "
+        f"[white]{len(nprong_selected)}[/white] event(s)"
     )
     return selected
 

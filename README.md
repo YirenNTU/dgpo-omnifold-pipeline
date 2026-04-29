@@ -114,6 +114,10 @@ Main outputs:
 - `config/generated_event_info.yaml`
 - Monitoring plots under the output directory
 
+Input preselection keeps events with `nprong == 2` and both reconstructed
+`tau_vis_prong` energies below the shared particle-energy sanity threshold
+(`91.25 GeV`).
+
 Current target invisible definition:
 
 - Selected visible tau is prong plus photons within `dR < 0.3`.

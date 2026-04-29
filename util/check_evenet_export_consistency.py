@@ -11,18 +11,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import vector
 
+from plot_style import OKABE_ITO_SEQUENCE
+
 
 DEFAULT_FLOAT = -99.0
-OKABE_ITO = [
-    "#0072B2",
-    "#E69F00",
-    "#009E73",
-    "#D55E00",
-    "#CC79A7",
-    "#56B4E9",
-    "#F0E442",
-    "#000000",
-]
+OKABE_ITO = OKABE_ITO_SEQUENCE
 
 vector.register_awkward()
 

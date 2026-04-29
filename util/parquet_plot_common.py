@@ -7,31 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import MultipleLocator
 
-
-PROCESS_LATEX_LABELS = {
-    "data94": "Data",
-    "data": "Data",
-    "Ztautau": r"$Z\to\tau\tau$",
-    "Ztautau_pipi": r"$\tau\tau\to\pi\pi$",
-    "Ztautau_pirho": r"$\tau\tau\to\pi\rho$",
-    "Ztautau_pie": r"$\tau\tau\to\pi e$",
-    "Ztautau_pimu": r"$\tau\tau\to\pi\mu$",
-    "Ztautau_rhoe": r"$\tau\tau\to\rho e$",
-    "Ztautau_rhomu": r"$\tau\tau\to\rho\mu$",
-    "Ztautau_rhorho": r"$\tau\tau\to\rho\rho$",
-    "Ztautau_ee": r"$\tau\tau\to ee$",
-    "Ztautau_mumu": r"$\tau\tau\to\mu\mu$",
-    "Ztautau_emu": r"$\tau\tau\to e\mu$",
-    "Ztautau_mue": r"$\tau\tau\to\mu e$",
-    "Ztautau_piother": r"$\tau\tau\to\pi+\mathrm{other}$",
-    "Ztautau_others": r"$Z\to\tau\tau$ other",
-    "Zll": r"$Z\to\ell\ell$",
-    "Zqq": r"$Z\to q\bar{q}$",
-}
-
-
-def process_latex_label(sample_name: str) -> str:
-    return PROCESS_LATEX_LABELS.get(sample_name, sample_name.replace("_", r"\_"))
+from plot_style import OKABE_ITO, method_color, process_color, process_latex_label
 
 
 def process_yield_label(sample_name: str, yield_value: float | None = None) -> str:
@@ -153,7 +129,6 @@ def plot_from_histograms(
         if use_normalize and sum_mc_yields <= 0:
             use_normalize = False
 
-        colors = plt.cm.tab10.colors
         for index, sample_name in enumerate(hist_mc):
             hist = hist_mc[sample_name].astype(float)
             err2 = hist_mc_err2[sample_name].astype(float)
@@ -169,7 +144,7 @@ def plot_from_histograms(
                 width=np.diff(bin_edges),
                 align="edge",
                 label=process_yield_label(sample_name, raw_yield),
-                color=colors[index % len(colors)],
+                color=process_color(sample_name, index),
                 alpha=0.75,
                 edgecolor="black",
             )

@@ -22,28 +22,18 @@ if str(EVENET_ROOT) not in sys.path:
 
 from build_evenet_input_from_parquet import merge_evenet_config, parse_config, read_yaml
 from ml_pipeline_config import parse_evenet_config
+from parquet_plot_common import OKABE_ITO, process_color, process_latex_label
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "plots" / "prediction_summary"
 DEFAULT_CLASS_NAME = "unselected"
 DEFAULT_FLOAT = -99.0
 MAX_NEUTRINO_SCATTER_POINTS = 50000
-OKABE_ITO = [
-    "#0072B2",
-    "#E69F00",
-    "#009E73",
-    "#D55E00",
-    "#CC79A7",
-    "#56B4E9",
-    "#F0E442",
-    "#000000",
-]
-STACK_COLORS = OKABE_ITO[:-1]
-MC_COLOR = OKABE_ITO[0]
-ACCENT_COLOR = OKABE_ITO[1]
-TRUTH_COLOR = OKABE_ITO[3]
-DATA_COLOR = OKABE_ITO[-1]
-SCATTER_COLOR = OKABE_ITO[0]
+MC_COLOR = OKABE_ITO["blue"]
+ACCENT_COLOR = OKABE_ITO["orange"]
+TRUTH_COLOR = OKABE_ITO["vermillion"]
+DATA_COLOR = OKABE_ITO["black"]
+SCATTER_COLOR = OKABE_ITO["blue"]
 BACKGROUND_COLOR = "#D8D8D8"
 HEATMAP_CMAP = LinearSegmentedColormap.from_list(
     "okabe_heat",
@@ -149,44 +139,7 @@ def build_class_names_from_analysis(analysis_config_path: Path, evenet_config_pa
 def latex_process_label(name: str) -> str:
     if name == DEFAULT_CLASS_NAME:
         return name
-
-    label = name
-    if label.startswith("Ztautau_"):
-        label = label[len("Ztautau_"):]
-    elif label == "Ztautau":
-        return r"$Z\to\tau\tau$"
-    elif label == "Zll":
-        return r"$Z\to\ell\ell$"
-    elif label == "Zqq":
-        return r"$Z\to q\bar{q}$"
-
-    if label == "others":
-        return r"$\tau\tau$ others"
-
-    token_map = {
-        "rho": r"\rho",
-        "pi": r"\pi",
-        "e": "e",
-        "mu": r"\mu",
-    }
-    tokens: list[str] = []
-    index = 0
-    ordered_keys = sorted(token_map, key=len, reverse=True)
-    while index < len(label):
-        matched = False
-        for key in ordered_keys:
-            if label.startswith(key, index):
-                tokens.append(token_map[key])
-                index += len(key)
-                matched = True
-                break
-        if not matched:
-            tokens.append(label[index])
-            index += 1
-
-    if tokens:
-        return r"$\tau\tau\to " + " ".join(tokens) + "$"
-    return name
+    return process_latex_label(name)
 
 
 def latex_labels(names: list[str]) -> list[str]:
@@ -232,7 +185,7 @@ def signal_channel_order(class_names: list[str]) -> list[str]:
 def process_stack_color(process_name: str, index: int) -> str:
     if is_background_like_channel(process_name):
         return BACKGROUND_COLOR
-    return STACK_COLORS[index % len(STACK_COLORS)]
+    return process_color(process_name, index)
 
 
 def stack_draw_order(process_names: list[str]) -> list[str]:

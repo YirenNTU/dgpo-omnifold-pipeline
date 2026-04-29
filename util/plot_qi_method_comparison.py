@@ -19,40 +19,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from quantum.observables_builder import get_observable_names
 from utils.common_functions import rebuild_p4
-from parquet_plot_common import choose_bins, plot_from_histograms, summarize_invalid_hist_values
+from parquet_plot_common import (
+    OKABE_ITO,
+    choose_bins,
+    method_color,
+    plot_from_histograms,
+    summarize_invalid_hist_values,
+)
 
 
 vector.register_awkward()
-
-OKABE_ITO = {
-    "black": "#000000",
-    "orange": "#E69F00",
-    "sky_blue": "#56B4E9",
-    "bluish_green": "#009E73",
-    "yellow": "#F0E442",
-    "blue": "#0072B2",
-    "vermillion": "#D55E00",
-    "reddish_purple": "#CC79A7",
-}
-
-METHOD_COLORS = {
-    "Baseline": OKABE_ITO["vermillion"],
-    "EveNet": OKABE_ITO["blue"],
-    "EveNet-Pretrain": OKABE_ITO["blue"],
-    "EveNet-Scratch": OKABE_ITO["bluish_green"],
-    "Pretrain": OKABE_ITO["blue"],
-    "Scratch": OKABE_ITO["bluish_green"],
-}
-COLOR_CYCLE = [
-    OKABE_ITO["vermillion"],
-    OKABE_ITO["blue"],
-    OKABE_ITO["bluish_green"],
-    OKABE_ITO["orange"],
-    OKABE_ITO["reddish_purple"],
-    OKABE_ITO["sky_blue"],
-    OKABE_ITO["black"],
-]
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -119,10 +95,6 @@ def parse_method_specs(args: argparse.Namespace) -> dict[str, Path]:
             raise ValueError(f"Duplicate method label '{label}'.")
         methods[label] = Path(path).expanduser()
     return methods
-
-
-def method_color(method: str, index: int) -> str:
-    return METHOD_COLORS.get(method, COLOR_CYCLE[index % len(COLOR_CYCLE)])
 
 
 def method_display_name(method: str) -> str:
