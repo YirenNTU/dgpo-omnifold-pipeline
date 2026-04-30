@@ -52,6 +52,7 @@ BASELINE_HADHAD_FINE_CHANNELS = (
     "pipi",
     "pirho",
     "rhopi",
+    "rhorho",
 )
 BASELINE_FINE_REGION_TO_PARENT = {
     "ee": ("ee", "Ztautau_ee"),
@@ -60,6 +61,7 @@ BASELINE_FINE_REGION_TO_PARENT = {
     "pipi": ("hadhad", "Ztautau_pipi"),
     "pirho": ("hadhad", "Ztautau_pirho"),
     "rhopi": ("hadhad", "Ztautau_rhopi"),
+    "rhorho": ("hadhad", "Ztautau_rhorho"),
     "Ztautau_pipi": ("hadhad", "Ztautau_pipi"),
     "Ztautau_pirho": ("hadhad", "Ztautau_pirho"),
     "Ztautau_rhopi": ("hadhad", "Ztautau_rhopi"),
@@ -340,6 +342,42 @@ def canonical_summary_region(region: str) -> str:
     return mapping.get(region, region)
 
 
+def comparison_channel_group(region: str) -> str:
+    """
+    inputs:
+      region: str, native region name from one method output.
+    outputs:
+      str, loose channel group used only for diagnostic comparison panels.
+    goal:
+      Draw broad and class-qualified versions of the same visible channel
+      together, e.g. ee and Ztautau_ee, without changing summary-row labels.
+    """
+    return region.removeprefix("Ztautau_")
+
+
+def broad_region_label(region: str) -> str:
+    """
+    inputs:
+      region: str, broad reconstruction region or grouped diagnostic channel.
+    outputs:
+      str, display label that does not imply a truth decay class.
+    goal:
+      Keep broad regions like ee/emu/mumu visually distinct from truth-class
+      labels like Ztautau_ee.
+    """
+    mapping = {
+        "ee": r"$ee$",
+        "emu": r"$e\mu$",
+        "mue": r"$\mu e$",
+        "mumu": r"$\mu\mu$",
+        "pipi": r"$\pi\pi$",
+        "pirho": r"$\pi\rho$",
+        "rhopi": r"$\rho\pi$",
+        "rhorho": r"$\rho\rho$",
+    }
+    return mapping.get(region, region.replace("_", r"\_"))
+
+
 def expected_truth_classes_for_region(region: str) -> set[str]:
     mapping = {
         "ee": {"Ztautau_ee"},
@@ -405,12 +443,9 @@ def select_truth_reco_events(events: ak.Array, region: str) -> tuple[ak.Array, d
 
 
 def summary_region_latex_label(region: str) -> str:
-    mapping = {
-        "ee": channel_latex_label("Ztautau_ee"),
-        "emu": channel_latex_label("Ztautau_emu"),
-        "mumu": channel_latex_label("Ztautau_mumu"),
-    }
-    return mapping.get(region, channel_latex_label(region))
+    if not region.startswith("Ztautau_"):
+        return broad_region_label(region)
+    return channel_latex_label(region)
 
 
 def to_numpy(values: Any, dtype=np.float64) -> np.ndarray:
@@ -721,6 +756,37 @@ def weighted_hist(values: np.ndarray, weights: np.ndarray, bins: np.ndarray, nor
     return hist
 
 
+def weighted_hist2d(
+    truth: np.ndarray,
+    reco: np.ndarray,
+    weights: np.ndarray,
+    edges: np.ndarray,
+    normalize: bool,
+) -> np.ndarray:
+    """
+    inputs:
+      truth/reco: np.ndarray, matched truth and reconstructed values.
+      weights: np.ndarray, positive event weights.
+      edges: np.ndarray, common x/y bin edges.
+      normalize: bool, whether to normalize to unit area.
+    outputs:
+      np.ndarray, weighted 2D histogram indexed as truth-bin, reco-bin.
+    goal:
+      Cache compact 2D diagnostic content so grouped comparison figures do
+      not need to keep full event arrays alive.
+    """
+    hist = np.histogram2d(truth, reco, bins=[edges, edges], weights=weights)[0].astype(np.float64)
+    if normalize:
+        total = np.sum(hist)
+        if total > 0:
+            hist = hist / total
+    return hist
+
+
+def histogram_centers(edges: np.ndarray) -> np.ndarray:
+    return 0.5 * (edges[:-1] + edges[1:])
+
+
 def region_marker(region: str) -> str:
     mapping = {
         "baseline": "o",
@@ -748,6 +814,162 @@ def method_marker(method: str, index: int) -> str:
     }
     fallback = ["o", "s", "D", "^", "v", "P", "X"]
     return named.get(method, fallback[index % len(fallback)])
+
+
+def render_grouped_truth_reco_panels(
+    records_by_group: dict[tuple[str, str], list[dict[str, Any]]],
+    output_root: Path,
+    output_dir: Path,
+    normalize: bool,
+    log_label: str,
+) -> dict[tuple[str, str], str]:
+    """
+    inputs:
+      records_by_group: dict, keyed by (channel_group, observable), with
+        compact per-method/region histograms.
+      output_root: Path, directory for this plot block.
+      output_dir: Path, top-level output directory used for relative paths.
+      normalize: bool, whether histograms are unit-normalized.
+      log_label: str, human-readable block label for progress messages.
+    outputs:
+      dict[(str, str), str], relative combined-plot path by group key.
+    goal:
+      Produce one diagnostic figure per similar channel and observable, with
+      the 1D truth/reco comparison on the left and the 2D truth-vs-reco view
+      on the right.
+    """
+    combined_dir = output_root / "combined"
+    combined_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[tuple[str, str], str] = {}
+
+    for (channel_group, observable), records in sorted(records_by_group.items()):
+        if not records:
+            continue
+
+        fig, (ax1d, ax2d) = plt.subplots(
+            1,
+            2,
+            figsize=(13.2, 5.4),
+            dpi=180,
+            gridspec_kw={"width_ratios": [1.05, 1.0]},
+        )
+        all_lows = [record["limits"][0] for record in records if record.get("limits") is not None]
+        all_highs = [record["limits"][1] for record in records if record.get("limits") is not None]
+        plot_low = float(np.nanmin(all_lows)) if all_lows else -1.0
+        plot_high = float(np.nanmax(all_highs)) if all_highs else 1.0
+        xlabel = records[0]["xlabel"]
+
+        legend_handles: list[Line2D] = []
+        for index, record in enumerate(records):
+            color = method_color(record["method"], record["method_index"])
+            if index > 0 and any(
+                previous["method"] == record["method"] for previous in records[:index]
+            ):
+                color = plt.get_cmap("tab20")(index % 20)
+            label = f"{method_display_name(record['method'])}: {record['region']}"
+            ax1d.step(
+                record["bins"][:-1],
+                record["truth_hist"],
+                where="post",
+                color=color,
+                linestyle="--",
+                linewidth=1.25,
+                alpha=0.65,
+            )
+            ax1d.step(
+                record["bins"][:-1],
+                record["reco_hist"],
+                where="post",
+                color=color,
+                linestyle="-",
+                linewidth=1.7,
+                alpha=0.95,
+            )
+
+            hist2d = record.get("hist2d")
+            if hist2d is not None and np.nanmax(hist2d) > 0:
+                x_centers = record["centers"]
+                y_centers = record["centers"]
+                positive = hist2d[hist2d > 0]
+                if positive.size > 0:
+                    if len(records) == 1:
+                        mesh = ax2d.pcolormesh(
+                            record["edges"],
+                            record["edges"],
+                            hist2d.T,
+                            cmap="Blues",
+                            shading="auto",
+                        )
+                        fig.colorbar(mesh, ax=ax2d, label="Normalized yield" if normalize else "Weighted yield")
+                    else:
+                        levels = np.quantile(positive, [0.55, 0.8])
+                        levels = np.unique(levels[levels > 0])
+                        if levels.size > 0:
+                            ax2d.contour(
+                                x_centers,
+                                y_centers,
+                                hist2d.T,
+                                levels=levels,
+                                colors=[color],
+                                linewidths=1.25,
+                                alpha=0.9,
+                            )
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color=color,
+                    linestyle="-",
+                    linewidth=1.8,
+                    label=label,
+                )
+            )
+
+        ax1d.set_xlabel(xlabel)
+        ax1d.set_ylabel("Normalized yield" if normalize else "Weighted yield")
+        ax1d.grid(alpha=0.22)
+        ax1d.set_title("1D truth/reco")
+        ax1d.plot([], [], color=OKABE_ITO_BLACK, linestyle="--", label="Truth")
+        ax1d.plot([], [], color=OKABE_ITO_BLACK, linestyle="-", label="Reco")
+
+        ax2d.plot([plot_low, plot_high], [plot_low, plot_high], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.1)
+        ax2d.set_xlim(plot_low, plot_high)
+        ax2d.set_ylim(plot_low, plot_high)
+        ax2d.set_xlabel(f"Truth {xlabel}")
+        ax2d.set_ylabel(f"Reco {xlabel}")
+        ax2d.grid(alpha=0.18)
+        ax2d.set_title("2D truth vs reco")
+
+        fig.suptitle(f"{broad_region_label(channel_group)}: {xlabel}", y=0.98)
+        style_handles = [
+            Line2D([0], [0], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.5, label="Truth 1D"),
+            Line2D([0], [0], color=OKABE_ITO_BLACK, linestyle="-", linewidth=1.5, label="Reco 1D / 2D contour"),
+        ]
+        fig.legend(
+            handles=style_handles + legend_handles,
+            frameon=False,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.02),
+            ncol=min(4, len(style_handles) + len(legend_handles)),
+            fontsize=8,
+        )
+        fig.tight_layout(rect=(0.0, 0.08, 1.0, 0.94))
+
+        channel_dir = combined_dir / sanitize_filename(channel_group)
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        plot_path = channel_dir / f"{sanitize_filename(observable)}.png"
+        fig.savefig(plot_path)
+        plt.close(fig)
+
+        relative_path = str(plot_path.relative_to(output_dir))
+        paths[(channel_group, observable)] = relative_path
+        print(
+            f"[preunfolding] wrote grouped {log_label} channel={channel_group} "
+            f"observable={observable} plot={plot_path}",
+            flush=True,
+        )
+
+    return paths
 
 
 def discover_method_regions(root: Path, sample_name: str, preferred_regions: list[str] | None = None) -> list[str]:
@@ -795,13 +1017,12 @@ def plot_truth_vs_reco_by_method_and_region(
     summary: dict[str, Any] = {}
     truth_dir = output_dir / subdir_name
     truth_dir.mkdir(parents=True, exist_ok=True)
+    grouped_records: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
-    for method, root in methods.items():
+    for method_index, (method, root) in enumerate(methods.items()):
         regions = method_regions.get(method, [])
         print(f"[preunfolding] {log_label} method={method} native_regions={regions}", flush=True)
         method_summary: dict[str, Any] = {}
-        method_dir = truth_dir / sanitize_filename(method)
-        method_dir.mkdir(parents=True, exist_ok=True)
 
         for region in regions:
             print(f"  [region] method={method} region={region}", flush=True)
@@ -844,8 +1065,6 @@ def plot_truth_vs_reco_by_method_and_region(
             if len(events) == 0:
                 print(f"    [skip] no events remain after class filter method={method} region={region}", flush=True)
                 continue
-            region_dir = method_dir / sanitize_filename(region)
-            region_dir.mkdir(parents=True, exist_ok=True)
             region_summary: dict[str, Any] = {}
 
             for observable, xlabel in observable_specs:
@@ -912,71 +1131,30 @@ def plot_truth_vs_reco_by_method_and_region(
                 truth_hist = weighted_hist(truth_values_full[truth_mask], weights_full[truth_mask], bins, normalize)
                 reco_hist = weighted_hist(reco_valid, weight_valid, bins, normalize)
 
-                fig, ax = plt.subplots(figsize=(8.0, 5.6), dpi=180)
-                ax.step(
-                    bins[:-1],
-                    truth_hist,
-                    where="post",
-                    color=OKABE_ITO_BLACK,
-                    linestyle="--",
-                    linewidth=1.8,
-                    label="Truth",
-                )
-                ax.step(
-                    bins[:-1],
-                    reco_hist,
-                    where="post",
-                    linewidth=1.8,
-                    color=method_color(method, 0),
-                    label=method_display_name(method),
-                )
-
-                ax.set_xlabel(xlabel)
-                ax.set_ylabel("Normalized yield" if normalize else "Weighted yield")
-                ax.set_title(f"{method_display_name(method)} {channel_latex_label(region)}: {xlabel}")
-                ax.grid(alpha=0.25)
-                ax.legend(frameon=False)
-                fig.tight_layout()
-
-                plot_path = region_dir / f"{sanitize_filename(observable)}.png"
-                fig.savefig(plot_path)
-                plt.close(fig)
-
-                plot_path_2d = None
+                hist2d = None
+                edges2d = None
+                centers2d = None
+                limits2d = None
                 if (
                     is_spin_observable(observable)
                     or observable.startswith("lead_")
                     or observable.startswith("reco_tau_")
                 ):
                     low, high = observable_2d_limits(observable, truth_valid, reco_valid)
-                    fig2d, ax2d = plt.subplots(figsize=(6.2, 5.8), dpi=180)
-                    hist2d = ax2d.hist2d(
-                        truth_valid,
-                        reco_valid,
-                        bins=[np.linspace(low, high, 51), np.linspace(low, high, 51)],
-                        weights=weight_valid,
-                        cmap="Blues",
-                    )
-                    ax2d.plot([low, high], [low, high], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.2)
-                    ax2d.set_xlim(low, high)
-                    ax2d.set_ylim(low, high)
-                    ax2d.set_xlabel(f"Truth {xlabel}")
-                    ax2d.set_ylabel(f"Reco {xlabel}")
-                    ax2d.set_title(f"{method_display_name(method)} {channel_latex_label(region)}")
-                    fig2d.colorbar(hist2d[3], ax=ax2d, label="Weighted yield")
-                    fig2d.tight_layout()
-                    plot_path_2d = region_dir / f"{sanitize_filename(observable)}_2d.png"
-                    fig2d.savefig(plot_path_2d)
-                    plt.close(fig2d)
+                    edges2d = np.linspace(low, high, 51)
+                    centers2d = histogram_centers(edges2d)
+                    hist2d = weighted_hist2d(truth_valid, reco_valid, weight_valid, edges2d, normalize)
+                    limits2d = (low, high)
 
                 print(
-                    f"    [write] method={method} region={region} observable={observable} plot={plot_path}",
+                    f"    [collect] method={method} region={region} observable={observable} "
+                    f"group={comparison_channel_group(region)}",
                     flush=True,
                 )
 
                 region_summary[observable] = {
-                    "plot": str(plot_path.relative_to(output_dir)),
-                    "plot_2d": str(plot_path_2d.relative_to(output_dir)) if plot_path_2d is not None else None,
+                    "plot": None,
+                    "plot_2d": None,
                     "normalize": normalize,
                     "reco_observable_source": reco_observable_source,
                     "num_events": int(np.count_nonzero(valid_mask)),
@@ -990,12 +1168,45 @@ def plot_truth_vs_reco_by_method_and_region(
                     "pearson_unc": pearson_uncertainty(truth_valid, reco_valid, weight_valid),
                     "neff": effective_sample_size(weight_valid),
                 }
+                grouped_records.setdefault((comparison_channel_group(region), observable), []).append(
+                    {
+                        "method": method,
+                        "method_index": method_index,
+                        "region": region,
+                        "observable": observable,
+                        "xlabel": xlabel,
+                        "bins": bins,
+                        "truth_hist": truth_hist,
+                        "reco_hist": reco_hist,
+                        "edges": edges2d,
+                        "centers": centers2d,
+                        "hist2d": hist2d,
+                        "limits": limits2d,
+                    }
+                )
 
             if region_summary:
                 method_summary[region] = region_summary
 
         if method_summary:
             summary[method] = method_summary
+
+    grouped_plot_paths = render_grouped_truth_reco_panels(
+        grouped_records,
+        truth_dir,
+        output_dir,
+        normalize,
+        log_label,
+    )
+    for method_info in summary.values():
+        for region, region_info in method_info.items():
+            channel_group = comparison_channel_group(region)
+            for observable, metrics in region_info.items():
+                plot_path = grouped_plot_paths.get((channel_group, observable))
+                if plot_path is not None:
+                    metrics["plot"] = plot_path
+                    metrics["plot_2d"] = plot_path
+                    metrics["combined_channel_group"] = channel_group
 
     return summary
 
