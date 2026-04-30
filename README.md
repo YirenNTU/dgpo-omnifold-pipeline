@@ -333,9 +333,9 @@ Scratch export:
 cd /path/to/lep_tree_ana/ml_pipeline
 python3 util/export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/test__evenet_pred.parquet \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/data__evenet_pred.parquet \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch \
+  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/test__evenet_pred.parquet \
+  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/data__evenet_pred.parquet \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch \
   --qi-method-label qi-export \
   --num-workers 4
 ```
@@ -345,9 +345,9 @@ Pretrain export:
 ```bash
 python3 util/export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/test__evenet_pred.parquet \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/data__evenet_pred.parquet \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain \
+  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/test__evenet_pred.parquet \
+  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data__evenet_pred.parquet \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain \
   --qi-method-label qi-export \
   --num-workers 4
 ```
@@ -355,7 +355,7 @@ python3 util/export_evenet_prediction_to_qi.py \
 Output structure:
 
 ```text
-/pscratch/.../ml_based/predict-scratch/qi-export/
+/pscratch/.../ml_based/predict-evenet-scratch/qi-export/
     data94/filtered___raw.parquet
     data94/filtered___Ztautau_pipi.parquet
     Ztautau/filtered___raw.parquet
@@ -373,14 +373,14 @@ For the ML-based QIProcessor configs in the repository, write the export directl
 ```bash
 python3 util/export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/test__evenet_pred.parquet \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/data__evenet_pred.parquet \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain \
+  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/test__evenet_pred.parquet \
+  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data__evenet_pred.parquet \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain \
   --qi-method-label qi-export \
   --num-workers 4
 ```
 
-This produces files under `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/{sample}/`. The scratch method uses the same pattern with `predict-scratch`.
+This produces files under `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/{sample}/`. The scratch method uses the same pattern with `predict-evenet-scratch`.
 
 The export writes both central cut-based files such as `filtered___hadhad.parquet` and ML dedicated files such as `filtered___Ztautau_pirho.parquet`. The ML dedicated files are selected by `evenet_pred_class_name`, while central files are selected by their original central cut flags.
 
@@ -500,13 +500,13 @@ The important convention is:
 
 First run the Step 6 export for each method. For the QIProcessor configs below, the exported roots must be:
 
-- Pretrain: `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export`
-- Scratch: `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/qi-export`
+- Pretrain: `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export`
+- Scratch: `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/qi-export`
 
 Each exported root should contain:
 
 ```text
-/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/
+/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/
   data94/filtered___raw.parquet
   data94/filtered___Ztautau_pipi.parquet
   ...
@@ -552,7 +552,7 @@ requirement rather than an EveNet export-format issue.
 Expected QIProcessor outputs:
 
 ```text
-/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/
+/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/QI_analysis/
   results.txt
   response_Ztautau_pipi.root
   response_Ztautau_pirho.root
@@ -570,8 +570,8 @@ and quantum-summary values. To turn it into table files:
 
 ```bash
 python3 ml_pipeline/util/extract_qi_final_measurements.py \
-  --results-txt /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/results.txt \
-  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/final_measurements
+  --results-txt /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/QI_analysis/results.txt \
+  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/QI_analysis/final_measurements
 ```
 
 This writes:
@@ -593,18 +593,24 @@ summary plots, pass multiple methods:
 ```bash
 python3 ml_pipeline/util/extract_qi_final_measurements.py \
   --method Baseline:/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260427-baseline/QI_analysis/results.txt \
-  --method Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-pretrain/qi-export/QI_analysis/results.txt \
-  --method Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-scratch/qi-export/QI_analysis/results.txt \
+  --method Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/QI_analysis/results.txt \
+  --method Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/qi-export/QI_analysis/results.txt \
   --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison/final_measurements
 ```
 
 The plots group channels/regions on the y-axis, use method-specific markers,
 and annotate the right side with `value ± unc.`.
 The broad `hadhad` region is ignored by default so Baseline can use fine
-channels such as `pipi`, `pirho`, and `rhopi`; add `--keep-hadhad` only if you
+channels such as `pipi`, `pirho`, `rhopi`, and `rhorho`; add `--keep-hadhad` only if you
 intentionally want the broad hadhad result.
-As in the pre-unfolding plots, `pirho` and `rhopi` are kept as separate summary
-rows.
+As in the pre-unfolding plots, `pirho`, `rhopi`, `emu`, and `mue` are kept as
+separate summary rows when the QIProcessor config writes them separately.
+
+`extract_qi_final_measurements.py` accepts the historical central output format
+(`value +err_up/-err_down`) and updated nominal-style symmetric lines
+(`value ± err` or `value +/- err`). Section labels such as `Final metrics` or
+`Nominal Quantum results` are normalized into the same output tables as the
+historical `Unfolded Quantum results` blocks.
 
 If you want the central broad-region QIProcessor instead, use the normal central config style and regions such as `hadhad`, `ee`, `mumu`, and `emu`. Do not mix that with the ML dedicated configs unless the comparison explicitly calls for it.
 

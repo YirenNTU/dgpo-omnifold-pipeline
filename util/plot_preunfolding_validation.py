@@ -940,7 +940,7 @@ def render_grouped_truth_reco_panels(
         ax2d.grid(alpha=0.18)
         ax2d.set_title("2D truth vs reco")
 
-        fig.suptitle(f"{broad_region_label(channel_group)}: {xlabel}", y=0.98)
+        fig.suptitle(f"{broad_region_label(channel_group)}: {xlabel}", y=0.90)
         style_handles = [
             Line2D([0], [0], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.5, label="Truth 1D"),
             Line2D([0], [0], color=OKABE_ITO_BLACK, linestyle="-", linewidth=1.5, label="Reco 1D / 2D contour"),
@@ -948,12 +948,12 @@ def render_grouped_truth_reco_panels(
         fig.legend(
             handles=style_handles + legend_handles,
             frameon=False,
-            loc="lower center",
-            bbox_to_anchor=(0.5, -0.02),
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.02),
             ncol=min(4, len(style_handles) + len(legend_handles)),
             fontsize=8,
         )
-        fig.tight_layout(rect=(0.0, 0.08, 1.0, 0.94))
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.86))
 
         channel_dir = combined_dir / sanitize_filename(channel_group)
         channel_dir.mkdir(parents=True, exist_ok=True)

@@ -21,11 +21,22 @@ import numpy as np
 from plot_style import channel_latex_label, method_color
 
 
-RESULT_LINE_RE = re.compile(
+RESULT_LINE_ASYMMETRIC_RE = re.compile(
     r"^\s*(?P<name>[^:]+):\s*"
     r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*"
     r"\+(?P<err_up>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
     r"/-(?P<err_down>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
+)
+RESULT_LINE_SYMMETRIC_RE = re.compile(
+    r"^\s*(?P<name>[^:=]+)\s*(?::|=)\s*"
+    r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*"
+    r"(?:±|\+/-)\s*"
+    r"(?P<err>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
+)
+SECTION_RE = re.compile(
+    r"(?:(?P<source>Unfolded|Truth|Final|Nominal)\s+)?"
+    r"(?P<group>B and C matrices|BC matrices|Quantum results|Final metrics|Metrics):$",
+    re.IGNORECASE,
 )
 METHOD_MARKERS = ("o", "D", "^", "s", "P", "X")
 DEFAULT_IGNORED_REGIONS = {"hadhad"}
@@ -140,14 +151,14 @@ def parse_results_text(
             section_group = None
             continue
 
-        match = re.match(r"(?P<source>Unfolded|Truth) (?P<group>B and C matrices|Quantum results):$", line)
+        match = SECTION_RE.match(line)
         if match:
-            section_source = match.group("source")
-            section_group = "BC" if match.group("group") == "B and C matrices" else "quantum"
+            section_source = canonical_source_name(match.group("source") or "Unfolded")
+            section_group = canonical_group_name(match.group("group"))
             continue
 
-        match = RESULT_LINE_RE.match(raw_line)
-        if not match or region is None or signal is None or section_source is None or section_group is None:
+        parsed_value = parse_measurement_line(raw_line)
+        if parsed_value is None or region is None or signal is None or section_source is None or section_group is None:
             continue
         if section_source == "Truth" and not keep_truth:
             continue
@@ -161,14 +172,79 @@ def parse_results_text(
                 "method": method,
                 "source": section_source,
                 "group": section_group,
-                "parameter": match.group("name").strip(),
-                "value": float(match.group("value")),
-                "err_up": float(match.group("err_up")),
-                "err_down": float(match.group("err_down")),
+                "parameter": parsed_value["name"],
+                "value": parsed_value["value"],
+                "err_up": parsed_value["err_up"],
+                "err_down": parsed_value["err_down"],
             }
         )
 
     return rows
+
+
+def canonical_source_name(source: str) -> str:
+    """
+    inputs:
+      source: str, source label printed by QIProcessor.
+    outputs:
+      str, stable source label stored in JSON/CSV.
+    goal:
+      Keep the extractor compatible with nominal output variants such as
+      "Final" or "Nominal" while preserving the historical "Unfolded" label.
+    """
+    normalized = source.strip().lower()
+    if normalized in {"final", "nominal"}:
+        return "Unfolded"
+    if normalized == "truth":
+        return "Truth"
+    return "Unfolded"
+
+
+def canonical_group_name(group: str) -> str:
+    """
+    inputs:
+      group: str, results section label printed by QIProcessor.
+    outputs:
+      str, compact group name used by output tables and plot filenames.
+    goal:
+      Map updated nominal final-metric headings onto the existing BC/quantum
+      grouping without hard-coding every downstream plot path.
+    """
+    normalized = group.strip().lower()
+    if "b and c" in normalized or normalized.startswith("bc"):
+        return "BC"
+    return "quantum"
+
+
+def parse_measurement_line(raw_line: str) -> dict[str, float | str] | None:
+    """
+    inputs:
+      raw_line: str, one candidate measurement line from results.txt.
+    outputs:
+      dict with name/value/err_up/err_down, or None if the line is not a measurement.
+    goal:
+      Accept both historical asymmetric "x +a/-b" lines and newer nominal
+      symmetric "x ± a" / "x +/- a" final-metric lines.
+    """
+    match = RESULT_LINE_ASYMMETRIC_RE.match(raw_line)
+    if match:
+        return {
+            "name": match.group("name").strip(),
+            "value": float(match.group("value")),
+            "err_up": float(match.group("err_up")),
+            "err_down": float(match.group("err_down")),
+        }
+
+    match = RESULT_LINE_SYMMETRIC_RE.match(raw_line)
+    if match:
+        err = float(match.group("err"))
+        return {
+            "name": match.group("name").strip(),
+            "value": float(match.group("value")),
+            "err_up": err,
+            "err_down": err,
+        }
+    return None
 
 
 def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
@@ -208,7 +284,7 @@ def canonical_channel_key(region: str, signal: str) -> str:
         channel = raw.removeprefix("Ztautau_")
     else:
         channel = raw
-    if channel in {"pipi", "pirho", "rhopi", "rhorho", "ee", "emu", "mumu"}:
+    if channel in {"pipi", "pirho", "rhopi", "rhorho", "ee", "emu", "mue", "mumu"}:
         return f"Ztautau_{channel}"
     return region
 
@@ -220,7 +296,7 @@ def parameter_label(parameter: str) -> str:
         return rf"$B_{{{parameter[-2]},{parameter[-1]}}}$"
     if parameter == "Concurrence":
         return "Concurrence"
-    match = re.match(r"C(?P<a>[a-z]{2}) (?P<op>[+-]) C(?P<b>[a-z]{2})$", parameter)
+    match = re.match(r"C_?(?P<a>[a-z]{2}) (?P<op>[+-]) C_?(?P<b>[a-z]{2})$", parameter)
     if match:
         return rf"$C_{{{match.group('a')}}} {match.group('op')} C_{{{match.group('b')}}}$"
     return parameter.replace("_", " ")
