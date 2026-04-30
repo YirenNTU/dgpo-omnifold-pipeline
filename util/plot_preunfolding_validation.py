@@ -46,7 +46,7 @@ vector.register_awkward()
 
 DEFAULT_FLOAT = -99.0
 OKABE_ITO_BLACK = "#000000"
-TARGET_INVISIBLE_COMPONENTS = ("energy", "pt", "eta", "phi")
+TARGET_INVISIBLE_COMPONENTS = ("pt", "eta", "phi")
 IGNORED_CHANNEL_REGIONS = {"hadhad"}
 BASELINE_HADHAD_FINE_CHANNELS = (
     "pipi",
@@ -329,10 +329,6 @@ def is_spin_observable(name: str) -> bool:
 
 def canonical_summary_region(region: str) -> str:
     mapping = {
-        "Ztautau_ee": "ee",
-        "Ztautau_emu": "emu",
-        "Ztautau_mue": "emu",
-        "Ztautau_mumu": "mumu",
         "pipi": "Ztautau_pipi",
         "pirho": "Ztautau_pirho",
         "rhopi": "Ztautau_rhopi",
@@ -510,6 +506,24 @@ def build_momentum4d(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.
     )
 
 
+def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
+    """
+    inputs:
+      pt/eta/phi: np.ndarray, invisible momentum coordinates.
+    outputs:
+      ak.Array Momentum4D, massless four-vector.
+    goal:
+      Support EveNet prediction/export parquets whose invisible target stores
+      only pt/eta/phi by reconstructing the neutrino energy.
+    """
+    return build_momentum4d(
+        pt * np.cos(phi),
+        pt * np.sin(phi),
+        pt * np.sinh(eta),
+        pt * np.cosh(eta),
+    )
+
+
 def choose_component_by_slot(events: ak.Array, prefix: str, slot_indices: np.ndarray, component: str) -> np.ndarray | None:
     slot0_name = f"{prefix}_slot0_{component}"
     slot1_name = f"{prefix}_slot1_{component}"
@@ -545,6 +559,24 @@ def remapped_slot_p4(events: ak.Array, prefix: str, leg: str) -> ak.Array | None
             pt * np.sinh(eta),
             energy,
         )
+    if pt is not None and eta is not None and phi is not None:
+        return massless_p4_from_pt_eta_phi(pt, eta, phi)
+
+    log_energy = choose_component_by_slot(events, prefix, slot_indices, "log_energy")
+    log_pt = choose_component_by_slot(events, prefix, slot_indices, "log_pt")
+    eta = choose_component_by_slot(events, prefix, slot_indices, "eta")
+    phi = choose_component_by_slot(events, prefix, slot_indices, "phi")
+    if log_energy is not None and log_pt is not None and eta is not None and phi is not None:
+        pt = np.expm1(log_pt)
+        energy = np.expm1(log_energy)
+        return build_momentum4d(
+            pt * np.cos(phi),
+            pt * np.sin(phi),
+            pt * np.sinh(eta),
+            energy,
+        )
+    if log_pt is not None and eta is not None and phi is not None:
+        return massless_p4_from_pt_eta_phi(np.expm1(log_pt), eta, phi)
     return None
 
 
@@ -782,11 +814,25 @@ def plot_truth_vs_reco_by_method_and_region(
                 f"paths={[str(path) for path in paths]}",
                 flush=True,
             )
-            events = load_truth_reco_method_events(root, signal_sample_name, region)
+            try:
+                events = load_truth_reco_method_events(root, signal_sample_name, region)
+            except Exception as error:
+                print(
+                    f"    [error] failed to load events method={method} region={region}: {error}",
+                    flush=True,
+                )
+                continue
             if events is None:
                 print(f"    [skip] failed to load events after path resolution method={method} region={region}", flush=True)
                 continue
-            events, selection_info = select_truth_reco_events(events, region)
+            try:
+                events, selection_info = select_truth_reco_events(events, region)
+            except Exception as error:
+                print(
+                    f"    [error] failed event selection method={method} region={region}: {error}",
+                    flush=True,
+                )
+                continue
             if selection_info["class_filter_applied"]:
                 print(
                     f"    [class-filter] method={method} region={region} "
@@ -803,12 +849,20 @@ def plot_truth_vs_reco_by_method_and_region(
             region_summary: dict[str, Any] = {}
 
             for observable, xlabel in observable_specs:
-                reco_values_full = truth_reco_observable_values(
-                    events,
-                    observable,
-                    source_mode=reco_observable_source,
-                )
-                truth_values_full = truth_observable_values(events, observable)
+                try:
+                    reco_values_full = truth_reco_observable_values(
+                        events,
+                        observable,
+                        source_mode=reco_observable_source,
+                    )
+                    truth_values_full = truth_observable_values(events, observable)
+                except Exception as error:
+                    print(
+                        f"    [error] failed observable extraction method={method} region={region} "
+                        f"observable={observable}: {error}",
+                        flush=True,
+                    )
+                    continue
                 if reco_values_full is None or truth_values_full is None:
                     print(
                         f"    [skip] method={method} region={region} observable={observable} "
@@ -1150,6 +1204,46 @@ def metric_precision(value: float, uncertainty: float) -> float:
     return abs(uncertainty / value) * 100.0
 
 
+def deduplicate_summary_rows(rows: list[dict[str, Any]], observable: str, log_label: str) -> list[dict[str, Any]]:
+    """
+    inputs:
+      rows: list[dict], candidate rows for one observable summary plot.
+      observable: str, observable name for debug logging.
+      log_label: str, summary block label for debug logging.
+    outputs:
+      list[dict], at most one row per (method, displayed summary region).
+    goal:
+      Avoid drawing duplicate method markers when broad and fine native regions
+      collapse onto the same displayed summary channel.
+    """
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault((row["method"], row["summary_region"]), []).append(row)
+
+    selected_rows: list[dict[str, Any]] = []
+    for (method, summary_region), group_rows in grouped.items():
+        if len(group_rows) == 1:
+            selected_rows.append(group_rows[0])
+            continue
+
+        def row_rank(row: dict[str, Any]) -> tuple[int, int]:
+            exact_region = row["region"] == summary_region
+            num_events = int(row.get("num_events") or 0)
+            return (0 if exact_region else 1, -num_events)
+
+        chosen = sorted(group_rows, key=row_rank)[0]
+        dropped = [row["region"] for row in group_rows if row is not chosen]
+        print(
+            f"[preunfolding] deduplicate {log_label} observable={observable} "
+            f"method={method} summary_region={summary_region} "
+            f"kept={chosen['region']} dropped={dropped}",
+            flush=True,
+        )
+        selected_rows.append(chosen)
+
+    return selected_rows
+
+
 def plot_truth_metric_summary(
     truth_summary: dict[str, Any],
     methods: dict[str, Path],
@@ -1209,6 +1303,7 @@ def plot_truth_metric_summary(
 
         if not rows:
             continue
+        rows = deduplicate_summary_rows(rows, observable, log_label)
 
         active_regions = [
             region
