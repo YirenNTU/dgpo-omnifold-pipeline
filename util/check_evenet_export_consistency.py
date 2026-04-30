@@ -155,6 +155,19 @@ def prediction_slot_p4(pred_events: ak.Array, prefix: str, slot: int) -> tuple[a
             )
         ), valid
 
+    if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("pt", "eta", "phi")):
+        pt = component("pt")
+        eta = component("eta")
+        phi = component("phi")
+        return canonicalize_p4(
+            build_momentum4d(
+                pt * np.cos(phi),
+                pt * np.sin(phi),
+                pt * np.sinh(eta),
+                pt * np.cosh(eta),
+            )
+        ), valid
+
     if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("log_energy", "log_pt", "eta", "phi")):
         pt = np.expm1(component("log_pt"))
         eta = component("eta")
@@ -166,6 +179,19 @@ def prediction_slot_p4(pred_events: ak.Array, prefix: str, slot: int) -> tuple[a
                 pt * np.sin(phi),
                 pt * np.sinh(eta),
                 energy,
+            )
+        ), valid
+
+    if all(f"{prefix}_slot{slot}_{name}" in fields for name in ("log_pt", "eta", "phi")):
+        pt = np.expm1(component("log_pt"))
+        eta = component("eta")
+        phi = component("phi")
+        return canonicalize_p4(
+            build_momentum4d(
+                pt * np.cos(phi),
+                pt * np.sin(phi),
+                pt * np.sinh(eta),
+                pt * np.cosh(eta),
             )
         ), valid
 

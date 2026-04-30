@@ -422,7 +422,8 @@ python3 util/plot_preunfolding_validation.py \
   --data-sample-name data94 \
   --mc-sample-names Ztautau Zll Zqq \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/preunfolding-validation \
-  --reco-observable-source recompute
+  --reco-observable-source recompute \
+  --num-workers 3
 ```
 
 Useful options:
@@ -433,6 +434,8 @@ Useful options:
   - force `theta_cm/mtautau/cos_theta_*` to be rebuilt from stored `reco_tau_a_p4`, `reco_tau_b_p4`, `lead_a_visible_p4`, `lead_b_visible_p4`
 - `--normalize-truth-reco`
   - normalize truth-vs-reco histograms to unit area
+- `--num-workers N`
+  - run independent truth/reco validation blocks in parallel; `3` is enough for the current truth, missing-neutrino, and reco-tau blocks
 - `--regions ee emu mumu pipi pirho rhopi Ztautau_pipi Ztautau_pirho Ztautau_rhopi Ztautau_rhorho`
   - limit the validation to a subset of native regions/channels
 

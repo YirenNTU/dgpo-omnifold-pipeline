@@ -6,6 +6,7 @@ import glob
 import json
 import math
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +126,15 @@ def parse_args() -> argparse.Namespace:
             "'auto' prefers stored parquet columns and falls back to recomputing from p4; "
             "'stored' requires the parquet column; "
             "'recompute' always rebuilds theta_cm/cos_theta_* from reco/visible p4."
+        ),
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of worker processes for independent pre-unfolding plot blocks. "
+            "Default 1 preserves serial behavior."
         ),
     )
     return parser.parse_args()
@@ -936,6 +946,30 @@ def plot_truth_vs_reco_by_method_and_region(
     return summary
 
 
+def run_truth_reco_plot_block(task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """
+    inputs:
+      task: dict[str, Any], serializable arguments for one truth-vs-reco plot block.
+    outputs:
+      tuple(str, dict), block key and the generated summary.
+    goal:
+      Allow independent pre-unfolding validation blocks to run in separate
+      worker processes without sharing matplotlib state.
+    """
+    summary = plot_truth_vs_reco_by_method_and_region(
+        method_regions=task["method_regions"],
+        methods=task["methods"],
+        signal_sample_name=task["signal_sample_name"],
+        observable_specs=task["observable_specs"],
+        output_dir=task["output_dir"],
+        normalize=task["normalize"],
+        reco_observable_source=task["reco_observable_source"],
+        subdir_name=task["subdir_name"],
+        log_label=task["log_label"],
+    )
+    return task["key"], summary
+
+
 def truth_reco_observable_values(events: ak.Array, observable: str, source_mode: str = "auto") -> np.ndarray | None:
     if source_mode not in {"auto", "stored", "recompute"}:
         raise ValueError(f"Unsupported reco observable source mode '{source_mode}'.")
@@ -1382,18 +1416,71 @@ def main() -> None:
     print(f"[preunfolding] truth_observables={[name for name, _ in observable_specs]}", flush=True)
     print(f"[preunfolding] missing_observables={[name for name, _ in missing_specs]}", flush=True)
     print(f"[preunfolding] reco_tau_observables={[name for name, _ in reco_tau_specs]}", flush=True)
+    print(f"[preunfolding] num_workers={args.num_workers}", flush=True)
 
-    truth_summary = plot_truth_vs_reco_by_method_and_region(
-        method_regions=method_regions,
-        methods=methods,
-        signal_sample_name=args.signal_sample_name,
-        observable_specs=observable_specs,
-        output_dir=args.output_dir,
-        normalize=args.normalize_truth_reco,
-        reco_observable_source=args.reco_observable_source,
-        subdir_name="truth_vs_reco",
-        log_label="truth-vs-reco",
-    )
+    plot_block_tasks = [
+        {
+            "key": "truth",
+            "method_regions": method_regions,
+            "methods": methods,
+            "signal_sample_name": args.signal_sample_name,
+            "observable_specs": observable_specs,
+            "output_dir": args.output_dir,
+            "normalize": args.normalize_truth_reco,
+            "reco_observable_source": args.reco_observable_source,
+            "subdir_name": "truth_vs_reco",
+            "log_label": "truth-vs-reco",
+        },
+        {
+            "key": "missing",
+            "method_regions": method_regions,
+            "methods": methods,
+            "signal_sample_name": args.signal_sample_name,
+            "observable_specs": missing_specs,
+            "output_dir": args.output_dir,
+            "normalize": args.normalize_truth_reco,
+            "reco_observable_source": "recompute",
+            "subdir_name": "missing_truth_vs_reco",
+            "log_label": "missing-truth-vs-reco",
+        },
+        {
+            "key": "reco_tau",
+            "method_regions": method_regions,
+            "methods": methods,
+            "signal_sample_name": args.signal_sample_name,
+            "observable_specs": reco_tau_specs,
+            "output_dir": args.output_dir,
+            "normalize": args.normalize_truth_reco,
+            "reco_observable_source": "recompute",
+            "subdir_name": "reco_tau_truth_vs_reco",
+            "log_label": "reco-tau-truth-vs-reco",
+        },
+    ]
+    if args.num_workers > 1:
+        print(
+            f"[preunfolding] launching parallel truth/reco blocks "
+            f"workers={args.num_workers} blocks={len(plot_block_tasks)}",
+            flush=True,
+        )
+        plot_block_results: dict[str, dict[str, Any]] = {}
+        with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+            futures = [executor.submit(run_truth_reco_plot_block, task) for task in plot_block_tasks]
+            for future in as_completed(futures):
+                key, block_summary = future.result()
+                plot_block_results[key] = block_summary
+                print(f"[preunfolding] finished parallel block={key} methods={list(block_summary)}", flush=True)
+        truth_summary = plot_block_results.get("truth", {})
+        missing_summary = plot_block_results.get("missing", {})
+        reco_tau_summary = plot_block_results.get("reco_tau", {})
+    else:
+        plot_block_results = {
+            key: summary
+            for key, summary in (run_truth_reco_plot_block(task) for task in plot_block_tasks)
+        }
+        truth_summary = plot_block_results["truth"]
+        missing_summary = plot_block_results["missing"]
+        reco_tau_summary = plot_block_results["reco_tau"]
+
     print(f"[preunfolding] finished truth-vs-reco methods={list(truth_summary)}", flush=True)
     truth_metric_summary = plot_truth_metric_summary(
         truth_summary=truth_summary,
@@ -1405,18 +1492,6 @@ def main() -> None:
         log_label="truth-summary",
     )
     print(f"[preunfolding] finished truth summary plots observables={list(truth_metric_summary)}", flush=True)
-
-    missing_summary = plot_truth_vs_reco_by_method_and_region(
-        method_regions=method_regions,
-        methods=methods,
-        signal_sample_name=args.signal_sample_name,
-        observable_specs=missing_specs,
-        output_dir=args.output_dir,
-        normalize=args.normalize_truth_reco,
-        reco_observable_source="recompute",
-        subdir_name="missing_truth_vs_reco",
-        log_label="missing-truth-vs-reco",
-    )
     print(f"[preunfolding] finished missing truth-vs-reco methods={list(missing_summary)}", flush=True)
     missing_metric_summary = plot_truth_metric_summary(
         truth_summary=missing_summary,
@@ -1428,18 +1503,6 @@ def main() -> None:
         log_label="missing-summary",
     )
     print(f"[preunfolding] finished missing summary plots observables={list(missing_metric_summary)}", flush=True)
-
-    reco_tau_summary = plot_truth_vs_reco_by_method_and_region(
-        method_regions=method_regions,
-        methods=methods,
-        signal_sample_name=args.signal_sample_name,
-        observable_specs=reco_tau_specs,
-        output_dir=args.output_dir,
-        normalize=args.normalize_truth_reco,
-        reco_observable_source="recompute",
-        subdir_name="reco_tau_truth_vs_reco",
-        log_label="reco-tau-truth-vs-reco",
-    )
     print(f"[preunfolding] finished reco-tau truth-vs-reco methods={list(reco_tau_summary)}", flush=True)
     reco_tau_metric_summary = plot_truth_metric_summary(
         truth_summary=reco_tau_summary,

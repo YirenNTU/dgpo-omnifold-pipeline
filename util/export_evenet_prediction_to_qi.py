@@ -309,6 +309,24 @@ def choose_valid_by_slot(events: ak.Array, prefix: str, slot_indices: np.ndarray
     return np.where(slot_indices == 0, valid0, valid1)
 
 
+def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
+    """
+    inputs:
+      pt/eta/phi: np.ndarray, invisible momentum coordinates.
+    outputs:
+      ak.Array Momentum4D, massless-neutrino four-vector.
+    goal:
+      Support EveNet checkpoints whose invisible target has only pt/eta/phi by
+      reconstructing energy with E = pt * cosh(eta).
+    """
+    return build_momentum4d(
+        pt * np.cos(phi),
+        pt * np.sin(phi),
+        pt * np.sinh(eta),
+        pt * np.cosh(eta),
+    )
+
+
 def build_remapped_p4(events: ak.Array, prefix: str, slot_indices: np.ndarray) -> tuple[ak.Array, np.ndarray]:
     px = choose_component_by_slot(events, prefix, slot_indices, "px")
     py = choose_component_by_slot(events, prefix, slot_indices, "py")
@@ -328,6 +346,8 @@ def build_remapped_p4(events: ak.Array, prefix: str, slot_indices: np.ndarray) -
             pt * np.sinh(eta),
             energy,
         ), choose_valid_by_slot(events, prefix, slot_indices)
+    if pt is not None and eta is not None and phi is not None:
+        return massless_p4_from_pt_eta_phi(pt, eta, phi), choose_valid_by_slot(events, prefix, slot_indices)
 
     log_energy = choose_component_by_slot(events, prefix, slot_indices, "log_energy")
     log_pt = choose_component_by_slot(events, prefix, slot_indices, "log_pt")
@@ -342,11 +362,14 @@ def build_remapped_p4(events: ak.Array, prefix: str, slot_indices: np.ndarray) -
             pt * np.sinh(eta),
             energy,
         ), choose_valid_by_slot(events, prefix, slot_indices)
+    if log_pt is not None and eta is not None and phi is not None:
+        pt = np.expm1(log_pt)
+        return massless_p4_from_pt_eta_phi(pt, eta, phi), choose_valid_by_slot(events, prefix, slot_indices)
 
     available = [field for field in events.fields if field.startswith(f"{prefix}_slot")]
     raise KeyError(
         f"Cannot build remapped p4 for prefix={prefix}. Need slot-wise E/px/py/pz, energy/pt/eta/phi, "
-        f"or log_energy/log_pt/eta/phi. Available: {available}"
+        f"pt/eta/phi, log_energy/log_pt/eta/phi, or log_pt/eta/phi. Available: {available}"
     )
 
 
