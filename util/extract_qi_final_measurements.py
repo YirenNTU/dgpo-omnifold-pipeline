@@ -8,7 +8,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp")
 
@@ -18,7 +18,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from plot_style import channel_latex_label, method_color
+try:
+    from plot_style import channel_latex_label, method_color
+except Exception:
+    def channel_latex_label(channel: str) -> str:
+        if channel == "combined":
+            return r"$\bf{Combined}$"
+        if channel.startswith("Ztautau_"):
+            return channel.removeprefix("Ztautau_").replace("_", r"\_")
+        return channel.replace("_", r"\_")
+
+    _FALLBACK_COLORS = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+    ]
+
+    def method_color(method: str, index: int) -> str:
+        return _FALLBACK_COLORS[index % len(_FALLBACK_COLORS)]
 
 
 RESULT_LINE_ASYMMETRIC_RE = re.compile(
@@ -38,73 +58,180 @@ SECTION_RE = re.compile(
     r"(?P<group>B and C matrices|BC matrices|Quantum results|Final metrics|Metrics):$",
     re.IGNORECASE,
 )
-METHOD_MARKERS = ("o", "D", "^", "s", "P", "X")
+UNFOLDING_HEADER_RE = re.compile(
+    r"Unfolding results for signal (?P<signal>.+?) in region (?P<region>.+):$"
+)
+
+METHOD_MARKERS = ("o", "D", "^", "s", "P", "X", "v", "*")
 DEFAULT_IGNORED_REGIONS = {"hadhad"}
+COMBINED_CHANNEL_KEY = "combined"
+COMBINED_REGION = "combined"
+COMBINED_SIGNAL = "combined"
+
+CHANNEL_ORDER = [
+    "Ztautau_pipi",
+    "Ztautau_pirho",
+    "Ztautau_rhopi",
+    "Ztautau_rhorho",
+    "Ztautau_ee",
+    "Ztautau_emu",
+    "Ztautau_mue",
+    "Ztautau_mumu",
+    COMBINED_CHANNEL_KEY,
+]
+
+QUANTUM_PARAMETER_ORDER = [
+    "Concurrence",
+    "Ckk + Cnn",
+    "Ckk - Cnn",
+    "Ckk + Crr",
+    "Ckk - Crr",
+    "Cnn + Crr",
+    "Cnn - Crr",
+]
+BC_PARAMETER_ORDER = [
+    "B_An",
+    "B_Bn",
+    "B_Ar",
+    "B_Br",
+    "B_Ak",
+    "B_Bk",
+    "C_nn",
+    "C_nr",
+    "C_nk",
+    "C_rn",
+    "C_rr",
+    "C_rk",
+    "C_kn",
+    "C_kr",
+    "C_kk",
+]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract final unfolded QI measurements from central QIProcessor results.txt."
-    )
-    parser.add_argument(
-        "--results-txt",
-        type=Path,
-        default=None,
-        help="Path to QI_analysis/results.txt produced by central QIProcessor.",
+        description=(
+            "Parse central QIProcessor results.txt files, draw per-channel method comparisons, "
+            "and append statistically combined all-channel results for each method."
+        )
     )
     parser.add_argument(
         "--method",
         action="append",
-        default=None,
+        required=True,
         help=(
-            "Optional method spec in the form Label:/path/to/results.txt. Repeat for Baseline/Pretrain/Scratch. "
-            "When provided, --results-txt is ignored."
+            "Method spec Label:/path/to/results.txt or Label:/path/to/directory. "
+            "If a directory is supplied, the script searches common results.txt locations. "
+            "Repeat for Baseline, EveNet-Pretrain, Scratch, etc."
         ),
     )
     parser.add_argument(
         "--output-prefix",
         type=Path,
         required=True,
-        help="Output path prefix. Writes <prefix>.json and <prefix>.csv.",
+        help="Output prefix. Writes <prefix>_per_channel.*, <prefix>_combined.*, and summary plots.",
     )
     parser.add_argument(
         "--keep-truth",
         action="store_true",
-        help="Also keep Truth sections. By default only Unfolded measurements are written.",
-    )
-    parser.add_argument(
-        "--no-plots",
-        action="store_true",
-        help="Only write JSON/CSV tables; skip summary plots.",
+        help="Also keep Truth sections. By default only Unfolded/Final/Nominal measurements are written.",
     )
     parser.add_argument(
         "--keep-hadhad",
         action="store_true",
-        help="Keep broad hadhad rows. By default they are ignored in favor of fine channels such as pipi/pirho/rhopi.",
+        help="Keep broad hadhad rows. By default they are ignored in favor of fine channels.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Only write JSON/CSV tables; skip plots.",
+    )
+    parser.add_argument(
+        "--no-tension-scale",
+        action="store_true",
+        help=(
+            "Do not inflate combined uncertainties when channels disagree more than expected. "
+            "By default a PDG/Birge scale factor is applied when chi2/ndof > 1."
+        ),
+    )
+    parser.add_argument(
+        "--combination-model",
+        choices=["split-normal", "symmetric"],
+        default="split-normal",
+        help=(
+            "Uncertainty model for cross-channel combination. split-normal uses err_down on the left "
+            "side and err_up on the right side of each measurement. symmetric uses the average error."
+        ),
+    )
+    parser.add_argument(
+        "--include-groups",
+        nargs="+",
+        choices=["BC", "quantum"],
+        default=["quantum", "BC"],
+        help="Which result groups to plot/write after parsing. Default: quantum BC.",
+    )
+    parser.add_argument(
+        "--only-key-quantum",
+        action="store_true",
+        help="For quantum plots/tables, keep only Concurrence and Ckk + Cnn.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print per-method and per-parameter parsing/combination diagnostics.",
     )
     return parser.parse_args()
 
 
-def parse_method_specs(args: argparse.Namespace) -> list[tuple[str, Path]]:
+def parse_method_specs(specs: Iterable[str]) -> list[tuple[str, Path]]:
+    methods: list[tuple[str, Path]] = []
+    for spec in specs:
+        if ":" not in spec:
+            raise ValueError(f"Invalid --method '{spec}'. Expected Label:/path/to/results.txt")
+        label, raw_path = spec.split(":", 1)
+        label = label.strip()
+        if not label:
+            raise ValueError(f"Invalid --method '{spec}'. Empty method label.")
+        methods.append((label, resolve_results_path(Path(raw_path))))
+    return methods
+
+
+def resolve_results_path(path: Path) -> Path:
     """
-    inputs:
-      args: argparse.Namespace, parsed command-line options.
-    outputs:
-      list[(method_label, results_path)], one entry per QIProcessor result text.
-    goal:
-      Support both the legacy single-file mode and multi-method comparison mode.
+    Accept either a direct results.txt path or a method directory.
+
+    This matters for your use case because baseline may live at:
+      baseline/QI_analysis/results.txt
+    while EveNet exports may live inside a qi-export directory.
     """
-    if args.method:
-        methods: list[tuple[str, Path]] = []
-        for spec in args.method:
-            if ":" not in spec:
-                raise ValueError(f"Invalid --method '{spec}'. Expected Label:/path/to/results.txt.")
-            label, path = spec.split(":", 1)
-            methods.append((label.strip(), Path(path)))
-        return methods
-    if args.results_txt is None:
-        raise ValueError("Provide either --results-txt or one or more --method Label:/path/to/results.txt options.")
-    return [("Measurement", args.results_txt)]
+    if path.is_file():
+        return path
+    if not path.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+    if not path.is_dir():
+        raise ValueError(f"Path is neither a file nor a directory: {path}")
+
+    candidates = [
+        path / "QI_analysis" / "results.txt",
+        path / "results.txt",
+        path / "central" / "QI_analysis" / "results.txt",
+        path / "central" / "results.txt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    matches = sorted(path.rglob("results.txt"))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(f"No results.txt found under directory: {path}")
+
+    pretty = "\n".join(f"  - {match}" for match in matches[:20])
+    extra = "" if len(matches) <= 20 else f"\n  ... and {len(matches) - 20} more"
+    raise ValueError(
+        f"Multiple results.txt files found under {path}. Please pass the exact one:\n{pretty}{extra}"
+    )
 
 
 def parse_results_text(
@@ -113,17 +240,6 @@ def parse_results_text(
     keep_truth: bool = False,
     ignored_regions: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """
-    inputs:
-      text: str, content of central QIProcessor results.txt.
-      method: str, user-facing method label for this result file.
-      keep_truth: bool, include Truth sections in addition to Unfolded sections.
-      ignored_regions: set[str] | None, broad regions to drop from final tables/plots.
-    outputs:
-      list[dict], one row per final B/C or quantum-result value.
-    goal:
-      Convert central human-readable final measurements into stable JSON/CSV rows.
-    """
     rows: list[dict[str, Any]] = []
     ignored_regions = ignored_regions or set()
     region: str | None = None
@@ -138,27 +254,29 @@ def parse_results_text(
 
         if line.startswith("Region: "):
             region = line.removeprefix("Region: ").strip()
-            signal = None
+            signal = region
             section_source = None
             section_group = None
             continue
 
-        match = re.match(r"Unfolding results for signal (?P<signal>.+?) in region (?P<region>.+):$", line)
-        if match:
-            signal = match.group("signal").strip()
-            region = match.group("region").strip()
+        header_match = UNFOLDING_HEADER_RE.match(line)
+        if header_match:
+            signal = header_match.group("signal").strip()
+            region = header_match.group("region").strip()
             section_source = None
             section_group = None
             continue
 
-        match = SECTION_RE.match(line)
-        if match:
-            section_source = canonical_source_name(match.group("source") or "Unfolded")
-            section_group = canonical_group_name(match.group("group"))
+        section_match = SECTION_RE.match(line)
+        if section_match:
+            section_source = canonical_source_name(section_match.group("source") or "Unfolded")
+            section_group = canonical_group_name(section_match.group("group"))
             continue
 
         parsed_value = parse_measurement_line(raw_line)
-        if parsed_value is None or region is None or signal is None or section_source is None or section_group is None:
+        if parsed_value is None:
+            continue
+        if region is None or signal is None or section_source is None or section_group is None:
             continue
         if section_source == "Truth" and not keep_truth:
             continue
@@ -167,15 +285,17 @@ def parse_results_text(
 
         rows.append(
             {
+                "method": method,
                 "region": region,
                 "signal": signal,
-                "method": method,
+                "channel": canonical_channel_key(region, signal),
                 "source": section_source,
                 "group": section_group,
-                "parameter": parsed_value["name"],
-                "value": parsed_value["value"],
-                "err_up": parsed_value["err_up"],
-                "err_down": parsed_value["err_down"],
+                "parameter": canonical_parameter_name(str(parsed_value["name"])),
+                "value": float(parsed_value["value"]),
+                "err_up": float(parsed_value["err_up"]),
+                "err_down": float(parsed_value["err_down"]),
+                "is_combined": False,
             }
         )
 
@@ -183,17 +303,8 @@ def parse_results_text(
 
 
 def canonical_source_name(source: str) -> str:
-    """
-    inputs:
-      source: str, source label printed by QIProcessor.
-    outputs:
-      str, stable source label stored in JSON/CSV.
-    goal:
-      Keep the extractor compatible with nominal output variants such as
-      "Final" or "Nominal" while preserving the historical "Unfolded" label.
-    """
     normalized = source.strip().lower()
-    if normalized in {"final", "nominal"}:
+    if normalized in {"final", "nominal", "unfolded"}:
         return "Unfolded"
     if normalized == "truth":
         return "Truth"
@@ -201,43 +312,37 @@ def canonical_source_name(source: str) -> str:
 
 
 def canonical_group_name(group: str) -> str:
-    """
-    inputs:
-      group: str, results section label printed by QIProcessor.
-    outputs:
-      str, compact group name used by output tables and plot filenames.
-    goal:
-      Map updated nominal final-metric headings onto the existing BC/quantum
-      grouping without hard-coding every downstream plot path.
-    """
     normalized = group.strip().lower()
     if "b and c" in normalized or normalized.startswith("bc"):
         return "BC"
     return "quantum"
 
 
+def canonical_parameter_name(parameter: str) -> str:
+    cleaned = " ".join(parameter.strip().replace("_", "_").split())
+    compact = cleaned.replace("C_kk", "Ckk").replace("C_nn", "Cnn").replace("C_rr", "Crr")
+    compact = compact.replace("Ckk+Cnn", "Ckk + Cnn")
+    compact = compact.replace("Ckk-Cnn", "Ckk - Cnn")
+    compact = compact.replace("Ckk+Crr", "Ckk + Crr")
+    compact = compact.replace("Ckk-Crr", "Ckk - Crr")
+    compact = compact.replace("Cnn+Crr", "Cnn + Crr")
+    compact = compact.replace("Cnn-Crr", "Cnn - Crr")
+    return compact
+
+
 def parse_measurement_line(raw_line: str) -> dict[str, float | str] | None:
-    """
-    inputs:
-      raw_line: str, one candidate measurement line from results.txt.
-    outputs:
-      dict with name/value/err_up/err_down, or None if the line is not a measurement.
-    goal:
-      Accept both historical asymmetric "x +a/-b" lines and newer nominal
-      symmetric "x ± a" / "x +/- a" final-metric lines.
-    """
     match = RESULT_LINE_ASYMMETRIC_RE.match(raw_line)
     if match:
         return {
             "name": match.group("name").strip(),
             "value": float(match.group("value")),
-            "err_up": float(match.group("err_up")),
-            "err_down": float(match.group("err_down")),
+            "err_up": abs(float(match.group("err_up"))),
+            "err_down": abs(float(match.group("err_down"))),
         }
 
     match = RESULT_LINE_SYMMETRIC_RE.match(raw_line)
     if match:
-        err = float(match.group("err"))
+        err = abs(float(match.group("err")))
         return {
             "name": match.group("name").strip(),
             "value": float(match.group("value")),
@@ -247,12 +352,319 @@ def parse_measurement_line(raw_line: str) -> dict[str, float | str] | None:
     return None
 
 
+def canonical_channel_key(region: str, signal: str) -> str:
+    """
+    Put baseline bare channels and EveNet Ztautau_* channels onto common rows.
+
+    Examples:
+      region=pipi, signal=pipi              -> Ztautau_pipi
+      region=pipi, signal=Ztautau_pipi      -> Ztautau_pipi
+      region=emu,  signal=Ztautau_mue       -> Ztautau_mue
+    """
+    raw = signal if signal.startswith("Ztautau_") else region
+    channel = raw.removeprefix("Ztautau_") if raw.startswith("Ztautau_") else raw
+    if channel in {"pipi", "pirho", "rhopi", "rhorho", "ee", "emu", "mue", "mumu"}:
+        return f"Ztautau_{channel}"
+    return channel
+
+
+def filter_rows(rows: list[dict[str, Any]], include_groups: list[str], only_key_quantum: bool) -> list[dict[str, Any]]:
+    output = [row for row in rows if row["group"] in set(include_groups)]
+    if only_key_quantum:
+        output = [
+            row
+            for row in output
+            if row["group"] != "quantum" or row["parameter"] in {"Concurrence", "Ckk + Cnn"}
+        ]
+    return output
+
+
+def combine_all_channels(
+    rows: list[dict[str, Any]],
+    combination_model: str = "split-normal",
+    apply_tension_scale: bool = True,
+    debug: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    Combine channels inside each method/source/group/parameter only.
+
+    This never combines Baseline with EveNet. Each method gets its own combined row.
+
+    Uncertainty treatment:
+      - split-normal: use err_down when theta < measured value and err_up when theta > measured value.
+      - symmetric: use 0.5 * (err_up + err_down).
+      - The combined central value is the minimum of the summed independent-channel NLL.
+      - The raw 1-sigma interval is found from delta NLL = 0.5.
+      - By default, if channels are more scattered than expected, apply a PDG/Birge scale factor:
+            scale = sqrt(chi2_min / ndof), if chi2_min / ndof > 1.
+        The raw and scaled uncertainties are both written to the output.
+
+    Limitation:
+      If you have a full covariance matrix across channels, use that instead. This script assumes
+      independent channel measurements because results.txt contains only per-channel up/down errors.
+    """
+    combined_rows: list[dict[str, Any]] = []
+    keys = list(
+        dict.fromkeys(
+            (row["method"], row["source"], row["group"], row["parameter"])
+            for row in rows
+            if not row.get("is_combined", False)
+        )
+    )
+
+    for method, source, group, parameter in keys:
+        channel_rows = [
+            row
+            for row in rows
+            if not row.get("is_combined", False)
+            and row["method"] == method
+            and row["source"] == source
+            and row["group"] == group
+            and row["parameter"] == parameter
+        ]
+        valid_rows = [
+            row
+            for row in channel_rows
+            if is_valid_measurement(row["value"], row["err_down"], row["err_up"])
+        ]
+        if not valid_rows:
+            continue
+
+        values = np.array([row["value"] for row in valid_rows], dtype=np.float64)
+        err_down = np.array([row["err_down"] for row in valid_rows], dtype=np.float64)
+        err_up = np.array([row["err_up"] for row in valid_rows], dtype=np.float64)
+
+        if combination_model == "symmetric":
+            result = combine_symmetric(values, err_down, err_up)
+        else:
+            result = combine_split_normal(values, err_down, err_up)
+
+        chi2_min = float(2.0 * result["nll_min"])
+        ndof = max(int(len(values) - 1), 0)
+        tension_scale = 1.0
+        if apply_tension_scale and ndof > 0:
+            reduced_chi2 = chi2_min / ndof
+            if np.isfinite(reduced_chi2) and reduced_chi2 > 1.0:
+                tension_scale = float(math.sqrt(reduced_chi2))
+
+        err_down_raw = float(result["err_down"])
+        err_up_raw = float(result["err_up"])
+        err_down_scaled = err_down_raw * tension_scale
+        err_up_scaled = err_up_raw * tension_scale
+
+        combined_rows.append(
+            {
+                "method": method,
+                "region": COMBINED_REGION,
+                "signal": COMBINED_SIGNAL,
+                "channel": COMBINED_CHANNEL_KEY,
+                "source": source,
+                "group": group,
+                "parameter": parameter,
+                "value": float(result["value"]),
+                "err_up": err_up_scaled,
+                "err_down": err_down_scaled,
+                "err_up_raw": err_up_raw,
+                "err_down_raw": err_down_raw,
+                "tension_scale": tension_scale,
+                "chi2_min": chi2_min,
+                "ndof": ndof,
+                "num_channels": int(len(values)),
+                "channels": ",".join(row["channel"] for row in valid_rows),
+                "combination_model": combination_model,
+                "is_combined": True,
+            }
+        )
+
+        if debug:
+            print(
+                "[qi-combine] "
+                f"method={method} group={group} parameter={parameter} "
+                f"n={len(values)} value={result['value']:.6g} "
+                f"raw=-{err_down_raw:.6g}/+{err_up_raw:.6g} "
+                f"scale={tension_scale:.4g} chi2={chi2_min:.4g} ndof={ndof}",
+                flush=True,
+            )
+
+    return combined_rows
+
+
+def is_valid_measurement(value: Any, err_down: Any, err_up: Any) -> bool:
+    try:
+        v = float(value)
+        lo = float(err_down)
+        hi = float(err_up)
+    except Exception:
+        return False
+    return np.isfinite(v) and np.isfinite(lo) and np.isfinite(hi) and lo > 0.0 and hi > 0.0
+
+
+def combine_symmetric(values: np.ndarray, err_down: np.ndarray, err_up: np.ndarray) -> dict[str, float]:
+    sigmas = 0.5 * (err_down + err_up)
+    weights = 1.0 / np.square(sigmas)
+    value = float(np.sum(weights * values) / np.sum(weights))
+    sigma = float(math.sqrt(1.0 / np.sum(weights)))
+    nll_min = float(0.5 * np.sum(np.square((value - values) / sigmas)))
+    return {"value": value, "err_down": sigma, "err_up": sigma, "nll_min": nll_min}
+
+
+def combine_split_normal(values: np.ndarray, err_down: np.ndarray, err_up: np.ndarray) -> dict[str, float]:
+    def nll(theta: float) -> float:
+        sigma = np.where(theta < values, err_down, err_up)
+        return float(0.5 * np.sum(np.square((theta - values) / sigma)))
+
+    lower, upper = robust_search_bounds(values, err_down, err_up)
+    theta_hat = minimize_1d(nll, lower, upper)
+    nll_min = nll(theta_hat)
+
+    target = nll_min + 0.5
+    left = find_delta_nll_crossing(nll, target, theta_hat, lower, side="left")
+    right = find_delta_nll_crossing(nll, target, theta_hat, upper, side="right")
+
+    return {
+        "value": float(theta_hat),
+        "err_down": float(theta_hat - left),
+        "err_up": float(right - theta_hat),
+        "nll_min": float(nll_min),
+    }
+
+
+def robust_search_bounds(values: np.ndarray, err_down: np.ndarray, err_up: np.ndarray) -> tuple[float, float]:
+    lo = float(np.nanmin(values - 8.0 * err_down))
+    hi = float(np.nanmax(values + 8.0 * err_up))
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        center = float(np.nanmean(values))
+        width = float(np.nanmax(np.maximum(err_down, err_up)))
+        width = width if np.isfinite(width) and width > 0 else 1.0
+        lo = center - 8.0 * width
+        hi = center + 8.0 * width
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def minimize_1d(func: Any, lower: float, upper: float, iterations: int = 180) -> float:
+    """Golden-section minimization with no scipy dependency."""
+    gr = (math.sqrt(5.0) - 1.0) / 2.0
+    a, b = float(lower), float(upper)
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    fc = func(c)
+    fd = func(d)
+    for _ in range(iterations):
+        if fc > fd:
+            a = c
+            c = d
+            fc = fd
+            d = a + gr * (b - a)
+            fd = func(d)
+        else:
+            b = d
+            d = c
+            fd = fc
+            c = b - gr * (b - a)
+            fc = func(c)
+    return 0.5 * (a + b)
+
+
+def find_delta_nll_crossing(func: Any, target: float, theta_hat: float, bound: float, side: str) -> float:
+    """Find theta where NLL(theta) = target on the requested side of theta_hat."""
+    assert side in {"left", "right"}
+    if side == "left":
+        low, high = bound, theta_hat
+        if func(low) < target:
+            step = theta_hat - bound
+            for _ in range(12):
+                low = theta_hat - 2.0 * step
+                step *= 2.0
+                if func(low) >= target:
+                    break
+    else:
+        low, high = theta_hat, bound
+        if func(high) < target:
+            step = bound - theta_hat
+            for _ in range(12):
+                high = theta_hat + 2.0 * step
+                step *= 2.0
+                if func(high) >= target:
+                    break
+
+    for _ in range(180):
+        mid = 0.5 * (low + high)
+        if side == "left":
+            if func(mid) >= target:
+                low = mid
+            else:
+                high = mid
+        else:
+            if func(mid) >= target:
+                high = mid
+            else:
+                low = mid
+    return 0.5 * (low + high)
+
+
 def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
-    fieldnames = ["method", "region", "signal", "source", "group", "parameter", "value", "err_up", "err_down"]
+    if not rows:
+        path.write_text("")
+        return
+
+    preferred = [
+        "method",
+        "region",
+        "signal",
+        "channel",
+        "source",
+        "group",
+        "parameter",
+        "value",
+        "err_up",
+        "err_down",
+        "is_combined",
+        "num_channels",
+        "channels",
+        "err_up_raw",
+        "err_down_raw",
+        "tension_scale",
+        "chi2_min",
+        "ndof",
+        "combination_model",
+    ]
+    keys = list(dict.fromkeys(preferred + [key for row in rows for key in row.keys()]))
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def sorted_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    method_order = {method: i for i, method in enumerate(dict.fromkeys(row["method"] for row in rows))}
+    group_order = {"quantum": 0, "BC": 1}
+    return sorted(
+        rows,
+        key=lambda row: (
+            group_order.get(row["group"], 99),
+            parameter_sort_key(row["group"], row["parameter"]),
+            channel_sort_key(row["channel"]),
+            method_order.get(row["method"], 99),
+            row["source"],
+        ),
+    )
+
+
+def parameter_sort_key(group: str, parameter: str) -> tuple[int, str]:
+    order = QUANTUM_PARAMETER_ORDER if group == "quantum" else BC_PARAMETER_ORDER
+    try:
+        return (order.index(parameter), parameter)
+    except ValueError:
+        return (len(order), parameter)
+
+
+def channel_sort_key(channel: str) -> tuple[int, str]:
+    try:
+        return (CHANNEL_ORDER.index(channel), channel)
+    except ValueError:
+        return (len(CHANNEL_ORDER) - 1, channel)
 
 
 def sanitize_filename(name: str) -> str:
@@ -264,29 +676,10 @@ def method_marker(method: str, method_index: int) -> str:
     return METHOD_MARKERS[method_index % len(METHOD_MARKERS)]
 
 
-def channel_label(region: str, signal: str) -> str:
-    return channel_latex_label(canonical_channel_key(region, signal))
-
-
-def canonical_channel_key(region: str, signal: str) -> str:
-    """
-    inputs:
-      region: str, QIProcessor region name from results.txt.
-      signal: str, QIProcessor signal name from results.txt.
-    outputs:
-      str, canonical channel key used for y-axis grouping.
-    goal:
-      Put baseline bare channels such as pipi/pirho/rhopi on the same y-axis row
-      as EveNet channels named Ztautau_pipi/Ztautau_pirho/Ztautau_rhopi.
-    """
-    raw = signal if signal.startswith("Ztautau_") else region
-    if raw.startswith("Ztautau_"):
-        channel = raw.removeprefix("Ztautau_")
-    else:
-        channel = raw
-    if channel in {"pipi", "pirho", "rhopi", "rhorho", "ee", "emu", "mue", "mumu"}:
-        return f"Ztautau_{channel}"
-    return region
+def channel_label(channel: str) -> str:
+    if channel == COMBINED_CHANNEL_KEY:
+        return r"$\bf{Combined}$"
+    return channel_latex_label(channel)
 
 
 def parameter_label(parameter: str) -> str:
@@ -303,82 +696,85 @@ def parameter_label(parameter: str) -> str:
 
 
 def format_value_unc(row: dict[str, Any]) -> str:
-    value = row["value"]
-    err_up = row["err_up"]
-    err_down = row["err_down"]
+    value = float(row["value"])
+    err_up = float(row["err_up"])
+    err_down = float(row["err_down"])
     if math.isclose(err_up, err_down, rel_tol=0.05, abs_tol=5.0e-4):
         return f"{value:.3f} ± {0.5 * (err_up + err_down):.3f}"
     return f"{value:.3f} +{err_up:.3f}/-{err_down:.3f}"
 
 
 def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) -> dict[str, Any]:
-    """
-    inputs:
-      rows: list[dict], parsed final measurements with method/region/signal/value/uncertainty.
-      output_prefix: Path, prefix used to create the summary-plot directory.
-    outputs:
-      dict, plot metadata keyed by measurement parameter.
-    goal:
-      Render final B/C and quantum measurements with the same compact summary
-      style used by pre-unfolding validation plots.
-    """
-    plot_dir = output_prefix.parent / f"{output_prefix.name}_summary_plots"
+    plot_dir = output_prefix.parent / f"{output_prefix.name}_plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     methods = list(dict.fromkeys(row["method"] for row in rows))
     method_index = {method: index for index, method in enumerate(methods)}
-    groups = list(dict.fromkeys(row["group"] for row in rows))
+    groups = list(dict.fromkeys(row["group"] for row in sorted_rows(rows)))
     plot_summary: dict[str, Any] = {}
 
     for group in groups:
         group_rows = [row for row in rows if row["group"] == group]
-        parameters = list(dict.fromkeys(row["parameter"] for row in group_rows))
+        parameters = list(dict.fromkeys(row["parameter"] for row in sorted_rows(group_rows)))
         for parameter in parameters:
             parameter_rows = [row for row in group_rows if row["parameter"] == parameter]
-            channel_keys = list(dict.fromkeys(canonical_channel_key(row["region"], row["signal"]) for row in parameter_rows))
+            channel_keys = list(dict.fromkeys(row["channel"] for row in sorted_rows(parameter_rows)))
+            if COMBINED_CHANNEL_KEY in channel_keys:
+                channel_keys = [key for key in channel_keys if key != COMBINED_CHANNEL_KEY] + [COMBINED_CHANNEL_KEY]
+
             y_base = np.arange(len(channel_keys), dtype=np.float64)
             channel_index = {key: index for index, key in enumerate(channel_keys)}
 
             values = np.array([row["value"] for row in parameter_rows], dtype=np.float64)
             err_up = np.array([row["err_up"] for row in parameter_rows], dtype=np.float64)
             err_down = np.array([row["err_down"] for row in parameter_rows], dtype=np.float64)
-            xmin = float(np.nanmin(values - err_down))
-            xmax = float(np.nanmax(values + err_up))
+            finite = np.isfinite(values) & np.isfinite(err_up) & np.isfinite(err_down)
+            if not np.any(finite):
+                continue
+            xmin = float(np.nanmin(values[finite] - err_down[finite]))
+            xmax = float(np.nanmax(values[finite] + err_up[finite]))
             span = xmax - xmin
             pad = max(0.12 * span, 0.02)
 
-            fig_height = max(4.0, 0.58 * len(channel_keys) + 1.8)
-            fig, ax = plt.subplots(figsize=(10.6, fig_height), dpi=200)
+            fig_height = max(4.4, 0.62 * len(channel_keys) + 2.2)
+            fig, ax = plt.subplots(figsize=(11.6, fig_height), dpi=200)
             ax.set_xlim(xmin - pad, xmax + pad)
 
-            x_text_value = 1.03
+            x_text_value = 1.025
             for key in channel_keys:
-                channel_rows = [
-                    row
-                    for row in parameter_rows
-                    if canonical_channel_key(row["region"], row["signal"]) == key
-                ]
+                channel_rows = [row for row in parameter_rows if row["channel"] == key]
                 channel_rows.sort(key=lambda row: method_index[row["method"]])
                 offsets = np.linspace(-0.24, 0.24, len(channel_rows)) if len(channel_rows) > 1 else np.array([0.0])
                 for offset, row in zip(offsets, channel_rows):
                     index = method_index[row["method"]]
                     y = y_base[channel_index[key]] + offset
                     color = method_color(row["method"], index)
+                    marker = method_marker(row["method"], index)
+                    markersize = 8.5 if row.get("is_combined", False) else 6.5
+                    linewidth = 1.6 if row.get("is_combined", False) else 1.2
                     ax.errorbar(
                         row["value"],
                         y,
-                        xerr=np.array([[row["err_down"]], [row["err_up"]]]),
-                        fmt=method_marker(row["method"], index),
+                        xerr=np.array([[row["err_down"]], [row["err_up"]]], dtype=np.float64),
+                        fmt=marker,
                         color=color,
                         markerfacecolor=color,
                         markeredgecolor=color,
-                        capsize=2.5,
-                        markersize=6.5,
-                        lw=1.2,
+                        capsize=2.8,
+                        markersize=markersize,
+                        lw=linewidth,
                     )
+                    label = format_value_unc(row)
+                    if row.get("is_combined", False):
+                        scale = float(row.get("tension_scale", 1.0))
+                        nchan = int(row.get("num_channels", 0))
+                        if scale > 1.0001:
+                            label += f"  [n={nchan}, scale={scale:.2f}]"
+                        else:
+                            label += f"  [n={nchan}]"
                     ax.text(
                         x_text_value,
                         y,
-                        format_value_unc(row),
+                        label,
                         color=color,
                         fontsize=8,
                         va="center",
@@ -387,16 +783,20 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                         clip_on=False,
                     )
 
+            ax.axvline(0.0, color="#B0B0B0", linewidth=0.8, linestyle="--", zorder=0)
             ax.text(x_text_value, 1.02, "value ± unc.", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
             ax.set_yticks(y_base)
-            ax.set_yticklabels([channel_label(channel, channel) for channel in channel_keys])
+            ax.set_yticklabels([channel_label(channel) for channel in channel_keys])
             ax.invert_yaxis()
             ax.grid(axis="y", alpha=0.18, linestyle=":")
             for separator in np.arange(len(channel_keys) - 1, dtype=np.float64) + 0.5:
-                ax.axhline(separator, color="#D9D9D9", linewidth=0.8, zorder=0)
+                if channel_keys[int(separator + 0.5)] == COMBINED_CHANNEL_KEY:
+                    ax.axhline(separator, color="#808080", linewidth=1.4, zorder=0)
+                else:
+                    ax.axhline(separator, color="#D9D9D9", linewidth=0.8, zorder=0)
             ax.set_xlabel(parameter_label(parameter))
-            ax.set_ylabel("Channel / Region")
-            ax.set_title(f"{parameter_label(parameter)} final measurement")
+            ax.set_ylabel("Channel / combined")
+            ax.set_title(f"{parameter_label(parameter)}: per-channel method comparison + combined")
 
             handles = [
                 plt.Line2D(
@@ -420,7 +820,7 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                 bbox_to_anchor=(0.5, 1.16),
                 ncol=min(len(handles), 4),
             )
-            fig.subplots_adjust(right=0.78, top=0.82, left=0.16, bottom=0.16)
+            fig.subplots_adjust(right=0.74, top=0.82, left=0.16, bottom=0.16)
 
             plot_path = plot_dir / f"{sanitize_filename(group)}_{sanitize_filename(parameter)}.png"
             fig.savefig(plot_path)
@@ -429,45 +829,71 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                 "plot": str(plot_path),
                 "num_points": len(parameter_rows),
                 "methods": methods,
+                "channels": channel_keys,
             }
-            print(f"[extract-qi-final] wrote_plot={plot_path}", flush=True)
+            print(f"[qi-final] wrote_plot={plot_path}", flush=True)
 
     return plot_summary
 
 
 def main() -> None:
     args = parse_args()
-    rows: list[dict[str, Any]] = []
     ignored_regions = set() if args.keep_hadhad else DEFAULT_IGNORED_REGIONS
-    for method, results_path in parse_method_specs(args):
-        rows.extend(
-            parse_results_text(
-                results_path.read_text(),
-                method=method,
-                keep_truth=args.keep_truth,
-                ignored_regions=ignored_regions,
-            )
+
+    per_channel_rows: list[dict[str, Any]] = []
+    for method, results_path in parse_method_specs(args.method):
+        rows = parse_results_text(
+            results_path.read_text(),
+            method=method,
+            keep_truth=args.keep_truth,
+            ignored_regions=ignored_regions,
         )
-    if not rows:
+        rows = filter_rows(rows, args.include_groups, args.only_key_quantum)
+        per_channel_rows.extend(rows)
+        print(f"[qi-final] method={method} rows={len(rows)} path={results_path}", flush=True)
+
+    if not per_channel_rows:
         raise ValueError(
-            "No final measurements found. "
-            "Check that QIProcessor finished and wrote Unfolded B/C or Quantum result sections."
+            "No final measurements found. Check that each input contains Unfolded/Final B/C or Quantum sections."
         )
+
+    combined_rows = combine_all_channels(
+        per_channel_rows,
+        combination_model=args.combination_model,
+        apply_tension_scale=not args.no_tension_scale,
+        debug=args.debug,
+    )
+    all_rows = sorted_rows(per_channel_rows + combined_rows)
+    combined_rows = sorted_rows(combined_rows)
+    per_channel_rows = sorted_rows(per_channel_rows)
 
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    json_path = args.output_prefix.with_suffix(".json")
-    csv_path = args.output_prefix.with_suffix(".csv")
-    json_path.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n")
-    write_csv(rows, csv_path)
-    if not args.no_plots:
-        plot_summary = plot_measurement_summaries(rows, args.output_prefix)
-        plot_json_path = args.output_prefix.parent / f"{args.output_prefix.name}_summary_plots.json"
-        plot_json_path.write_text(json.dumps(plot_summary, indent=2, sort_keys=True) + "\n")
-        print(f"[extract-qi-final] wrote_plot_summary={plot_json_path}")
 
-    print(f"[extract-qi-final] rows={len(rows)}")
-    print(f"[extract-qi-final] wrote_json={json_path}")
-    print(f"[extract-qi-final] wrote_csv={csv_path}")
+    per_channel_json = args.output_prefix.parent / f"{args.output_prefix.name}_per_channel.json"
+    per_channel_csv = args.output_prefix.parent / f"{args.output_prefix.name}_per_channel.csv"
+    combined_json = args.output_prefix.parent / f"{args.output_prefix.name}_combined.json"
+    combined_csv = args.output_prefix.parent / f"{args.output_prefix.name}_combined.csv"
+    all_json = args.output_prefix.parent / f"{args.output_prefix.name}_per_channel_plus_combined.json"
+    all_csv = args.output_prefix.parent / f"{args.output_prefix.name}_per_channel_plus_combined.csv"
+
+    per_channel_json.write_text(json.dumps(per_channel_rows, indent=2, sort_keys=True) + "\n")
+    combined_json.write_text(json.dumps(combined_rows, indent=2, sort_keys=True) + "\n")
+    all_json.write_text(json.dumps(all_rows, indent=2, sort_keys=True) + "\n")
+    write_csv(per_channel_rows, per_channel_csv)
+    write_csv(combined_rows, combined_csv)
+    write_csv(all_rows, all_csv)
+
+    if not args.no_plots:
+        plot_summary = plot_measurement_summaries(all_rows, args.output_prefix)
+        plot_json_path = args.output_prefix.parent / f"{args.output_prefix.name}_plots.json"
+        plot_json_path.write_text(json.dumps(plot_summary, indent=2, sort_keys=True) + "\n")
+        print(f"[qi-final] wrote_plot_summary={plot_json_path}", flush=True)
+
+    print(f"[qi-final] per_channel_rows={len(per_channel_rows)}")
+    print(f"[qi-final] combined_rows={len(combined_rows)}")
+    print(f"[qi-final] wrote_json={all_json}")
+    print(f"[qi-final] wrote_csv={all_csv}")
+    print(f"[qi-final] wrote_combined_csv={combined_csv}")
 
 
 if __name__ == "__main__":
