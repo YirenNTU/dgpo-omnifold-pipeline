@@ -531,6 +531,15 @@ python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet
 python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_scratch.yaml
 ```
 
+Use `--num-workers N` to split the QI regions over independent Python/ROOT
+processes. This parallelizes over regions, not over threads inside one ROOT
+process:
+
+```bash
+cd /path/to/lep_tree_ana
+python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml --num-workers 4
+```
+
 By default the wrapper sets `QI_EXCLUDE_UNFOLD_OBSERVABLES=mtautau` and
 `QI_PRESERVE_PARQUET_WEIGHTS=1`. The latter is important for EveNet test-split
 normalization: if prediction/export wrote a split-corrected `weight` to parquet,
@@ -657,16 +666,19 @@ python3 util/plot_qi_method_comparison.py \
   --data-sample-name data94 \
   --mc-sample-names Ztautau Zll Zqq \
   --metric-grouping evenet-channel \
+  --metrics-only \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison
 ```
 
 Use `--metric-grouping evenet-channel` to make the final metric summary y-axis follow the actual EveNet predicted classes such as `Ztautau_pipi`, `Ztautau_pirho`, `Ztautau_pie`, and `Ztautau_others`. Use `--metric-grouping region` if you intentionally want central cut-based files such as `hadhad`, `ee`, `mumu`, and `emu`.
+Use `--metrics-only` when you only want the final metric summary; omit it to also draw optional data-vs-MC control histograms.
 
 Outputs:
 
 - `qi_metric_<observable>.png`, one channel-vs-method plot per metric or QI observable
-- `physics_data_mc_<method>/<region>_<observable>.png`, data-vs-stacked-MC physics distributions
-- `physics_data_mc_<method>/<region>_<observable>_log.png`, log-y companion plots
+- `qi_method_comparison_combined_metrics.{json,csv,md}`, final cross-channel metrics combined with inverse-variance weights while treating channels as uncorrelated
+- `physics_data_mc_<method>/<region>_<observable>.png`, optional data-vs-stacked-MC physics distributions
+- `physics_data_mc_<method>/<region>_<observable>_log.png`, optional log-y companion plots
 - `neutrino_truth_vs_pred_<region>.png`
 - `cut_based_vs_evenet_region_matrix.png`, comparing central cut-based regions against EveNet fine predicted channels when the raw parquet contains EveNet predicted class labels
 - `qi_method_comparison_metrics.json`

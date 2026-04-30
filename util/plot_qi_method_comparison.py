@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -70,6 +71,13 @@ def parse_args() -> argparse.Namespace:
             "Optional observable list for data-vs-MC plots. If omitted, use QI observables plus "
             "reconstructed tau-pair kinematics."
         ),
+    )
+    parser.add_argument(
+        "--skip-physics-plots",
+        "--metrics-only",
+        action="store_true",
+        dest="skip_physics_plots",
+        help="Only summarize final QI metrics; skip optional data-vs-MC physics histograms.",
     )
     parser.add_argument("--max-scatter-points", type=int, default=8000, help="Maximum points per scatter panel.")
     return parser.parse_args()
@@ -381,8 +389,6 @@ METRIC_PLOT_SPECS = [
     ("nu_a_pt_mae", r"$\nu_a$ pT MAE", "MAE [GeV]", "{:.3f}", "absolute"),
     ("nu_b_pt_mae", r"$\nu_b$ pT MAE", "MAE [GeV]", "{:.3f}", "absolute"),
 ]
-
-
 def sanitize_filename(name: str) -> str:
     output = []
     for char in name:
@@ -414,6 +420,155 @@ def finite_metric_values(
             values.append(region_metrics.get(metric_key, np.nan))
             errors.append(region_metrics.get(f"{metric_key}_unc", np.nan))
     return np.asarray(values, dtype=np.float64), np.asarray(errors, dtype=np.float64)
+
+
+def metric_plot_specs() -> list[tuple[str, str, str, str, str]]:
+    specs = list(METRIC_PLOT_SPECS)
+    for observable in get_observable_names():
+        specs.append(
+            (
+                f"{observable}_mean",
+                observable.replace("_", " "),
+                "Weighted mean",
+                "{:.3f}",
+                "absolute",
+            )
+        )
+    return specs
+
+
+def combine_uncorrelated(values: np.ndarray, uncertainties: np.ndarray) -> tuple[float, float, int, float]:
+    """
+    inputs:
+      values: np.ndarray, per-channel nominal measurements.
+      uncertainties: np.ndarray, per-channel one-sigma uncertainties.
+    outputs:
+      tuple(value, uncertainty, n_channels, weight_sum), inverse-variance combined result.
+    goal:
+      Combine statistically independent channel measurements without assuming
+      correlations between channels.
+    """
+    mask = np.isfinite(values) & np.isfinite(uncertainties) & (uncertainties > 0)
+    if not np.any(mask):
+        return np.nan, np.nan, 0, 0.0
+    channel_weights = 1.0 / np.square(uncertainties[mask])
+    weight_sum = float(np.sum(channel_weights))
+    if weight_sum <= 0:
+        return np.nan, np.nan, 0, 0.0
+    combined_value = float(np.sum(channel_weights * values[mask]) / weight_sum)
+    combined_uncertainty = float(1.0 / np.sqrt(weight_sum))
+    return combined_value, combined_uncertainty, int(np.sum(mask)), weight_sum
+
+
+def build_combined_metrics(
+    metrics: dict[str, dict[str, dict[str, Any]]],
+    method_names: list[str],
+    regions: list[str],
+) -> dict[str, dict[str, Any]]:
+    """
+    inputs:
+      metrics: dict, per-method per-channel metric table.
+      method_names: list[str], methods to combine.
+      regions: list[str], channels treated as statistically independent.
+    outputs:
+      dict, per-method combined final metrics with nominal, uncertainty, and n_channels.
+    goal:
+      Report one final number per method and metric by inverse-variance
+      combining the channel measurements.
+    """
+    combined: dict[str, dict[str, Any]] = {}
+    for method in method_names:
+        method_combined: dict[str, Any] = {}
+        for metric_key, title, *_ in metric_plot_specs():
+            values = []
+            uncertainties = []
+            channels = []
+            for region in regions:
+                region_metrics = metrics.get(method, {}).get(region, {})
+                value = region_metrics.get(metric_key, np.nan)
+                uncertainty = region_metrics.get(f"{metric_key}_unc", np.nan)
+                values.append(value)
+                uncertainties.append(uncertainty)
+                channels.append(region)
+            value, uncertainty, n_channels, weight_sum = combine_uncorrelated(
+                np.asarray(values, dtype=np.float64),
+                np.asarray(uncertainties, dtype=np.float64),
+            )
+            if n_channels == 0:
+                continue
+            method_combined[metric_key] = {
+                "title": title,
+                "value": value,
+                "uncertainty": uncertainty,
+                "n_channels": n_channels,
+                "weight_sum": weight_sum,
+                "channels": [
+                    channel
+                    for channel, channel_value, channel_uncertainty in zip(channels, values, uncertainties)
+                    if np.isfinite(channel_value) and np.isfinite(channel_uncertainty) and channel_uncertainty > 0
+                ],
+            }
+        combined[method] = method_combined
+    return combined
+
+
+def write_combined_metrics(combined_metrics: dict[str, dict[str, Any]], output_dir: Path) -> None:
+    """
+    inputs:
+      combined_metrics: dict, output of build_combined_metrics.
+      output_dir: pathlib.Path, destination directory.
+    outputs:
+      None. Writes JSON, CSV, and Markdown summaries.
+    goal:
+      Make final cross-channel metrics easy to inspect, parse, and paste into notes.
+    """
+    json_path = output_dir / "qi_method_comparison_combined_metrics.json"
+    csv_path = output_dir / "qi_method_comparison_combined_metrics.csv"
+    md_path = output_dir / "qi_method_comparison_combined_metrics.md"
+
+    with json_path.open("w") as handle:
+        json.dump(json_safe(combined_metrics), handle, indent=2, sort_keys=True)
+
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["method", "metric", "title", "value", "uncertainty", "n_channels", "channels"],
+        )
+        writer.writeheader()
+        for method, method_metrics in combined_metrics.items():
+            for metric_key, result in method_metrics.items():
+                writer.writerow(
+                    {
+                        "method": method,
+                        "metric": metric_key,
+                        "title": result.get("title", metric_key),
+                        "value": result.get("value"),
+                        "uncertainty": result.get("uncertainty"),
+                        "n_channels": result.get("n_channels"),
+                        "channels": " ".join(result.get("channels", [])),
+                    }
+                )
+
+    lines = [
+        "# Combined QI Method Metrics",
+        "",
+        "Channels are treated as uncorrelated and combined with inverse-variance weights.",
+        "",
+        "| Method | Metric | Value ± unc. | Channels |",
+        "|---|---|---:|---:|",
+    ]
+    for method, method_metrics in combined_metrics.items():
+        for metric_key, result in method_metrics.items():
+            value = result.get("value", np.nan)
+            uncertainty = result.get("uncertainty", np.nan)
+            title = result.get("title", metric_key)
+            n_channels = result.get("n_channels", 0)
+            if np.isfinite(value) and np.isfinite(uncertainty):
+                value_text = f"{value:.6g} ± {uncertainty:.3g}"
+            else:
+                value_text = "n/a"
+            lines.append(f"| {method} | {title} (`{metric_key}`) | {value_text} | {n_channels} |")
+    md_path.write_text("\n".join(lines) + "\n")
 
 
 def plot_single_metric_summary(
@@ -533,19 +688,7 @@ def plot_metric_summary(
     regions: list[str],
     method_names: list[str],
 ) -> None:
-    specs = list(METRIC_PLOT_SPECS)
-    for observable in get_observable_names():
-        specs.append(
-            (
-                f"{observable}_mean",
-                observable.replace("_", " "),
-                "Weighted mean",
-                "{:.3f}",
-                "absolute",
-            )
-        )
-
-    for metric_key, title, xlabel, uncertainty_format, precision_mode in specs:
+    for metric_key, title, xlabel, uncertainty_format, precision_mode in metric_plot_specs():
         plot_single_metric_summary(
             metrics=metrics,
             output_dir=output_dir,
@@ -731,6 +874,14 @@ def metric_groups_from_evenet_channels(
 
 
 def weighted_hist_and_err2(values: np.ndarray, weights: np.ndarray, bins: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if values.size == 0:
+        zeros = np.zeros(len(bins) - 1, dtype=np.float64)
+        return zeros, zeros.copy()
+    if values.shape != weights.shape:
+        raise ValueError(
+            "Cannot histogram observable with mismatched value/weight lengths: "
+            f"values={values.shape}, weights={weights.shape}."
+        )
     mask = np.isfinite(values) & np.isfinite(weights)
     hist = np.histogram(values[mask], bins=bins, weights=weights[mask])[0].astype(np.float64)
     err2 = np.histogram(values[mask], bins=bins, weights=np.square(weights[mask]))[0].astype(np.float64)
@@ -1001,18 +1152,24 @@ def main() -> None:
         physics_regions = active_regions
 
     plot_metric_summary(metrics, args.output_dir, active_regions, method_names)
+    combined_metrics = build_combined_metrics(metrics, method_names, active_regions)
+    write_combined_metrics(combined_metrics, args.output_dir)
     if raw_for_matrix is not None:
         cut_based_regions = [region for region in args.regions if not is_background_like_region(region)]
         if cut_based_regions:
             plot_cut_based_vs_evenet(raw_for_matrix, args.output_dir, cut_based_regions)
-    physics_data_mc_summary = plot_physics_data_mc_comparisons(
-        methods=methods,
-        output_dir=args.output_dir,
-        regions=physics_regions,
-        data_sample_name=args.data_sample_name,
-        mc_sample_names=list(args.mc_sample_names),
-        requested_observables=args.physics_observables,
-    )
+    if args.skip_physics_plots:
+        physics_data_mc_summary = {}
+        print("[plot-qi-method-comparison] skipping optional physics data/MC plots", flush=True)
+    else:
+        physics_data_mc_summary = plot_physics_data_mc_comparisons(
+            methods=methods,
+            output_dir=args.output_dir,
+            regions=physics_regions,
+            data_sample_name=args.data_sample_name,
+            mc_sample_names=list(args.mc_sample_names),
+            requested_observables=args.physics_observables,
+        )
 
     audit = build_audit_summary(
         methods=methods,
@@ -1024,6 +1181,7 @@ def main() -> None:
         physics_data_mc_summary=physics_data_mc_summary,
         metric_grouping=args.metric_grouping,
     )
+    audit["combined_metrics"] = combined_metrics
     with (args.output_dir / "qi_method_comparison_audit.json").open("w") as handle:
         json.dump(json_safe(audit), handle, indent=2, sort_keys=True)
     write_audit_report(json_safe(audit), args.output_dir)
