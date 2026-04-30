@@ -46,6 +46,72 @@ def maybe_load_roounfold() -> None:
         )
 
 
+def patch_qi_unfold_observables() -> None:
+    """
+    inputs:
+      None. Reads QI_EXCLUDE_UNFOLD_OBSERVABLES from the environment.
+    outputs:
+      None. Patches quantum.observables_builder.get_observable_names in this process.
+    goal:
+      Keep the central QIProcessor untouched while allowing the ml_pipeline
+      wrapper to skip non-SDM observables, such as mtautau, in RooUnfold.
+    """
+    excluded_text = os.environ.get("QI_EXCLUDE_UNFOLD_OBSERVABLES", "mtautau")
+    excluded = {item.strip() for item in excluded_text.split(",") if item.strip()}
+    if not excluded:
+        return
+
+    import quantum.observables_builder as observables_builder
+
+    original_get_observable_names = observables_builder.get_observable_names
+
+    def get_filtered_observable_names():
+        return [name for name in original_get_observable_names() if name not in excluded]
+
+    observables_builder.get_observable_names = get_filtered_observable_names
+    print(
+        "[run-tree-ana-root-preload] excluding unfold observables: "
+        f"{sorted(excluded)}",
+        flush=True,
+    )
+
+
+def patch_preserve_parquet_weights() -> None:
+    """
+    inputs:
+      None. Reads QI_PRESERVE_PARQUET_WEIGHTS from the environment.
+    outputs:
+      None. Patches processor.DataLoader.DataLoader.postprocess in this process.
+    goal:
+      Keep nominal DataLoader code unchanged while allowing the ml_pipeline QI
+      wrapper to unfold already-normalized parquet exports with their stored
+      event weights, including EveNet test-split corrections.
+    """
+    enabled = os.environ.get("QI_PRESERVE_PARQUET_WEIGHTS", "1").lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return
+
+    from processor import DataLoader as DataLoaderModule
+
+    original_postprocess = DataLoaderModule.DataLoader.postprocess
+
+    def postprocess_preserve_parquet_weights(self):
+        parquet_inputs = all(str(path).endswith(".parquet") for path in self.input_files)
+        has_stored_weights = bool(self.data) and all("weight" in events.fields for events in self.data.values())
+        if not parquet_inputs or not has_stored_weights:
+            return original_postprocess(self)
+
+        for events in self.data.values():
+            events["weight_nominal"] = events["weight"]
+        self.current_variation = ("nominal", 0.0)
+
+    DataLoaderModule.DataLoader.postprocess = postprocess_preserve_parquet_weights
+    print(
+        "[run-tree-ana-root-preload] preserving parquet event weights in DataLoader.postprocess",
+        flush=True,
+    )
+
+
 def main() -> None:
     set_thread_defaults()
     os.environ.setdefault("TREE_ANA_DIR", str(REPO_ROOT))
@@ -62,6 +128,8 @@ def main() -> None:
             "This is an environment issue, not an EveNet parquet-content issue."
         ) from exc
     maybe_load_roounfold()
+    patch_qi_unfold_observables()
+    patch_preserve_parquet_weights()
 
     sys.argv = [str(TREE_ANA), *sys.argv[1:]]
     runpy.run_path(str(TREE_ANA), run_name="__main__")

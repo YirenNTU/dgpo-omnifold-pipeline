@@ -519,21 +519,36 @@ Each exported root should contain:
 
 The raw parquet also contains matching cut flags such as `Ztautau_pipi_cut`, which QIProcessor needs when building response matrices.
 
-Then run QIProcessor from the repository root, not from `ml_pipeline`:
-
-```bash
-cd /path/to/lep_tree_ana
-PYTHONPATH=$PWD python3 bin/tree_ana -c config/config_qi_evenet_pretrain.yaml
-PYTHONPATH=$PWD python3 bin/tree_ana -c config/config_qi_evenet_scratch.yaml
-```
-
-If ROOT/cppyy crashes during import in the active environment, use the ml_pipeline wrapper
-instead of editing `bin/tree_ana`:
+Then run QIProcessor from the repository root, not from `ml_pipeline`.
+For EveNet final metrics, prefer the ml_pipeline wrapper so ROOT is preloaded,
+the parquet-export event weights are preserved, and non-SDM observables such
+as `mtautau` are excluded from RooUnfold without editing the nominal QIProcessor
+or DataLoader:
 
 ```bash
 cd /path/to/lep_tree_ana
 python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
 python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_scratch.yaml
+```
+
+By default the wrapper sets `QI_EXCLUDE_UNFOLD_OBSERVABLES=mtautau` and
+`QI_PRESERVE_PARQUET_WEIGHTS=1`. The latter is important for EveNet test-split
+normalization: if prediction/export wrote a split-corrected `weight` to parquet,
+the wrapper keeps that value as `weight_nominal` instead of letting DataLoader
+replace it with `norm_factor / initial_total_num_events`. To restore the nominal
+observable list for a special cross-check, run with an empty value:
+
+```bash
+cd /path/to/lep_tree_ana
+QI_EXCLUDE_UNFOLD_OBSERVABLES= python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
+```
+
+To deliberately use nominal DataLoader weight recomputation for a cross-check,
+turn off parquet-weight preservation:
+
+```bash
+cd /path/to/lep_tree_ana
+QI_PRESERVE_PARQUET_WEIGHTS=0 python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
 ```
 
 If `QIProcessor` fails with `AttributeError: Failed to get attribute RooUnfoldResponse from ROOT`,
