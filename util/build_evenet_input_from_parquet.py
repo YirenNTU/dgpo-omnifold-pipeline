@@ -241,6 +241,31 @@ def limit_events_for_monitoring(events: ak.Array, max_events: int | None) -> ak.
     return ak.to_packed(events[:max_events])
 
 
+def release_worker_memory() -> None:
+    """
+    inputs:
+      None.
+    outputs:
+      None.
+    goal:
+      Encourage pyarrow/awkward temporary buffers to return memory to the OS
+      between parquet batches in long-lived worker processes.
+    """
+    gc.collect()
+    try:
+        import pyarrow as pa
+
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def safe_path_name(name: str) -> str:
     """
     inputs:
@@ -412,7 +437,16 @@ def load_preselected_file_worker(payload: dict) -> dict:
                 monitor_selected_remaining -= selected_take
 
         del raw_events, selected_events
-        gc.collect()
+        if keep_monitoring:
+            try:
+                del monitor_raw
+            except UnboundLocalError:
+                pass
+            try:
+                del monitor_selected
+            except UnboundLocalError:
+                pass
+        release_worker_memory()
 
     return {
         "task_index": task_index,
@@ -522,7 +556,7 @@ def load_selected_sample_events(
     keep_monitoring: bool,
     monitor_max_events: int | None,
     num_workers: int = 1,
-    load_batch_size: int = 200_000,
+    load_batch_size: int = 50_000,
     tmp_root: Path | None = None,
 ) -> tuple[ak.Array, ak.Array | None, ak.Array | None]:
     """
@@ -594,7 +628,7 @@ def load_selected_sample_events(
                     monitor_selected_remaining -= selected_take
 
             del raw_events, selected_events
-            gc.collect()
+            release_worker_memory()
 
         console.print(
             f"  [green]Loaded task[/green] [white]{task['task_label']}[/white] "
@@ -1915,7 +1949,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--load-batch-size",
         type=int,
-        default=200000,
+        default=50000,
         help=(
             "Rows per pyarrow batch while loading parquet chunks. Lower this if a worker is still killed."
         ),

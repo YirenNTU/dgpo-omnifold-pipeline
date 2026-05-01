@@ -94,7 +94,7 @@ python3 util/build_evenet_input_from_parquet.py \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset \
   --skip-monitoring \
   --num-workers 3 \
-  --load-batch-size 200000 \
+  --load-batch-size 50000 \
   --no-compress-output
 ```
 
