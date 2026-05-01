@@ -253,29 +253,106 @@ def safe_path_name(name: str) -> str:
     return "_".join("".join(char if char.isalnum() else "_" for char in name).strip("_").lower().split("_"))
 
 
+def parquet_row_groups(path: str) -> list[int] | None:
+    """
+    inputs:
+      path: str, parquet file path.
+    outputs:
+      list[int] | None, row-group indices when the file has multiple groups;
+      None when row-group metadata is unavailable or only one group exists.
+    goal:
+      Split very large parquet files more finely than file-level workers.
+    """
+    try:
+        import pyarrow.parquet as pq
+    except Exception:
+        return None
+
+    try:
+        num_row_groups = pq.ParquetFile(path).metadata.num_row_groups
+    except Exception:
+        return None
+    if num_row_groups <= 1:
+        return None
+    return list(range(num_row_groups))
+
+
+def parquet_load_tasks(parquet_files: list[str]) -> list[dict]:
+    """
+    inputs:
+      parquet_files: list[str], expanded sample input files.
+    outputs:
+      list[dict], file or row-group tasks.
+    goal:
+      Give workers smaller read units when parquet row groups are available.
+    """
+    tasks: list[dict] = []
+    for file_index, parquet_file in enumerate(parquet_files, start=1):
+        row_groups = parquet_row_groups(parquet_file)
+        if row_groups is None:
+            tasks.append(
+                {
+                    "parquet_file": parquet_file,
+                    "file_index": file_index,
+                    "row_group": None,
+                    "task_label": f"{file_index}",
+                }
+            )
+            continue
+        for row_group in row_groups:
+            tasks.append(
+                {
+                    "parquet_file": parquet_file,
+                    "file_index": file_index,
+                    "row_group": row_group,
+                    "task_label": f"{file_index}_rg{row_group}",
+                }
+            )
+    return tasks
+
+
+def load_parquet_task(parquet_file: str, row_group: int | None) -> ak.Array:
+    """
+    inputs:
+      parquet_file: str, parquet path.
+      row_group: int | None, optional row-group index.
+    outputs:
+      ak.Array, loaded events for the task.
+    goal:
+      Keep the row-group loading call in one place because awkward versions
+      differ mainly around optional parquet arguments.
+    """
+    if row_group is None:
+        return ak.from_parquet(parquet_file)
+    return ak.from_parquet(parquet_file, row_groups=[row_group])
+
+
 def load_preselected_file_worker(payload: dict) -> dict:
     """
     inputs:
-      payload: dict, one parquet file plus monitoring/output settings.
+      payload: dict, one parquet file or row-group plus monitoring/output settings.
     outputs:
       dict, counts and temporary parquet paths for selected/monitor chunks.
     goal:
-      Let each worker hold only one raw parquet file in memory, preselect it,
-      write the smaller selected chunk to disk, and exit.
+      Let each worker hold only one raw parquet chunk in memory, preselect it,
+      write the smaller selected shard to disk, and exit.
     """
     parquet_file = payload["parquet_file"]
     file_index = int(payload["file_index"])
+    row_group = payload.get("row_group")
+    task_index = int(payload["task_index"])
+    task_label = str(payload["task_label"])
     keep_monitoring = bool(payload["keep_monitoring"])
     monitor_max_events = payload["monitor_max_events"]
     worker_dir = Path(payload["worker_dir"])
     worker_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_events = ak.from_parquet(parquet_file)
+    raw_events = load_parquet_task(parquet_file, row_group)
     raw_count = len(raw_events)
     selected_events = apply_preselection(raw_events)
     selected_count = len(selected_events)
 
-    selected_path = worker_dir / f"selected_{file_index:04d}.parquet"
+    selected_path = worker_dir / f"selected_{task_index:04d}.parquet"
     ak.to_parquet(selected_events, selected_path, compression="snappy")
 
     monitor_raw_path = None
@@ -283,13 +360,16 @@ def load_preselected_file_worker(payload: dict) -> dict:
     if keep_monitoring:
         monitor_raw = limit_events_for_monitoring(raw_events, monitor_max_events)
         monitor_selected = limit_events_for_monitoring(selected_events, monitor_max_events)
-        monitor_raw_path = worker_dir / f"monitor_raw_{file_index:04d}.parquet"
-        monitor_selected_path = worker_dir / f"monitor_selected_{file_index:04d}.parquet"
+        monitor_raw_path = worker_dir / f"monitor_raw_{task_index:04d}.parquet"
+        monitor_selected_path = worker_dir / f"monitor_selected_{task_index:04d}.parquet"
         ak.to_parquet(monitor_raw, monitor_raw_path, compression="snappy")
         ak.to_parquet(monitor_selected, monitor_selected_path, compression="snappy")
 
     return {
+        "task_index": task_index,
+        "task_label": task_label,
         "file_index": file_index,
+        "row_group": row_group,
         "raw_count": raw_count,
         "selected_count": selected_count,
         "selected_path": str(selected_path),
@@ -322,25 +402,29 @@ def load_selected_sample_events_parallel(
     """
     sample_tmp = tmp_root / safe_path_name(sample.name)
     sample_tmp.mkdir(parents=True, exist_ok=True)
-    worker_count = max(1, min(int(num_workers), len(parquet_files)))
+    tasks = parquet_load_tasks(parquet_files)
+    worker_count = max(1, min(int(num_workers), len(tasks)))
     console.print(
         f"  [bold cyan]Parallel load[/bold cyan] workers=[white]{worker_count}[/white] "
-        f"files=[white]{len(parquet_files)}[/white]"
+        f"files=[white]{len(parquet_files)}[/white] tasks=[white]{len(tasks)}[/white]"
     )
 
     per_file_monitor_max = monitor_max_events
     if keep_monitoring and monitor_max_events is not None and monitor_max_events > 0:
-        per_file_monitor_max = max(1, (monitor_max_events + len(parquet_files) - 1) // len(parquet_files))
+        per_file_monitor_max = max(1, (monitor_max_events + len(tasks) - 1) // len(tasks))
 
     payloads = [
         {
-            "parquet_file": parquet_file,
-            "file_index": file_index,
+            "parquet_file": task["parquet_file"],
+            "file_index": task["file_index"],
+            "row_group": task["row_group"],
+            "task_index": task_index,
+            "task_label": task["task_label"],
             "keep_monitoring": keep_monitoring,
             "monitor_max_events": per_file_monitor_max,
             "worker_dir": str(sample_tmp),
         }
-        for file_index, parquet_file in enumerate(parquet_files, start=1)
+        for task_index, task in enumerate(tasks, start=1)
     ]
 
     results: list[dict] = []
@@ -350,11 +434,11 @@ def load_selected_sample_events_parallel(
             result = future.result()
             results.append(result)
             console.print(
-                f"  [green]Loaded file[/green] [white]{result['file_index']}/{len(parquet_files)}[/white] "
+                f"  [green]Loaded task[/green] [white]{result['task_label']}[/white] "
                 f"raw=[white]{result['raw_count']}[/white] selected=[white]{result['selected_count']}[/white]"
             )
 
-    results.sort(key=lambda item: item["file_index"])
+    results.sort(key=lambda item: item["task_index"])
     selected_chunks = [ak.from_parquet(result["selected_path"]) for result in results]
     monitor_raw_chunks = [
         ak.from_parquet(result["monitor_raw_path"])
@@ -403,7 +487,8 @@ def load_selected_sample_events(
     if not parquet_files:
         raise ValueError(f"No parquet inputs found for sample '{sample.name}'.")
 
-    if num_workers > 1 and len(parquet_files) > 1:
+    tasks = parquet_load_tasks(parquet_files)
+    if num_workers > 1 and len(tasks) > 1:
         if tmp_root is None:
             raise ValueError("tmp_root is required when num_workers > 1.")
         return load_selected_sample_events_parallel(
@@ -423,8 +508,8 @@ def load_selected_sample_events(
     monitor_raw_remaining = None if monitor_max_events is None or monitor_max_events <= 0 else monitor_max_events
     monitor_selected_remaining = None if monitor_max_events is None or monitor_max_events <= 0 else monitor_max_events
 
-    for file_index, parquet_file in enumerate(parquet_files, start=1):
-        raw_events = ak.from_parquet(parquet_file)
+    for task in tasks:
+        raw_events = load_parquet_task(task["parquet_file"], task["row_group"])
         raw_total += len(raw_events)
         if keep_monitoring and (monitor_raw_remaining is None or monitor_raw_remaining > 0):
             raw_take = len(raw_events) if monitor_raw_remaining is None else min(monitor_raw_remaining, len(raw_events))
@@ -446,7 +531,7 @@ def load_selected_sample_events(
                 monitor_selected_remaining -= selected_take
 
         console.print(
-            f"  [green]Loaded file[/green] [white]{file_index}/{len(parquet_files)}[/white] "
+            f"  [green]Loaded task[/green] [white]{task['task_label']}[/white] "
             f"raw=[white]{len(raw_events)}[/white] selected=[white]{len(selected_events)}[/white]"
         )
         del raw_events, selected_events

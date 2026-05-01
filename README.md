@@ -97,10 +97,11 @@ python3 util/build_evenet_input_from_parquet.py \
   --no-compress-output
 ```
 
-`--num-workers` parallelizes only multi-file sample loading/preselection. Each
-worker loads one parquet file, writes a selected temporary shard under the
-output directory, and exits; this lowers the memory pressure per process
-compared with loading all files before preselection.
+`--num-workers` parallelizes sample loading/preselection over parquet row groups
+when available, otherwise over files. Each worker loads one parquet chunk,
+writes a selected temporary shard under the output directory, and exits; this
+lowers the memory pressure per process compared with loading all files before
+preselection.
 
 Optional point-cloud collection filter:
 
