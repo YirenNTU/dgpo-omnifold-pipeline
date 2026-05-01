@@ -22,7 +22,17 @@ Processes:
       - "vis-"
     "tau+":
       - "vis+"
+  Ztautau_epi:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
   Ztautau_rhoe:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
+  Ztautau_erho:
     "tau-":
       - "vis-"
     "tau+":
@@ -32,7 +42,17 @@ Processes:
       - "vis-"
     "tau+":
       - "vis+"
+  Ztautau_mupi:
+    "tau-":
+      - "vis-"
+    "tau+":
+        - "vis+"
   Ztautau_rhomu:
+    "tau-":
+      - "vis-"
+    "tau+":
+      - "vis+"
+  Ztautau_murho:
     "tau-":
       - "vis-"
     "tau+":
