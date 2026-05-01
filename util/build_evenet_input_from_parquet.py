@@ -17,7 +17,6 @@ from evenet_parquet_common import (
     MAX_PART_ENERGY_GEV,
     build_central_leg_slot_indices,
     build_tau_targets,
-    build_truth_tau_slots,
     build_visible_tau_assumptions,
     build_momentum4d,
     extract_target_invisible_observable,
@@ -25,7 +24,11 @@ from evenet_parquet_common import (
     extract_part_momentum_observable,
     extract_visible_tau_observable,
     features_from_p4,
+    p4_is_finite,
     part_energy_mask,
+    rebuild_momentum4d,
+    stack_tau_pair,
+    stack_tau_pair_mask,
 )
 from ml_pipeline_config import EveNetConfig, FeatureConfig, parse_evenet_config, parse_feature_config
 from parquet_plot_common import (
@@ -934,19 +937,61 @@ def p4_component_values(p4, component: str):
     raise ValueError(f"Unsupported p4 component '{component}'.")
 
 
+def build_truth_visible_tau_slots(events: ak.Array):
+    """
+    inputs:
+      events: ak.Array, selected signal events.
+    outputs:
+      tuple(truth_visible_pair, truth_visible_mask, source): Momentum4D [event, a/b],
+      validity mask, and source description; source is None if unavailable.
+    goal:
+      Resolve truth visible tau p4 in the same nominal a/b basis used by the
+      EveNet visible inputs, without comparing visible taus to full truth taus.
+    """
+    fields = set(events.fields)
+    if {"truth_visible_a_p4", "truth_visible_b_p4"}.issubset(fields):
+        truth_visible_a = rebuild_momentum4d(events["truth_visible_a_p4"])
+        truth_visible_b = rebuild_momentum4d(events["truth_visible_b_p4"])
+        return (
+            stack_tau_pair(truth_visible_a, truth_visible_b),
+            stack_tau_pair_mask(p4_is_finite(truth_visible_a), p4_is_finite(truth_visible_b)),
+            "truth_visible_a_p4/truth_visible_b_p4",
+        )
+
+    if {
+        "truth_tau_a_p4",
+        "truth_tau_b_p4",
+        "truth_missing_a_p4",
+        "truth_missing_b_p4",
+    }.issubset(fields):
+        truth_tau_a = rebuild_momentum4d(events["truth_tau_a_p4"])
+        truth_tau_b = rebuild_momentum4d(events["truth_tau_b_p4"])
+        truth_missing_a = rebuild_momentum4d(events["truth_missing_a_p4"])
+        truth_missing_b = rebuild_momentum4d(events["truth_missing_b_p4"])
+        truth_visible_a = truth_tau_a - truth_missing_a
+        truth_visible_b = truth_tau_b - truth_missing_b
+        return (
+            stack_tau_pair(truth_visible_a, truth_visible_b),
+            stack_tau_pair_mask(p4_is_finite(truth_visible_a), p4_is_finite(truth_visible_b)),
+            "truth_tau_{a,b}_p4 - truth_missing_{a,b}_p4",
+        )
+
+    return None, None, None
+
+
 def visible_truth_tau_pairs(events: ak.Array, component: str) -> tuple[np.ndarray, np.ndarray]:
     """
     inputs:
       events: ak.Array, selected signal events.
-      component: str, visible/truth tau component to compare.
+      component: str, visible/truth-visible tau component to compare.
     outputs:
-      tuple(np.ndarray, np.ndarray), flattened visible and truth tau values.
+      tuple(np.ndarray, np.ndarray), flattened reconstructed visible and truth-visible tau values.
     goal:
-      Compare visible tau slots against truth tau slots in the same nominal a/b
+      Compare visible tau slots against truth-visible tau slots in the same nominal a/b
       basis, exposing possible leg-flipping in step-1 monitoring.
     """
     visible_tau, visible_mask, _, _ = build_visible_tau_assumptions(events)
-    truth_tau, truth_mask, truth_source = build_truth_tau_slots(events)
+    truth_tau, truth_mask, truth_source = build_truth_visible_tau_slots(events)
     if truth_source is None:
         return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
 
@@ -994,7 +1039,7 @@ def write_visible_truth_tau_2d_plot(sample_name: str, events: ak.Array, output_p
     outputs:
       None; writes a 2D monitor plot.
     goal:
-      Sanity-check whether visible tau slots and truth tau slots are aligned in
+      Sanity-check whether visible tau slots and truth-visible tau slots are aligned in
       the same hemisphere/leg basis before training.
     """
     components = ["energy", "pt", "eta", "phi"]
@@ -1021,7 +1066,7 @@ def write_visible_truth_tau_2d_plot(sample_name: str, events: ak.Array, output_p
         axis.plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
         axis.set_xlim(low, high)
         axis.set_ylim(low, high)
-        axis.set_xlabel(f"Truth tau {component}")
+        axis.set_xlabel(f"Truth visible tau {component}")
         axis.set_ylabel(f"Visible tau {component}")
         axis.set_title(component)
         wrote_any = True
@@ -1030,11 +1075,139 @@ def write_visible_truth_tau_2d_plot(sample_name: str, events: ak.Array, output_p
         plt.close(fig)
         return
 
-    fig.suptitle(f"Visible tau vs truth tau slot check: {sample_name}")
+    fig.suptitle(f"Visible tau vs truth visible tau slot check: {sample_name}")
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
     console.print(f"  [green]Wrote monitor[/green] [white]{output_path}[/white]")
+
+
+def target_missing_qi_observables(events: ak.Array) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """
+    inputs:
+      events: ak.Array, selected signal events with truth tau information.
+    outputs:
+      tuple(dict, np.ndarray): observables rebuilt from visible tau + target missing,
+      and a per-event valid mask for the target construction.
+    goal:
+      Check whether the step-1 visible/tau-target definitions reproduce the
+      stored truth-level QI observables before EveNet training.
+    """
+    from quantum.observables_builder import build_observables
+
+    tau_vis_prong_p4, tau_vis_prong_mask, tau_vis_rho_p4, tau_vis_rho_mask = build_visible_tau_assumptions(events)
+    target_missing_p4, target_missing_mask, _, _, target_visible_p4, target_visible_mask = build_tau_targets(
+        events,
+        tau_vis_prong_p4,
+        tau_vis_prong_mask,
+        tau_vis_rho_p4,
+        tau_vis_rho_mask,
+    )
+
+    valid = ak.to_numpy(
+        ak.all(target_missing_mask & target_visible_mask, axis=1),
+        allow_missing=False,
+    ).astype(bool)
+    tau_a_p4 = target_visible_p4[:, 0] + target_missing_p4[:, 0]
+    tau_b_p4 = target_visible_p4[:, 1] + target_missing_p4[:, 1]
+    observables = build_observables(
+        tau_a_p4=tau_a_p4,
+        tau_b_p4=tau_b_p4,
+        vis_a_p4=target_visible_p4[:, 0],
+        vis_b_p4=target_visible_p4[:, 1],
+    )
+    observable_arrays = {
+        name: ak.to_numpy(values, allow_missing=False).astype(np.float64)
+        for name, values in observables.items()
+    }
+    return observable_arrays, valid
+
+
+def qi_observable_axis_limits(observable: str, truth_values: np.ndarray, reco_values: np.ndarray) -> tuple[float, float]:
+    """
+    inputs:
+      observable: str, QI observable name.
+      truth_values/reco_values: np.ndarray, values drawn on the same axis.
+    outputs:
+      tuple(float, float), shared lower/upper axis limits.
+    goal:
+      Make QI 2D monitors visually comparable and keep bounded cos observables
+      on physical axes.
+    """
+    if "cos_theta" in observable:
+        return -1.0, 1.0
+    if observable == "theta_cm":
+        return 0.0, 1.0
+    merged = np.concatenate([truth_values, reco_values])
+    if merged.size == 0:
+        return 0.0, 1.0
+    low, high = np.nanpercentile(merged, [0.5, 99.5])
+    if not np.isfinite(low) or not np.isfinite(high) or low == high:
+        return 0.0, 1.0
+    padding = 0.05 * (high - low)
+    return float(low - padding), float(high + padding)
+
+
+def write_target_missing_qi_2d_plots(sample_name: str, events: ak.Array, output_dir: Path) -> None:
+    """
+    inputs:
+      sample_name: str, label used in monitor titles.
+      events: ak.Array, selected signal events.
+      output_dir: Path, destination directory for one PNG per QI observable.
+    outputs:
+      None.
+    goal:
+      Compare QI observables computed from visible tau + target missing against
+      the stored truth-level observables at step 1.
+    """
+    try:
+        from quantum.observables_builder import get_observable_names
+
+        rebuilt_observables, target_valid = target_missing_qi_observables(events)
+    except Exception as exc:
+        console.print(
+            f"  [yellow]Skipped monitor[/yellow] [white]{sample_name} target QI[/white]: {exc}"
+        )
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    wrote_any = False
+    for observable in get_observable_names():
+        truth_field = f"truth_{observable}"
+        if observable not in rebuilt_observables or truth_field not in events.fields:
+            continue
+        reco_values = rebuilt_observables[observable]
+        truth_values = ak.to_numpy(events[truth_field], allow_missing=False).astype(np.float64)
+        finite = target_valid & np.isfinite(reco_values) & np.isfinite(truth_values)
+        if not np.any(finite):
+            continue
+        truth_values = truth_values[finite]
+        reco_values = reco_values[finite]
+        low, high = qi_observable_axis_limits(observable, truth_values, reco_values)
+
+        fig, axis = plt.subplots(figsize=(6.2, 5.4), dpi=160)
+        hist = axis.hist2d(
+            truth_values,
+            reco_values,
+            bins=70,
+            range=[[low, high], [low, high]],
+            cmap="Blues",
+            cmin=1,
+        )
+        fig.colorbar(hist[3], ax=axis, label="Entries")
+        axis.plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
+        axis.set_xlim(low, high)
+        axis.set_ylim(low, high)
+        axis.set_xlabel(f"Stored truth {observable}")
+        axis.set_ylabel(f"Visible + target missing {observable}")
+        axis.set_title(f"{sample_name}: {observable}")
+        fig.tight_layout()
+        fig.savefig(output_dir / f"{observable}.png")
+        plt.close(fig)
+        wrote_any = True
+
+    if wrote_any:
+        console.print(f"  [green]Wrote monitor[/green] [white]{output_dir}[/white]")
 
 
 def write_monitoring_plots(
@@ -1142,8 +1315,10 @@ def write_monitoring_plots(
             signal_only=signal_only,
         )
 
-    visible_truth_dir = monitor_dir / "vis_tau_vs_truth_tau"
+    visible_truth_dir = monitor_dir / "vis_tau_vs_truth_visible_tau"
+    target_qi_dir = monitor_dir / "target_missing_qi_vs_truth"
     visible_truth_dir.mkdir(parents=True, exist_ok=True)
+    target_qi_dir.mkdir(parents=True, exist_ok=True)
     for sample, events in expanded_samples:
         if not sample_uses_invisible_target(sample):
             continue
@@ -1151,6 +1326,11 @@ def write_monitoring_plots(
             sample_name=sample.name,
             events=events,
             output_path=visible_truth_dir / f"{sample.name}.png",
+        )
+        write_target_missing_qi_2d_plots(
+            sample_name=sample.name,
+            events=events,
+            output_dir=target_qi_dir / sample.name,
         )
 
     for observable in FOUR_VECTOR_FEATURES:

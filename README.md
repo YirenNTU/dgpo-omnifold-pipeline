@@ -114,6 +114,11 @@ Main outputs:
 - `config/generated_event_info.yaml`
 - Monitoring plots under the output directory
 
+Step-1 monitoring includes:
+
+- `monitoring/vis_tau_vs_truth_visible_tau/<sample>.png`, reconstructed visible tau vs truth-visible tau in the central a/b basis.
+- `monitoring/target_missing_qi_vs_truth/<sample>/<observable>.png`, QI observables rebuilt from `visible tau + target missing` compared with the stored `truth_<observable>` fields.
+
 Input preselection keeps events with `nprong == 2` and both reconstructed
 `tau_vis_prong` energies below the shared particle-energy sanity threshold
 (`91.25 GeV`).
