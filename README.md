@@ -94,14 +94,16 @@ python3 util/build_evenet_input_from_parquet.py \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset \
   --skip-monitoring \
   --num-workers 3 \
+  --load-batch-size 200000 \
   --no-compress-output
 ```
 
 `--num-workers` parallelizes sample loading/preselection over parquet row groups
 when available, otherwise over files. Each worker loads one parquet chunk,
-writes a selected temporary shard under the output directory, and exits; this
-lowers the memory pressure per process compared with loading all files before
-preselection.
+writes selected temporary shards under the output directory, and exits. Within
+each worker, `--load-batch-size` streams the parquet chunk through pyarrow
+batches, which is important when a source parquet has only one very large row
+group.
 
 Optional point-cloud collection filter:
 

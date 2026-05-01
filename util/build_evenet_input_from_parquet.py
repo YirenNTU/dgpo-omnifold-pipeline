@@ -327,6 +327,30 @@ def load_parquet_task(parquet_file: str, row_group: int | None) -> ak.Array:
     return ak.from_parquet(parquet_file, row_groups=[row_group])
 
 
+def parquet_batches(parquet_file: str, row_group: int | None, batch_size: int):
+    """
+    inputs:
+      parquet_file: str, parquet path.
+      row_group: int | None, optional row-group index.
+      batch_size: int, rows per pyarrow batch.
+    outputs:
+      iterator yielding ak.Array event batches.
+    goal:
+      Stream huge single-row-group parquet files without materializing the full
+      file in a worker process.
+    """
+    if batch_size <= 0:
+        yield load_parquet_task(parquet_file, row_group)
+        return
+
+    import pyarrow.parquet as pq
+
+    parquet = pq.ParquetFile(parquet_file)
+    row_groups = None if row_group is None else [row_group]
+    for record_batch in parquet.iter_batches(batch_size=batch_size, row_groups=row_groups):
+        yield ak.from_arrow(record_batch)
+
+
 def load_preselected_file_worker(payload: dict) -> dict:
     """
     inputs:
@@ -344,26 +368,51 @@ def load_preselected_file_worker(payload: dict) -> dict:
     task_label = str(payload["task_label"])
     keep_monitoring = bool(payload["keep_monitoring"])
     monitor_max_events = payload["monitor_max_events"]
+    load_batch_size = int(payload["load_batch_size"])
     worker_dir = Path(payload["worker_dir"])
     worker_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_events = load_parquet_task(parquet_file, row_group)
-    raw_count = len(raw_events)
-    selected_events = apply_preselection(raw_events)
-    selected_count = len(selected_events)
+    raw_count = 0
+    selected_count = 0
+    selected_paths: list[str] = []
+    monitor_raw_paths: list[str] = []
+    monitor_selected_paths: list[str] = []
+    monitor_raw_remaining = None if monitor_max_events is None or monitor_max_events <= 0 else monitor_max_events
+    monitor_selected_remaining = None if monitor_max_events is None or monitor_max_events <= 0 else monitor_max_events
 
-    selected_path = worker_dir / f"selected_{task_index:04d}.parquet"
-    ak.to_parquet(selected_events, selected_path, compression="snappy")
+    for batch_index, raw_events in enumerate(parquet_batches(parquet_file, row_group, load_batch_size), start=1):
+        raw_count += len(raw_events)
+        selected_events = apply_preselection(raw_events)
+        selected_count += len(selected_events)
 
-    monitor_raw_path = None
-    monitor_selected_path = None
-    if keep_monitoring:
-        monitor_raw = limit_events_for_monitoring(raw_events, monitor_max_events)
-        monitor_selected = limit_events_for_monitoring(selected_events, monitor_max_events)
-        monitor_raw_path = worker_dir / f"monitor_raw_{task_index:04d}.parquet"
-        monitor_selected_path = worker_dir / f"monitor_selected_{task_index:04d}.parquet"
-        ak.to_parquet(monitor_raw, monitor_raw_path, compression="snappy")
-        ak.to_parquet(monitor_selected, monitor_selected_path, compression="snappy")
+        selected_path = worker_dir / f"selected_{task_index:04d}_{batch_index:04d}.parquet"
+        ak.to_parquet(selected_events, selected_path, compression="snappy")
+        selected_paths.append(str(selected_path))
+
+        if keep_monitoring and (monitor_raw_remaining is None or monitor_raw_remaining > 0):
+            raw_take = len(raw_events) if monitor_raw_remaining is None else min(monitor_raw_remaining, len(raw_events))
+            monitor_raw = ak.to_packed(raw_events[:raw_take])
+            monitor_raw_path = worker_dir / f"monitor_raw_{task_index:04d}_{batch_index:04d}.parquet"
+            ak.to_parquet(monitor_raw, monitor_raw_path, compression="snappy")
+            monitor_raw_paths.append(str(monitor_raw_path))
+            if monitor_raw_remaining is not None:
+                monitor_raw_remaining -= raw_take
+
+        if keep_monitoring and (monitor_selected_remaining is None or monitor_selected_remaining > 0):
+            selected_take = (
+                len(selected_events)
+                if monitor_selected_remaining is None
+                else min(monitor_selected_remaining, len(selected_events))
+            )
+            monitor_selected = ak.to_packed(selected_events[:selected_take])
+            monitor_selected_path = worker_dir / f"monitor_selected_{task_index:04d}_{batch_index:04d}.parquet"
+            ak.to_parquet(monitor_selected, monitor_selected_path, compression="snappy")
+            monitor_selected_paths.append(str(monitor_selected_path))
+            if monitor_selected_remaining is not None:
+                monitor_selected_remaining -= selected_take
+
+        del raw_events, selected_events
+        gc.collect()
 
     return {
         "task_index": task_index,
@@ -372,9 +421,9 @@ def load_preselected_file_worker(payload: dict) -> dict:
         "row_group": row_group,
         "raw_count": raw_count,
         "selected_count": selected_count,
-        "selected_path": str(selected_path),
-        "monitor_raw_path": str(monitor_raw_path) if monitor_raw_path is not None else None,
-        "monitor_selected_path": str(monitor_selected_path) if monitor_selected_path is not None else None,
+        "selected_paths": selected_paths,
+        "monitor_raw_paths": monitor_raw_paths,
+        "monitor_selected_paths": monitor_selected_paths,
     }
 
 
@@ -384,6 +433,7 @@ def load_selected_sample_events_parallel(
     keep_monitoring: bool,
     monitor_max_events: int | None,
     num_workers: int,
+    load_batch_size: int,
     tmp_root: Path,
 ) -> tuple[ak.Array, ak.Array | None, ak.Array | None]:
     """
@@ -393,6 +443,7 @@ def load_selected_sample_events_parallel(
       keep_monitoring: bool, whether to keep monitor subsets.
       monitor_max_events: int | None, maximum monitor events per worker file.
       num_workers: int, process count.
+      load_batch_size: int, rows per pyarrow batch inside each worker.
       tmp_root: Path, temporary directory for worker parquet shards.
     outputs:
       tuple(selected_events, monitor_raw_events, monitor_selected_events).
@@ -422,6 +473,7 @@ def load_selected_sample_events_parallel(
             "task_label": task["task_label"],
             "keep_monitoring": keep_monitoring,
             "monitor_max_events": per_file_monitor_max,
+            "load_batch_size": load_batch_size,
             "worker_dir": str(sample_tmp),
         }
         for task_index, task in enumerate(tasks, start=1)
@@ -439,16 +491,20 @@ def load_selected_sample_events_parallel(
             )
 
     results.sort(key=lambda item: item["task_index"])
-    selected_chunks = [ak.from_parquet(result["selected_path"]) for result in results]
-    monitor_raw_chunks = [
-        ak.from_parquet(result["monitor_raw_path"])
+    selected_chunks = [
+        ak.from_parquet(path)
         for result in results
-        if result["monitor_raw_path"] is not None
+        for path in result["selected_paths"]
+    ]
+    monitor_raw_chunks = [
+        ak.from_parquet(path)
+        for result in results
+        for path in result["monitor_raw_paths"]
     ]
     monitor_selected_chunks = [
-        ak.from_parquet(result["monitor_selected_path"])
+        ak.from_parquet(path)
         for result in results
-        if result["monitor_selected_path"] is not None
+        for path in result["monitor_selected_paths"]
     ]
 
     selected = concatenate_event_chunks(selected_chunks)
@@ -466,6 +522,7 @@ def load_selected_sample_events(
     keep_monitoring: bool,
     monitor_max_events: int | None,
     num_workers: int = 1,
+    load_batch_size: int = 200_000,
     tmp_root: Path | None = None,
 ) -> tuple[ak.Array, ak.Array | None, ak.Array | None]:
     """
@@ -473,6 +530,7 @@ def load_selected_sample_events(
       sample: Sample, configured source sample.
       keep_monitoring: bool, whether to keep small raw/selected monitor subsets.
       monitor_max_events: int | None, maximum monitor events per source sample.
+      load_batch_size: int, rows per pyarrow batch for each parquet task.
     outputs:
       tuple(selected_events, monitor_raw_events, monitor_selected_events).
     goal:
@@ -497,6 +555,7 @@ def load_selected_sample_events(
             keep_monitoring=keep_monitoring,
             monitor_max_events=monitor_max_events,
             num_workers=num_workers,
+            load_batch_size=load_batch_size,
             tmp_root=tmp_root,
         )
 
@@ -509,33 +568,38 @@ def load_selected_sample_events(
     monitor_selected_remaining = None if monitor_max_events is None or monitor_max_events <= 0 else monitor_max_events
 
     for task in tasks:
-        raw_events = load_parquet_task(task["parquet_file"], task["row_group"])
-        raw_total += len(raw_events)
-        if keep_monitoring and (monitor_raw_remaining is None or monitor_raw_remaining > 0):
-            raw_take = len(raw_events) if monitor_raw_remaining is None else min(monitor_raw_remaining, len(raw_events))
-            monitor_raw_chunks.append(ak.to_packed(raw_events[:raw_take]))
-            if monitor_raw_remaining is not None:
-                monitor_raw_remaining -= raw_take
+        task_raw_total = 0
+        task_selected_total = 0
+        for raw_events in parquet_batches(task["parquet_file"], task["row_group"], load_batch_size):
+            raw_total += len(raw_events)
+            task_raw_total += len(raw_events)
+            if keep_monitoring and (monitor_raw_remaining is None or monitor_raw_remaining > 0):
+                raw_take = len(raw_events) if monitor_raw_remaining is None else min(monitor_raw_remaining, len(raw_events))
+                monitor_raw_chunks.append(ak.to_packed(raw_events[:raw_take]))
+                if monitor_raw_remaining is not None:
+                    monitor_raw_remaining -= raw_take
 
-        selected_events = apply_preselection(raw_events)
-        selected_total += len(selected_events)
-        selected_chunks.append(selected_events)
-        if keep_monitoring and (monitor_selected_remaining is None or monitor_selected_remaining > 0):
-            selected_take = (
-                len(selected_events)
-                if monitor_selected_remaining is None
-                else min(monitor_selected_remaining, len(selected_events))
-            )
-            monitor_selected_chunks.append(ak.to_packed(selected_events[:selected_take]))
-            if monitor_selected_remaining is not None:
-                monitor_selected_remaining -= selected_take
+            selected_events = apply_preselection(raw_events)
+            selected_total += len(selected_events)
+            task_selected_total += len(selected_events)
+            selected_chunks.append(selected_events)
+            if keep_monitoring and (monitor_selected_remaining is None or monitor_selected_remaining > 0):
+                selected_take = (
+                    len(selected_events)
+                    if monitor_selected_remaining is None
+                    else min(monitor_selected_remaining, len(selected_events))
+                )
+                monitor_selected_chunks.append(ak.to_packed(selected_events[:selected_take]))
+                if monitor_selected_remaining is not None:
+                    monitor_selected_remaining -= selected_take
+
+            del raw_events, selected_events
+            gc.collect()
 
         console.print(
             f"  [green]Loaded task[/green] [white]{task['task_label']}[/white] "
-            f"raw=[white]{len(raw_events)}[/white] selected=[white]{len(selected_events)}[/white]"
+            f"raw=[white]{task_raw_total}[/white] selected=[white]{task_selected_total}[/white]"
         )
-        del raw_events, selected_events
-        gc.collect()
 
     selected = concatenate_event_chunks(selected_chunks)
     monitor_raw = concatenate_event_chunks(monitor_raw_chunks) if keep_monitoring else None
@@ -1849,6 +1913,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--load-batch-size",
+        type=int,
+        default=200000,
+        help=(
+            "Rows per pyarrow batch while loading parquet chunks. Lower this if a worker is still killed."
+        ),
+    )
+    parser.add_argument(
         "--compress-output",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1898,6 +1970,7 @@ def main() -> None:
                 keep_monitoring=not args.skip_monitoring,
                 monitor_max_events=args.monitor_max_events,
                 num_workers=max(1, args.num_workers),
+                load_batch_size=args.load_batch_size,
                 tmp_root=tmp_root,
             )
             sample_events[sample_key] = selected_events
