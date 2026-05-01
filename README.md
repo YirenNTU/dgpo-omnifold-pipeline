@@ -93,6 +93,7 @@ python3 util/build_evenet_input_from_parquet.py \
   --evenet-config config/evenet_schema.yaml \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset \
   --skip-monitoring \
+  --sharded-output \
   --num-workers 3 \
   --load-batch-size 50000 \
   --no-compress-output
@@ -104,6 +105,11 @@ writes selected temporary shards under the output directory, and exits. Within
 each worker, `--load-batch-size` streams the parquet chunk through pyarrow
 batches, which is important when a source parquet has only one very large row
 group.
+
+For very large selected samples, use `--sharded-output`. It writes
+`evenet_input_shards/*.npz`, optional `data_shards/*.npz`, and
+`evenet_input_shards_manifest.json` instead of building one huge
+`evenet_input.npz` in memory.
 
 Optional point-cloud collection filter:
 

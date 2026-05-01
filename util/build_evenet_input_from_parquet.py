@@ -551,6 +551,74 @@ def load_selected_sample_events_parallel(
     return selected, monitor_raw, monitor_selected
 
 
+def write_selected_sample_shards(
+    sample: Sample,
+    keep_monitoring: bool,
+    monitor_max_events: int | None,
+    num_workers: int,
+    load_batch_size: int,
+    tmp_root: Path,
+) -> list[Path]:
+    """
+    inputs:
+      sample: Sample, configured source sample.
+      keep_monitoring: bool, currently unused for sharded production output.
+      monitor_max_events: int | None, currently unused for sharded production output.
+      num_workers: int, process count for parquet chunk preselection.
+      load_batch_size: int, rows per pyarrow batch.
+      tmp_root: Path, directory for selected parquet shards.
+    outputs:
+      list[Path], selected parquet shard paths.
+    goal:
+      Preselect huge samples into many temporary shards without reading the
+      selected shards back into one parent-process array.
+    """
+    parquet_files = expand_input_files(sample.input_files)
+    if not parquet_files:
+        raise ValueError(f"No parquet inputs found for sample '{sample.name}'.")
+    sample_tmp = tmp_root / safe_path_name(sample.name)
+    sample_tmp.mkdir(parents=True, exist_ok=True)
+    tasks = parquet_load_tasks(parquet_files)
+    worker_count = max(1, min(int(num_workers), len(tasks)))
+    console.print(
+        f"[bold cyan]Loading sample[/bold cyan] [white]{sample.name}[/white] "
+        f"from [white]{len(parquet_files)}[/white] parquet file(s)"
+    )
+    console.print(
+        f"  [bold cyan]Shard load[/bold cyan] workers=[white]{worker_count}[/white] "
+        f"files=[white]{len(parquet_files)}[/white] tasks=[white]{len(tasks)}[/white]"
+    )
+
+    payloads = [
+        {
+            "parquet_file": task["parquet_file"],
+            "file_index": task["file_index"],
+            "row_group": task["row_group"],
+            "task_index": task_index,
+            "task_label": task["task_label"],
+            "keep_monitoring": False,
+            "monitor_max_events": monitor_max_events,
+            "load_batch_size": load_batch_size,
+            "worker_dir": str(sample_tmp),
+        }
+        for task_index, task in enumerate(tasks, start=1)
+    ]
+
+    results: list[dict] = []
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(load_preselected_file_worker, payload) for payload in payloads]
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            console.print(
+                f"  [green]Wrote selected task[/green] [white]{result['task_label']}[/white] "
+                f"raw=[white]{result['raw_count']}[/white] selected=[white]{result['selected_count']}[/white]"
+            )
+
+    results.sort(key=lambda item: item["task_index"])
+    return [Path(path) for result in results for path in result["selected_paths"]]
+
+
 def load_selected_sample_events(
     sample: Sample,
     keep_monitoring: bool,
@@ -899,6 +967,62 @@ def select_data_samples(expanded_samples: list[tuple[Sample, ak.Array]]) -> list
     return [(sample, events) for sample, events in expanded_samples if sample.is_data]
 
 
+def infer_max_particles_from_shards(
+    sample_shards: list[tuple[str, Sample, Path]],
+    samples: dict[str, Sample],
+    subcategories: dict[str, list[CategorySplit]],
+    override: int | None,
+    remove_neutral_non_photon: bool,
+) -> tuple[int, list[str]]:
+    """
+    inputs:
+      sample_shards: list[(sample_key, sample, path)], preselected parquet shards.
+      samples/subcategories: config-derived sample definitions.
+      override: int | None, explicit max-particles override.
+      remove_neutral_non_photon: bool, sequential input filtering mode.
+    outputs:
+      tuple(max_particles, class_labels), inferred over MC shards only.
+    goal:
+      Discover global padding and stable class-label order without holding all
+      selected events in memory.
+    """
+    if override is not None:
+        max_particles = override
+    else:
+        max_particles = 0
+    class_labels: list[str] = []
+    seen_labels: set[str] = set()
+
+    for sample_key, sample, shard_path in sample_shards:
+        events = ak.from_parquet(shard_path)
+        expanded = expand_samples({sample_key: sample}, {sample_key: events}, subcategories)
+        for split_sample, split_events in expanded:
+            if not split_sample.is_data:
+                if split_sample.name not in seen_labels:
+                    seen_labels.add(split_sample.name)
+                    class_labels.append(split_sample.name)
+                if override is None and len(split_events) > 0:
+                    shard_max = int(
+                        ak.max(
+                            ak.num(
+                                split_events["Part_pdgId"][
+                                    build_input_particle_mask(split_events, remove_neutral_non_photon)
+                                ],
+                                axis=1,
+                            )
+                        )
+                    )
+                    max_particles = max(max_particles, shard_max)
+        del events, expanded
+        gc.collect()
+
+    if max_particles <= 0:
+        raise ValueError("Unable to infer max_particles from sharded MC inputs.")
+    if not class_labels:
+        raise ValueError("No MC class labels found in sharded inputs.")
+    return max_particles, class_labels
+
+
 def to_numpy_array(values, dtype=None) -> np.ndarray:
     if isinstance(values, ak.Array):
         values = ak.to_numpy(values, allow_missing=False)
@@ -1109,8 +1233,14 @@ def build_dataset(
     evenet_config: EveNetConfig,
     include_classification: bool = True,
     remove_neutral_non_photon: bool = False,
+    class_labels_override: list[str] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict]:
-    class_labels = [sample.name for sample, _ in expanded_samples] if include_classification else []
+    if include_classification and class_labels_override is not None:
+        class_labels = list(class_labels_override)
+    elif include_classification:
+        class_labels = list(dict.fromkeys(sample.name for sample, _ in expanded_samples))
+    else:
+        class_labels = []
     class_index = {label: index for index, label in enumerate(class_labels)}
 
     batches = []
@@ -1886,6 +2016,108 @@ def write_outputs(
         console.print(f"[green]Wrote[/green] [white]{GENERATED_EVENT_INFO_PATH}[/white]")
 
 
+def build_sharded_outputs(
+    sample_shards: list[tuple[str, Sample, Path]],
+    samples: dict[str, Sample],
+    subcategories: dict[str, list[CategorySplit]],
+    output_dir: Path,
+    max_particles: int,
+    feature_config: FeatureConfig,
+    evenet_config: EveNetConfig,
+    class_labels: list[str],
+    remove_neutral_non_photon: bool,
+    compress: bool,
+) -> None:
+    """
+    inputs:
+      sample_shards: list[(sample_key, sample, path)], selected parquet shards.
+      samples/subcategories: config-derived sample definitions.
+      output_dir: Path, destination root.
+      max_particles: int, fixed padding size.
+      feature_config/evenet_config: parsed EveNet configs.
+      class_labels: list[str], global MC class-label order.
+      remove_neutral_non_photon: bool, sequential input filtering mode.
+      compress: bool, NPZ compression mode.
+    outputs:
+      None. Writes shard NPZ files plus a manifest.
+    goal:
+      Build EveNet input in bounded memory by converting one selected shard at
+      a time instead of concatenating the full sample into one NPZ.
+    """
+    shard_dir = output_dir / "evenet_input_shards"
+    data_shard_dir = output_dir / "data_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    data_shard_dir.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, object] = {
+        "format": "evenet_input_shards_v1",
+        "max_particles": max_particles,
+        "class_labels": class_labels,
+        "remove_neutral_non_photon": bool(remove_neutral_non_photon),
+        "training_shards": [],
+        "data_shards": [],
+    }
+    wrote_event_info = False
+
+    for shard_index, (sample_key, sample, shard_path) in enumerate(sample_shards):
+        events = ak.from_parquet(shard_path)
+        expanded = expand_samples({sample_key: sample}, {sample_key: events}, subcategories)
+        training_samples = [(split_sample, split_events) for split_sample, split_events in expanded if not split_sample.is_data]
+        data_samples = [(split_sample, split_events) for split_sample, split_events in expanded if split_sample.is_data]
+
+        if training_samples:
+            dataset, metadata = build_dataset(
+                training_samples,
+                max_particles,
+                feature_config,
+                evenet_config,
+                include_classification=True,
+                remove_neutral_non_photon=remove_neutral_non_photon,
+                class_labels_override=class_labels,
+            )
+            stem = f"evenet_input_shard_{shard_index:06d}"
+            write_outputs(
+                dataset,
+                metadata,
+                shard_dir,
+                stem=stem,
+                compress=compress,
+                write_event_info=not wrote_event_info,
+                feature_config=feature_config,
+                evenet_config=evenet_config,
+            )
+            wrote_event_info = True
+            manifest["training_shards"].append(str((shard_dir / f"{stem}.npz").relative_to(output_dir)))
+            del dataset, metadata
+
+        if data_samples:
+            dataset, metadata = build_dataset(
+                data_samples,
+                max_particles,
+                feature_config,
+                evenet_config,
+                include_classification=False,
+                remove_neutral_non_photon=remove_neutral_non_photon,
+            )
+            stem = f"data_shard_{shard_index:06d}"
+            write_outputs(
+                dataset,
+                metadata,
+                data_shard_dir,
+                stem=stem,
+                compress=compress,
+                write_event_info=False,
+            )
+            manifest["data_shards"].append(str((data_shard_dir / f"{stem}.npz").relative_to(output_dir)))
+            del dataset, metadata
+
+        del events, expanded, training_samples, data_samples
+        gc.collect()
+
+    manifest_path = output_dir / "evenet_input_shards_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    console.print(f"[green]Wrote[/green] [white]{manifest_path}[/white]")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert DataLoader awkward parquet files into a simple EveNet-style NPZ bundle."
@@ -1927,6 +2159,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--skip-monitoring",
         action="store_true",
         help="Skip all step-1 monitoring plots. This is the lowest-memory and fastest build mode.",
+    )
+    parser.add_argument(
+        "--sharded-output",
+        action="store_true",
+        help="Write many bounded-memory NPZ shards plus a manifest instead of one large evenet_input.npz.",
     )
     parser.add_argument(
         "--monitor-max-events",
@@ -1998,6 +2235,45 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="evenet_build_", dir=str(args.output_dir)) as tmp_dir:
         tmp_root = Path(tmp_dir)
+        if args.sharded_output:
+            sample_shards: list[tuple[str, Sample, Path]] = []
+            for sample_key, sample in samples.items():
+                shard_paths = write_selected_sample_shards(
+                    sample=sample,
+                    keep_monitoring=False,
+                    monitor_max_events=args.monitor_max_events,
+                    num_workers=max(1, args.num_workers),
+                    load_batch_size=args.load_batch_size,
+                    tmp_root=tmp_root,
+                )
+                sample_shards.extend((sample_key, sample, shard_path) for shard_path in shard_paths)
+
+            max_particles, class_labels = infer_max_particles_from_shards(
+                sample_shards=sample_shards,
+                samples=samples,
+                subcategories=subcategories,
+                override=args.max_particles,
+                remove_neutral_non_photon=remove_neutral_non_photon,
+            )
+            console.print(f"[bold]Point-cloud padding[/bold] max_particles=[white]{max_particles}[/white]")
+            console.print(
+                f"[bold]EveNet class labels[/bold] [white]{', '.join(class_labels)}[/white]"
+            )
+            build_sharded_outputs(
+                sample_shards=sample_shards,
+                samples=samples,
+                subcategories=subcategories,
+                output_dir=args.output_dir,
+                max_particles=max_particles,
+                feature_config=feature_config,
+                evenet_config=evenet_config,
+                class_labels=class_labels,
+                remove_neutral_non_photon=remove_neutral_non_photon,
+                compress=args.compress_output,
+            )
+            console.print("[yellow]Skipped monitoring[/yellow] sharded-output mode")
+            return
+
         for sample_key, sample in samples.items():
             selected_events, monitor_raw_events, monitor_selected_events = load_selected_sample_events(
                 sample=sample,
