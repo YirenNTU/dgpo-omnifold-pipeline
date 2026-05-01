@@ -84,6 +84,24 @@ python3 util/build_evenet_input_from_parquet.py \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset
 ```
 
+For a faster/lower-memory production build, skip plots and avoid compressed NPZ
+writing:
+
+```bash
+python3 util/build_evenet_input_from_parquet.py \
+  --config config/analysis.yaml \
+  --evenet-config config/evenet_schema.yaml \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset \
+  --skip-monitoring \
+  --num-workers 3 \
+  --no-compress-output
+```
+
+`--num-workers` parallelizes only multi-file sample loading/preselection. Each
+worker loads one parquet file, writes a selected temporary shard under the
+output directory, and exits; this lowers the memory pressure per process
+compared with loading all files before preselection.
+
 Optional point-cloud collection filter:
 
 ```bash
@@ -118,6 +136,10 @@ Step-1 monitoring includes:
 
 - `monitoring/vis_tau_vs_truth_visible_tau/<sample>.png`, reconstructed visible tau vs truth-visible tau in the central a/b basis.
 - `monitoring/target_missing_qi_vs_truth/<sample>/<observable>.png`, QI observables rebuilt from `visible tau + target missing` compared with the stored `truth_<observable>` fields.
+
+Monitoring uses at most `--monitor-max-events 50000` events per source sample by
+default. Use `--monitor-max-events 0` only for full-statistics diagnostic plots;
+it is slower and can require much more memory.
 
 Input preselection keeps events with `nprong == 2` and both reconstructed
 `tau_vis_prong` energies below the shared particle-energy sanity threshold

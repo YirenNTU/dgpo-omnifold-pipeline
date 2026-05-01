@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import json
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
@@ -149,6 +152,23 @@ def load_sample_events(sample: Sample) -> ak.Array:
     return events
 
 
+def concatenate_event_chunks(chunks: list[ak.Array]) -> ak.Array:
+    """
+    inputs:
+      chunks: list[ak.Array], already-packed event chunks.
+    outputs:
+      ak.Array, concatenated events.
+    goal:
+      Centralize chunk concatenation so streaming loaders avoid keeping raw
+      parquet arrays alive longer than needed.
+    """
+    if not chunks:
+        return ak.Array([])
+    if len(chunks) == 1:
+        return chunks[0]
+    return ak.to_packed(ak.concatenate(chunks, axis=0))
+
+
 def tau_vis_prong_energy_mask(events: ak.Array) -> np.ndarray:
     """
     inputs:
@@ -186,7 +206,7 @@ def preselection_mask(events: ak.Array) -> np.ndarray:
 
 def apply_preselection(events: ak.Array) -> ak.Array:
     if "nprong" not in events.fields:
-        return events
+        return ak.to_packed(events)
 
     nprong_mask = ak.to_numpy(events["nprong"], allow_missing=False).astype(np.int64) == 2
     nprong_selected = events[nprong_mask]
@@ -202,7 +222,244 @@ def apply_preselection(events: ak.Array) -> ak.Array:
         f"{MAX_PART_ENERGY_GEV:g} GeV -> [white]{len(selected)}[/white] / "
         f"[white]{len(nprong_selected)}[/white] event(s)"
     )
-    return selected
+    return ak.to_packed(selected)
+
+
+def limit_events_for_monitoring(events: ak.Array, max_events: int | None) -> ak.Array:
+    """
+    inputs:
+      events: ak.Array, events used only for diagnostic plots.
+      max_events: int | None, maximum events to keep; None or <=0 keeps all.
+    outputs:
+      ak.Array, first max_events events when limiting is enabled.
+    goal:
+      Keep step-1 monitoring useful without letting plotting duplicate the full
+      training sample in memory.
+    """
+    if max_events is None or max_events <= 0 or len(events) <= max_events:
+        return ak.to_packed(events)
+    return ak.to_packed(events[:max_events])
+
+
+def safe_path_name(name: str) -> str:
+    """
+    inputs:
+      name: str, sample or worker label.
+    outputs:
+      str, filesystem-safe lowercase token.
+    goal:
+      Keep temporary worker output paths simple and deterministic.
+    """
+    return "_".join("".join(char if char.isalnum() else "_" for char in name).strip("_").lower().split("_"))
+
+
+def load_preselected_file_worker(payload: dict) -> dict:
+    """
+    inputs:
+      payload: dict, one parquet file plus monitoring/output settings.
+    outputs:
+      dict, counts and temporary parquet paths for selected/monitor chunks.
+    goal:
+      Let each worker hold only one raw parquet file in memory, preselect it,
+      write the smaller selected chunk to disk, and exit.
+    """
+    parquet_file = payload["parquet_file"]
+    file_index = int(payload["file_index"])
+    keep_monitoring = bool(payload["keep_monitoring"])
+    monitor_max_events = payload["monitor_max_events"]
+    worker_dir = Path(payload["worker_dir"])
+    worker_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_events = ak.from_parquet(parquet_file)
+    raw_count = len(raw_events)
+    selected_events = apply_preselection(raw_events)
+    selected_count = len(selected_events)
+
+    selected_path = worker_dir / f"selected_{file_index:04d}.parquet"
+    ak.to_parquet(selected_events, selected_path, compression="snappy")
+
+    monitor_raw_path = None
+    monitor_selected_path = None
+    if keep_monitoring:
+        monitor_raw = limit_events_for_monitoring(raw_events, monitor_max_events)
+        monitor_selected = limit_events_for_monitoring(selected_events, monitor_max_events)
+        monitor_raw_path = worker_dir / f"monitor_raw_{file_index:04d}.parquet"
+        monitor_selected_path = worker_dir / f"monitor_selected_{file_index:04d}.parquet"
+        ak.to_parquet(monitor_raw, monitor_raw_path, compression="snappy")
+        ak.to_parquet(monitor_selected, monitor_selected_path, compression="snappy")
+
+    return {
+        "file_index": file_index,
+        "raw_count": raw_count,
+        "selected_count": selected_count,
+        "selected_path": str(selected_path),
+        "monitor_raw_path": str(monitor_raw_path) if monitor_raw_path is not None else None,
+        "monitor_selected_path": str(monitor_selected_path) if monitor_selected_path is not None else None,
+    }
+
+
+def load_selected_sample_events_parallel(
+    sample: Sample,
+    parquet_files: list[str],
+    keep_monitoring: bool,
+    monitor_max_events: int | None,
+    num_workers: int,
+    tmp_root: Path,
+) -> tuple[ak.Array, ak.Array | None, ak.Array | None]:
+    """
+    inputs:
+      sample: Sample, configured source sample.
+      parquet_files: list[str], expanded parquet files.
+      keep_monitoring: bool, whether to keep monitor subsets.
+      monitor_max_events: int | None, maximum monitor events per worker file.
+      num_workers: int, process count.
+      tmp_root: Path, temporary directory for worker parquet shards.
+    outputs:
+      tuple(selected_events, monitor_raw_events, monitor_selected_events).
+    goal:
+      Use multiple processes while keeping each process' memory footprint to a
+      single input parquet file.
+    """
+    sample_tmp = tmp_root / safe_path_name(sample.name)
+    sample_tmp.mkdir(parents=True, exist_ok=True)
+    worker_count = max(1, min(int(num_workers), len(parquet_files)))
+    console.print(
+        f"  [bold cyan]Parallel load[/bold cyan] workers=[white]{worker_count}[/white] "
+        f"files=[white]{len(parquet_files)}[/white]"
+    )
+
+    per_file_monitor_max = monitor_max_events
+    if keep_monitoring and monitor_max_events is not None and monitor_max_events > 0:
+        per_file_monitor_max = max(1, (monitor_max_events + len(parquet_files) - 1) // len(parquet_files))
+
+    payloads = [
+        {
+            "parquet_file": parquet_file,
+            "file_index": file_index,
+            "keep_monitoring": keep_monitoring,
+            "monitor_max_events": per_file_monitor_max,
+            "worker_dir": str(sample_tmp),
+        }
+        for file_index, parquet_file in enumerate(parquet_files, start=1)
+    ]
+
+    results: list[dict] = []
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(load_preselected_file_worker, payload) for payload in payloads]
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            console.print(
+                f"  [green]Loaded file[/green] [white]{result['file_index']}/{len(parquet_files)}[/white] "
+                f"raw=[white]{result['raw_count']}[/white] selected=[white]{result['selected_count']}[/white]"
+            )
+
+    results.sort(key=lambda item: item["file_index"])
+    selected_chunks = [ak.from_parquet(result["selected_path"]) for result in results]
+    monitor_raw_chunks = [
+        ak.from_parquet(result["monitor_raw_path"])
+        for result in results
+        if result["monitor_raw_path"] is not None
+    ]
+    monitor_selected_chunks = [
+        ak.from_parquet(result["monitor_selected_path"])
+        for result in results
+        if result["monitor_selected_path"] is not None
+    ]
+
+    selected = concatenate_event_chunks(selected_chunks)
+    monitor_raw = concatenate_event_chunks(monitor_raw_chunks) if keep_monitoring else None
+    monitor_selected = concatenate_event_chunks(monitor_selected_chunks) if keep_monitoring else None
+    console.print(
+        f"  [green]Loaded sample[/green] raw=[white]{sum(item['raw_count'] for item in results)}[/white] "
+        f"selected=[white]{sum(item['selected_count'] for item in results)}[/white]"
+    )
+    return selected, monitor_raw, monitor_selected
+
+
+def load_selected_sample_events(
+    sample: Sample,
+    keep_monitoring: bool,
+    monitor_max_events: int | None,
+    num_workers: int = 1,
+    tmp_root: Path | None = None,
+) -> tuple[ak.Array, ak.Array | None, ak.Array | None]:
+    """
+    inputs:
+      sample: Sample, configured source sample.
+      keep_monitoring: bool, whether to keep small raw/selected monitor subsets.
+      monitor_max_events: int | None, maximum monitor events per source sample.
+    outputs:
+      tuple(selected_events, monitor_raw_events, monitor_selected_events).
+    goal:
+      Load multi-file samples one parquet at a time, immediately preselect and
+      pack the selected subset, then release raw file arrays to reduce peak RSS.
+    """
+    parquet_files = expand_input_files(sample.input_files)
+    console.print(
+        f"[bold cyan]Loading sample[/bold cyan] [white]{sample.name}[/white] "
+        f"from [white]{len(parquet_files)}[/white] parquet file(s)"
+    )
+    if not parquet_files:
+        raise ValueError(f"No parquet inputs found for sample '{sample.name}'.")
+
+    if num_workers > 1 and len(parquet_files) > 1:
+        if tmp_root is None:
+            raise ValueError("tmp_root is required when num_workers > 1.")
+        return load_selected_sample_events_parallel(
+            sample=sample,
+            parquet_files=parquet_files,
+            keep_monitoring=keep_monitoring,
+            monitor_max_events=monitor_max_events,
+            num_workers=num_workers,
+            tmp_root=tmp_root,
+        )
+
+    selected_chunks: list[ak.Array] = []
+    monitor_raw_chunks: list[ak.Array] = []
+    monitor_selected_chunks: list[ak.Array] = []
+    raw_total = 0
+    selected_total = 0
+    monitor_raw_remaining = None if monitor_max_events is None or monitor_max_events <= 0 else monitor_max_events
+    monitor_selected_remaining = None if monitor_max_events is None or monitor_max_events <= 0 else monitor_max_events
+
+    for file_index, parquet_file in enumerate(parquet_files, start=1):
+        raw_events = ak.from_parquet(parquet_file)
+        raw_total += len(raw_events)
+        if keep_monitoring and (monitor_raw_remaining is None or monitor_raw_remaining > 0):
+            raw_take = len(raw_events) if monitor_raw_remaining is None else min(monitor_raw_remaining, len(raw_events))
+            monitor_raw_chunks.append(ak.to_packed(raw_events[:raw_take]))
+            if monitor_raw_remaining is not None:
+                monitor_raw_remaining -= raw_take
+
+        selected_events = apply_preselection(raw_events)
+        selected_total += len(selected_events)
+        selected_chunks.append(selected_events)
+        if keep_monitoring and (monitor_selected_remaining is None or monitor_selected_remaining > 0):
+            selected_take = (
+                len(selected_events)
+                if monitor_selected_remaining is None
+                else min(monitor_selected_remaining, len(selected_events))
+            )
+            monitor_selected_chunks.append(ak.to_packed(selected_events[:selected_take]))
+            if monitor_selected_remaining is not None:
+                monitor_selected_remaining -= selected_take
+
+        console.print(
+            f"  [green]Loaded file[/green] [white]{file_index}/{len(parquet_files)}[/white] "
+            f"raw=[white]{len(raw_events)}[/white] selected=[white]{len(selected_events)}[/white]"
+        )
+        del raw_events, selected_events
+        gc.collect()
+
+    selected = concatenate_event_chunks(selected_chunks)
+    monitor_raw = concatenate_event_chunks(monitor_raw_chunks) if keep_monitoring else None
+    monitor_selected = concatenate_event_chunks(monitor_selected_chunks) if keep_monitoring else None
+    console.print(
+        f"  [green]Loaded sample[/green] raw=[white]{raw_total}[/white] "
+        f"selected=[white]{selected_total}[/white]"
+    )
+    return selected, monitor_raw, monitor_selected
 
 
 def parse_category_values(raw_values) -> tuple[int, ...]:
@@ -256,7 +513,7 @@ def split_sample_by_category(sample: Sample, events: ak.Array, splits: list[Cate
         for category in split.categories:
             category_mask = category_mask | (events["event_category"] == category)
         category_mask = available_mask & category_mask
-        split_events = events[category_mask]
+        split_events = ak.to_packed(events[category_mask])
         if len(split_events) == 0:
             console.print(f"  [yellow]Skipping empty split[/yellow] [white]{split.name}[/white]")
             continue
@@ -268,7 +525,7 @@ def split_sample_by_category(sample: Sample, events: ak.Array, splits: list[Cate
             f"categories={list(split.categories)} events=[white]{len(split_events)}[/white]"
         )
 
-    remainder = events[available_mask]
+    remainder = ak.to_packed(events[available_mask])
     if len(remainder) > 0:
         remainder_name = f"{sample.name}_others"
         outputs.append((replace(sample, name=remainder_name), remainder))
@@ -767,10 +1024,14 @@ def build_dataset(
     fill_missing_passthrough_batch_keys(batches, batch_sample_names)
     all_keys = sorted(set().union(*(batch.keys() for batch in batches)))
 
-    dataset = {
-        key: np.concatenate([batch[key] for batch in batches], axis=0)
-        for key in all_keys
-    }
+    dataset = {}
+    for key in all_keys:
+        # Concatenate one field at a time and drop the per-sample pieces as soon
+        # as possible. The point-cloud tensor is large enough that keeping all
+        # batch dictionaries alive during every concatenate can double peak RSS.
+        pieces = [batch.pop(key) for batch in batches]
+        dataset[key] = np.concatenate(pieces, axis=0)
+        del pieces
 
     expected_passthrough_union = sorted(set().union(*batch_expected_passthrough))
     missing_dataset_passthrough = sorted(set(expected_passthrough_union) - set(dataset))
@@ -1398,6 +1659,7 @@ def write_outputs(
     metadata: dict,
     output_dir: Path,
     stem: str,
+    compress: bool = True,
     write_event_info: bool = False,
     feature_config: FeatureConfig | None = None,
     evenet_config: EveNetConfig | None = None,
@@ -1407,7 +1669,8 @@ def write_outputs(
     npz_path = output_dir / f"{stem}.npz"
     metadata_path = output_dir / f"{stem}_metadata.json"
 
-    np.savez_compressed(npz_path, **dataset)
+    save_npz = np.savez_compressed if compress else np.savez
+    save_npz(npz_path, **dataset)
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
     with np.load(npz_path, allow_pickle=False) as saved_npz:
@@ -1477,6 +1740,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Use --no-remove-neutral-non-photon to override the config and keep all neutral particles."
         ),
     )
+    parser.add_argument(
+        "--skip-monitoring",
+        action="store_true",
+        help="Skip all step-1 monitoring plots. This is the lowest-memory and fastest build mode.",
+    )
+    parser.add_argument(
+        "--monitor-max-events",
+        type=int,
+        default=50000,
+        help=(
+            "Maximum events per source sample used for monitoring plots. "
+            "Use 0 to monitor all events. Ignored with --skip-monitoring."
+        ),
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of worker processes for multi-file sample loading/preselection. "
+            "Each worker holds one input parquet file at a time."
+        ),
+    )
+    parser.add_argument(
+        "--compress-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write compressed NPZ by default. Use --no-compress-output for faster, lower-CPU writes.",
+    )
     return parser
 
 
@@ -1509,16 +1801,39 @@ def main() -> None:
         merge_evenet_config(evenet_schema_config, analysis_config),
         feature_config,
     )
-    raw_sample_events = {
-        sample_key: load_sample_events(sample)
-        for sample_key, sample in samples.items()
-    }
-    sample_events = {
-        sample_key: apply_preselection(raw_sample_events[sample_key])
-        for sample_key in samples
-    }
-    raw_expanded_samples = expand_samples(samples, raw_sample_events, subcategories)
+    sample_events: dict[str, ak.Array] = {}
+    monitor_raw_sample_events: dict[str, ak.Array] = {}
+    monitor_sample_events: dict[str, ak.Array] = {}
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="evenet_build_", dir=str(args.output_dir)) as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        for sample_key, sample in samples.items():
+            selected_events, monitor_raw_events, monitor_selected_events = load_selected_sample_events(
+                sample=sample,
+                keep_monitoring=not args.skip_monitoring,
+                monitor_max_events=args.monitor_max_events,
+                num_workers=max(1, args.num_workers),
+                tmp_root=tmp_root,
+            )
+            sample_events[sample_key] = selected_events
+            if not args.skip_monitoring and monitor_raw_events is not None and monitor_selected_events is not None:
+                monitor_raw_sample_events[sample_key] = monitor_raw_events
+                monitor_sample_events[sample_key] = monitor_selected_events
+            gc.collect()
+
+    raw_expanded_samples = (
+        expand_samples(samples, monitor_raw_sample_events, subcategories)
+        if not args.skip_monitoring
+        else []
+    )
+    monitor_expanded_samples = (
+        expand_samples(samples, monitor_sample_events, subcategories)
+        if not args.skip_monitoring
+        else []
+    )
     expanded_samples = expand_samples(samples, sample_events, subcategories)
+    sample_events.clear()
+    gc.collect()
 
     training_samples = select_training_samples(expanded_samples)
     data_samples = select_data_samples(expanded_samples)
@@ -1566,10 +1881,19 @@ def main() -> None:
         mc_metadata,
         args.output_dir,
         stem="evenet_input",
+        compress=args.compress_output,
         write_event_info=True,
         feature_config=feature_config,
         evenet_config=evenet_config,
     )
+    del mc_dataset, mc_metadata, training_samples
+    if args.skip_monitoring:
+        # Drop MC event arrays before building the optional data payload.
+        expanded_samples = data_samples
+        for sample_key, sample in list(samples.items()):
+            if not sample.is_data:
+                sample_events.pop(sample_key, None)
+    gc.collect()
 
     if data_samples:
         console.print(
@@ -1589,10 +1913,17 @@ def main() -> None:
             data_metadata,
             args.output_dir,
             stem="data",
+            compress=args.compress_output,
             write_event_info=False,
         )
+        del data_dataset, data_metadata
+        gc.collect()
     else:
-        console.print("[yellow]Skipped dataw[/yellow] no data samples configured")
+        console.print("[yellow]Skipped data[/yellow] no data samples configured")
+
+    if args.skip_monitoring:
+        console.print("[yellow]Skipped monitoring[/yellow] --skip-monitoring")
+        return
 
     resolved_luminosity = infer_luminosity(samples, None)
     normalize = resolved_luminosity is None
@@ -1608,7 +1939,7 @@ def main() -> None:
 
     write_monitoring_plots(
         raw_expanded_samples=raw_expanded_samples,
-        expanded_samples=expanded_samples,
+        expanded_samples=monitor_expanded_samples,
         output_dir=args.output_dir,
         luminosity=resolved_luminosity,
         normalize=normalize,
