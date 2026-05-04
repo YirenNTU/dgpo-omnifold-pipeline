@@ -8,11 +8,13 @@ import gc
 import json
 import logging
 import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from numpy.lib import format as npy_format
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -32,6 +34,16 @@ from preprocessing.helper import (  # noqa: E402
 
 
 LOGGER = logging.getLogger("preprocess_evenet_shards")
+DEFAULT_MISSING_FLOAT = -99.0
+CORE_MODEL_KEYS = {
+    "x",
+    "x_mask",
+    "conditions",
+    "conditions_mask",
+    "x_invisible",
+    "x_invisible_mask",
+    "event_weight",
+}
 
 
 def generate_assignment_names(event_info):
@@ -100,6 +112,121 @@ def load_shards(manifest_path: Path, key: str) -> list[Path]:
         raise FileNotFoundError(f"Missing {key} files: {missing[:5]}")
 
     return shards
+
+
+def read_npz_header_schema(path: Path) -> dict[str, tuple[tuple[int, ...], np.dtype]]:
+    """
+    inputs:
+      path: Path, NPZ shard.
+    outputs:
+      schema: dict[str, (shape, dtype)], parsed from embedded NPY headers.
+    goal:
+      Discover the global shard schema without materializing large arrays.
+    """
+    schema: dict[str, tuple[tuple[int, ...], np.dtype]] = {}
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if not name.endswith(".npy"):
+                continue
+            key = name.removesuffix(".npy")
+            with archive.open(name) as stream:
+                version = npy_format.read_magic(stream)
+                shape, _, dtype = npy_format._read_array_header(stream, version)
+            schema[key] = (tuple(shape), np.dtype(dtype))
+    return schema
+
+
+def build_reference_schema(shards: list[Path]) -> dict[str, tuple[tuple[int, ...], np.dtype]]:
+    """
+    inputs:
+      shards: list[Path], training NPZ shards.
+    outputs:
+      reference: dict[str, (tail_shape, dtype)], union schema excluding event axis.
+    goal:
+      Make independently built NPZ shards look like one globally consistent
+      dataset before converting them to parquet.
+    """
+    reference: dict[str, tuple[tuple[int, ...], np.dtype]] = {}
+    conflicts: list[str] = []
+    for shard in shards:
+        for key, (shape, dtype) in read_npz_header_schema(shard).items():
+            tail_shape = tuple(shape[1:])
+            if key not in reference:
+                reference[key] = (tail_shape, dtype)
+                continue
+            ref_shape, ref_dtype = reference[key]
+            if ref_shape != tail_shape or ref_dtype != dtype:
+                conflicts.append(
+                    f"{key}: reference(shape={ref_shape}, dtype={ref_dtype}) "
+                    f"vs {shard.name}(shape={tail_shape}, dtype={dtype})"
+                )
+
+    if conflicts:
+        raise ValueError("Inconsistent NPZ shard schema:\n  " + "\n  ".join(conflicts[:20]))
+    return reference
+
+
+def default_missing_array(key: str, tail_shape: tuple[int, ...], dtype: np.dtype, num_events: int) -> np.ndarray:
+    """
+    inputs:
+      key: str, missing array name.
+      tail_shape: tuple[int, ...], shape after the event axis.
+      dtype: np.dtype, target dtype.
+      num_events: int, number of events in this shard.
+    outputs:
+      values: np.ndarray, synthetic defaults matching the global schema.
+    goal:
+      Fill optional passthrough fields that are absent in one shard but present
+      in another, matching the defaults used by the EveNet input builder.
+    """
+    shape = (num_events,) + tuple(tail_shape)
+    if np.issubdtype(dtype, np.bool_):
+        return np.zeros(shape, dtype=bool)
+    if np.issubdtype(dtype, np.integer):
+        if key == "initial_total_num_events":
+            return np.full(shape, num_events, dtype=dtype)
+        if key.startswith("truth_num_"):
+            return np.zeros(shape, dtype=dtype)
+        return np.full(shape, -1, dtype=dtype)
+    if np.issubdtype(dtype, np.floating):
+        if key.startswith("analyzing_power"):
+            return np.zeros(shape, dtype=dtype)
+        return np.full(shape, DEFAULT_MISSING_FLOAT, dtype=dtype)
+    raise ValueError(f"Cannot synthesize missing array for {key}: dtype={dtype}")
+
+
+def align_to_reference_schema(
+    data: dict[str, np.ndarray],
+    reference_schema: dict[str, tuple[tuple[int, ...], np.dtype]],
+    shard_path: Path,
+) -> dict[str, np.ndarray]:
+    """
+    inputs:
+      data: dict[str, np.ndarray], loaded NPZ shard.
+      reference_schema: dict[str, (tail_shape, dtype)], global training schema.
+      shard_path: Path, current shard path used for diagnostics.
+    outputs:
+      data: dict[str, np.ndarray], with missing optional arrays filled.
+    goal:
+      Prevent parquet/shape_metadata drift caused by independently built NPZ
+      shards having different passthrough columns.
+    """
+    num_events = len(data["x"]) if "x" in data else len(next(iter(data.values())))
+    missing_required = sorted(CORE_MODEL_KEYS - set(data))
+    if missing_required:
+        raise ValueError(f"{shard_path} is missing core EveNet keys: {missing_required}")
+
+    for key, (tail_shape, dtype) in reference_schema.items():
+        if key in data:
+            actual_tail = tuple(data[key].shape[1:])
+            if actual_tail != tail_shape:
+                raise ValueError(
+                    f"{shard_path} has inconsistent shape for {key}: "
+                    f"{actual_tail} vs reference {tail_shape}"
+                )
+            continue
+        data[key] = default_missing_array(key, tail_shape, dtype, num_events)
+    return data
 
 
 def split_output_path(store_dir: Path, split_name: str, shard_index: int) -> Path:
@@ -184,6 +311,7 @@ def preprocess_shards(
     shape_metadata = None
     train_stats = PostProcessor(global_config)
     log_scale_plan = build_log_scale_plan(global_config)
+    reference_schema = build_reference_schema(shards)
     rng = np.random.default_rng(42)
     summary = {
         "store_dir": str(store_dir),
@@ -200,7 +328,7 @@ def preprocess_shards(
         if verbose:
             print(f"[preprocess-shards] loading {shard_index + 1}/{len(shards)} {shard_path}")
 
-        data = load_npz(shard_path)
+        data = align_to_reference_schema(load_npz(shard_path), reference_schema, shard_path)
         n_events = len(data["x"])
         split_indices = dict(zip(("train", "val", "test"), event_split_indices(n_events, split_ratio, rng)))
 
@@ -240,7 +368,7 @@ def preprocess_shards(
         if verbose:
             print(f"[preprocess-shards] loading data {shard_index + 1}/{len(data_shards)} {shard_path}")
 
-        data = load_npz(shard_path)
+        data = align_to_reference_schema(load_npz(shard_path), reference_schema, shard_path)
         chunks: list[pa.Table] = []
         shape_metadata = process_dict(
             data,
