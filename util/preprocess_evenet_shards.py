@@ -9,6 +9,7 @@ import json
 import logging
 import sys
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +43,6 @@ CORE_MODEL_KEYS = {
     "conditions_mask",
     "x_invisible",
     "x_invisible_mask",
-    "event_weight",
 }
 
 
@@ -210,12 +210,15 @@ def align_to_reference_schema(
     data: dict[str, np.ndarray],
     reference_schema: dict[str, tuple[tuple[int, ...], np.dtype]],
     shard_path: Path,
+    *,
+    is_data: bool = False,
 ) -> dict[str, np.ndarray]:
     """
     inputs:
       data: dict[str, np.ndarray], loaded NPZ shard.
       reference_schema: dict[str, (tail_shape, dtype)], global training schema.
       shard_path: Path, current shard path used for diagnostics.
+      is_data: bool, allow data-only defaults for non-training labels/weights.
     outputs:
       data: dict[str, np.ndarray], with missing optional arrays filled.
     goal:
@@ -226,6 +229,10 @@ def align_to_reference_schema(
     missing_required = sorted(CORE_MODEL_KEYS - set(data))
     if missing_required:
         raise ValueError(f"{shard_path} is missing core EveNet keys: {missing_required}")
+    if "event_weight" not in data:
+        data["event_weight"] = np.ones(num_events, dtype=np.float32)
+    if is_data and "classification" not in data:
+        data["classification"] = np.full(num_events, -1, dtype=np.int64)
 
     for key, (tail_shape, dtype) in reference_schema.items():
         if key in data:
@@ -291,6 +298,169 @@ def write_chunk_table(chunks: list[pa.Table], out_path: Path, *, shuffle_seed: i
     return summary
 
 
+def ensure_global_config_loaded(config_path: str | Path) -> None:
+    """
+    inputs:
+      config_path: str | Path, preprocessing config.
+    outputs:
+      None.
+    goal:
+      Load EveNet global_config once per process; repeated load_yaml calls can
+      mutate already-constructed event_info objects.
+    """
+    if not getattr(global_config, "loaded", False):
+        global_config.load_yaml(str(config_path))
+
+
+def process_training_shard_worker(payload: dict) -> dict:
+    """
+    inputs:
+      payload: dict, training shard task and preprocessing configuration.
+    outputs:
+      result: dict, split write summaries, shape metadata, and train stats.
+    goal:
+      Process one NPZ shard independently so preprocessing can use multiple CPU
+      workers while preserving a globally merged normalization file.
+    """
+    ensure_global_config_loaded(payload["config_path"])
+    shard_index = int(payload["shard_index"])
+    shard_path = Path(payload["shard_path"])
+    store_dir = Path(payload["store_dir"])
+    split_ratio = tuple(payload["split_ratio"])
+    reference_schema = payload["reference_schema"]
+    unique_process_ids = payload["unique_process_ids"]
+    assignment_keys = payload["assignment_keys"]
+    verbose = bool(payload["verbose"])
+
+    train_stats = PostProcessor(global_config)
+    log_scale_plan = build_log_scale_plan(global_config)
+    rng = np.random.default_rng(int(payload["split_seed"]) + shard_index)
+
+    if verbose:
+        print(f"[preprocess-shards] worker loading {shard_index} {shard_path}", flush=True)
+
+    data = align_to_reference_schema(load_npz(shard_path), reference_schema, shard_path)
+    n_events = len(data["x"])
+    split_indices = dict(zip(("train", "val", "test"), event_split_indices(n_events, split_ratio, rng)))
+    result = {"shard_index": shard_index, "train": [], "val": [], "test": [], "shape_metadata": None, "train_stats": train_stats}
+
+    for split_name, indices in split_indices.items():
+        if len(indices) == 0:
+            continue
+
+        pdict = slice_event_dict(data, indices, n_events)
+        chunks: list[pa.Table] = []
+        shape_metadata = process_dict(
+            pdict,
+            global_config=global_config,
+            unique_process_ids=unique_process_ids,
+            assignment_keys=assignment_keys,
+            log_scale_plan=log_scale_plan,
+            statistics=train_stats if split_name == "train" else None,
+            shape_metadata=result["shape_metadata"],
+            store_chunks=chunks,
+        )
+        if shape_metadata is not None:
+            result["shape_metadata"] = shape_metadata
+
+        out_path = split_output_path(store_dir, split_name, shard_index)
+        written = write_chunk_table(chunks, out_path, shuffle_seed=31 + shard_index)
+        result[split_name].append(written)
+        if verbose and written["written"]:
+            print(
+                "[preprocess-shards] wrote "
+                f"{split_name} rows={written['rows']} size={written['size_mb']:.2f} MB -> {out_path}",
+                flush=True,
+            )
+
+        del pdict, chunks
+        gc.collect()
+
+    del data, split_indices
+    gc.collect()
+    result["train_stats"] = train_stats
+    return result
+
+
+def process_data_shard_worker(payload: dict) -> dict:
+    """
+    inputs:
+      payload: dict, data shard task and preprocessing configuration.
+    outputs:
+      result: dict, data write summary.
+    goal:
+      Convert data shards in parallel without contributing to normalization.
+    """
+    ensure_global_config_loaded(payload["config_path"])
+    shard_index = int(payload["shard_index"])
+    shard_path = Path(payload["shard_path"])
+    store_dir = Path(payload["store_dir"])
+    reference_schema = payload["reference_schema"]
+    unique_process_ids = payload["unique_process_ids"]
+    assignment_keys = payload["assignment_keys"]
+    verbose = bool(payload["verbose"])
+
+    log_scale_plan = build_log_scale_plan(global_config)
+    if verbose:
+        print(f"[preprocess-shards] worker loading data {shard_index} {shard_path}", flush=True)
+
+    data = align_to_reference_schema(load_npz(shard_path), reference_schema, shard_path, is_data=True)
+    chunks: list[pa.Table] = []
+    process_dict(
+        data,
+        global_config=global_config,
+        unique_process_ids=unique_process_ids,
+        assignment_keys=assignment_keys,
+        log_scale_plan=log_scale_plan,
+        statistics=None,
+        shape_metadata=None,
+        store_chunks=chunks,
+    )
+    out_path = store_dir / "data" / f"data_{shard_index:06d}.parquet"
+    written = write_chunk_table(chunks, out_path, shuffle_seed=None)
+    if verbose and written["written"]:
+        print(
+            "[preprocess-shards] wrote "
+            f"data rows={written['rows']} size={written['size_mb']:.2f} MB -> {out_path}",
+            flush=True,
+        )
+    del data, chunks
+    gc.collect()
+    return {"shard_index": shard_index, "data": [written]}
+
+
+def run_tasks(task_payloads: list[dict], worker_fn, num_workers: int, label: str) -> list[dict]:
+    """
+    inputs:
+      task_payloads: list[dict], worker payloads.
+      worker_fn: callable, worker function.
+      num_workers: int, requested worker count.
+      label: str, progress label.
+    outputs:
+      results: list[dict], sorted by shard_index.
+    goal:
+      Share one sequential/parallel execution path for easier debugging.
+    """
+    if not task_payloads:
+        return []
+    worker_count = max(1, min(int(num_workers), len(task_payloads)))
+    if worker_count == 1:
+        return [worker_fn(payload) for payload in task_payloads]
+
+    print(f"[preprocess-shards] {label} workers={worker_count} tasks={len(task_payloads)}", flush=True)
+    results: list[dict] = []
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(worker_fn, payload) for payload in task_payloads]
+        for done, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            results.append(result)
+            print(
+                f"[preprocess-shards] {label} done {done}/{len(task_payloads)} shard={result['shard_index']}",
+                flush=True,
+            )
+    return sorted(results, key=lambda item: item["shard_index"])
+
+
 def preprocess_shards(
     *,
     shards: list[Path],
@@ -299,6 +469,8 @@ def preprocess_shards(
     split_ratio: tuple[float, float, float],
     unique_process_ids,
     assignment_keys,
+    config_path: Path,
+    num_workers: int,
     verbose: bool,
 ) -> dict:
     """
@@ -309,6 +481,8 @@ def preprocess_shards(
       split_ratio: tuple[float, float, float], event-level train/val/test split.
       unique_process_ids: list[str], class labels from EveNet event info.
       assignment_keys: list[str], assignment labels for preprocessing statistics.
+      config_path: Path, preprocessing config loaded by worker processes.
+      num_workers: int, number of CPU worker processes.
       verbose: bool, print progress lines.
     outputs:
       summary: dict, written parquet paths and row counts.
@@ -321,11 +495,7 @@ def preprocess_shards(
     (store_dir / "test").mkdir(parents=True, exist_ok=True)
     (store_dir / "data").mkdir(parents=True, exist_ok=True)
 
-    shape_metadata = None
-    train_stats = PostProcessor(global_config)
-    log_scale_plan = build_log_scale_plan(global_config)
     reference_schema = build_reference_schema(shards)
-    rng = np.random.default_rng(42)
     summary = {
         "store_dir": str(store_dir),
         "split_ratio": list(split_ratio),
@@ -335,79 +505,52 @@ def preprocess_shards(
         "data": [],
     }
 
-    LOGGER.info("Applying np.log1p to log-scale features:%s", log_scale_plan.description())
+    common_payload = {
+        "config_path": str(config_path),
+        "store_dir": str(store_dir),
+        "split_ratio": list(split_ratio),
+        "reference_schema": reference_schema,
+        "unique_process_ids": list(unique_process_ids),
+        "assignment_keys": list(assignment_keys),
+        "verbose": verbose,
+        "split_seed": 42,
+    }
+    train_payloads = [
+        {
+            **common_payload,
+            "shard_index": shard_index,
+            "shard_path": str(shard_path),
+        }
+        for shard_index, shard_path in enumerate(shards)
+    ]
+    train_results = run_tasks(train_payloads, process_training_shard_worker, num_workers, "training")
 
-    for shard_index, shard_path in enumerate(shards):
-        if verbose:
-            print(f"[preprocess-shards] loading {shard_index + 1}/{len(shards)} {shard_path}")
+    shape_metadata = None
+    train_stats: list[PostProcessor] = []
+    for result in train_results:
+        train_stats.append(result["train_stats"])
+        if shape_metadata is None:
+            shape_metadata = result["shape_metadata"]
+        elif result["shape_metadata"] is not None and shape_metadata != result["shape_metadata"]:
+            raise AssertionError("Shape metadata mismatch across worker results.")
+        for split_name in ("train", "val", "test"):
+            summary[split_name].extend(result[split_name])
 
-        data = align_to_reference_schema(load_npz(shard_path), reference_schema, shard_path)
-        n_events = len(data["x"])
-        split_indices = dict(zip(("train", "val", "test"), event_split_indices(n_events, split_ratio, rng)))
-
-        for split_name, indices in split_indices.items():
-            if len(indices) == 0:
-                continue
-
-            pdict = slice_event_dict(data, indices, n_events)
-            chunks: list[pa.Table] = []
-            shape_metadata = process_dict(
-                pdict,
-                global_config=global_config,
-                unique_process_ids=unique_process_ids,
-                assignment_keys=assignment_keys,
-                log_scale_plan=log_scale_plan,
-                statistics=train_stats if split_name == "train" else None,
-                shape_metadata=shape_metadata,
-                store_chunks=chunks,
-            )
-
-            out_path = split_output_path(store_dir, split_name, shard_index)
-            written = write_chunk_table(chunks, out_path, shuffle_seed=31 + shard_index)
-            summary[split_name].append(written)
-            if verbose and written["written"]:
-                print(
-                    "[preprocess-shards] wrote "
-                    f"{split_name} rows={written['rows']} size={written['size_mb']:.2f} MB -> {out_path}"
-                )
-
-            del pdict, chunks
-            gc.collect()
-
-        del data, split_indices
-        gc.collect()
-
-    for shard_index, shard_path in enumerate(data_shards):
-        if verbose:
-            print(f"[preprocess-shards] loading data {shard_index + 1}/{len(data_shards)} {shard_path}")
-
-        data = align_to_reference_schema(load_npz(shard_path), reference_schema, shard_path)
-        chunks: list[pa.Table] = []
-        shape_metadata = process_dict(
-            data,
-            global_config=global_config,
-            unique_process_ids=unique_process_ids,
-            assignment_keys=assignment_keys,
-            log_scale_plan=log_scale_plan,
-            statistics=None,
-            shape_metadata=shape_metadata,
-            store_chunks=chunks,
-        )
-        out_path = store_dir / "data" / f"data_{shard_index:06d}.parquet"
-        written = write_chunk_table(chunks, out_path, shuffle_seed=None)
-        summary["data"].append(written)
-        if verbose and written["written"]:
-            print(
-                "[preprocess-shards] wrote "
-                f"data rows={written['rows']} size={written['size_mb']:.2f} MB -> {out_path}"
-            )
-
-        del data, chunks
-        gc.collect()
+    data_payloads = [
+        {
+            **common_payload,
+            "shard_index": shard_index,
+            "shard_path": str(shard_path),
+        }
+        for shard_index, shard_path in enumerate(data_shards)
+    ]
+    data_results = run_tasks(data_payloads, process_data_shard_worker, num_workers, "data")
+    for result in data_results:
+        summary["data"].extend(result["data"])
 
     with (store_dir / "shape_metadata.json").open("w") as stream:
         json.dump(shape_metadata, stream)
-    PostProcessor.merge([train_stats], saved_results_path=store_dir)
+    PostProcessor.merge(train_stats, saved_results_path=store_dir)
 
     summary_path = store_dir / "preprocess_shards_manifest.json"
     summary_path.write_text(json.dumps(summary, indent=2))
@@ -450,6 +593,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not convert data_shards from the manifest into store-dir/data.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of CPU worker processes for shard preprocessing. Default: 1.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
     return parser
 
@@ -476,6 +625,8 @@ def main() -> None:
         split_ratio=split_ratio,
         unique_process_ids=process_ids,
         assignment_keys=assignment_keys,
+        config_path=args.config,
+        num_workers=args.num_workers,
         verbose=True,
     )
 

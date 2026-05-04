@@ -223,7 +223,8 @@ python3 util/preprocess_evenet_shards.py \
   --config config/preprocess_config.yaml \
   --manifest /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/dataset/evenet_input_shards_manifest.json \
   --store-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train \
-  --split-ratio 0.4,0.1,0.5
+  --split-ratio 0.4,0.1,0.5 \
+  --num-workers 4
 ```
 
 Sharded preprocessing outputs:
