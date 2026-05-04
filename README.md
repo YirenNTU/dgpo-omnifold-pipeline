@@ -239,6 +239,64 @@ The training configs point `data_parquet_dir` at the train shard directory and
 `data_parquet_val_dir` at the validation shard directory, while both splits use
 the same `normalization.pt`.
 
+If the train shards are process-ordered, mix them before training. This keeps
+the same shared `normalization.pt` and `shape_metadata.json`, copies
+`val/`, `test/`, and `data/`, and rewrites only the train parquet shards:
+
+```bash
+python3 util/mix_evenet_train_parquets.py \
+  --input-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed \
+  --rows-per-output 100000 \
+  --read-batch-size 8192 \
+  --seed 42
+```
+
+Mixed preprocessing outputs:
+
+- `/pscratch/.../ml_based/evenet_train_mixed/train_*.parquet`
+- `/pscratch/.../ml_based/evenet_train_mixed/val/val_*.parquet`
+- `/pscratch/.../ml_based/evenet_train_mixed/test/test_*.parquet`
+- `/pscratch/.../ml_based/evenet_train_mixed/data/data_*.parquet`
+- `/pscratch/.../ml_based/evenet_train_mixed/normalization.pt`
+- `/pscratch/.../ml_based/evenet_train_mixed/shape_metadata.json`
+- `/pscratch/.../ml_based/evenet_train_mixed/mix_evenet_train_parquets_summary.json`
+
+For training with the mixed output, set:
+
+```yaml
+platform:
+  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed
+  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/val
+
+options:
+  Dataset:
+    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/normalization.pt
+```
+
+After preprocessing or mixing, run a lightweight parquet monitor before
+training:
+
+```bash
+python3 util/monitor_evenet_preprocessed_parquets.py \
+  --input-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/monitoring \
+  --shard-manifest /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/dataset/evenet_input_shards_manifest.json \
+  --splits train val test data \
+  --max-rows-per-file 20000
+```
+
+This writes:
+
+- `preprocessed_monitor_summary.json`
+- `train/rows_per_file.png`
+- `train/class_counts.png`
+- `train/class_fraction_per_file.png`
+- `*/numeric_hists/*.png`
+
+The `class_fraction_per_file.png` plot is the quickest check that mixed train
+parquets contain a healthy process mixture rather than process-ordered shards.
+
 For data-only inference conversion, a practical workaround is:
 
 ```bash
@@ -289,7 +347,7 @@ To run an EMA prediction intentionally, omit `--disable-ema`.
 ## 4. Standalone EveNet Prediction
 
 `util/predict_evenet_from_raw_parquet.py` consumes converted parquet files or
-directories such as `evenet_train/test` and `evenet_train/data`. It no longer
+directories such as `evenet_train_mixed/test` and `evenet_train_mixed/data`. It no longer
 reads raw parquet files or reruns raw-side selection during prediction.
 
 For sharded preprocessing output, run MC/test and data prediction separately so
@@ -303,8 +361,8 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/pretrain/last.ckpt \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
   --disable-ema \
-  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/test \
-  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/shape_metadata.json \
+  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
+  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
   --converted-split-fraction 0.5 \
   --batch-size 2048 \
   --num-gpus 4
@@ -315,8 +373,8 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/pretrain/last.ckpt \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data-pred \
   --disable-ema \
-  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/data \
-  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/shape_metadata.json \
+  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/data \
+  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
   --batch-size 2048 \
   --num-gpus 4
 ```
