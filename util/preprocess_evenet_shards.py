@@ -155,11 +155,22 @@ def build_reference_schema(shards: list[Path]) -> dict[str, tuple[tuple[int, ...
                 reference[key] = (tail_shape, dtype)
                 continue
             ref_shape, ref_dtype = reference[key]
-            if ref_shape != tail_shape or ref_dtype != dtype:
+            if ref_shape != tail_shape:
                 conflicts.append(
                     f"{key}: reference(shape={ref_shape}, dtype={ref_dtype}) "
                     f"vs {shard.name}(shape={tail_shape}, dtype={dtype})"
                 )
+                continue
+            if ref_dtype != dtype:
+                try:
+                    promoted = np.promote_types(ref_dtype, dtype)
+                except TypeError:
+                    conflicts.append(
+                        f"{key}: reference(shape={ref_shape}, dtype={ref_dtype}) "
+                        f"vs {shard.name}(shape={tail_shape}, dtype={dtype})"
+                    )
+                    continue
+                reference[key] = (ref_shape, np.dtype(promoted))
 
     if conflicts:
         raise ValueError("Inconsistent NPZ shard schema:\n  " + "\n  ".join(conflicts[:20]))
@@ -224,6 +235,8 @@ def align_to_reference_schema(
                     f"{shard_path} has inconsistent shape for {key}: "
                     f"{actual_tail} vs reference {tail_shape}"
                 )
+            if data[key].dtype != dtype:
+                data[key] = data[key].astype(dtype, copy=False)
             continue
         data[key] = default_missing_array(key, tail_shape, dtype, num_events)
     return data
