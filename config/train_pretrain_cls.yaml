@@ -28,7 +28,7 @@ options:
   Training:
     total_epochs: 80
     epochs: 80
-    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/checkpoint-pretrain-diffusion
+    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/checkpoint-pretrain-cls
     model_checkpoint_load_path: null
     pretrain_model_load_path: /global/homes/t/tihsu/CMSOpenData-GridStudy/pretrain-weights/checkpoints.20M.a4.last.ckpt
     freeze_modules: []
@@ -78,7 +78,7 @@ options:
 
       Classification:
         learning_rate: *lr_classification
-        include: false
+        include: true
         optimizer_type: "adamW"
 
       Regression:
@@ -97,7 +97,7 @@ options:
         include: false
 
       TruthGeneration:
-        include: true
+        include: false
         diffusion_steps: 50
         optimizer_type: "adamW"
         learning_rate: *lr
@@ -129,7 +129,7 @@ options:
           epoch_ratio: 1.0
           transition_ratio: 0.0
           loss_weights:
-            generation-truth: [1.0, 1.0]
+            classification: [1.0, 1.0]
 
   Dataset:
     dataset_limit: 1.0
