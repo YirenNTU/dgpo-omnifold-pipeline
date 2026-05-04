@@ -19,6 +19,7 @@ SIDECAR_FILES = (
     "preprocess_shards_manifest.json",
 )
 SIDECAR_DIRS = ("val", "test", "data")
+DEFAULT_FLOAT = -99.0
 
 
 def discover_train_files(input_dir: Path) -> list[Path]:
@@ -90,11 +91,110 @@ def copy_sidecars(input_dir: Path, output_dir: Path, *, overwrite: bool, copy_no
         shutil.copytree(source, destination, dirs_exist_ok=overwrite)
 
 
-def parquet_batch_iter(path: Path, read_batch_size: int):
+def promote_arrow_type(left: pa.DataType, right: pa.DataType) -> pa.DataType:
+    """
+    inputs:
+      left/right: pa.DataType, two observed column types.
+    outputs:
+      dtype: pa.DataType, common type for mixed parquet output.
+    goal:
+      Allow harmless preprocessing dtype drift, such as float32 vs float64.
+    """
+    if left == right:
+        return left
+    if pa.types.is_floating(left) and pa.types.is_floating(right):
+        return pa.float64()
+    if pa.types.is_integer(left) and pa.types.is_integer(right):
+        return pa.int64() if pa.types.is_signed_integer(left) or pa.types.is_signed_integer(right) else pa.uint64()
+    if pa.types.is_integer(left) and pa.types.is_floating(right):
+        return pa.float64()
+    if pa.types.is_floating(left) and pa.types.is_integer(right):
+        return pa.float64()
+    raise TypeError(f"Cannot promote incompatible parquet column types: {left} vs {right}")
+
+
+def build_reference_schema(files: list[Path]) -> pa.Schema:
+    """
+    inputs:
+      files: list[Path], source train parquet files.
+    outputs:
+      schema: pa.Schema, union schema with promoted numeric types.
+    goal:
+      Make mixing robust to independently written train parquet shards.
+    """
+    field_by_name: dict[str, pa.Field] = {}
+    column_order: list[str] = []
+    conflicts: list[str] = []
+
+    for path in files:
+        for field in pq.ParquetFile(path).schema_arrow:
+            if field.name not in field_by_name:
+                field_by_name[field.name] = field
+                column_order.append(field.name)
+                continue
+            old_field = field_by_name[field.name]
+            try:
+                promoted_type = promote_arrow_type(old_field.type, field.type)
+            except TypeError as exc:
+                conflicts.append(f"{field.name}: {old_field.type} vs {field.type} in {path.name}: {exc}")
+                continue
+            field_by_name[field.name] = pa.field(field.name, promoted_type, nullable=old_field.nullable or field.nullable)
+
+    if conflicts:
+        raise ValueError("Inconsistent train parquet schema:\n  " + "\n  ".join(conflicts[:20]))
+    return pa.schema([field_by_name[name] for name in column_order])
+
+
+def default_column_array(field: pa.Field, num_rows: int) -> pa.Array:
+    """
+    inputs:
+      field: pa.Field, missing column field definition.
+      num_rows: int, number of rows to synthesize.
+    outputs:
+      array: pa.Array, default values compatible with training input.
+    goal:
+      Fill rare missing passthrough columns rather than failing during mixing.
+    """
+    dtype = field.type
+    name = field.name
+    if pa.types.is_boolean(dtype):
+        values = np.zeros(num_rows, dtype=bool)
+    elif pa.types.is_integer(dtype):
+        default = 0 if name.startswith("truth_num_") else -1
+        values = np.full(num_rows, default, dtype=np.int64)
+    elif pa.types.is_floating(dtype):
+        default = 0.0 if name.startswith("analyzing_power") else DEFAULT_FLOAT
+        values = np.full(num_rows, default, dtype=np.float64)
+    else:
+        raise TypeError(f"Cannot synthesize missing column {name} with type {dtype}")
+    return pa.array(values, type=dtype)
+
+
+def align_table_to_schema(table: pa.Table, reference_schema: pa.Schema) -> pa.Table:
+    """
+    inputs:
+      table: pa.Table, source batch.
+      reference_schema: pa.Schema, target schema/order.
+    outputs:
+      table: pa.Table, columns reordered/cast and missing columns filled.
+    goal:
+      Ensure pa.concat_tables always sees identical schemas.
+    """
+    arrays = []
+    for field in reference_schema:
+        if field.name in table.column_names:
+            arrays.append(table[field.name].cast(field.type, safe=False))
+        else:
+            arrays.append(default_column_array(field, table.num_rows))
+    return pa.Table.from_arrays(arrays, schema=reference_schema)
+
+
+def parquet_batch_iter(path: Path, read_batch_size: int, reference_schema: pa.Schema):
     """
     inputs:
       path: Path, source parquet file.
       read_batch_size: int, rows per streaming batch.
+      reference_schema: pa.Schema, target mixed schema.
     outputs:
       iterator yielding pyarrow.Table batches.
     goal:
@@ -102,7 +202,7 @@ def parquet_batch_iter(path: Path, read_batch_size: int):
     """
     parquet = pq.ParquetFile(path)
     for batch in parquet.iter_batches(batch_size=read_batch_size):
-        yield pa.Table.from_batches([batch])
+        yield align_table_to_schema(pa.Table.from_batches([batch]), reference_schema)
 
 
 def write_mixed_table(
@@ -179,13 +279,14 @@ def mix_train_parquets(
         raise ValueError("Use a separate --output-dir so the original train shards are preserved.")
 
     files = discover_train_files(input_dir)
+    reference_schema = build_reference_schema(files)
     prepare_output_dir(output_dir, overwrite=overwrite)
     copy_sidecars(input_dir, output_dir, overwrite=overwrite, copy_non_train=copy_non_train)
 
     rng = np.random.default_rng(seed)
     file_order = list(files)
     rng.shuffle(file_order)
-    iterators = {path: parquet_batch_iter(path, read_batch_size) for path in file_order}
+    iterators = {path: parquet_batch_iter(path, read_batch_size, reference_schema) for path in file_order}
     active = list(file_order)
 
     output_index = 0
