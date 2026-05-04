@@ -284,7 +284,8 @@ python3 util/monitor_evenet_preprocessed_parquets.py \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/monitoring \
   --shard-manifest /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/dataset/evenet_input_shards_manifest.json \
   --splits train val test data \
-  --max-rows-per-file 20000
+  --max-rows-per-file 20000 \
+  --max-rows-per-split 200000
 ```
 
 This writes:
@@ -294,9 +295,16 @@ This writes:
 - `train/class_counts.png`
 - `train/class_fraction_per_file.png`
 - `*/numeric_hists/*.png`
+- `structured/x_mask_multiplicity.png`
+- `structured/x_features/*.png`
+- `structured/x_invisible_features/*.png`
+- `structured/conditions/*.png`
 
 The `class_fraction_per_file.png` plot is the quickest check that mixed train
 parquets contain a healthy process mixture rather than process-ordered shards.
+The `structured/` plots are split-overlay distributions reconstructed from
+`shape_metadata.json`, so they are closer to the original preprocessing ntuple
+monitoring than raw flattened-column checks.
 
 For data-only inference conversion, a practical workaround is:
 
