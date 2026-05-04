@@ -192,12 +192,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_events(path: Path) -> ak.Array:
+def resolve_parquet_inputs(path: Path) -> list[Path]:
+    """
+    inputs:
+      path: Path, parquet file, parquet directory, or glob pattern.
+    outputs:
+      paths: list[Path], concrete parquet files.
+    goal:
+      Allow sharded prediction outputs to be passed as one directory while
+      preserving the single-file interface.
+    """
+    expanded = Path(str(path)).expanduser()
+    if expanded.is_dir():
+        final_prediction_paths = sorted(expanded.glob("*__evenet_pred.parquet"))
+        paths = final_prediction_paths if final_prediction_paths else sorted(expanded.glob("*.parquet"))
+    else:
+        matches = sorted(glob.glob(str(expanded)))
+        paths = [Path(match) for match in matches] if matches else [expanded]
+    if not paths:
+        raise FileNotFoundError(f"No parquet files found for {path}")
+    return paths
+
+
+def load_single_events(path: Path) -> ak.Array:
     events = ak.from_parquet(path)
     for field in events.fields:
         if field.endswith("_p4"):
             events[field] = rebuild_vector(events[field])
     return events
+
+
+def load_events(path: Path) -> ak.Array:
+    paths = resolve_parquet_inputs(path)
+    arrays = [load_single_events(item) for item in paths]
+    return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
 
 
 def expand_paths(patterns: list[str] | tuple[str, ...]) -> list[str]:

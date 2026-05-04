@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
+import os
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -193,7 +195,22 @@ def resolve_converted_parquets(args: argparse.Namespace, pred_cfg: dict[str, Any
         converted = values
     if not converted:
         raise ValueError("Pass --converted-parquet or set EveNetPrediction.converted_parquets in analysis.yaml.")
-    return [str(Path(path).expanduser()) for path in converted]
+
+    resolved: list[str] = []
+    for item in converted:
+        path_text = os.path.expanduser(str(item))
+        matches = sorted(glob.glob(path_text))
+        candidates = matches if matches else [path_text]
+        for candidate in candidates:
+            path = Path(candidate)
+            if path.is_dir():
+                resolved.extend(str(parquet_path.resolve()) for parquet_path in sorted(path.glob("*.parquet")))
+            else:
+                resolved.append(str(path.resolve()))
+
+    if not resolved:
+        raise ValueError(f"No converted parquet files found from: {converted}")
+    return resolved
 
 
 def resolve_converted_split_fraction(args: argparse.Namespace, pred_cfg: dict[str, Any]) -> float | None:
@@ -586,13 +603,16 @@ def prediction_passthrough_columns(batch_np: dict[str, np.ndarray]) -> dict[str,
 def resolve_shape_metadata_path(input_path: Path, override: Path | None) -> Path:
     if override is not None:
         return override.expanduser().resolve()
-    candidate = input_path.parent / "shape_metadata.json"
-    if not candidate.exists():
-        raise FileNotFoundError(
-            f"shape_metadata.json not found next to converted parquet {input_path}. "
-            "Pass --shape-metadata explicitly."
-        )
-    return candidate.resolve()
+    for candidate in (
+        input_path.parent / "shape_metadata.json",
+        input_path.parent.parent / "shape_metadata.json",
+    ):
+        if candidate.exists():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        f"shape_metadata.json not found next to converted parquet {input_path}. "
+        "Pass --shape-metadata explicitly."
+    )
 
 
 def load_flat_parquet_dict(

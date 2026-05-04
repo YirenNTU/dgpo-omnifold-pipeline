@@ -1,5 +1,6 @@
 platform:
   data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train
+  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/val
   number_of_workers: 4
   resources_per_worker: {
     "CPU": 20,

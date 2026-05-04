@@ -213,6 +213,32 @@ Outputs:
 - `normalization.pt`
 - `shape_metadata.json`
 
+For large sharded step-1 output, preprocess the NPZ shards directly. This reads
+one NPZ shard at a time, writes one parquet shard at a time, and accumulates a
+single shared training normalization file:
+
+```bash
+cd /path/to/lep_tree_ana/ml_pipeline
+python3 util/preprocess_evenet_shards.py \
+  --config config/preprocess_config.yaml \
+  --manifest /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/dataset/evenet_input_shards_manifest.json \
+  --store-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train \
+  --split-ratio 0.4,0.1,0.5
+```
+
+Sharded preprocessing outputs:
+
+- `/pscratch/.../ml_based/evenet_train/train_*.parquet`
+- `/pscratch/.../ml_based/evenet_train/val/val_*.parquet`
+- `/pscratch/.../ml_based/evenet_train/test/test_*.parquet`
+- `/pscratch/.../ml_based/evenet_train/data/data_*.parquet`
+- `/pscratch/.../ml_based/evenet_train/normalization.pt`
+- `/pscratch/.../ml_based/evenet_train/shape_metadata.json`
+
+The training configs point `data_parquet_dir` at the train shard directory and
+`data_parquet_val_dir` at the validation shard directory, while both splits use
+the same `normalization.pt`.
+
 For data-only inference conversion, a practical workaround is:
 
 ```bash
@@ -262,7 +288,38 @@ To run an EMA prediction intentionally, omit `--disable-ema`.
 
 ## 4. Standalone EveNet Prediction
 
-`util/predict_evenet_from_raw_parquet.py` currently consumes converted parquet files such as `test.parquet` or `data.parquet`. It no longer reads raw parquet files or reruns raw-side selection during prediction.
+`util/predict_evenet_from_raw_parquet.py` consumes converted parquet files or
+directories such as `evenet_train/test` and `evenet_train/data`. It no longer
+reads raw parquet files or reruns raw-side selection during prediction.
+
+For sharded preprocessing output, run MC/test and data prediction separately so
+the QI export can keep their outputs distinct:
+
+```bash
+cd /path/to/lep_tree_ana/ml_pipeline
+python3 util/predict_evenet_from_raw_parquet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train_pretrain.yaml \
+  --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/pretrain/last.ckpt \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
+  --disable-ema \
+  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/test \
+  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/shape_metadata.json \
+  --converted-split-fraction 0.5 \
+  --batch-size 2048 \
+  --num-gpus 4
+
+python3 util/predict_evenet_from_raw_parquet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train_pretrain.yaml \
+  --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/pretrain/last.ckpt \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data-pred \
+  --disable-ema \
+  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/data \
+  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train/shape_metadata.json \
+  --batch-size 2048 \
+  --num-gpus 4
+```
 
 Scratch example:
 
@@ -381,8 +438,8 @@ Pretrain export:
 ```bash
 python3 util/export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/test__evenet_pred.parquet \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data__evenet_pred.parquet \
+  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
+  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data-pred \
   --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain \
   --qi-method-label qi-export \
   --num-workers 4
