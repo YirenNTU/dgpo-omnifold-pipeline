@@ -1197,6 +1197,17 @@ def histogram_centers(edges: np.ndarray) -> np.ndarray:
     return 0.5 * (edges[:-1] + edges[1:])
 
 
+def normalize_hist2d_per_method(hist2d: np.ndarray | None) -> np.ndarray | None:
+    """Return a unit-area copy for per-method 2D shape comparisons."""
+    if hist2d is None:
+        return None
+    hist = np.array(hist2d, copy=True, dtype=np.float64)
+    total = float(np.nansum(hist))
+    if total > 0.0:
+        hist /= total
+    return hist
+
+
 def region_marker(region: str) -> str:
     mapping = {
         "baseline": "o",
@@ -1244,7 +1255,7 @@ def render_grouped_truth_reco_panels(
         records = deduplicate_grouped_records(records, channel_group, observable, log_label)
 
         num_2d_blocks = max(1, len(records))
-        fig_width = max(13.2, 5.4 + 3.35 * num_2d_blocks)
+        fig_width = max(13.8, 5.6 + 3.9 * num_2d_blocks)
         fig, axes = plt.subplots(
             1,
             1 + num_2d_blocks,
@@ -1259,15 +1270,6 @@ def render_grouped_truth_reco_panels(
         plot_low = float(np.nanmin(all_lows)) if all_lows else -1.0
         plot_high = float(np.nanmax(all_highs)) if all_highs else 1.0
         xlabel = records[0]["xlabel"]
-        hist2d_max = max(
-            (
-                float(np.nanmax(record["hist2d"]))
-                for record in records
-                if record.get("hist2d") is not None and np.any(np.isfinite(record["hist2d"]))
-            ),
-            default=0.0,
-        )
-        colorbar_mesh = None
 
         legend_handles: list[Line2D] = []
         for index, record in enumerate(records):
@@ -1296,7 +1298,7 @@ def render_grouped_truth_reco_panels(
                 alpha=0.95,
             )
 
-            hist2d = record.get("hist2d")
+            hist2d = normalize_hist2d_per_method(record.get("hist2d"))
             ax2d = axes2d[index]
             if hist2d is not None and np.nanmax(hist2d) > 0:
                 colorbar_mesh = ax2d.pcolormesh(
@@ -1306,8 +1308,11 @@ def render_grouped_truth_reco_panels(
                     cmap="Blues",
                     shading="auto",
                     vmin=0.0,
-                    vmax=hist2d_max if hist2d_max > 0 else None,
+                    vmax=float(np.nanmax(hist2d)),
                 )
+                colorbar = fig.colorbar(colorbar_mesh, ax=ax2d, fraction=0.046, pad=0.03)
+                colorbar.set_label("Fraction of method yield", fontsize=8)
+                colorbar.ax.tick_params(labelsize=7)
             else:
                 ax2d.text(
                     0.5,
@@ -1347,16 +1352,6 @@ def render_grouped_truth_reco_panels(
         ax1d.plot([], [], color=OKABE_ITO_BLACK, linestyle="--", label="Truth")
         ax1d.plot([], [], color=OKABE_ITO_BLACK, linestyle="-", label="Reco")
 
-        if colorbar_mesh is not None:
-            colorbar_axis = fig.add_axes([0.018, 0.18, 0.012, 0.56])
-            fig.colorbar(
-                colorbar_mesh,
-                cax=colorbar_axis,
-                label="Normalized yield" if normalize else "Weighted yield",
-            )
-            colorbar_axis.yaxis.set_ticks_position("left")
-            colorbar_axis.yaxis.set_label_position("left")
-
         fig.suptitle(f"{broad_region_label(channel_group)}: {xlabel}", y=0.90)
         style_handles = [
             Line2D([0], [0], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.5, label="Truth 1D"),
@@ -1370,7 +1365,7 @@ def render_grouped_truth_reco_panels(
             ncol=min(4, len(style_handles) + len(legend_handles)),
             fontsize=8,
         )
-        fig.tight_layout(rect=(0.055, 0.0, 1.0, 0.86))
+        fig.tight_layout(rect=(0.03, 0.0, 1.0, 0.86), w_pad=1.3)
 
         channel_dir = combined_dir / sanitize_filename(channel_group)
         channel_dir.mkdir(parents=True, exist_ok=True)
