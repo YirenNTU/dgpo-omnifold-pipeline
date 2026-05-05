@@ -54,18 +54,52 @@ _SKIP_COLUMN_PREFIXES = (
 )
 
 
-def load_events(path: Path) -> ak.Array:
-    """Load a parquet, dropping heavy slot-level columns not used by this script."""
+def parquet_columns_to_load(path: Path) -> list[str] | None:
     try:
         schema = pq.read_schema(path)
-        columns = [f.name for f in schema if not f.name.startswith(_SKIP_COLUMN_PREFIXES)]
+        return [f.name for f in schema if not f.name.startswith(_SKIP_COLUMN_PREFIXES)]
     except Exception:
-        columns = None
-    events = ak.from_parquet(path, columns=columns)
+        return None
+
+
+def rebuild_event_vectors(events: ak.Array) -> ak.Array:
     for field in events.fields:
         if field.endswith("_p4"):
             events[field] = rebuild_vector(events[field])
     return events
+
+
+def iter_event_batches(path: Path, batch_size: int, max_entries: int | None = None):
+    columns = parquet_columns_to_load(path)
+    if batch_size <= 0:
+        events = ak.from_parquet(path, columns=columns)
+        if max_entries is not None:
+            events = events[:max_entries]
+        yield rebuild_event_vectors(events)
+        return
+
+    parquet = pq.ParquetFile(path)
+    remaining = None if max_entries is None else max(0, int(max_entries))
+    for record_batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
+        events = ak.from_arrow(record_batch)
+        if remaining is not None and len(events) > remaining:
+            events = events[:remaining]
+        if len(events) == 0:
+            continue
+        yield rebuild_event_vectors(events)
+        if remaining is not None:
+            remaining -= len(events)
+            if remaining <= 0:
+                break
+
+
+def load_events(path: Path, max_entries: int | None = None) -> ak.Array:
+    """Load a parquet, dropping heavy slot-level columns not used by this script."""
+    columns = parquet_columns_to_load(path)
+    events = ak.from_parquet(path, columns=columns)
+    if max_entries is not None:
+        events = events[:max_entries]
+    return rebuild_event_vectors(events)
 
 
 DEFAULT_FLOAT = -99.0
@@ -171,6 +205,12 @@ def parse_args() -> argparse.Namespace:
             "Number of worker processes for independent pre-unfolding plot blocks. "
             "Default 1 preserves serial behavior."
         ),
+    )
+    parser.add_argument(
+        "--load-batch-size",
+        type=int,
+        default=50000,
+        help="Parquet rows per streaming batch for large truth-vs-reco inputs.",
     )
     parser.add_argument(
         "--max-entries",
@@ -280,6 +320,356 @@ def load_truth_reco_method_events(root: Path, sample_name: str, region: str, max
         return None
     arrays = [load_events(path, max_entries) for path in paths]
     return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
+
+
+def iter_truth_reco_method_event_batches(
+    root: Path,
+    sample_name: str,
+    region: str,
+    batch_size: int,
+    max_entries: int | None = None,
+):
+    paths = truth_reco_event_paths(root, sample_name, region)
+    if not paths:
+        return
+    remaining = None if max_entries is None else max(0, int(max_entries))
+    for path in paths:
+        path_limit = remaining
+        for events in iter_event_batches(path, batch_size=batch_size, max_entries=path_limit):
+            yield events
+            if remaining is not None:
+                remaining -= len(events)
+                if remaining <= 0:
+                    return
+
+
+def observable_bins_from_limits(observable: str, low: float, high: float) -> np.ndarray:
+    if observable == "theta_cm":
+        return np.linspace(0.0, 1.0, 41)
+    if observable.startswith("cos_theta_"):
+        return np.linspace(-1.0, 1.0, 41)
+    if observable.endswith("_phi"):
+        return np.linspace(-np.pi, np.pi, 41)
+    if observable.endswith("_eta"):
+        bound = max(abs(low), abs(high), 1.0)
+        return np.linspace(-bound, bound, 41)
+    if any(observable.endswith(suffix) for suffix in ("_px", "_py", "_pz")):
+        bound = max(abs(low), abs(high), 1.0)
+        return np.linspace(-bound, bound, 41)
+    bounded_low = min(low, 0.0) if observable.endswith(("_E", "_pt", "_mass")) else low
+    if not np.isfinite(bounded_low) or not np.isfinite(high) or bounded_low == high:
+        high = max(high, 1.0)
+        bounded_low = 0.0 if observable.endswith(("_E", "_pt", "_mass")) else -1.0
+    if observable.endswith(("_E", "_pt", "_mass")):
+        bounded_low = 0.0
+        high = max(high, 1.0)
+    return np.linspace(bounded_low, high, 41)
+
+
+def init_streaming_summary(
+    observable: str,
+    bins: np.ndarray,
+    normalize: bool,
+    include_2d: bool,
+    edges2d: np.ndarray | None,
+    limits2d: tuple[float, float] | None,
+) -> dict[str, Any]:
+    return {
+        "observable": observable,
+        "bins": bins,
+        "normalize": normalize,
+        "truth_hist": np.zeros(len(bins) - 1, dtype=np.float64),
+        "reco_hist": np.zeros(len(bins) - 1, dtype=np.float64),
+        "hist2d": np.zeros((len(edges2d) - 1, len(edges2d) - 1), dtype=np.float64) if include_2d and edges2d is not None else None,
+        "edges2d": edges2d,
+        "centers2d": histogram_centers(edges2d) if include_2d and edges2d is not None else None,
+        "limits2d": limits2d,
+        "num_events": 0,
+        "sumw": 0.0,
+        "sumw2": 0.0,
+        "sum_truth": 0.0,
+        "sum_reco": 0.0,
+        "sum_diff": 0.0,
+        "sum_absdiff": 0.0,
+        "sum_sqdiff": 0.0,
+        "sum_truth2": 0.0,
+        "sum_reco2": 0.0,
+        "sum_truthreco": 0.0,
+        "truth_count": 0,
+        "valid_count": 0,
+        "truth_finite": 0,
+        "reco_finite": 0,
+        "positive_weight": 0,
+        "flags_valid": 0,
+    }
+
+
+def finalize_streaming_summary(state: dict[str, Any]) -> dict[str, Any]:
+    truth_hist = state["truth_hist"].copy()
+    reco_hist = state["reco_hist"].copy()
+    hist2d = None if state["hist2d"] is None else state["hist2d"].copy()
+    if state["normalize"]:
+        truth_total = np.sum(truth_hist)
+        reco_total = np.sum(reco_hist)
+        hist2d_total = np.sum(hist2d) if hist2d is not None else 0.0
+        if truth_total > 0:
+            truth_hist /= truth_total
+        if reco_total > 0:
+            reco_hist /= reco_total
+        if hist2d is not None and hist2d_total > 0:
+            hist2d /= hist2d_total
+
+    sumw = state["sumw"]
+    sumw2 = state["sumw2"]
+    if sumw <= 0:
+        truth_mean = reco_mean = bias = mae = rmse = pearson = pearson_unc = neff = float("nan")
+    else:
+        truth_mean = state["sum_truth"] / sumw
+        reco_mean = state["sum_reco"] / sumw
+        bias = state["sum_diff"] / sumw
+        mae = state["sum_absdiff"] / sumw
+        rmse = math.sqrt(max(state["sum_sqdiff"] / sumw, 0.0))
+        var_truth = max(state["sum_truth2"] / sumw - truth_mean ** 2, 0.0)
+        var_reco = max(state["sum_reco2"] / sumw - reco_mean ** 2, 0.0)
+        cov = state["sum_truthreco"] / sumw - truth_mean * reco_mean
+        denom = math.sqrt(var_truth * var_reco)
+        pearson = float(cov / denom) if denom > 0 else float("nan")
+        neff = float(sumw ** 2 / sumw2) if sumw2 > 0 else 0.0
+        if np.isfinite(pearson) and neff > 3.0:
+            clipped = float(np.clip(pearson, -0.999999, 0.999999))
+            pearson_unc = float((1.0 - clipped ** 2) / math.sqrt(neff - 3.0))
+        else:
+            pearson_unc = float("nan")
+
+    return {
+        "truth_hist": truth_hist,
+        "reco_hist": reco_hist,
+        "hist2d": hist2d,
+        "edges2d": state["edges2d"],
+        "centers2d": state["centers2d"],
+        "limits2d": state["limits2d"],
+        "num_events": int(state["num_events"]),
+        "weight_sum": float(sumw),
+        "truth_mean": float(truth_mean),
+        "reco_mean": float(reco_mean),
+        "bias": float(bias),
+        "mae": float(mae),
+        "rmse": float(rmse),
+        "pearson": float(pearson),
+        "pearson_unc": float(pearson_unc),
+        "neff": float(neff),
+        "truth_count": int(state["truth_count"]),
+        "valid_count": int(state["valid_count"]),
+        "truth_finite": int(state["truth_finite"]),
+        "reco_finite": int(state["reco_finite"]),
+        "positive_weight": int(state["positive_weight"]),
+        "flags_valid": int(state["flags_valid"]),
+    }
+
+
+def stream_truth_reco_region_summary(
+    root: Path,
+    signal_sample_name: str,
+    region: str,
+    observable_specs: list[tuple[str, str]],
+    reco_observable_source: str,
+    require_reco_valid_flags: bool,
+    normalize: bool,
+    load_batch_size: int,
+    max_entries: int | None,
+):
+    selection_totals = {
+        "input_events": 0,
+        "selected_events": 0,
+        "expected_truth_classes": sorted(expected_truth_classes_for_region(region)),
+        "class_filter_applied": False,
+        "correct_assignment_required": region.startswith("Ztautau_"),
+    }
+    first_events = None
+    range_state: dict[str, dict[str, Any]] = {}
+
+    for batch in iter_truth_reco_method_event_batches(
+        root,
+        signal_sample_name,
+        region,
+        batch_size=load_batch_size,
+        max_entries=max_entries,
+    ):
+        if first_events is None:
+            first_events = batch[:1] if len(batch) > 0 else batch
+        selected_events, selection_info = select_truth_reco_events(batch, region)
+        selection_totals["input_events"] += int(selection_info["input_events"])
+        selection_totals["selected_events"] += int(selection_info["selected_events"])
+        selection_totals["class_filter_applied"] = selection_totals["class_filter_applied"] or bool(selection_info["class_filter_applied"])
+        if len(selected_events) == 0:
+            continue
+
+        for observable, _ in observable_specs:
+            state = range_state.setdefault(
+                observable,
+                {
+                    "missing_reco": False,
+                    "missing_truth": False,
+                    "truth_count": 0,
+                    "valid_count": 0,
+                    "truth_finite": 0,
+                    "reco_finite": 0,
+                    "positive_weight": 0,
+                    "flags_valid": 0,
+                    "low": float("inf"),
+                    "high": float("-inf"),
+                    "limits2d": None,
+                },
+            )
+            reco_values_full = truth_reco_observable_values(selected_events, observable, source_mode=reco_observable_source)
+            truth_values_full = truth_observable_values(selected_events, observable)
+            if reco_values_full is None:
+                state["missing_reco"] = True
+                continue
+            if truth_values_full is None:
+                state["missing_truth"] = True
+                continue
+
+            weights_full = event_weights(selected_events)
+            truth_mask = valid_truth_reco_mask(truth_values_full, truth_values_full, weights_full)
+            valid_mask = valid_truth_reco_mask(truth_values_full, reco_values_full, weights_full)
+            reco_event_mask = valid_reco_event_mask(selected_events)
+            if reco_event_mask is not None and require_reco_valid_flags:
+                truth_mask &= reco_event_mask
+                valid_mask &= reco_event_mask
+
+            state["truth_count"] += int(np.count_nonzero(truth_mask))
+            state["valid_count"] += int(np.count_nonzero(valid_mask))
+            state["truth_finite"] += int(np.count_nonzero(np.isfinite(truth_values_full)))
+            state["reco_finite"] += int(np.count_nonzero(np.isfinite(reco_values_full)))
+            state["positive_weight"] += int(np.count_nonzero(np.isfinite(weights_full) & (weights_full > 0)))
+            state["flags_valid"] += int(np.count_nonzero(reco_event_mask)) if reco_event_mask is not None else 0
+
+            if np.any(truth_mask):
+                truth_values = truth_values_full[truth_mask]
+                state["low"] = min(state["low"], float(np.nanmin(truth_values)))
+                state["high"] = max(state["high"], float(np.nanmax(truth_values)))
+            if np.any(valid_mask):
+                truth_valid = truth_values_full[valid_mask]
+                reco_valid = reco_values_full[valid_mask]
+                state["low"] = min(state["low"], float(np.nanmin(reco_valid)))
+                state["high"] = max(state["high"], float(np.nanmax(reco_valid)))
+                if is_spin_observable(observable) or observable.startswith("lead_") or observable.startswith("reco_tau_"):
+                    low2d, high2d = observable_2d_limits(observable, truth_valid, reco_valid)
+                    if state["limits2d"] is None:
+                        state["limits2d"] = (low2d, high2d)
+                    else:
+                        state["limits2d"] = (
+                            min(state["limits2d"][0], low2d),
+                            max(state["limits2d"][1], high2d),
+                        )
+
+    if first_events is None:
+        return None, selection_totals
+
+    summaries: dict[str, Any] = {}
+    grouped_records: list[dict[str, Any]] = []
+    streaming_states: dict[str, dict[str, Any]] = {}
+    for observable, xlabel in observable_specs:
+        state = range_state.get(observable)
+        if state is None:
+            continue
+        if state["missing_reco"] or state["missing_truth"] or state["truth_count"] <= 0 or state["valid_count"] <= 0:
+            continue
+        bins = observable_bins_from_limits(observable, state["low"], state["high"])
+        include_2d = is_spin_observable(observable) or observable.startswith("lead_") or observable.startswith("reco_tau_")
+        limits2d = state["limits2d"]
+        edges2d = np.linspace(limits2d[0], limits2d[1], 51) if include_2d and limits2d is not None else None
+        streaming_states[observable] = init_streaming_summary(observable, bins, normalize, include_2d, edges2d, limits2d)
+
+    if not streaming_states:
+        return {"region_summary": {}, "grouped_records": [], "first_events": first_events}, selection_totals
+
+    for batch in iter_truth_reco_method_event_batches(
+        root,
+        signal_sample_name,
+        region,
+        batch_size=load_batch_size,
+        max_entries=max_entries,
+    ):
+        selected_events, _ = select_truth_reco_events(batch, region)
+        if len(selected_events) == 0:
+            continue
+        for observable, _ in observable_specs:
+            if observable not in streaming_states:
+                continue
+            reco_values_full = truth_reco_observable_values(selected_events, observable, source_mode=reco_observable_source)
+            truth_values_full = truth_observable_values(selected_events, observable)
+            if reco_values_full is None or truth_values_full is None:
+                continue
+            weights_full = event_weights(selected_events)
+            truth_mask = valid_truth_reco_mask(truth_values_full, truth_values_full, weights_full)
+            valid_mask = valid_truth_reco_mask(truth_values_full, reco_values_full, weights_full)
+            reco_event_mask = valid_reco_event_mask(selected_events)
+            if reco_event_mask is not None and require_reco_valid_flags:
+                truth_mask &= reco_event_mask
+                valid_mask &= reco_event_mask
+            if not np.any(truth_mask) or not np.any(valid_mask):
+                continue
+            state = streaming_states[observable]
+            bins = state["bins"]
+            state["truth_hist"] += np.histogram(truth_values_full[truth_mask], bins=bins, weights=weights_full[truth_mask])[0].astype(np.float64)
+            truth_valid = truth_values_full[valid_mask]
+            reco_valid = reco_values_full[valid_mask]
+            weight_valid = weights_full[valid_mask]
+            state["reco_hist"] += np.histogram(reco_valid, bins=bins, weights=weight_valid)[0].astype(np.float64)
+            if state["hist2d"] is not None and state["edges2d"] is not None:
+                state["hist2d"] += np.histogram2d(truth_valid, reco_valid, bins=[state["edges2d"], state["edges2d"]], weights=weight_valid)[0].astype(np.float64)
+            state["num_events"] += int(np.count_nonzero(valid_mask))
+            state["sumw"] += float(np.sum(weight_valid))
+            state["sumw2"] += float(np.sum(weight_valid ** 2))
+            state["sum_truth"] += float(np.sum(weight_valid * truth_valid))
+            state["sum_reco"] += float(np.sum(weight_valid * reco_valid))
+            diff = reco_valid - truth_valid
+            state["sum_diff"] += float(np.sum(weight_valid * diff))
+            state["sum_absdiff"] += float(np.sum(weight_valid * np.abs(diff)))
+            state["sum_sqdiff"] += float(np.sum(weight_valid * diff ** 2))
+            state["sum_truth2"] += float(np.sum(weight_valid * truth_valid ** 2))
+            state["sum_reco2"] += float(np.sum(weight_valid * reco_valid ** 2))
+            state["sum_truthreco"] += float(np.sum(weight_valid * truth_valid * reco_valid))
+
+    for observable, xlabel in observable_specs:
+        if observable not in streaming_states:
+            continue
+        final_state = finalize_streaming_summary(streaming_states[observable])
+        summaries[observable] = {
+            "plot": None,
+            "plot_2d": None,
+            "normalize": normalize,
+            "reco_observable_source": reco_observable_source,
+            "num_events": final_state["num_events"],
+            "weight_sum": final_state["weight_sum"],
+            "truth_mean": final_state["truth_mean"],
+            "reco_mean": final_state["reco_mean"],
+            "bias": final_state["bias"],
+            "mae": final_state["mae"],
+            "rmse": final_state["rmse"],
+            "pearson": final_state["pearson"],
+            "pearson_unc": final_state["pearson_unc"],
+            "neff": final_state["neff"],
+        }
+        grouped_records.append(
+            {
+                "region": region,
+                "observable": observable,
+                "xlabel": xlabel,
+                "bins": streaming_states[observable]["bins"],
+                "truth_hist": final_state["truth_hist"],
+                "reco_hist": final_state["reco_hist"],
+                "edges": final_state["edges2d"],
+                "centers": final_state["centers2d"],
+                "hist2d": final_state["hist2d"],
+                "limits": final_state["limits2d"],
+                "num_events": final_state["num_events"],
+            }
+        )
+
+    return {"region_summary": summaries, "grouped_records": grouped_records, "first_events": first_events}, selection_totals
 
 
 def truth_observable_specs(requested: list[str] | None) -> list[tuple[str, str]]:
@@ -1191,6 +1581,7 @@ def plot_truth_vs_reco_by_method_and_region(
     log_label: str = "truth-vs-reco",
     require_reco_valid_flags: bool = True,
     max_entries: int = None,
+    load_batch_size: int = 0,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     truth_dir = output_dir / subdir_name
@@ -1213,6 +1604,62 @@ def plot_truth_vs_reco_by_method_and_region(
                 f"paths={[str(path) for path in paths]}",
                 flush=True,
             )
+            if load_batch_size > 0:
+                try:
+                    streamed, selection_info = stream_truth_reco_region_summary(
+                        root=root,
+                        signal_sample_name=signal_sample_name,
+                        region=region,
+                        observable_specs=observable_specs,
+                        reco_observable_source=reco_observable_source,
+                        require_reco_valid_flags=require_reco_valid_flags,
+                        normalize=normalize,
+                        load_batch_size=load_batch_size,
+                        max_entries=max_entries,
+                    )
+                except Exception as error:
+                    print(
+                        f"    [error] failed streaming load method={method} region={region}: {error}",
+                        flush=True,
+                    )
+                    continue
+                if selection_info["class_filter_applied"]:
+                    print(
+                        f"    [class-filter] method={method} region={region} "
+                        f"input={selection_info['input_events']} selected={selection_info['selected_events']} "
+                        f"expected_truth_classes={selection_info['expected_truth_classes']} "
+                        f"correct_assignment_required={selection_info['correct_assignment_required']}",
+                        flush=True,
+                    )
+                if streamed is None or not streamed["region_summary"]:
+                    print(f"    [skip] no streamed observables remain after filtering method={method} region={region}", flush=True)
+                    continue
+                region_summary = streamed["region_summary"]
+                for record in streamed["grouped_records"]:
+                    print(
+                        f"    [collect] method={method} region={region} observable={record['observable']} "
+                        f"group={comparison_channel_group(region)}",
+                        flush=True,
+                    )
+                    grouped_records.setdefault((comparison_channel_group(region), record["observable"]), []).append(
+                        {
+                            "method": method,
+                            "method_index": method_index,
+                            "region": region,
+                            "observable": record["observable"],
+                            "xlabel": record["xlabel"],
+                            "bins": record["bins"],
+                            "truth_hist": record["truth_hist"],
+                            "reco_hist": record["reco_hist"],
+                            "edges": record["edges"],
+                            "centers": record["centers"],
+                            "hist2d": record["hist2d"],
+                            "limits": record["limits"],
+                            "num_events": record["num_events"],
+                        }
+                    )
+                method_summary[region] = region_summary
+                continue
             try:
                 events = load_truth_reco_method_events(root, signal_sample_name, region, max_entries)
             except Exception as error:
@@ -1412,6 +1859,7 @@ def run_truth_reco_plot_block(task: dict[str, Any]) -> tuple[str, dict[str, Any]
         log_label=task["log_label"],
         require_reco_valid_flags=task.get("require_reco_valid_flags", True),
         max_entries=task.get("max_entries", None),
+        load_batch_size=task.get("load_batch_size", 0),
     )
     return task["key"], summary
 
@@ -2043,7 +2491,8 @@ def main() -> None:
             "subdir_name": "truth_vs_reco",
             "log_label": "truth-vs-reco",
             "require_reco_valid_flags": True,
-            "max_entries": args.max_entries
+            "max_entries": args.max_entries,
+            "load_batch_size": args.load_batch_size,
         },
         {
             "key": "truth_neutrino",
@@ -2057,7 +2506,8 @@ def main() -> None:
             "subdir_name": "truth_neutrino_upper_limit",
             "log_label": "truth-neutrino-upper-limit",
             "require_reco_valid_flags": False,
-            "max_entries": args.max_entries
+            "max_entries": args.max_entries,
+            "load_batch_size": args.load_batch_size,
         },
         {
             "key": "missing",
@@ -2071,7 +2521,8 @@ def main() -> None:
             "subdir_name": "missing_truth_vs_reco",
             "log_label": "missing-truth-vs-reco",
             "require_reco_valid_flags": True,
-            "max_entries": args.max_entries
+            "max_entries": args.max_entries,
+            "load_batch_size": args.load_batch_size,
 
         },
         {
@@ -2086,7 +2537,8 @@ def main() -> None:
             "subdir_name": "reco_tau_truth_vs_reco",
             "log_label": "reco-tau-truth-vs-reco",
             "require_reco_valid_flags": True,
-            "max_entries": args.max_entries
+            "max_entries": args.max_entries,
+            "load_batch_size": args.load_batch_size,
 
         },
         {
@@ -2101,7 +2553,8 @@ def main() -> None:
             "subdir_name": "visible_tau_truth_vs_reco",
             "log_label": "visible-tau-truth-vs-reco",
             "require_reco_valid_flags": False,
-            "max_entries": args.max_entries
+            "max_entries": args.max_entries,
+            "load_batch_size": args.load_batch_size,
 
         },
     ]

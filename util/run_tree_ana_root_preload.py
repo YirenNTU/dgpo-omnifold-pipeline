@@ -37,6 +37,8 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", "-l", default=None, help="tree_ana log level.")
     parser.add_argument("--output-dir", "-o", default=None, help="tree_ana output directory.")
     parser.add_argument("--num-workers", type=int, default=1, help="Number of region-parallel QI worker processes.")
+    parser.add_argument("--root-step-size", type=int, default=50000, help="ROOT events per uproot.iterate batch inside DataLoader.")
+    parser.add_argument("--raw-batch-size", type=int, default=50000, help="Parquet rows per raw streaming batch inside QIProcessor.")
     return parser
 
 
@@ -129,7 +131,10 @@ def build_chunk_config(config: dict, regions: list[str]) -> dict:
     qi_config["dict_region_to_signals"] = {region: full_region_to_signals[region] for region in regions}
 
     global_configs = chunk_config.setdefault("GlobalConfigs", {})
-    global_configs["load_regions"] = ["raw", *regions]
+    if set(processors) == {"QIProcessor"}:
+        global_configs["load_regions"] = list(regions)
+    else:
+        global_configs["load_regions"] = ["raw", *regions]
 
     used_signals = {
         signal
@@ -242,6 +247,10 @@ def run_parallel(args: argparse.Namespace, passthrough: list[str]) -> None:
                 "-o",
                 str(chunk_root),
                 *([] if args.log_level is None else ["-l", args.log_level]),
+                "--root-step-size",
+                str(args.root_step_size),
+                "--raw-batch-size",
+                str(args.raw_batch_size),
                 *passthrough,
             ]
             env = os.environ.copy()
@@ -414,6 +423,8 @@ def main() -> None:
 
     set_thread_defaults()
     os.environ.setdefault("TREE_ANA_DIR", str(REPO_ROOT))
+    os.environ["TREE_ANA_ROOT_STEP_SIZE"] = str(max(1, int(args.root_step_size)))
+    os.environ["QI_RAW_BATCH_SIZE"] = str(max(1, int(args.raw_batch_size)))
     for path in reversed(LEGACY_IMPORT_PATHS):
         path_str = str(path)
         if path_str not in sys.path:
