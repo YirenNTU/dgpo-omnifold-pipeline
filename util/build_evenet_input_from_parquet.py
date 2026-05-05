@@ -1700,6 +1700,53 @@ def target_missing_qi_observables(events: ak.Array) -> tuple[dict[str, np.ndarra
     return observable_arrays, valid
 
 
+def recalculated_truth_qi_observables(events: ak.Array) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """
+    inputs:
+      events: ak.Array, selected signal events with truth tau information.
+    outputs:
+      tuple(dict, np.ndarray): observables rebuilt from truth tau p4 plus truth visible tau p4,
+      and a per-event valid mask for the truth-side reconstruction.
+    goal:
+      Sanity-check that stored truth_* observables match a direct recalculation
+      from the nominal truth tau / truth visible tau representation at step 1.
+    """
+    from quantum.observables_builder import build_observables
+
+    truth_visible_p4, truth_visible_mask, truth_visible_source = build_truth_visible_tau_slots(events)
+    if truth_visible_source is None:
+        return {}, np.zeros(len(events), dtype=bool)
+
+    fields = set(events.fields)
+    truth_tau_a = None
+    truth_tau_b = None
+    if {"truth_tau_a_p4", "truth_tau_b_p4"}.issubset(fields):
+        truth_tau_a = rebuild_momentum4d(events["truth_tau_a_p4"])
+        truth_tau_b = rebuild_momentum4d(events["truth_tau_b_p4"])
+    elif {"truth_missing_a_p4", "truth_missing_b_p4"}.issubset(fields):
+        truth_tau_a = rebuild_momentum4d(events["truth_missing_a_p4"]) + truth_visible_p4[:, 0]
+        truth_tau_b = rebuild_momentum4d(events["truth_missing_b_p4"]) + truth_visible_p4[:, 1]
+    else:
+        return {}, np.zeros(len(events), dtype=bool)
+
+    truth_tau_mask = stack_tau_pair_mask(p4_is_finite(truth_tau_a), p4_is_finite(truth_tau_b))
+    valid = ak.to_numpy(
+        ak.all(truth_visible_mask & truth_tau_mask, axis=1),
+        allow_missing=False,
+    ).astype(bool)
+    observables = build_observables(
+        tau_a_p4=truth_tau_a,
+        tau_b_p4=truth_tau_b,
+        vis_a_p4=truth_visible_p4[:, 0],
+        vis_b_p4=truth_visible_p4[:, 1],
+    )
+    observable_arrays = {
+        name: ak.to_numpy(values, allow_missing=False).astype(np.float64)
+        for name, values in observables.items()
+    }
+    return observable_arrays, valid
+
+
 def qi_observable_axis_limits(observable: str, truth_values: np.ndarray, reco_values: np.ndarray) -> tuple[float, float]:
     """
     inputs:
@@ -1783,6 +1830,164 @@ def write_target_missing_qi_2d_plots(sample_name: str, events: ak.Array, output_
         plt.close(fig)
         wrote_any = True
 
+    if wrote_any:
+        console.print(f"  [green]Wrote monitor[/green] [white]{output_dir}[/white]")
+
+
+def origin_pair_summary(reference: np.ndarray, comparison: np.ndarray) -> dict[str, float | int | None]:
+    """
+    inputs:
+      reference/comparison: np.ndarray, finite event-aligned observable values.
+    outputs:
+      dict with simple residual metrics.
+    goal:
+      Keep origin sanity-check summaries compact and readable directly from JSON.
+    """
+    if reference.size == 0 or comparison.size == 0:
+        return {
+            "count": 0,
+            "mean_diff": None,
+            "mean_abs_diff": None,
+            "rmse": None,
+            "corr": None,
+        }
+    diff = comparison - reference
+    corr = None
+    if reference.size >= 2:
+        corr_matrix = np.corrcoef(reference, comparison)
+        corr_value = corr_matrix[0, 1]
+        corr = float(corr_value) if np.isfinite(corr_value) else None
+    return {
+        "count": int(reference.size),
+        "mean_diff": float(np.mean(diff)),
+        "mean_abs_diff": float(np.mean(np.abs(diff))),
+        "rmse": float(np.sqrt(np.mean(diff * diff))),
+        "corr": corr,
+    }
+
+
+def write_truth_observable_origin_checks(sample_name: str, events: ak.Array, output_dir: Path) -> None:
+    """
+    inputs:
+      sample_name: str, label used in monitor titles.
+      events: ak.Array, selected signal events.
+      output_dir: Path, destination directory for plots and summary JSON.
+    outputs:
+      None.
+    goal:
+      Compare three truth-observable origins before training:
+        1. stored parquet truth_* fields
+        2. direct recalculation from truth tau / truth visible p4
+        3. target-invisible reconstruction from visible tau + target missing
+    """
+    from quantum.observables_builder import get_observable_names
+
+    try:
+        target_observables, target_valid = target_missing_qi_observables(events)
+        recalculated_observables, recalculated_valid = recalculated_truth_qi_observables(events)
+    except Exception as exc:
+        console.print(
+            f"  [yellow]Skipped monitor[/yellow] [white]{sample_name} truth origin[/white]: {exc}"
+        )
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary: dict[str, dict[str, float | int | None | str]] = {}
+    wrote_any = False
+    for observable in get_observable_names():
+        truth_field = f"truth_{observable}"
+        if truth_field not in events.fields or observable not in target_observables or observable not in recalculated_observables:
+            continue
+
+        stored_values = ak.to_numpy(events[truth_field], allow_missing=False).astype(np.float64)
+        recalculated_values = recalculated_observables[observable]
+        target_values = target_observables[observable]
+        valid = (
+            recalculated_valid
+            & target_valid
+            & np.isfinite(stored_values)
+            & np.isfinite(recalculated_values)
+            & np.isfinite(target_values)
+        )
+        if not np.any(valid):
+            continue
+
+        stored_values = stored_values[valid]
+        recalculated_values = recalculated_values[valid]
+        target_values = target_values[valid]
+        summary[observable] = {
+            "stored_vs_recalculated": origin_pair_summary(stored_values, recalculated_values),
+            "stored_vs_target_reconstructed": origin_pair_summary(stored_values, target_values),
+            "recalculated_vs_target_reconstructed": origin_pair_summary(recalculated_values, target_values),
+        }
+
+        if "cos_theta" in observable:
+            low, high = -1.0, 1.0
+        elif observable == "theta_cm":
+            low, high = 0.0, 1.0
+        else:
+            merged = np.concatenate([stored_values, recalculated_values, target_values])
+            low = float(np.nanpercentile(merged, 0.5))
+            high = float(np.nanpercentile(merged, 99.5))
+            if not np.isfinite(low) or not np.isfinite(high) or low == high:
+                low, high = 0.0, 1.0
+            else:
+                padding = 0.05 * (high - low)
+                low -= padding
+                high += padding
+
+        fig, axes = plt.subplots(1, 4, figsize=(18, 4.8), dpi=170, gridspec_kw={"width_ratios": [1.4, 1.0, 1.0, 1.0]})
+        bins = np.linspace(low, high, 60)
+        ax1d = axes[0]
+        for label, values, color in [
+            ("Stored truth", stored_values, "black"),
+            ("Recalc truth", recalculated_values, "#009E73"),
+            ("Target reco", target_values, "#D55E00"),
+        ]:
+            hist = np.histogram(values, bins=bins)[0].astype(np.float64)
+            total = np.sum(hist)
+            if total > 0:
+                hist /= total
+            ax1d.step(bins[:-1], hist, where="post", linewidth=1.6, color=color, label=label)
+        ax1d.set_xlabel(observable)
+        ax1d.set_ylabel("Normalized yield")
+        ax1d.set_title("1D overlay")
+        ax1d.grid(alpha=0.2)
+        ax1d.legend(frameon=False, fontsize=8)
+
+        for axis, x_values, y_values, x_label, y_label in [
+            (axes[1], stored_values, recalculated_values, "Stored truth", "Recalc truth"),
+            (axes[2], stored_values, target_values, "Stored truth", "Target reco"),
+            (axes[3], recalculated_values, target_values, "Recalc truth", "Target reco"),
+        ]:
+            hist = axis.hist2d(
+                x_values,
+                y_values,
+                bins=60,
+                range=[[low, high], [low, high]],
+                cmap="Blues",
+                cmin=1,
+            )
+            fig.colorbar(hist[3], ax=axis, label="Entries")
+            axis.plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
+            axis.set_xlim(low, high)
+            axis.set_ylim(low, high)
+            axis.set_xlabel(x_label)
+            axis.set_ylabel(y_label)
+            axis.grid(alpha=0.16)
+
+        fig.suptitle(f"{sample_name}: {observable}")
+        fig.tight_layout()
+        fig.savefig(output_dir / f"{observable}.png")
+        plt.close(fig)
+        wrote_any = True
+
+    if summary:
+        summary_path = output_dir / "summary.json"
+        with summary_path.open("w") as handle:
+            json.dump(summary, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        console.print(f"  [green]Wrote monitor[/green] [white]{summary_path}[/white]")
     if wrote_any:
         console.print(f"  [green]Wrote monitor[/green] [white]{output_dir}[/white]")
 
@@ -1894,8 +2099,10 @@ def write_monitoring_plots(
 
     visible_truth_dir = monitor_dir / "vis_tau_vs_truth_visible_tau"
     target_qi_dir = monitor_dir / "target_missing_qi_vs_truth"
+    truth_origin_dir = monitor_dir / "truth_observable_origin_check"
     visible_truth_dir.mkdir(parents=True, exist_ok=True)
     target_qi_dir.mkdir(parents=True, exist_ok=True)
+    truth_origin_dir.mkdir(parents=True, exist_ok=True)
     for sample, events in expanded_samples:
         if not sample_uses_invisible_target(sample):
             continue
@@ -1908,6 +2115,11 @@ def write_monitoring_plots(
             sample_name=sample.name,
             events=events,
             output_dir=target_qi_dir / sample.name,
+        )
+        write_truth_observable_origin_checks(
+            sample_name=sample.name,
+            events=events,
+            output_dir=truth_origin_dir / sample.name,
         )
 
     for observable in FOUR_VECTOR_FEATURES:

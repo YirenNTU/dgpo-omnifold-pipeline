@@ -145,6 +145,8 @@ Step-1 monitoring includes:
 
 - `monitoring/vis_tau_vs_truth_visible_tau/<sample>.png`, reconstructed visible tau vs truth-visible tau in the central a/b basis.
 - `monitoring/target_missing_qi_vs_truth/<sample>/<observable>.png`, QI observables rebuilt from `visible tau + target missing` compared with the stored `truth_<observable>` fields.
+- `monitoring/truth_observable_origin_check/<sample>/<observable>.png`, direct three-way comparison between stored `truth_<observable>`, a fresh truth-p4 recalculation, and the target-invisible reconstruction used for EveNet inputs.
+- `monitoring/truth_observable_origin_check/<sample>/summary.json`, compact residual metrics for the same three-way truth-origin comparison.
 
 Monitoring uses at most `--monitor-max-events 50000` events per source sample by
 default. Use `--monitor-max-events 0` only for full-statistics diagnostic plots;
