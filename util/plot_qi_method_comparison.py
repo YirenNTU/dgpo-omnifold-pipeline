@@ -110,8 +110,10 @@ def method_display_name(method: str) -> str:
     return method.removeprefix("EveNet-")
 
 
-def load_events(path: Path) -> ak.Array:
+def load_events(path: Path, max_entries:int = None) -> ak.Array:
     events = ak.from_parquet(path)
+    if max_entries is not None:
+        events = events[:max_entries]
     for field in events.fields:
         if field.endswith("_p4"):
             events[field] = rebuild_vector(events[field])

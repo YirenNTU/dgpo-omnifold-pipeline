@@ -149,6 +149,11 @@ def parse_args() -> argparse.Namespace:
             "Default 1 preserves serial behavior."
         ),
     )
+    parser.add_argument(
+        "--max-entries",
+        type=int,
+        default=None
+    )
     return parser.parse_args()
 
 
@@ -246,11 +251,11 @@ def truth_reco_event_paths(root: Path, sample_name: str, region: str) -> list[Pa
     return method_paths
 
 
-def load_truth_reco_method_events(root: Path, sample_name: str, region: str) -> ak.Array | None:
+def load_truth_reco_method_events(root: Path, sample_name: str, region: str, max_entries: int=None) -> ak.Array | None:
     paths = truth_reco_event_paths(root, sample_name, region)
     if not paths:
         return None
-    arrays = [load_events(path) for path in paths]
+    arrays = [load_events(path, max_entries) for path in paths]
     return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
 
 
