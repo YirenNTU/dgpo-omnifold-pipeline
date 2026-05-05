@@ -117,7 +117,7 @@ def to_numpy(values: Any, dtype=np.float64) -> np.ndarray:
 
 
 def build_momentum4d(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.ndarray) -> ak.Array:
-    return vector.zip(
+    return ak.zip(
         {
             "px": np.asarray(px, dtype=np.float64),
             "py": np.asarray(py, dtype=np.float64),
