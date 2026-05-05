@@ -1167,6 +1167,7 @@ def plot_truth_vs_reco_by_method_and_region(
     subdir_name: str = "truth_vs_reco",
     log_label: str = "truth-vs-reco",
     require_reco_valid_flags: bool = True,
+    max_entries: int = None,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     truth_dir = output_dir / subdir_name
@@ -1190,7 +1191,7 @@ def plot_truth_vs_reco_by_method_and_region(
                 flush=True,
             )
             try:
-                events = load_truth_reco_method_events(root, signal_sample_name, region, args.max_entries)
+                events = load_truth_reco_method_events(root, signal_sample_name, region, max_entries)
             except Exception as error:
                 print(
                     f"    [error] failed to load events method={method} region={region}: {error}",
@@ -1387,6 +1388,7 @@ def run_truth_reco_plot_block(task: dict[str, Any]) -> tuple[str, dict[str, Any]
         subdir_name=task["subdir_name"],
         log_label=task["log_label"],
         require_reco_valid_flags=task.get("require_reco_valid_flags", True),
+        max_entries=task.get("max_entries", None),
     )
     return task["key"], summary
 
@@ -2018,6 +2020,7 @@ def main() -> None:
             "subdir_name": "truth_vs_reco",
             "log_label": "truth-vs-reco",
             "require_reco_valid_flags": True,
+            "max_entries": args.max_entries
         },
         {
             "key": "truth_neutrino",
@@ -2031,6 +2034,7 @@ def main() -> None:
             "subdir_name": "truth_neutrino_upper_limit",
             "log_label": "truth-neutrino-upper-limit",
             "require_reco_valid_flags": False,
+            "max_entries": args.max_entries
         },
         {
             "key": "missing",
@@ -2044,6 +2048,8 @@ def main() -> None:
             "subdir_name": "missing_truth_vs_reco",
             "log_label": "missing-truth-vs-reco",
             "require_reco_valid_flags": True,
+            "max_entries": args.max_entries
+
         },
         {
             "key": "reco_tau",
@@ -2057,6 +2063,8 @@ def main() -> None:
             "subdir_name": "reco_tau_truth_vs_reco",
             "log_label": "reco-tau-truth-vs-reco",
             "require_reco_valid_flags": True,
+            "max_entries": args.max_entries
+
         },
         {
             "key": "visible_tau",
@@ -2070,6 +2078,8 @@ def main() -> None:
             "subdir_name": "visible_tau_truth_vs_reco",
             "log_label": "visible-tau-truth-vs-reco",
             "require_reco_valid_flags": False,
+            "max_entries": args.max_entries
+
         },
     ]
     if args.num_workers > 1:
