@@ -99,11 +99,18 @@ def expand_paths(patterns: list[str] | None) -> list[str]:
         return []
     output: list[str] = []
     for pattern in patterns:
-        matches = sorted(glob.glob(pattern))
+        expanded = Path(pattern).expanduser()
+        if expanded.is_dir():
+            final_prediction_paths = sorted(expanded.glob("*__evenet_pred.parquet"))
+            paths = final_prediction_paths if final_prediction_paths else sorted(expanded.glob("*.parquet"))
+            output.extend(str(path) for path in paths)
+            continue
+
+        matches = sorted(glob.glob(str(expanded)))
         if matches:
-            output.extend(matches)
+            output.extend(str(Path(match)) for match in matches)
         else:
-            output.append(pattern)
+            output.append(str(expanded))
     return output
 
 
