@@ -5,6 +5,7 @@ import argparse
 import copy
 import os
 from pathlib import Path
+import re
 import runpy
 import shutil
 import subprocess
@@ -165,23 +166,86 @@ def output_root_from_args(args: argparse.Namespace, config: dict) -> Path:
     return Path(config.get("GlobalConfigs", {}).get("default_output_dir", "./output/"))
 
 
-def merge_qi_outputs(chunk_roots: list[Path], final_root: Path) -> None:
+def qi_output_dir_name_from_config(config: dict) -> str:
+    """
+    inputs:
+      config: dict, full tree_ana configuration.
+    outputs:
+      str, QI processor output subdirectory name.
+    goal:
+      Merge region-parallel worker outputs back into the same directory name a
+      normal single-process tree_ana run would use.
+    """
+    qi_config = config.get("Processors", {}).get("QIProcessor", {})
+    return str(qi_config.get("output_dir_name", "QI_results"))
+
+
+def merge_results_text(result_texts: list[str], region_order: list[str]) -> str:
+    """
+    inputs:
+      result_texts: list[str], worker results.txt contents.
+      region_order: list[str], desired region ordering from the original config.
+    outputs:
+      str, merged results text in the usual region order.
+    goal:
+      Rebuild one central-style results.txt instead of leaving one text file per
+      worker or a region order that depends on parallel chunking.
+    """
+    region_pattern = re.compile(r"(?=^\s*Region:\s+)", re.MULTILINE)
+    region_blocks: dict[str, str] = {}
+    preamble_blocks: list[str] = []
+
+    for text in result_texts:
+        stripped = text.strip()
+        if not stripped:
+            continue
+        blocks = [block.strip() for block in region_pattern.split(stripped) if block.strip()]
+        for block in blocks:
+            lines = block.splitlines()
+            first_line = lines[0].strip() if lines else ""
+            if first_line.startswith("Region:"):
+                region_name = first_line.split(":", 1)[1].strip()
+                region_blocks[region_name] = block
+            else:
+                preamble_blocks.append(block)
+
+    ordered_blocks: list[str] = []
+    seen_regions: set[str] = set()
+    if preamble_blocks:
+        ordered_blocks.extend(preamble_blocks)
+    for region in region_order:
+        block = region_blocks.get(region)
+        if block is None:
+            continue
+        ordered_blocks.append(block)
+        seen_regions.add(region)
+    for region_name, block in region_blocks.items():
+        if region_name in seen_regions:
+            continue
+        ordered_blocks.append(block)
+    return "\n\n".join(ordered_blocks).strip() + ("\n" if ordered_blocks else "")
+
+
+def merge_qi_outputs(chunk_roots: list[Path], final_root: Path, config: dict, region_order: list[str]) -> None:
     """
     inputs:
       chunk_roots: list[pathlib.Path], per-worker tree_ana output roots.
       final_root: pathlib.Path, final tree_ana output root.
+      config: dict, full tree_ana configuration.
+      region_order: list[str], original region ordering from the full config.
     outputs:
       None.
     goal:
       Reconstruct the usual QI_analysis directory after region-parallel workers
       finish in isolated output roots.
     """
-    final_qi_dir = final_root / "QI_analysis"
+    qi_dir_name = qi_output_dir_name_from_config(config)
+    final_qi_dir = final_root / qi_dir_name
     final_qi_dir.mkdir(parents=True, exist_ok=True)
     result_text: list[str] = []
 
     for chunk_root in chunk_roots:
-        chunk_qi_dir = chunk_root / "QI_analysis"
+        chunk_qi_dir = chunk_root / qi_dir_name
         result_path = chunk_qi_dir / "results.txt"
         if result_path.exists():
             result_text.append(result_path.read_text())
@@ -195,7 +259,7 @@ def merge_qi_outputs(chunk_roots: list[Path], final_root: Path) -> None:
                 shutil.copy2(child, destination)
 
     if result_text:
-        (final_qi_dir / "results.txt").write_text("\n".join(result_text))
+        (final_qi_dir / "results.txt").write_text(merge_results_text(result_text, region_order))
 
 
 def run_parallel(args: argparse.Namespace, passthrough: list[str]) -> None:
@@ -272,10 +336,14 @@ def run_parallel(args: argparse.Namespace, passthrough: list[str]) -> None:
             details = ", ".join(f"regions={chunk} exit={code}" for chunk, code in failures)
             raise RuntimeError(f"One or more QI parallel workers failed: {details}")
 
-        merge_qi_outputs(chunk_roots, final_root)
+        merge_qi_outputs(chunk_roots, final_root, config, regions)
+        try:
+            next(work_root.iterdir())
+        except StopIteration:
+            work_root.rmdir()
         print(
             "[run-tree-ana-root-preload] merged parallel QI outputs into "
-            f"{final_root / 'QI_analysis'}",
+            f"{final_root / qi_output_dir_name_from_config(config)}",
             flush=True,
         )
 

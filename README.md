@@ -590,10 +590,26 @@ python3 util/export_evenet_prediction_to_qi.py \
   --qi-method-label pretrain \
   --write-truth-neutrino-copy \
   --truth-qi-method-label truth \
+  --prediction-weight-source class \
+  --prediction-split-fraction 0.5 \
   --raw-batch-size 50000 \
   --num-workers 1 \
   --worker-backend thread
 ```
+
+Use `--prediction-weight-source class` when the prediction parquet only covers a
+test split or any other fraction of the EveNet-selected MC universe and you
+need the export to recover the full MC normalization. In that mode the export
+recalculates the predicted-row weight from `analysis.yaml` sample
+`norm_factor`, `initial_total_num_events`, luminosity, and
+`--prediction-split-fraction`.
+
+Use `--prediction-weight-source evenet` only when the prediction parquet
+already contains the final split-aware `evenet_weight` you want to preserve
+exactly. The current `auto` mode prefers split-aware prediction weights when
+they are explicitly marked in the prediction parquet; otherwise it falls back
+to `class` when `--prediction-split-fraction` is provided, and to
+`central_weight` only when no split information is available.
 
 `--mc-pred-parquet` and `--data-pred-parquet` may point to either a single
 prediction parquet, a glob, or a directory. Directories are expanded to final
@@ -953,11 +969,13 @@ EveNet methods come from `export_evenet_prediction_to_qi.py` method trees.
 Do not apply the split-weight correction twice:
 
 - `predict_evenet_from_raw_parquet.py --converted-split-fraction`: writes `evenet_weight` in the prediction parquet for standalone EveNet plots.
-- `export_evenet_prediction_to_qi.py`: uses prediction-parquet `evenet_weight` for predicted rows when that field is available.
-- `export_evenet_prediction_to_qi.py --prediction-split-fraction`: legacy fallback only for old prediction parquets that do not contain `evenet_weight`.
+- `export_evenet_prediction_to_qi.py --prediction-weight-source evenet`: preserves prediction-parquet `evenet_weight` exactly for predicted rows.
+- `export_evenet_prediction_to_qi.py --prediction-weight-source class --prediction-split-fraction F`: recomputes predicted-row weight from `norm_factor / initial_total_num_events * luminosity / F`. This is the recommended export mode when prediction only covers a test split such as `F = 0.5`.
+- `export_evenet_prediction_to_qi.py --prediction-weight-source auto`: prefers split-aware prediction weights when available, otherwise falls back to `class` if `--prediction-split-fraction` is provided, and only then falls back to central weights.
 - Data is never MC split-reweighted.
 - If the MC test split is 0.5, pass `--converted-split-fraction 0.5` during prediction to recover full MC yield in data/MC comparisons.
 - Raw-only rows without EveNet predictions do not receive the split factor.
+- In the current concat export, if `num_predicted_events` is smaller than `num_raw_selected_for_prediction`, the selected raw rows without prediction are not exported. In that case the reco yield will be low unless the predicted rows statistically represent the missing selected fraction through split-aware weighting.
 
 ## Alignment Checklist
 

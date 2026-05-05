@@ -1035,6 +1035,8 @@ class QIParquetChunkWriter:
         if writer_name == "raw":
             if self.raw_writer is None:
                 self.raw_writer = pq.ParquetWriter(path, table.schema, compression=self.compression)
+            else:
+                table = table.cast(self.raw_writer.schema, safe=False)
             self.raw_writer.write_table(table)
             return
 
@@ -1042,6 +1044,8 @@ class QIParquetChunkWriter:
         if writer is None:
             writer = pq.ParquetWriter(path, table.schema, compression=self.compression)
             self.region_writers[writer_name] = writer
+        else:
+            table = table.cast(writer.schema, safe=False)
         writer.write_table(table)
 
     def append(self, events: ak.Array) -> None:
