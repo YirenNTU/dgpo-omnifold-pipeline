@@ -138,8 +138,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Legacy fallback fraction represented by the EveNet-predicted subset, e.g. 0.5 for a test split. "
-            "If the prediction parquet has evenet_weight, that already includes the split correction and is used "
-            "directly for predicted rows. This option is only applied when evenet_weight is absent."
+            "This is only applied when --prediction-weight-source resolves to class/fallback weights."
+        ),
+    )
+    parser.add_argument(
+        "--prediction-weight-source",
+        choices=["auto", "central", "evenet", "event", "unit", "class"],
+        default=None,
+        help=(
+            "Weight source for predicted rows in config-driven export. 'auto' prefers central_weight/weight "
+            "from the prediction parquet and ignores stale split-corrected evenet_weight. Use 'evenet' only "
+            "to preserve prediction-parquet evenet_weight exactly."
         ),
     )
     parser.add_argument(
@@ -809,6 +818,7 @@ def with_evenet_reconstruction(
     zero_unpredicted_selected_mc: bool = False,
     missing_prefix: str = "pred_invisible",
     method_name: str = "EveNet",
+    prediction_weight_source: str = "auto",
 ) -> tuple[ak.Array, dict[str, Any]]:
     pred_values, metrics = build_predicted_reconstruction(
         central_pred_events,
@@ -825,13 +835,27 @@ def with_evenet_reconstruction(
         original_weight = ak.to_numpy(output["weight"], allow_missing=False).astype(np.float64)
         output["central_weight"] = original_weight.astype(np.float32)
         predicted_weight = None
-        if "evenet_weight" in pred_events.fields:
+        resolved_weight_source = prediction_weight_source
+        if resolved_weight_source == "auto":
+            resolved_weight_source = "central"
+        if resolved_weight_source == "evenet" and "evenet_weight" in pred_events.fields:
             predicted_weight = ak.to_numpy(pred_events["evenet_weight"], allow_missing=False).astype(np.float64)
             if len(predicted_weight) != len(full_indices):
                 raise ValueError(
                     "Prediction parquet evenet_weight length does not match the mapped prediction rows: "
                     f"evenet_weight={len(predicted_weight)}, mapped_rows={len(full_indices)}."
                 )
+        elif resolved_weight_source == "event" and "event_weight" in pred_events.fields:
+            predicted_weight = ak.to_numpy(pred_events["event_weight"], allow_missing=False).astype(np.float64)
+        elif resolved_weight_source == "unit":
+            predicted_weight = np.ones(len(full_indices), dtype=np.float64)
+        elif resolved_weight_source not in {"central", "class"}:
+            raise ValueError(f"Unsupported prediction weight source: {prediction_weight_source}.")
+        if predicted_weight is not None and len(predicted_weight) != len(full_indices):
+            raise ValueError(
+                "Prediction weight length does not match the mapped prediction rows: "
+                f"weight={len(predicted_weight)}, mapped_rows={len(full_indices)}."
+            )
         weight_scale = np.ones(len(output), dtype=np.float32)
         export_weight = original_weight.copy()
         if predicted_weight is not None:
@@ -844,9 +868,9 @@ def with_evenet_reconstruction(
                     where=original_weight[full_indices] != 0,
                 )
             weight_scale[full_indices] = predicted_scale.astype(np.float32)
-            metrics["prediction_weight_source"] = "prediction_parquet_evenet_weight"
+            metrics["prediction_weight_source"] = resolved_weight_source
             metrics["prediction_split_fraction_applied_in_export"] = None
-        elif prediction_split_fraction is not None:
+        elif resolved_weight_source == "class" and prediction_split_fraction is not None:
             if not (0.0 < prediction_split_fraction <= 1.0):
                 raise ValueError(
                     f"--prediction-split-fraction must be in (0, 1], got {prediction_split_fraction}."
@@ -877,6 +901,8 @@ def with_evenet_reconstruction(
             metrics["selected_source_rows_zero_weighted"] = 0
         output["evenet_qi_weight_scale"] = weight_scale
         output["weight"] = export_weight.astype(np.float32)
+        output["evenet_weight"] = export_weight.astype(np.float32)
+        output["evenet_weight_source"] = ak.Array([metrics["prediction_weight_source"]] * len(output))
 
     metrics["num_raw_events"] = int(len(full_events))
     metrics["num_events_with_prediction"] = int(len(full_indices))
@@ -1374,6 +1400,13 @@ def config_prediction_batch_size(args: argparse.Namespace, analysis_cfg: dict, r
     return max(1, int(value)) if value is not None else min(raw_batch_size, 25_000)
 
 
+def config_prediction_weight_source(args: argparse.Namespace, analysis_cfg: dict) -> str:
+    if args.prediction_weight_source is not None:
+        return str(args.prediction_weight_source)
+    pred_cfg = analysis_cfg.get("EveNetPrediction", {})
+    return str(pred_cfg.get("prediction_weight_source") or pred_cfg.get("export_prediction_weight_source") or "auto")
+
+
 def config_worker_backend(args: argparse.Namespace, analysis_cfg: dict) -> str:
     if args.worker_backend is not None:
         return args.worker_backend
@@ -1410,6 +1443,7 @@ def merge_prediction_group(
     source_events: ak.Array,
     pred_events: ak.Array,
     prediction_split_fraction: float | None,
+    prediction_weight_source: str = "auto",
 ) -> tuple[ak.Array, dict[str, Any]]:
     full_indices = map_prediction_rows_to_full(full_events, source_events, allow_prefix_match=False)
     return with_evenet_reconstruction(
@@ -1418,6 +1452,7 @@ def merge_prediction_group(
         pred_events=pred_events,
         full_indices=full_indices,
         prediction_split_fraction=prediction_split_fraction,
+        prediction_weight_source=prediction_weight_source,
     )
 
 
@@ -1454,6 +1489,7 @@ def build_concat_prediction_rows(
     is_data: bool,
     missing_prefix: str = "pred_invisible",
     method_name: str = "EveNet",
+    prediction_weight_source: str = "auto",
 ) -> tuple[ak.Array, dict[str, Any]]:
     if len(pred_events) == 0:
         raise ValueError("Prediction parquet group is empty; cannot build concat rows.")
@@ -1478,6 +1514,7 @@ def build_concat_prediction_rows(
         zero_unpredicted_selected_mc=False,
         missing_prefix=missing_prefix,
         method_name=method_name,
+        prediction_weight_source=prediction_weight_source,
     )
 
 
@@ -1496,6 +1533,7 @@ def build_concat_raw_complement_rows(
         selected_full_indices=None,
         zero_unpredicted_selected_mc=False,
         method_name=method_name,
+        prediction_weight_source="central",
     )
 
 
@@ -1523,6 +1561,7 @@ def export_config_group(
     output_label: str,
     raw_batch_size: int,
     prediction_batch_size: int,
+    prediction_weight_source: str,
     truth_output_label: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     print(f"[export-evenet-to-qi] worker {os.getpid()} start {parent_name}", flush=True)
@@ -1555,6 +1594,7 @@ def export_config_group(
             pred_events=pred_batch,
             prediction_split_fraction=split_fraction,
             is_data=group["is_data"],
+            prediction_weight_source=prediction_weight_source,
         )
         writer.append(predicted_events)
         predicted_rows_total += int(len(predicted_events))
@@ -1568,6 +1608,7 @@ def export_config_group(
                 is_data=group["is_data"],
                 missing_prefix=truth_missing_prefix,
                 method_name=truth_method_name,
+                prediction_weight_source=prediction_weight_source,
             )
             truth_writer.append(truth_predicted_events)
             truth_predicted_rows_total += int(len(truth_predicted_events))
@@ -1645,6 +1686,7 @@ def export_config_group(
         "concat_mode": "streamed_raw_outside_selected_plus_prediction_rows",
         "raw_batch_size": int(raw_batch_size),
         "prediction_batch_size": int(prediction_batch_size),
+        "prediction_weight_source": prediction_weight_source,
         "raw_num_batches": int(raw_batch_count),
         "prediction_num_batches": int(prediction_batch_count),
         "prediction_paths": group["pred_paths"],
@@ -1683,7 +1725,7 @@ def export_config_group(
 
 
 def export_config_group_worker(
-    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, int, str | None],
+    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, int, str, str | None],
 ) -> tuple[str, dict[str, Any]]:
     return export_config_group(*payload)
 
@@ -1701,6 +1743,7 @@ def export_config_prediction(
     worker_backend: str,
     raw_batch_size: int,
     prediction_batch_size: int,
+    prediction_weight_source: str,
     truth_output_label: str | None,
 ) -> dict[str, Any]:
     pred_paths = resolve_parquet_inputs(pred_path)
@@ -1767,6 +1810,7 @@ def export_config_prediction(
                 output_label=output_label,
                 raw_batch_size=raw_batch_size,
                 prediction_batch_size=prediction_batch_size,
+                prediction_weight_source=prediction_weight_source,
                 truth_output_label=truth_output_label,
             )
             summary["samples"][parent_name] = metrics
@@ -1783,6 +1827,7 @@ def export_config_prediction(
                 output_label,
                 raw_batch_size,
                 prediction_batch_size,
+                prediction_weight_source,
                 truth_output_label,
             )
             for parent_name, group in group_items
@@ -1821,6 +1866,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
     worker_backend = config_worker_backend(args, analysis_cfg)
     raw_batch_size = config_raw_batch_size(args, analysis_cfg)
     prediction_batch_size = config_prediction_batch_size(args, analysis_cfg, raw_batch_size)
+    prediction_weight_source = config_prediction_weight_source(args, analysis_cfg)
     write_truth_copy = config_write_truth_neutrino_copy(args, analysis_cfg)
     truth_output_label = config_truth_qi_method_label(args, analysis_cfg, output_label) if write_truth_copy else None
 
@@ -1839,6 +1885,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
             worker_backend=worker_backend,
             raw_batch_size=raw_batch_size,
             prediction_batch_size=prediction_batch_size,
+            prediction_weight_source=prediction_weight_source,
             truth_output_label=truth_output_label,
         )
     if data_pred is not None:
@@ -1855,6 +1902,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
             worker_backend=worker_backend,
             raw_batch_size=raw_batch_size,
             prediction_batch_size=prediction_batch_size,
+            prediction_weight_source=prediction_weight_source,
             truth_output_label=truth_output_label,
         )
     if not summaries:
@@ -1908,6 +1956,7 @@ def main() -> None:
         pred_events,
         full_indices,
         prediction_split_fraction=args.prediction_split_fraction,
+        prediction_weight_source=args.prediction_weight_source or "auto",
     )
     method_output_root = args.output_dir / args.method_output_subdir if args.method_output_subdir else args.output_dir
     counts = write_qi_tree(evenet_events, method_output_root, args.sample_name, list(args.regions))

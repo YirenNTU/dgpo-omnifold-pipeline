@@ -227,6 +227,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If set, write evenet_weight=1 for all events instead of physics-normalized MC weights.",
     )
+    parser.add_argument(
+        "--converted-weight-source",
+        choices=["auto", "central", "class", "event", "unit"],
+        default="auto",
+        help=(
+            "Weight source for converted prediction outputs. 'auto' uses central_weight from the "
+            "converted parquet when available, otherwise class weights. Split-fraction correction "
+            "is applied only to class weights."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -359,6 +369,53 @@ def build_converted_class_weights(
             continue
         output[class_name] = float(sample.norm_factor) / float(initial_total_num_events) * float(luminosity)
     return output
+
+
+def valid_positive_weight(values: np.ndarray) -> np.ndarray:
+    weights = np.asarray(values, dtype=np.float32)
+    return np.where(np.isfinite(weights) & (weights > 0), weights, 0.0).astype(np.float32)
+
+
+def converted_physics_weight(
+    batch_np: dict[str, np.ndarray],
+    target_class_name: np.ndarray,
+    valid_target_class: np.ndarray,
+    class_weight_map: dict[str, float] | None,
+    converted_split_fraction: float | None,
+    use_weighted_output: bool,
+    weight_source: str,
+) -> tuple[np.ndarray, str, bool]:
+    num_events = len(target_class_name)
+    if not use_weighted_output or weight_source == "unit":
+        return np.ones(num_events, dtype=np.float32), "unit", False
+
+    resolved_source = weight_source
+    if resolved_source == "auto":
+        resolved_source = "central" if "central_weight" in batch_np else "class"
+
+    if resolved_source == "central":
+        if "central_weight" not in batch_np:
+            resolved_source = "class"
+        else:
+            return valid_positive_weight(batch_np["central_weight"]), "central_weight", False
+
+    if resolved_source == "event":
+        return valid_positive_weight(batch_np["event_weight"]), "event_weight", False
+
+    physics_weight = np.ones(num_events, dtype=np.float32)
+    if class_weight_map is not None:
+        for class_name, class_weight in class_weight_map.items():
+            physics_weight[target_class_name == class_name] = np.float32(class_weight)
+    split_applied = False
+    if converted_split_fraction is not None:
+        if not (0.0 < converted_split_fraction <= 1.0):
+            raise ValueError(
+                f"converted_split_fraction must be in (0, 1], got {converted_split_fraction}."
+            )
+        mc_like_mask = valid_target_class
+        physics_weight[mc_like_mask] = physics_weight[mc_like_mask] / np.float32(converted_split_fraction)
+        split_applied = True
+    return physics_weight.astype(np.float32), "class_weight_map", split_applied
 
 
 def prepare_runtime_train_config(
@@ -859,6 +916,7 @@ def predict_converted_events(
     class_weight_map: dict[str, float] | None,
     converted_split_fraction: float | None,
     use_weighted_output: bool,
+    converted_weight_source: str,
     device: torch.device,
 ) -> dict[str, Any]:
     class_names = model_bundle["class_names"]
@@ -994,17 +1052,15 @@ def predict_converted_events(
     target_class_name = np.full(num_events, DEFAULT_CLASS_NAME, dtype=object)
     valid_target_class = (target_class_index >= 0) & (target_class_index < len(class_names))
     target_class_name[valid_target_class] = np.asarray(class_names, dtype=object)[target_class_index[valid_target_class]]
-    physics_weight = np.ones(num_events, dtype=np.float32)
-    if use_weighted_output and class_weight_map is not None:
-        for class_name, class_weight in class_weight_map.items():
-            physics_weight[target_class_name == class_name] = np.float32(class_weight)
-    if use_weighted_output and converted_split_fraction is not None:
-        if not (0.0 < converted_split_fraction <= 1.0):
-            raise ValueError(
-                f"converted_split_fraction must be in (0, 1], got {converted_split_fraction}."
-            )
-        mc_like_mask = valid_target_class
-        physics_weight[mc_like_mask] = physics_weight[mc_like_mask] / np.float32(converted_split_fraction)
+    physics_weight, weight_source_used, split_applied = converted_physics_weight(
+        batch_np=batch_np,
+        target_class_name=target_class_name,
+        valid_target_class=valid_target_class,
+        class_weight_map=class_weight_map,
+        converted_split_fraction=converted_split_fraction,
+        use_weighted_output=use_weighted_output,
+        weight_source=converted_weight_source,
+    )
 
     return {
         "pred_class_index": pred_class_index,
@@ -1015,6 +1071,8 @@ def predict_converted_events(
         "target_class_name": target_class_name,
         "event_weight": batch_np["event_weight"].astype(np.float32),
         "physics_weight": physics_weight,
+        "weight_source_used": weight_source_used,
+        "split_correction_applied": split_applied,
         **pred_invisible,
         **target_invisible,
     }
@@ -1029,6 +1087,7 @@ def augment_converted_parquet_task(
     class_weight_map: dict[str, float] | None,
     converted_split_fraction: float | None,
     use_weighted_output: bool,
+    converted_weight_source: str,
     shape_metadata_path: Path | None,
     device: torch.device,
 ) -> None:
@@ -1058,6 +1117,7 @@ def augment_converted_parquet_task(
         class_weight_map=class_weight_map,
         converted_split_fraction=converted_split_fraction,
         use_weighted_output=use_weighted_output,
+        converted_weight_source=converted_weight_source,
         device=device,
     )
 
@@ -1073,6 +1133,8 @@ def augment_converted_parquet_task(
         "evenet_truth_class_name": ak.Array(outputs["target_class_name"].tolist()),
         "event_weight": outputs["event_weight"],
         "evenet_weight": outputs["physics_weight"],
+        "evenet_weight_source": ak.Array([outputs["weight_source_used"]] * num_events),
+        "evenet_weight_split_correction_applied": np.full(num_events, bool(outputs["split_correction_applied"]), dtype=bool),
     }
 
     for source_key in (
@@ -1112,6 +1174,8 @@ def augment_converted_parquet_task(
             "target_class_name",
             "event_weight",
             "physics_weight",
+            "weight_source_used",
+            "split_correction_applied",
         }:
             continue
         output_columns[key] = value
@@ -1198,6 +1262,7 @@ def worker_main(
     shape_metadata_path: str | None = None,
     class_weight_map: dict[str, float] | None = None,
     converted_split_fraction: float | None = None,
+    converted_weight_source: str = "auto",
 ) -> None:
     use_cuda = torch.cuda.is_available() and world_size > 0
     device = torch.device(f"cuda:{rank}" if use_cuda else "cpu")
@@ -1224,6 +1289,7 @@ def worker_main(
             class_weight_map=class_weight_map,
             converted_split_fraction=converted_split_fraction,
             use_weighted_output=use_weighted_output,
+            converted_weight_source=converted_weight_source,
             shape_metadata_path=Path(shape_metadata_path) if shape_metadata_path is not None else None,
             device=device,
         )
@@ -1346,6 +1412,7 @@ def main() -> None:
                 "shape_metadata": str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
                 "class_weight_map": class_weight_map,
                 "converted_split_fraction": converted_split_fraction,
+                "converted_weight_source": str(args.converted_weight_source),
                 "disable_ema": bool(args.disable_ema),
                 "classification_use_ema": False,
                 "diffusion_use_ema": bool(diffusion_use_ema),
@@ -1372,6 +1439,7 @@ def main() -> None:
             shape_metadata_path=str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
             class_weight_map=class_weight_map,
             converted_split_fraction=converted_split_fraction,
+            converted_weight_source=args.converted_weight_source,
         )
         if args.skip_merge or args.task_num_shards > 1:
             print("[converted-merge] skipped; run again with --merge-only after all shards finish", flush=True)
@@ -1395,6 +1463,7 @@ def main() -> None:
             str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
             class_weight_map,
             converted_split_fraction,
+            args.converted_weight_source,
         ),
         nprocs=num_workers,
         join=True,

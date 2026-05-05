@@ -93,11 +93,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--weight-source",
-        choices=["evenet", "central", "event", "unit"],
-        default="evenet",
+        choices=["auto", "evenet", "central", "event", "unit"],
+        default="auto",
         help=(
-            "MC weight source. 'evenet' uses split-corrected evenet_weight, "
-            "'central' uses central_weight/weight without EveNet split correction, "
+            "MC weight source. 'auto' prefers central_weight/weight and falls back to evenet_weight, "
+            "'evenet' uses prediction-parquet evenet_weight, "
             "'event' uses event_weight, and 'unit' ignores weights."
         ),
     )
@@ -218,11 +218,12 @@ def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     return output
 
 
-def event_weights(events: ak.Array, use_weighted: bool, weight_source: str = "evenet") -> np.ndarray:
+def event_weights(events: ak.Array, use_weighted: bool, weight_source: str = "auto") -> np.ndarray:
     if not use_weighted or weight_source == "unit":
         return np.ones(len(events), dtype=np.float64)
 
     field_priority = {
+        "auto": ("central_weight", "weight", "event_weight", "evenet_weight"),
         "evenet": ("evenet_weight", "central_weight", "event_weight", "weight"),
         "central": ("central_weight", "weight", "event_weight"),
         "event": ("event_weight", "central_weight", "weight"),
