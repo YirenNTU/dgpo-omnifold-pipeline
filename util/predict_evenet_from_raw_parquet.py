@@ -538,7 +538,18 @@ def checkpoint_state_dict(checkpoint_path: Path, *, use_ema: bool, device: torch
     return checkpoint["state_dict"]
 
 
-def build_evenet_model(device: torch.device, normalization_dict: dict[str, Any]) -> EveNetModel:
+def build_evenet_model(
+    device: torch.device,
+    normalization_dict: dict[str, Any],
+    *,
+    classification: bool | None = None,
+    regression: bool | None = None,
+    global_generation: bool | None = None,
+    point_cloud_generation: bool | None = None,
+    neutrino_generation: bool | None = None,
+    assignment: bool | None = None,
+    segmentation: bool | None = None,
+) -> EveNetModel:
     """
     inputs:
       device: torch.device, target device.
@@ -546,20 +557,22 @@ def build_evenet_model(device: torch.device, normalization_dict: dict[str, Any])
     outputs:
       model: EveNetModel, configured with enabled components from train config.
     goal:
-      Build identical classification and diffusion models when split
-      checkpoints are used.
+      Build EveNet models with optional component overrides for split
+      classification and diffusion checkpoints.
     """
     components = global_config.options.Training.Components
     model = EveNetModel(
         config=global_config,
         device=device,
-        classification=components.Classification.include,
-        regression=components.Regression.include,
-        global_generation=components.GlobalGeneration.include,
-        point_cloud_generation=components.ReconGeneration.include,
-        neutrino_generation=components.TruthGeneration.include,
-        assignment=components.Assignment.include,
-        segmentation=components.Segmentation.include,
+        classification=components.Classification.include if classification is None else classification,
+        regression=components.Regression.include if regression is None else regression,
+        global_generation=components.GlobalGeneration.include if global_generation is None else global_generation,
+        point_cloud_generation=components.ReconGeneration.include
+        if point_cloud_generation is None
+        else point_cloud_generation,
+        neutrino_generation=components.TruthGeneration.include if neutrino_generation is None else neutrino_generation,
+        assignment=components.Assignment.include if assignment is None else assignment,
+        segmentation=components.Segmentation.include if segmentation is None else segmentation,
         normalization_dict=normalization_dict,
     )
     return model.to(device=device)
@@ -596,7 +609,17 @@ def load_model_bundle(
     if classification_path == diffusion_path and not use_ema:
         classification_model = model
     else:
-        classification_model = build_evenet_model(device, normalization_dict)
+        classification_model = build_evenet_model(
+            device,
+            normalization_dict,
+            classification=True,
+            regression=False,
+            global_generation=False,
+            point_cloud_generation=False,
+            neutrino_generation=False,
+            assignment=False,
+            segmentation=False,
+        )
         safe_load_state(
             classification_model,
             checkpoint_state_dict(classification_path, use_ema=False, device=device),
@@ -881,7 +904,14 @@ def predict_converted_events(
                     ("deterministic", True),
                 ],
             )
-            logits = next(iter(cls_outputs["classification"].values()))
+            classification_outputs = cls_outputs.get("classification")
+            if not classification_outputs:
+                raise RuntimeError(
+                    "Classification model produced no classification outputs. "
+                    "Use a train config/checkpoint with options.Training.Components.Classification.include=true, "
+                    "or pass --classification-checkpoint for split classification/diffusion prediction."
+                )
+            logits = next(iter(classification_outputs.values()))
             probs = torch.softmax(logits, dim=-1)
             batch_pred_index = torch.argmax(probs, dim=-1)
             batch_pred_prob = torch.gather(probs, -1, batch_pred_index.unsqueeze(-1)).squeeze(-1)
