@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare stored truth observables against observables rebuilt from "
-            "target missing plus visible tau inputs."
+            "target or predicted missing plus visible tau inputs."
         )
     )
     parser.add_argument(
@@ -197,6 +197,19 @@ def target_missing_p4(events: ak.Array, slot: int) -> ak.Array:
     return massless_p4_from_slot_features(events, "target_invisible", slot)
 
 
+def predicted_missing_p4(events: ak.Array, slot: int) -> ak.Array:
+    required = {
+        f"pred_invisible_slot{slot}_pt",
+        f"pred_invisible_slot{slot}_eta",
+        f"pred_invisible_slot{slot}_phi",
+    }
+    fields = set(events.fields)
+    missing = sorted(required - fields)
+    if missing:
+        raise ValueError(f"Missing pred-invisible fields for slot {slot}: {missing}")
+    return massless_p4_from_slot_features(events, "pred_invisible", slot)
+
+
 def parquet_columns_to_load(path: Path, observables: list[str], region: str | None, truth_region_only: bool) -> list[str] | None:
     schema = pq.read_schema(path)
     available = {field.name for field in schema}
@@ -209,6 +222,9 @@ def parquet_columns_to_load(path: Path, observables: list[str], region: str | No
                 f"target_invisible_slot{slot}_pt",
                 f"target_invisible_slot{slot}_eta",
                 f"target_invisible_slot{slot}_phi",
+                f"pred_invisible_slot{slot}_pt",
+                f"pred_invisible_slot{slot}_eta",
+                f"pred_invisible_slot{slot}_phi",
                 f"tau_vis_prong_slot{slot}_energy",
                 f"tau_vis_prong_slot{slot}_pt",
                 f"tau_vis_prong_slot{slot}_eta",
@@ -296,12 +312,28 @@ def target_reconstructed_values(events: ak.Array, observable: str) -> np.ndarray
     return np.asarray(observables[observable], dtype=np.float64)
 
 
-def observable_limits(observable: str, truth: np.ndarray, reco: np.ndarray) -> tuple[float, float]:
+def predicted_reconstructed_values(events: ak.Array, observable: str) -> np.ndarray:
+    visible_a = visible_tau_p4(events, 0)
+    visible_b = visible_tau_p4(events, 1)
+    pred_a = predicted_missing_p4(events, 0)
+    pred_b = predicted_missing_p4(events, 1)
+    tau_a = build_momentum4d_with_mass(visible_a + pred_a, TAU_MASS)
+    tau_b = build_momentum4d_with_mass(visible_b + pred_b, TAU_MASS)
+    observables = build_observables(
+        tau_a_p4=tau_a,
+        tau_b_p4=tau_b,
+        vis_a_p4=visible_a,
+        vis_b_p4=visible_b,
+    )
+    return np.asarray(observables[observable], dtype=np.float64)
+
+
+def observable_limits(observable: str, *value_arrays: np.ndarray) -> tuple[float, float]:
     if observable == "theta_cm":
         return 0.0, 1.0
     if observable.startswith("cos_theta_"):
         return -1.0, 1.0
-    merged = np.concatenate([truth, reco])
+    merged = np.concatenate([values for values in value_arrays if values.size > 0])
     low = float(np.nanpercentile(merged, 0.5))
     high = float(np.nanpercentile(merged, 99.5))
     if not np.isfinite(low) or not np.isfinite(high) or low == high:
@@ -349,26 +381,47 @@ def compare_summary(truth: np.ndarray, reco: np.ndarray) -> dict[str, float | in
 def plot_observable(
     output_path: Path,
     observable: str,
-    truth: np.ndarray,
-    reco: np.ndarray,
-    weights: np.ndarray,
+    target_truth: np.ndarray,
+    target_reco: np.ndarray,
+    target_weights: np.ndarray,
+    pred_truth: np.ndarray | None,
+    pred_reco: np.ndarray | None,
+    pred_weights: np.ndarray | None,
     normalize: bool,
 ) -> None:
-    low, high = observable_limits(observable, truth, reco)
+    low, high = observable_limits(
+        observable,
+        target_truth,
+        target_reco,
+        pred_truth if pred_truth is not None else np.array([], dtype=np.float64),
+        pred_reco if pred_reco is not None else np.array([], dtype=np.float64),
+    )
     bins = np.linspace(low, high, 60)
-    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.6), dpi=180, gridspec_kw={"width_ratios": [1.1, 1.0]})
+    has_pred = pred_reco is not None and pred_reco.size > 0
+    fig, axes = plt.subplots(
+        1,
+        3 if has_pred else 2,
+        figsize=(15.2 if has_pred else 10.8, 4.6),
+        dpi=180,
+        gridspec_kw={"width_ratios": [1.1, 1.0, 1.0] if has_pred else [1.1, 1.0]},
+    )
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
 
-    truth_hist = weighted_hist(truth, weights, bins, normalize)
-    reco_hist = weighted_hist(reco, weights, bins, normalize)
+    truth_hist = weighted_hist(target_truth, target_weights, bins, normalize)
+    target_hist = weighted_hist(target_reco, target_weights, bins, normalize)
     axes[0].step(bins[:-1], truth_hist, where="post", color="black", linewidth=1.7, label="Stored truth")
-    axes[0].step(bins[:-1], reco_hist, where="post", color="#D55E00", linewidth=1.7, label="Target missing + visible")
+    axes[0].step(bins[:-1], target_hist, where="post", color="#D55E00", linewidth=1.7, label="Target missing + visible")
+    if has_pred:
+        pred_hist = weighted_hist(pred_reco, pred_weights, bins, normalize)
+        axes[0].step(bins[:-1], pred_hist, where="post", color="#0072B2", linewidth=1.7, label="Predicted missing + visible")
     axes[0].set_xlabel(observable)
     axes[0].set_ylabel("Normalized yield" if normalize else "Weighted yield")
     axes[0].set_title("1D overlay")
     axes[0].grid(alpha=0.2)
     axes[0].legend(frameon=False, fontsize=8)
 
-    hist2d = np.histogram2d(truth, reco, bins=[bins, bins], weights=weights)[0].astype(np.float64)
+    hist2d = np.histogram2d(target_truth, target_reco, bins=[bins, bins], weights=target_weights)[0].astype(np.float64)
     mesh = axes[1].pcolormesh(bins, bins, hist2d.T, cmap="Blues", shading="auto", vmin=0.0)
     fig.colorbar(mesh, ax=axes[1], fraction=0.046, pad=0.03, label="Entries")
     axes[1].plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
@@ -376,8 +429,20 @@ def plot_observable(
     axes[1].set_ylim(low, high)
     axes[1].set_xlabel(f"Stored truth {observable}")
     axes[1].set_ylabel(f"Target missing + visible {observable}")
-    axes[1].set_title("2D comparison")
+    axes[1].set_title("Truth vs target reco")
     axes[1].grid(alpha=0.16)
+
+    if has_pred:
+        pred_hist2d = np.histogram2d(pred_truth, pred_reco, bins=[bins, bins], weights=pred_weights)[0].astype(np.float64)
+        pred_mesh = axes[2].pcolormesh(bins, bins, pred_hist2d.T, cmap="Blues", shading="auto", vmin=0.0)
+        fig.colorbar(pred_mesh, ax=axes[2], fraction=0.046, pad=0.03, label="Entries")
+        axes[2].plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
+        axes[2].set_xlim(low, high)
+        axes[2].set_ylim(low, high)
+        axes[2].set_xlabel(f"Stored truth {observable}")
+        axes[2].set_ylabel(f"Predicted missing + visible {observable}")
+        axes[2].set_title("Truth vs predicted reco")
+        axes[2].grid(alpha=0.16)
 
     fig.suptitle(observable)
     fig.tight_layout()
@@ -393,9 +458,12 @@ def main() -> None:
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    collected_truth: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
-    collected_reco: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
-    collected_weights: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
+    collected_target_truth: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
+    collected_target_reco: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
+    collected_target_weights: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
+    collected_pred_truth: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
+    collected_pred_reco: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
+    collected_pred_weights: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
     rows_seen = 0
     rows_used = 0
 
@@ -422,13 +490,25 @@ def main() -> None:
                 if truth_field not in selected.fields:
                     continue
                 truth = truth_values(selected, observable)
-                reco = target_reconstructed_values(selected, observable)
-                finite = np.isfinite(truth) & np.isfinite(reco) & np.isfinite(weights) & (weights > 0.0)
-                if not np.any(finite):
+                target_reco = target_reconstructed_values(selected, observable)
+                try:
+                    pred_reco = predicted_reconstructed_values(selected, observable)
+                except Exception:
+                    pred_reco = None
+
+                finite_target = np.isfinite(truth) & np.isfinite(target_reco) & np.isfinite(weights) & (weights > 0.0)
+                if np.any(finite_target):
+                    collected_target_truth[observable].append(truth[finite_target])
+                    collected_target_reco[observable].append(target_reco[finite_target])
+                    collected_target_weights[observable].append(weights[finite_target])
+                if pred_reco is not None:
+                    finite_pred = np.isfinite(truth) & np.isfinite(pred_reco) & np.isfinite(weights) & (weights > 0.0)
+                    if np.any(finite_pred):
+                        collected_pred_truth[observable].append(truth[finite_pred])
+                        collected_pred_reco[observable].append(pred_reco[finite_pred])
+                        collected_pred_weights[observable].append(weights[finite_pred])
+                if not np.any(finite_target) and pred_reco is None:
                     continue
-                collected_truth[observable].append(truth[finite])
-                collected_reco[observable].append(reco[finite])
-                collected_weights[observable].append(weights[finite])
             if remaining is not None:
                 remaining -= len(batch)
                 if remaining <= 0:
@@ -447,14 +527,35 @@ def main() -> None:
     }
 
     for observable in observables:
-        if not collected_truth[observable]:
+        if not collected_target_truth[observable]:
             continue
-        truth = np.concatenate(collected_truth[observable])
-        reco = np.concatenate(collected_reco[observable])
-        weights = np.concatenate(collected_weights[observable])
-        summary["observables"][observable] = compare_summary(truth, reco)
+        target_truth = np.concatenate(collected_target_truth[observable])
+        target_reco = np.concatenate(collected_target_reco[observable])
+        target_weights = np.concatenate(collected_target_weights[observable])
+        observable_summary: dict[str, Any] = {
+            "target_vs_truth": compare_summary(target_truth, target_reco),
+        }
+        pred_truth = None
+        pred_reco = None
+        pred_weights = None
+        if collected_pred_reco[observable]:
+            pred_truth = np.concatenate(collected_pred_truth[observable])
+            pred_reco = np.concatenate(collected_pred_reco[observable])
+            pred_weights = np.concatenate(collected_pred_weights[observable])
+            observable_summary["predicted_vs_truth"] = compare_summary(pred_truth, pred_reco)
+        summary["observables"][observable] = observable_summary
         plot_path = output_dir / "plots" / f"{sanitize_filename(observable)}.png"
-        plot_observable(plot_path, observable, truth, reco, weights, args.normalize)
+        plot_observable(
+            plot_path,
+            observable,
+            target_truth,
+            target_reco,
+            target_weights,
+            pred_truth,
+            pred_reco,
+            pred_weights,
+            args.normalize,
+        )
         summary["observables"][observable]["plot"] = str(plot_path.relative_to(output_dir))
         print(f"[check-target-missing-vs-truth] wrote observable={observable} plot={plot_path}", flush=True)
 
