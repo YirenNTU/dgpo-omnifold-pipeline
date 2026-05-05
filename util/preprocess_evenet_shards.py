@@ -230,7 +230,10 @@ def align_to_reference_schema(
     if missing_required:
         raise ValueError(f"{shard_path} is missing core EveNet keys: {missing_required}")
     if "event_weight" not in data:
-        data["event_weight"] = np.ones(num_events, dtype=np.float32)
+        if "central_weight" in data:
+            data["event_weight"] = np.asarray(data["central_weight"], dtype=np.float32)
+        else:
+            data["event_weight"] = np.ones(num_events, dtype=np.float32)
     if is_data and "classification" not in data:
         data["classification"] = np.full(num_events, -1, dtype=np.int64)
 

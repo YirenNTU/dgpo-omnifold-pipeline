@@ -1136,7 +1136,7 @@ def default_concat_passthrough_fields(sample: Sample, num_events: int) -> dict[s
 
     defaults: dict[str, np.ndarray] = {
         "event_category": np.full(num_events, -1, dtype=np.int64),
-        "initial_total_num_events": np.full(num_events, num_events, dtype=np.int64),
+        "initial_total_num_events": np.zeros(num_events, dtype=np.int64),
         "truth_QI_region": np.zeros(num_events, dtype=bool),
         "analyzing_power": np.zeros(num_events, dtype=np.float32),
         "analyzing_power_a": np.zeros(num_events, dtype=np.float32),
@@ -1165,7 +1165,7 @@ def default_missing_passthrough_array(field: str, reference: np.ndarray, num_eve
         return np.zeros(num_events, dtype=bool)
     if np.issubdtype(dtype, np.integer):
         if field == "initial_total_num_events":
-            return np.full(num_events, num_events, dtype=dtype)
+            return np.zeros(num_events, dtype=dtype)
         if field.startswith("truth_num_"):
             return np.zeros(num_events, dtype=dtype)
         if field == "event_category":
@@ -1323,7 +1323,10 @@ def build_dataset(
         apply_default_concat_passthrough_fields(batch, sample, len(events))
         if include_classification:
             batch["classification"] = np.full(len(events), class_index[sample.name], dtype=np.int64)
-            batch["event_weight"] = np.ones(len(events), dtype=np.float32)
+            if "central_weight" in batch:
+                batch["event_weight"] = np.asarray(batch["central_weight"], dtype=np.float32)
+            else:
+                batch["event_weight"] = np.ones(len(events), dtype=np.float32)
 
         batch_expected_passthrough.append(validate_batch_passthrough_fields(batch, events, sample))
         batches.append(batch)

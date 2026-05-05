@@ -181,7 +181,7 @@ def sample_initial_total_num_events(sample) -> int:
             continue
         values.append(int(ak.to_numpy(events["initial_total_num_events"][:1], allow_missing=False)[0]))
     if values:
-        return max(values)
+        return int(sum(values))
     return 0
 
 

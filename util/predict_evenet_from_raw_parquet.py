@@ -345,7 +345,7 @@ def sample_initial_total_num_events(sample) -> int:
             continue
         values.append(int(ak.to_numpy(events["initial_total_num_events"][:1], allow_missing=False)[0]))
     if values:
-        return max(values)
+        return int(sum(values))
     return 0
 
 
@@ -397,10 +397,32 @@ def converted_physics_weight(
         if "central_weight" not in batch_np:
             resolved_source = "class"
         else:
-            return valid_positive_weight(batch_np["central_weight"]), "central_weight", False
+            physics_weight = valid_positive_weight(batch_np["central_weight"])
+            split_applied = False
+            if converted_split_fraction is not None:
+                if not (0.0 < converted_split_fraction <= 1.0):
+                    raise ValueError(
+                        f"converted_split_fraction must be in (0, 1], got {converted_split_fraction}."
+                    )
+                physics_weight[valid_target_class] = (
+                    physics_weight[valid_target_class] / np.float32(converted_split_fraction)
+                )
+                split_applied = True
+            return physics_weight.astype(np.float32), "central_weight", split_applied
 
     if resolved_source == "event":
-        return valid_positive_weight(batch_np["event_weight"]), "event_weight", False
+        physics_weight = valid_positive_weight(batch_np["event_weight"])
+        split_applied = False
+        if converted_split_fraction is not None:
+            if not (0.0 < converted_split_fraction <= 1.0):
+                raise ValueError(
+                    f"converted_split_fraction must be in (0, 1], got {converted_split_fraction}."
+                )
+            physics_weight[valid_target_class] = (
+                physics_weight[valid_target_class] / np.float32(converted_split_fraction)
+            )
+            split_applied = True
+        return physics_weight.astype(np.float32), "event_weight", split_applied
 
     physics_weight = np.ones(num_events, dtype=np.float32)
     if class_weight_map is not None:
@@ -846,7 +868,10 @@ def ensure_converted_batch_fields(
     if "classification" not in output:
         output["classification"] = np.full(num_events, -1, dtype=np.int64)
     if "event_weight" not in output:
-        output["event_weight"] = np.ones(num_events, dtype=np.float32)
+        if "central_weight" in output:
+            output["event_weight"] = np.asarray(output["central_weight"], dtype=np.float32)
+        else:
+            output["event_weight"] = np.ones(num_events, dtype=np.float32)
 
     return output
 
