@@ -26,6 +26,8 @@ from utils.common_functions import rebuild_p4
 
 vector.register_awkward()
 
+TAU_MASS = 1.777  # GeV
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -128,6 +130,23 @@ def build_momentum4d(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.
     )
 
 
+def build_momentum4d_with_mass(obj: ak.Array, mass: float) -> ak.Array:
+    px = np.asarray(obj.px, dtype=np.float64)
+    py = np.asarray(obj.py, dtype=np.float64)
+    pz = np.asarray(obj.pz, dtype=np.float64)
+    energy = np.sqrt(px * px + py * py + pz * pz + mass * mass)
+    return build_momentum4d(px, py, pz, energy)
+
+
+def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
+    return build_momentum4d(
+        pt * np.cos(phi),
+        pt * np.sin(phi),
+        pt * np.sinh(eta),
+        pt * np.cosh(eta),
+    )
+
+
 def p4_from_slot_features(events: ak.Array, prefix: str, slot: int) -> ak.Array:
     energy = to_numpy(events[f"{prefix}_slot{slot}_energy"], np.float64)
     pt = to_numpy(events[f"{prefix}_slot{slot}_pt"], np.float64)
@@ -139,6 +158,13 @@ def p4_from_slot_features(events: ak.Array, prefix: str, slot: int) -> ak.Array:
         pt * np.sinh(eta),
         energy,
     )
+
+
+def massless_p4_from_slot_features(events: ak.Array, prefix: str, slot: int) -> ak.Array:
+    pt = to_numpy(events[f"{prefix}_slot{slot}_pt"], np.float64)
+    eta = to_numpy(events[f"{prefix}_slot{slot}_eta"], np.float64)
+    phi = to_numpy(events[f"{prefix}_slot{slot}_phi"], np.float64)
+    return massless_p4_from_pt_eta_phi(pt, eta, phi)
 
 
 def visible_tau_p4(events: ak.Array, slot: int) -> ak.Array:
@@ -160,7 +186,6 @@ def visible_tau_p4(events: ak.Array, slot: int) -> ak.Array:
 
 def target_missing_p4(events: ak.Array, slot: int) -> ak.Array:
     required = {
-        f"target_invisible_slot{slot}_energy",
         f"target_invisible_slot{slot}_pt",
         f"target_invisible_slot{slot}_eta",
         f"target_invisible_slot{slot}_phi",
@@ -169,7 +194,7 @@ def target_missing_p4(events: ak.Array, slot: int) -> ak.Array:
     missing = sorted(required - fields)
     if missing:
         raise ValueError(f"Missing target-invisible fields for slot {slot}: {missing}")
-    return p4_from_slot_features(events, "target_invisible", slot)
+    return massless_p4_from_slot_features(events, "target_invisible", slot)
 
 
 def parquet_columns_to_load(path: Path, observables: list[str], region: str | None, truth_region_only: bool) -> list[str] | None:
@@ -181,7 +206,6 @@ def parquet_columns_to_load(path: Path, observables: list[str], region: str | No
     for slot in (0, 1):
         columns.update(
             {
-                f"target_invisible_slot{slot}_energy",
                 f"target_invisible_slot{slot}_pt",
                 f"target_invisible_slot{slot}_eta",
                 f"target_invisible_slot{slot}_phi",
@@ -261,8 +285,8 @@ def target_reconstructed_values(events: ak.Array, observable: str) -> np.ndarray
     visible_b = visible_tau_p4(events, 1)
     target_a = target_missing_p4(events, 0)
     target_b = target_missing_p4(events, 1)
-    tau_a = visible_a + target_a
-    tau_b = visible_b + target_b
+    tau_a = build_momentum4d_with_mass(visible_a + target_a, TAU_MASS)
+    tau_b = build_momentum4d_with_mass(visible_b + target_b, TAU_MASS)
     observables = build_observables(
         tau_a_p4=tau_a,
         tau_b_p4=tau_b,
