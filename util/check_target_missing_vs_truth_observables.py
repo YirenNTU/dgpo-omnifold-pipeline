@@ -271,6 +271,7 @@ def parquet_columns_to_load(path: Path, observables: list[str], region: str | No
                 f"tau_vis_prong_slot{slot}_phi",
             }
         )
+    columns.update({"source_slot_for_a", "source_slot_for_b"})
     columns.update({"lead_a_visible_p4", "lead_b_visible_p4", "weight", "central_weight", "evenet_weight"})
     if region is not None:
         columns.add(f"{region}_cut")
