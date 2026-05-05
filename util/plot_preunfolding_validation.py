@@ -115,10 +115,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional subset of data-vs-MC control observables. Defaults to the existing method-comparison list.",
     )
-    parser.add_argument(
+    normalize_group = parser.add_mutually_exclusive_group()
+    normalize_group.add_argument(
         "--normalize-truth-reco",
+        dest="normalize_truth_reco",
         action="store_true",
-        help="Normalize truth-vs-reco distributions to unit area instead of plotting absolute weighted yields.",
+        default=True,
+        help="Normalize truth-vs-reco distributions to unit area. This is the default.",
+    )
+    normalize_group.add_argument(
+        "--no-normalize-truth-reco",
+        dest="normalize_truth_reco",
+        action="store_false",
+        help="Plot absolute weighted yields for truth-vs-reco distributions.",
     )
     parser.add_argument(
         "--reco-observable-source",
@@ -1020,13 +1029,14 @@ def render_grouped_truth_reco_panels(
         ax1d.plot([], [], color=OKABE_ITO_BLACK, linestyle="-", label="Reco")
 
         if colorbar_mesh is not None:
+            colorbar_axis = fig.add_axes([0.018, 0.18, 0.012, 0.56])
             fig.colorbar(
                 colorbar_mesh,
-                ax=axes2d,
+                cax=colorbar_axis,
                 label="Normalized yield" if normalize else "Weighted yield",
-                shrink=0.86,
-                pad=0.012,
             )
+            colorbar_axis.yaxis.set_ticks_position("left")
+            colorbar_axis.yaxis.set_label_position("left")
 
         fig.suptitle(f"{broad_region_label(channel_group)}: {xlabel}", y=0.90)
         style_handles = [
@@ -1041,7 +1051,7 @@ def render_grouped_truth_reco_panels(
             ncol=min(4, len(style_handles) + len(legend_handles)),
             fontsize=8,
         )
-        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.86))
+        fig.tight_layout(rect=(0.055, 0.0, 1.0, 0.86))
 
         channel_dir = combined_dir / sanitize_filename(channel_group)
         channel_dir.mkdir(parents=True, exist_ok=True)
