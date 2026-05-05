@@ -210,6 +210,16 @@ def predicted_missing_p4(events: ak.Array, slot: int) -> ak.Array:
     return massless_p4_from_slot_features(events, "pred_invisible", slot)
 
 
+def flattened_slot_feature(events: ak.Array, prefix: str, component: str) -> np.ndarray:
+    values = []
+    for slot in (0, 1):
+        field = f"{prefix}_slot{slot}_{component}"
+        if field not in events.fields:
+            raise ValueError(f"Missing field '{field}'.")
+        values.append(to_numpy(events[field], np.float64))
+    return np.concatenate(values)
+
+
 def parquet_columns_to_load(path: Path, observables: list[str], region: str | None, truth_region_only: bool) -> list[str] | None:
     schema = pq.read_schema(path)
     available = {field.name for field in schema}
@@ -378,6 +388,10 @@ def compare_summary(truth: np.ndarray, reco: np.ndarray) -> dict[str, float | in
     }
 
 
+def weighted_hist2d(x: np.ndarray, y: np.ndarray, weights: np.ndarray, bins: np.ndarray) -> np.ndarray:
+    return np.histogram2d(x, y, bins=[bins, bins], weights=weights)[0].astype(np.float64)
+
+
 def plot_observable(
     output_path: Path,
     observable: str,
@@ -387,6 +401,9 @@ def plot_observable(
     pred_truth: np.ndarray | None,
     pred_reco: np.ndarray | None,
     pred_weights: np.ndarray | None,
+    pred_neutrino_truth: dict[str, np.ndarray] | None,
+    pred_neutrino_pred: dict[str, np.ndarray] | None,
+    pred_neutrino_weights: np.ndarray | None,
     normalize: bool,
 ) -> None:
     low, high = observable_limits(
@@ -398,51 +415,88 @@ def plot_observable(
     )
     bins = np.linspace(low, high, 60)
     has_pred = pred_reco is not None and pred_reco.size > 0
+    row_count = 2 if has_pred and pred_neutrino_truth is not None and pred_neutrino_pred is not None else 1
+    col_count = 3 if has_pred else 2
+    width_ratios = [1.1, 1.0, 1.0] if has_pred else [1.1, 1.0]
     fig, axes = plt.subplots(
-        1,
-        3 if has_pred else 2,
-        figsize=(15.2 if has_pred else 10.8, 4.6),
+        row_count,
+        col_count,
+        figsize=(15.2 if has_pred else 10.8, 8.8 if row_count == 2 else 4.6),
         dpi=180,
-        gridspec_kw={"width_ratios": [1.1, 1.0, 1.0] if has_pred else [1.1, 1.0]},
+        gridspec_kw={"width_ratios": width_ratios},
     )
-    if not isinstance(axes, np.ndarray):
-        axes = np.array([axes])
+    axes = np.asarray(axes)
+    if axes.ndim == 1:
+        axes = axes[np.newaxis, :]
 
     truth_hist = weighted_hist(target_truth, target_weights, bins, normalize)
     target_hist = weighted_hist(target_reco, target_weights, bins, normalize)
-    axes[0].step(bins[:-1], truth_hist, where="post", color="black", linewidth=1.7, label="Stored truth")
-    axes[0].step(bins[:-1], target_hist, where="post", color="#D55E00", linewidth=1.7, label="Target missing + visible")
+    axes[0, 0].step(bins[:-1], truth_hist, where="post", color="black", linewidth=1.7, label="Stored truth")
+    axes[0, 0].step(bins[:-1], target_hist, where="post", color="#D55E00", linewidth=1.7, label="Target missing + visible")
     if has_pred:
         pred_hist = weighted_hist(pred_reco, pred_weights, bins, normalize)
-        axes[0].step(bins[:-1], pred_hist, where="post", color="#0072B2", linewidth=1.7, label="Predicted missing + visible")
-    axes[0].set_xlabel(observable)
-    axes[0].set_ylabel("Normalized yield" if normalize else "Weighted yield")
-    axes[0].set_title("1D overlay")
-    axes[0].grid(alpha=0.2)
-    axes[0].legend(frameon=False, fontsize=8)
+        axes[0, 0].step(bins[:-1], pred_hist, where="post", color="#0072B2", linewidth=1.7, label="Predicted missing + visible")
+    axes[0, 0].set_xlabel(observable)
+    axes[0, 0].set_ylabel("Normalized yield" if normalize else "Weighted yield")
+    axes[0, 0].set_title("1D overlay")
+    axes[0, 0].grid(alpha=0.2)
+    axes[0, 0].legend(frameon=False, fontsize=8)
 
-    hist2d = np.histogram2d(target_truth, target_reco, bins=[bins, bins], weights=target_weights)[0].astype(np.float64)
-    mesh = axes[1].pcolormesh(bins, bins, hist2d.T, cmap="Blues", shading="auto", vmin=0.0)
-    fig.colorbar(mesh, ax=axes[1], fraction=0.046, pad=0.03, label="Entries")
-    axes[1].plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
-    axes[1].set_xlim(low, high)
-    axes[1].set_ylim(low, high)
-    axes[1].set_xlabel(f"Stored truth {observable}")
-    axes[1].set_ylabel(f"Target missing + visible {observable}")
-    axes[1].set_title("Truth vs target reco")
-    axes[1].grid(alpha=0.16)
+    hist2d = weighted_hist2d(target_truth, target_reco, target_weights, bins)
+    mesh = axes[0, 1].pcolormesh(bins, bins, hist2d.T, cmap="Blues", shading="auto", vmin=0.0)
+    fig.colorbar(mesh, ax=axes[0, 1], fraction=0.046, pad=0.03, label="Entries")
+    axes[0, 1].plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
+    axes[0, 1].set_xlim(low, high)
+    axes[0, 1].set_ylim(low, high)
+    axes[0, 1].set_xlabel(f"Stored truth {observable}")
+    axes[0, 1].set_ylabel(f"Target missing + visible {observable}")
+    axes[0, 1].set_title("Truth vs target reco")
+    axes[0, 1].grid(alpha=0.16)
 
     if has_pred:
-        pred_hist2d = np.histogram2d(pred_truth, pred_reco, bins=[bins, bins], weights=pred_weights)[0].astype(np.float64)
-        pred_mesh = axes[2].pcolormesh(bins, bins, pred_hist2d.T, cmap="Blues", shading="auto", vmin=0.0)
-        fig.colorbar(pred_mesh, ax=axes[2], fraction=0.046, pad=0.03, label="Entries")
-        axes[2].plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
-        axes[2].set_xlim(low, high)
-        axes[2].set_ylim(low, high)
-        axes[2].set_xlabel(f"Stored truth {observable}")
-        axes[2].set_ylabel(f"Predicted missing + visible {observable}")
-        axes[2].set_title("Truth vs predicted reco")
-        axes[2].grid(alpha=0.16)
+        pred_hist2d = weighted_hist2d(pred_truth, pred_reco, pred_weights, bins)
+        pred_mesh = axes[0, 2].pcolormesh(bins, bins, pred_hist2d.T, cmap="Blues", shading="auto", vmin=0.0)
+        fig.colorbar(pred_mesh, ax=axes[0, 2], fraction=0.046, pad=0.03, label="Entries")
+        axes[0, 2].plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
+        axes[0, 2].set_xlim(low, high)
+        axes[0, 2].set_ylim(low, high)
+        axes[0, 2].set_xlabel(f"Stored truth {observable}")
+        axes[0, 2].set_ylabel(f"Predicted missing + visible {observable}")
+        axes[0, 2].set_title("Truth vs predicted reco")
+        axes[0, 2].grid(alpha=0.16)
+
+    if row_count == 2:
+        for axis, component in zip(axes[1], ("pt", "eta", "phi")):
+            truth_component = pred_neutrino_truth[component]
+            pred_component = pred_neutrino_pred[component]
+            if component == "phi":
+                component_low, component_high = -np.pi, np.pi
+            elif component == "eta":
+                merged_component = np.concatenate([truth_component, pred_component])
+                bound = max(float(np.nanpercentile(np.abs(merged_component), 99.5)), 1.0)
+                component_low, component_high = -bound, bound
+            else:
+                merged_component = np.concatenate([truth_component, pred_component])
+                component_low = 0.0
+                component_high = max(float(np.nanpercentile(merged_component, 99.5)), 1.0)
+            component_bins = np.linspace(component_low, component_high, 60)
+            component_hist2d = weighted_hist2d(truth_component, pred_component, pred_neutrino_weights, component_bins)
+            component_mesh = axis.pcolormesh(
+                component_bins,
+                component_bins,
+                component_hist2d.T,
+                cmap="Blues",
+                shading="auto",
+                vmin=0.0,
+            )
+            fig.colorbar(component_mesh, ax=axis, fraction=0.046, pad=0.03, label="Entries")
+            axis.plot([component_low, component_high], [component_low, component_high], color="black", linestyle="--", linewidth=1.0)
+            axis.set_xlim(component_low, component_high)
+            axis.set_ylim(component_low, component_high)
+            axis.set_xlabel(f"Truth neutrino {component}")
+            axis.set_ylabel(f"Pred neutrino {component}")
+            axis.set_title(f"Neutrino {component}")
+            axis.grid(alpha=0.16)
 
     fig.suptitle(observable)
     fig.tight_layout()
@@ -464,6 +518,9 @@ def main() -> None:
     collected_pred_truth: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
     collected_pred_reco: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
     collected_pred_weights: dict[str, list[np.ndarray]] = {observable: [] for observable in observables}
+    collected_pred_neutrino_truth: dict[str, list[np.ndarray]] = {component: [] for component in ("pt", "eta", "phi")}
+    collected_pred_neutrino_pred: dict[str, list[np.ndarray]] = {component: [] for component in ("pt", "eta", "phi")}
+    collected_pred_neutrino_weights: list[np.ndarray] = []
     rows_seen = 0
     rows_used = 0
 
@@ -485,6 +542,33 @@ def main() -> None:
                 continue
             rows_used += len(selected)
             weights = event_weights(selected, args.weight_field)
+            try:
+                pred_neutrino_truth_batch = {
+                    component: flattened_slot_feature(selected, "target_invisible", component)
+                    for component in ("pt", "eta", "phi")
+                }
+                pred_neutrino_pred_batch = {
+                    component: flattened_slot_feature(selected, "pred_invisible", component)
+                    for component in ("pt", "eta", "phi")
+                }
+                neutrino_weights_batch = np.repeat(weights, 2)
+                neutrino_finite = (
+                    np.isfinite(neutrino_weights_batch)
+                    & (neutrino_weights_batch > 0.0)
+                    & np.isfinite(pred_neutrino_truth_batch["pt"])
+                    & np.isfinite(pred_neutrino_truth_batch["eta"])
+                    & np.isfinite(pred_neutrino_truth_batch["phi"])
+                    & np.isfinite(pred_neutrino_pred_batch["pt"])
+                    & np.isfinite(pred_neutrino_pred_batch["eta"])
+                    & np.isfinite(pred_neutrino_pred_batch["phi"])
+                )
+                if np.any(neutrino_finite):
+                    for component in ("pt", "eta", "phi"):
+                        collected_pred_neutrino_truth[component].append(pred_neutrino_truth_batch[component][neutrino_finite])
+                        collected_pred_neutrino_pred[component].append(pred_neutrino_pred_batch[component][neutrino_finite])
+                    collected_pred_neutrino_weights.append(neutrino_weights_batch[neutrino_finite])
+            except Exception:
+                pass
             for observable in observables:
                 truth_field = f"truth_{observable}"
                 if truth_field not in selected.fields:
@@ -538,6 +622,23 @@ def main() -> None:
         pred_truth = None
         pred_reco = None
         pred_weights = None
+        pred_neutrino_truth = {
+            component: np.concatenate(chunks) if chunks else np.array([], dtype=np.float64)
+            for component, chunks in collected_pred_neutrino_truth.items()
+        }
+        pred_neutrino_pred = {
+            component: np.concatenate(chunks) if chunks else np.array([], dtype=np.float64)
+            for component, chunks in collected_pred_neutrino_pred.items()
+        }
+        pred_neutrino_weights = (
+            np.concatenate(collected_pred_neutrino_weights)
+            if collected_pred_neutrino_weights
+            else np.array([], dtype=np.float64)
+        )
+        if pred_neutrino_weights.size == 0:
+            pred_neutrino_truth = None
+            pred_neutrino_pred = None
+            pred_neutrino_weights = None
         if collected_pred_reco[observable]:
             pred_truth = np.concatenate(collected_pred_truth[observable])
             pred_reco = np.concatenate(collected_pred_reco[observable])
@@ -554,6 +655,9 @@ def main() -> None:
             pred_truth,
             pred_reco,
             pred_weights,
+            pred_neutrino_truth,
+            pred_neutrino_pred,
+            pred_neutrino_weights,
             args.normalize,
         )
         summary["observables"][observable]["plot"] = str(plot_path.relative_to(output_dir))
