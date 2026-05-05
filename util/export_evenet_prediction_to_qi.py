@@ -12,6 +12,7 @@ from typing import Any
 
 import awkward as ak
 import numpy as np
+import pyarrow.parquet as pq
 import vector
 
 
@@ -150,6 +151,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--write-truth-neutrino-copy",
+        action="store_true",
+        help=(
+            "Also write a truth-neutrino oracle method tree in config-driven export. "
+            "MC predicted rows use target_invisible as the missing neutrino; data falls back to the nominal prediction."
+        ),
+    )
+    parser.add_argument(
+        "--truth-qi-method-label",
+        dest="truth_qi_method_label",
+        default=None,
+        help=(
+            "Output method subdirectory for --write-truth-neutrino-copy. "
+            "Overrides EveNetPrediction.truth_qi_method_label; default is '<qi-method-label>_truth'."
+        ),
+    )
+    parser.add_argument(
         "--write-baseline-copy",
         action="store_true",
         help=(
@@ -189,6 +207,15 @@ def parse_args() -> argparse.Namespace:
             "awkward arrays into subprocesses. Use 'process' only if memory is sufficient."
         ),
     )
+    parser.add_argument(
+        "--raw-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Rows per raw parquet batch in config-driven export. Lower this to reduce peak memory. "
+            "If omitted, use EveNetPrediction.raw_batch_size/export_raw_batch_size or 100000."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -216,6 +243,10 @@ def resolve_parquet_inputs(path: Path) -> list[Path]:
 
 def load_single_events(path: Path) -> ak.Array:
     events = ak.from_parquet(path)
+    return rebuild_event_vectors(events)
+
+
+def rebuild_event_vectors(events: ak.Array) -> ak.Array:
     for field in events.fields:
         if field.endswith("_p4"):
             events[field] = rebuild_vector(events[field])
@@ -241,6 +272,27 @@ def load_concat_events(paths: list[str]) -> ak.Array:
         raise ValueError("No parquet paths were provided.")
     arrays = [load_events(Path(path)) for path in paths]
     return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
+
+
+def iter_parquet_event_batches(paths: list[str], batch_size: int):
+    """
+    inputs:
+      paths: list[str], parquet files.
+      batch_size: int, rows per pyarrow record batch.
+    outputs:
+      iterator over (path, batch_index, events).
+    goal:
+      Stream very large raw central parquets during QI export instead of
+      materializing a full sample in memory.
+    """
+    if batch_size < 1:
+        raise ValueError(f"raw batch size must be >= 1, got {batch_size}.")
+    for path_text in paths:
+        path = Path(path_text)
+        parquet = pq.ParquetFile(path)
+        for batch_index, record_batch in enumerate(parquet.iter_batches(batch_size=batch_size)):
+            events = rebuild_event_vectors(ak.from_arrow(record_batch))
+            yield path, batch_index, events
 
 
 def rebuild_vector(values: ak.Array) -> ak.Array:
@@ -521,18 +573,22 @@ def prediction_selection_mask(full_events: ak.Array) -> np.ndarray:
 def build_predicted_reconstruction(
     central_pred_events: ak.Array,
     pred_events: ak.Array,
+    missing_prefix: str = "pred_invisible",
+    method_name: str = "EveNet",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     inputs:
       central_pred_events: ak.Array, prediction rows after joining central parquet fields.
       pred_events: ak.Array, EveNet prediction rows with slot-level invisible p4.
+      missing_prefix: str, slot-level invisible field prefix to use.
+      method_name: str, value written to neutrino_method.
     outputs:
       tuple(output_fields, metrics):
         output_fields: dict[str, Any], central-schema reco p4, QI observables, and EveNet metadata.
         metrics: dict[str, Any], event counts and source bookkeeping for the export summary.
     goal:
-      Materialize EveNet predictions into the same a/b-leg reconstruction schema
-      used by central QI/unfolding code.
+      Materialize EveNet or oracle missing-neutrino inputs into the same a/b-leg
+      reconstruction schema used by central QI/unfolding code.
     """
     num_predicted_rows = len(pred_events)
 
@@ -559,8 +615,8 @@ def build_predicted_reconstruction(
         lead_a_visible, vis_valid_a = build_remapped_p4(pred_events, "tau_vis_prong", slot_for_a)
         lead_b_visible, vis_valid_b = build_remapped_p4(pred_events, "tau_vis_prong", slot_for_b)
         visible_source = "prediction_slots.tau_vis_prong"
-    lead_a_missing, pred_valid_a = build_remapped_p4(pred_events, "pred_invisible", slot_for_a)
-    lead_b_missing, pred_valid_b = build_remapped_p4(pred_events, "pred_invisible", slot_for_b)
+    lead_a_missing, pred_valid_a = build_remapped_p4(pred_events, missing_prefix, slot_for_a)
+    lead_b_missing, pred_valid_b = build_remapped_p4(pred_events, missing_prefix, slot_for_b)
     reco_tau_a = lead_a_visible + lead_a_missing
     reco_tau_b = lead_b_visible + lead_b_missing
     reco_tau_a = build_momentum4d_with_mass(reco_tau_a, mass=TAU_MASS)
@@ -596,7 +652,7 @@ def build_predicted_reconstruction(
         "reco_tau_b_p4": reco_tau_b,
         "flags_valid": flags_valid,
         "mmc_likelihood": np.zeros(num_predicted_rows, dtype=np.float32),
-        "neutrino_method": ak.Array(["EveNet"] * num_predicted_rows),
+        "neutrino_method": ak.Array([method_name] * num_predicted_rows),
         "evenet_has_prediction": np.ones(num_predicted_rows, dtype=bool),
         "evenet_slot_for_a": slot_for_a.astype(np.int8),
         "evenet_slot_for_b": slot_for_b.astype(np.int8),
@@ -621,6 +677,8 @@ def build_predicted_reconstruction(
         "valid_predicted_fraction": float(np.mean(flags_valid)) if len(flags_valid) else 0.0,
         "slot_alignment": "prediction_metadata_source_slot_for_a",
         "visible_source": visible_source,
+        "missing_source": missing_prefix,
+        "neutrino_method": method_name,
         "slot_swap_fraction": float(np.mean(slot_for_a == 0)) if len(slot_for_a) else 0.0,
         "median_deltaR_a": finite_median(delta_r_a),
         "median_deltaR_b": finite_median(delta_r_b),
@@ -717,8 +775,15 @@ def with_evenet_reconstruction(
     prediction_split_fraction: float | None,
     selected_full_indices: np.ndarray | None = None,
     zero_unpredicted_selected_mc: bool = False,
+    missing_prefix: str = "pred_invisible",
+    method_name: str = "EveNet",
 ) -> tuple[ak.Array, dict[str, Any]]:
-    pred_values, metrics = build_predicted_reconstruction(central_pred_events, pred_events)
+    pred_values, metrics = build_predicted_reconstruction(
+        central_pred_events,
+        pred_events,
+        missing_prefix=missing_prefix,
+        method_name=method_name,
+    )
     output = full_events
     columns = default_evenet_columns(full_events, pred_values)
     for field, base_values in columns.items():
@@ -853,6 +918,103 @@ def write_qi_tree(events: ak.Array, output_root: Path, sample_name: str, regions
         counts[region] = int(len(region_events))
         ak.to_parquet(region_events, sample_dir / f"filtered___{region}.parquet", compression="snappy")
     return counts
+
+
+def align_events_to_template(events: ak.Array, template: ak.Array) -> ak.Array:
+    output = events
+    for field in template.fields:
+        if field not in output.fields:
+            output[field] = default_field_like(template[field], len(output))
+    return ak.Array({field: output[field] for field in template.fields})
+
+
+def events_to_arrow_table(events: ak.Array):
+    return ak.to_arrow_table(events, extensionarray=False)
+
+
+class QIParquetChunkWriter:
+    """
+    Append QI export chunks to the usual single-file output paths.
+
+    The first appended chunk fixes the parquet schema. Later chunks are aligned
+    to that schema before writing so raw complement batches and predicted rows
+    can be streamed without holding the full sample in memory.
+    """
+
+    def __init__(self, output_root: Path, sample_name: str, regions: list[str], compression: str = "snappy") -> None:
+        self.sample_dir = output_root / sample_name
+        self.sample_dir.mkdir(parents=True, exist_ok=True)
+        self.regions = list(regions)
+        self.compression = compression
+        self.template: ak.Array | None = None
+        self.raw_writer: pq.ParquetWriter | None = None
+        self.region_writers: dict[str, pq.ParquetWriter] = {}
+        self.region_seen: set[str] = set()
+        self.counts: dict[str, int] = {"raw": 0}
+
+    def _prepare(self, events: ak.Array) -> ak.Array:
+        events = add_evenet_region_cut_fields(events, self.regions)
+        parquet_events = prepare_events_for_parquet(events)
+        if self.template is None:
+            self.template = parquet_events[:0]
+            return parquet_events
+        return align_events_to_template(parquet_events, self.template)
+
+    def _write_table(self, path: Path, writer_name: str, events: ak.Array) -> None:
+        table = events_to_arrow_table(events)
+        if writer_name == "raw":
+            if self.raw_writer is None:
+                self.raw_writer = pq.ParquetWriter(path, table.schema, compression=self.compression)
+            self.raw_writer.write_table(table)
+            return
+
+        writer = self.region_writers.get(writer_name)
+        if writer is None:
+            writer = pq.ParquetWriter(path, table.schema, compression=self.compression)
+            self.region_writers[writer_name] = writer
+        writer.write_table(table)
+
+    def append(self, events: ak.Array) -> None:
+        parquet_events = self._prepare(events)
+        raw_path = self.sample_dir / "filtered___raw.parquet"
+        self.counts["raw"] += int(len(parquet_events))
+        if len(parquet_events) > 0:
+            self._write_table(raw_path, "raw", parquet_events)
+
+        for region in self.regions:
+            if region == "raw":
+                continue
+            cut_field = f"{region}_cut"
+            if cut_field not in parquet_events.fields:
+                continue
+            self.region_seen.add(region)
+            region_events = parquet_events[parquet_events[cut_field] == 1]
+            self.counts[region] = self.counts.get(region, 0) + int(len(region_events))
+            if len(region_events) > 0:
+                self._write_table(self.sample_dir / f"filtered___{region}.parquet", region, region_events)
+
+    def close(self) -> dict[str, int]:
+        if self.raw_writer is not None:
+            self.raw_writer.close()
+        elif self.template is not None:
+            pq.write_table(
+                events_to_arrow_table(self.template),
+                self.sample_dir / "filtered___raw.parquet",
+                compression=self.compression,
+            )
+
+        for region, writer in self.region_writers.items():
+            writer.close()
+        if self.template is not None:
+            empty_table = events_to_arrow_table(self.template)
+            for region in self.region_seen:
+                if region not in self.region_writers:
+                    pq.write_table(
+                        empty_table,
+                        self.sample_dir / f"filtered___{region}.parquet",
+                        compression=self.compression,
+                    )
+        return dict(self.counts)
 
 
 def robust_event_keys(events: ak.Array) -> np.ndarray:
@@ -1080,11 +1242,34 @@ def config_num_workers(args: argparse.Namespace, analysis_cfg: dict) -> int:
     return max(1, int(value)) if value is not None else 1
 
 
+def config_raw_batch_size(args: argparse.Namespace, analysis_cfg: dict) -> int:
+    if args.raw_batch_size is not None:
+        return max(1, int(args.raw_batch_size))
+    pred_cfg = analysis_cfg.get("EveNetPrediction", {})
+    value = pred_cfg.get("raw_batch_size") or pred_cfg.get("export_raw_batch_size")
+    return max(1, int(value)) if value is not None else 100_000
+
+
 def config_worker_backend(args: argparse.Namespace, analysis_cfg: dict) -> str:
     if args.worker_backend is not None:
         return args.worker_backend
     pred_cfg = analysis_cfg.get("EveNetPrediction", {})
     return str(pred_cfg.get("worker_backend") or pred_cfg.get("export_worker_backend") or "thread")
+
+
+def config_write_truth_neutrino_copy(args: argparse.Namespace, analysis_cfg: dict) -> bool:
+    if bool(args.write_truth_neutrino_copy):
+        return True
+    pred_cfg = analysis_cfg.get("EveNetPrediction", {})
+    return bool(pred_cfg.get("write_truth_neutrino_copy", False))
+
+
+def config_truth_qi_method_label(args: argparse.Namespace, analysis_cfg: dict, output_label: str) -> str:
+    if args.truth_qi_method_label is not None:
+        return str(args.truth_qi_method_label)
+    pred_cfg = analysis_cfg.get("EveNetPrediction", {})
+    value = pred_cfg.get("truth_qi_method_label")
+    return str(value) if value is not None else f"{output_label}_truth"
 
 
 def print_progress(label: str, done: int, total: int, detail: str = "") -> None:
@@ -1143,6 +1328,8 @@ def build_concat_prediction_rows(
     pred_events: ak.Array,
     prediction_split_fraction: float | None,
     is_data: bool,
+    missing_prefix: str = "pred_invisible",
+    method_name: str = "EveNet",
 ) -> tuple[ak.Array, dict[str, Any]]:
     if len(pred_events) == 0:
         raise ValueError("Prediction parquet group is empty; cannot build concat rows.")
@@ -1165,12 +1352,15 @@ def build_concat_prediction_rows(
         prediction_split_fraction=prediction_split_fraction,
         selected_full_indices=full_indices,
         zero_unpredicted_selected_mc=False,
+        missing_prefix=missing_prefix,
+        method_name=method_name,
     )
 
 
 def build_concat_raw_complement_rows(
     raw_events: ak.Array,
     pred_template_events: ak.Array,
+    method_name: str = "EveNet_default",
 ) -> tuple[ak.Array, dict[str, Any]]:
     compact_raw = build_compact_base_events(raw_events)
     return with_evenet_reconstruction(
@@ -1181,6 +1371,7 @@ def build_concat_raw_complement_rows(
         prediction_split_fraction=None,
         selected_full_indices=None,
         zero_unpredicted_selected_mc=False,
+        method_name=method_name,
     )
 
 
@@ -1192,17 +1383,11 @@ def export_config_group(
     regions: list[str],
     prediction_split_fraction: float | None,
     output_label: str,
+    raw_batch_size: int,
+    truth_output_label: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     print(f"[export-evenet-to-qi] worker {os.getpid()} start {parent_name}", flush=True)
     raw_files = sample_raw_files(analysis_cfg, group["parent_key"], parent_name)
-    full_events = load_concat_events(raw_files)
-    selected_mask = prediction_selection_mask(full_events)
-    outside_selected_events = full_events[~selected_mask]
-    print(
-        f"[export-evenet-to-qi] worker {os.getpid()} loaded {parent_name} raw_events={len(full_events)} "
-        f"selected_for_prediction={int(np.sum(selected_mask))} outside_selected={len(outside_selected_events)}",
-        flush=True,
-    )
     split_fraction = None if group["is_data"] else prediction_split_fraction
     pred_group = ak.concatenate(group["pred_parts"], axis=0) if len(group["pred_parts"]) > 1 else group["pred_parts"][0]
     predicted_events, predicted_metrics = build_concat_prediction_rows(
@@ -1210,40 +1395,124 @@ def export_config_group(
         prediction_split_fraction=split_fraction,
         is_data=group["is_data"],
     )
-    outside_events, outside_metrics = build_concat_raw_complement_rows(
-        raw_events=outside_selected_events,
-        pred_template_events=pred_group,
+    truth_predicted_events = None
+    truth_predicted_metrics = None
+    if truth_output_label is not None:
+        truth_missing_prefix = "pred_invisible" if group["is_data"] else "target_invisible"
+        truth_method_name = "TruthNeutrinoDataFallback" if group["is_data"] else "TruthNeutrino"
+        truth_predicted_events, truth_predicted_metrics = build_concat_prediction_rows(
+            pred_events=pred_group,
+            prediction_split_fraction=split_fraction,
+            is_data=group["is_data"],
+            missing_prefix=truth_missing_prefix,
+            method_name=truth_method_name,
+        )
+
+    writer = QIParquetChunkWriter(output_root / output_label, parent_name, regions)
+    truth_writer = (
+        QIParquetChunkWriter(output_root / truth_output_label, parent_name, regions)
+        if truth_output_label is not None
+        else None
     )
-    outside_events, predicted_events = align_fields_for_concat([outside_events, predicted_events])
-    evenet_events = ak.concatenate([outside_events, predicted_events], axis=0)
+    raw_events_total = 0
+    raw_selected_total = 0
+    raw_outside_total = 0
+    raw_batch_count = 0
+    wrote_predicted_rows = False
+
+    for raw_path, batch_index, raw_events in iter_parquet_event_batches(raw_files, raw_batch_size):
+        raw_batch_count += 1
+        raw_events_total += int(len(raw_events))
+        selected_mask = prediction_selection_mask(raw_events)
+        selected_count = int(np.sum(selected_mask))
+        raw_selected_total += selected_count
+        outside_raw = raw_events[~selected_mask]
+        raw_outside_total += int(len(outside_raw))
+        if batch_index == 0 or raw_batch_count % 25 == 0:
+            print(
+                f"[export-evenet-to-qi] worker {os.getpid()} raw batch {parent_name} "
+                f"path={Path(raw_path).name} batch={batch_index} rows={len(raw_events)} "
+                f"selected={selected_count} outside={len(outside_raw)}",
+                flush=True,
+            )
+        if len(outside_raw) == 0:
+            continue
+
+        outside_events, _outside_metrics = build_concat_raw_complement_rows(
+            raw_events=outside_raw,
+            pred_template_events=pred_group,
+        )
+        if not wrote_predicted_rows:
+            outside_events, predicted_events = align_fields_for_concat([outside_events, predicted_events])
+            writer.append(outside_events)
+            writer.append(predicted_events)
+            if truth_writer is not None and truth_predicted_events is not None:
+                truth_outside_events, truth_predicted_events = align_fields_for_concat(
+                    [outside_events, truth_predicted_events]
+                )
+                truth_writer.append(truth_outside_events)
+                truth_writer.append(truth_predicted_events)
+            wrote_predicted_rows = True
+        else:
+            writer.append(outside_events)
+            if truth_writer is not None:
+                truth_writer.append(outside_events)
+
+    if not wrote_predicted_rows:
+        writer.append(predicted_events)
+        if truth_writer is not None and truth_predicted_events is not None:
+            truth_writer.append(truth_predicted_events)
+        wrote_predicted_rows = True
+
+    counts = writer.close()
+    truth_counts = truth_writer.close() if truth_writer is not None else None
     metrics = {
-        "num_raw_events": int(len(full_events)),
-        "num_raw_outside_selected": int(len(outside_events)),
+        "num_raw_events": int(raw_events_total),
+        "num_raw_selected_for_prediction": int(raw_selected_total),
+        "num_raw_outside_selected": int(raw_outside_total),
         "num_predicted_events": int(len(predicted_events)),
         "prediction_split_fraction": split_fraction,
         "prediction_parquet_rows": int(len(pred_group)),
-        "concat_mode": "raw_outside_selected_plus_prediction_rows",
+        "concat_mode": "streamed_raw_outside_selected_plus_prediction_rows",
+        "raw_batch_size": int(raw_batch_size),
+        "raw_num_batches": int(raw_batch_count),
+        "raw_files": raw_files,
         "prediction_metrics": predicted_metrics,
-        "outside_selected_metrics": outside_metrics,
+        "truth_neutrino_oracle": (
+            {
+                "output_label": truth_output_label,
+                "region_counts": truth_counts,
+                "prediction_metrics": truth_predicted_metrics,
+                "data_fallback_to_prediction": bool(group["is_data"]),
+            }
+            if truth_output_label is not None
+            else None
+        ),
+        "outside_selected_metrics": {
+            "num_raw_events": int(raw_outside_total),
+            "num_events_with_prediction": 0,
+            "valid_events": 0,
+            "valid_fraction": 0.0,
+        },
     }
     print(
-        f"[export-evenet-to-qi] worker {os.getpid()} concat {parent_name} raw_outside={len(outside_events)} "
-        f"predicted={len(predicted_events)} total={len(evenet_events)}",
+        f"[export-evenet-to-qi] worker {os.getpid()} streamed {parent_name} raw={raw_events_total} "
+        f"raw_outside={raw_outside_total} predicted={len(predicted_events)} "
+        f"total={counts.get('raw', 0)}",
         flush=True,
     )
-    sample_output_root = output_root / output_label
-    counts = write_qi_tree(evenet_events, sample_output_root, parent_name, regions)
     print(f"[export-evenet-to-qi] worker {os.getpid()} wrote {parent_name}", flush=True)
     metrics["region_counts"] = counts
     metrics["parent_sample"] = parent_name
     metrics["expanded_samples"] = group["expanded_samples"]
-    metrics["raw_files"] = raw_files
     metrics["is_data"] = group["is_data"]
     metrics["worker_pid"] = os.getpid()
     return parent_name, metrics
 
 
-def export_config_group_worker(payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str]) -> tuple[str, dict[str, Any]]:
+def export_config_group_worker(
+    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, str | None],
+) -> tuple[str, dict[str, Any]]:
     return export_config_group(*payload)
 
 
@@ -1258,6 +1527,8 @@ def export_config_prediction(
     summary_label: str,
     num_workers: int,
     worker_backend: str,
+    raw_batch_size: int,
+    truth_output_label: str | None,
 ) -> dict[str, Any]:
     pred_events = load_events(pred_path)
     require_source_columns(pred_events, pred_path)
@@ -1311,12 +1582,24 @@ def export_config_prediction(
                 regions=regions,
                 prediction_split_fraction=prediction_split_fraction,
                 output_label=output_label,
+                raw_batch_size=raw_batch_size,
+                truth_output_label=truth_output_label,
             )
             summary["samples"][parent_name] = metrics
             print_progress(f"{summary_label} export", done, total_groups, parent_name)
     else:
         payloads = [
-            (parent_name, group, analysis_cfg, output_root, regions, prediction_split_fraction, output_label)
+            (
+                parent_name,
+                group,
+                analysis_cfg,
+                output_root,
+                regions,
+                prediction_split_fraction,
+                output_label,
+                raw_batch_size,
+                truth_output_label,
+            )
             for parent_name, group in group_items
         ]
         executor_class = ProcessPoolExecutor if backend == "process" else ThreadPoolExecutor
@@ -1351,6 +1634,9 @@ def run_config_mode(args: argparse.Namespace) -> None:
     split_fraction = config_split_fraction(args, analysis_cfg)
     num_workers = config_num_workers(args, analysis_cfg)
     worker_backend = config_worker_backend(args, analysis_cfg)
+    raw_batch_size = config_raw_batch_size(args, analysis_cfg)
+    write_truth_copy = config_write_truth_neutrino_copy(args, analysis_cfg)
+    truth_output_label = config_truth_qi_method_label(args, analysis_cfg, output_label) if write_truth_copy else None
 
     summaries: dict[str, Any] = {}
     if mc_pred is not None:
@@ -1365,6 +1651,8 @@ def run_config_mode(args: argparse.Namespace) -> None:
             summary_label="mc",
             num_workers=num_workers,
             worker_backend=worker_backend,
+            raw_batch_size=raw_batch_size,
+            truth_output_label=truth_output_label,
         )
     if data_pred is not None:
         summaries["data"] = export_config_prediction(
@@ -1378,6 +1666,8 @@ def run_config_mode(args: argparse.Namespace) -> None:
             summary_label="data",
             num_workers=num_workers,
             worker_backend=worker_backend,
+            raw_batch_size=raw_batch_size,
+            truth_output_label=truth_output_label,
         )
     if not summaries:
         raise ValueError(

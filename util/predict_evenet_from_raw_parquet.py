@@ -198,6 +198,11 @@ def parse_args() -> argparse.Namespace:
         help="Merge existing .part*.parquet outputs and exit without loading checkpoints or running inference.",
     )
     parser.add_argument(
+        "--delete-merged-parts",
+        action="store_true",
+        help="After a successful merge, delete .part*.parquet chunk files. Defaults to keeping parts.",
+    )
+    parser.add_argument(
         "--converted-split-fraction",
         type=float,
         default=None,
@@ -1137,7 +1142,7 @@ def signal_class_names_from_analysis(analysis_config_path: Path) -> set[str]:
     return signal_names
 
 
-def merge_converted_chunk_outputs(tasks: list[InferenceTask]) -> None:
+def merge_converted_chunk_outputs(tasks: list[InferenceTask], delete_parts: bool = False) -> None:
     grouped_tasks: dict[str, list[InferenceTask]] = {}
     for task in tasks:
         final_output_path = task.final_output_path or task.output_path
@@ -1148,19 +1153,34 @@ def merge_converted_chunk_outputs(tasks: list[InferenceTask]) -> None:
             continue
 
         chunk_paths = [Path(task.output_path) for task in sorted(group, key=lambda item: item.event_start or 0)]
+        final_path = Path(final_output_path)
+        missing_chunk_paths = [chunk_path for chunk_path in chunk_paths if not chunk_path.exists()]
+        if missing_chunk_paths:
+            if final_path.exists():
+                print(
+                    f"[converted-merge] skipped {final_path}; final output already exists "
+                    f"and {len(missing_chunk_paths)}/{len(chunk_paths)} chunk(s) are absent",
+                    flush=True,
+                )
+                continue
+            missing_preview = ", ".join(str(path) for path in missing_chunk_paths[:5])
+            raise FileNotFoundError(
+                f"Cannot merge {final_path}; missing {len(missing_chunk_paths)}/{len(chunk_paths)} chunk file(s): "
+                f"{missing_preview}"
+            )
         arrays = [ak.from_parquet(chunk_path) for chunk_path in chunk_paths]
         merged = ak.concatenate(arrays, axis=0) if len(arrays) > 1 else arrays[0]
         order = np.argsort(ak.to_numpy(merged["event_index"], allow_missing=False))
         merged = merged[order]
 
-        final_path = Path(final_output_path)
         final_path.parent.mkdir(parents=True, exist_ok=True)
         ak.to_parquet(merged, final_path)
         print(f"[converted-merge] wrote {final_path} from {len(chunk_paths)} chunk(s)", flush=True)
 
-        for chunk_path in chunk_paths:
-            if chunk_path != final_path and chunk_path.exists():
-                chunk_path.unlink()
+        if delete_parts:
+            for chunk_path in chunk_paths:
+                if chunk_path != final_path and chunk_path.exists():
+                    chunk_path.unlink()
 
 
 def worker_main(
@@ -1228,7 +1248,14 @@ def main() -> None:
     )
 
     if args.merge_only:
-        merge_converted_chunk_outputs(all_tasks)
+        if args.task_num_shards > 1 and args.task_shard_index != 0:
+            print(
+                f"[converted-merge] skipped on shard {args.task_shard_index}; "
+                "run merge once from shard 0 to avoid duplicate merge work",
+                flush=True,
+            )
+            return
+        merge_converted_chunk_outputs(all_tasks, delete_parts=args.delete_merged_parts)
         return
 
     runtime_train_config = prepare_runtime_train_config(
@@ -1344,7 +1371,7 @@ def main() -> None:
         if args.skip_merge or args.task_num_shards > 1:
             print("[converted-merge] skipped; run again with --merge-only after all shards finish", flush=True)
         else:
-            merge_converted_chunk_outputs(tasks)
+            merge_converted_chunk_outputs(tasks, delete_parts=args.delete_merged_parts)
         return
 
     mp.spawn(
@@ -1370,7 +1397,7 @@ def main() -> None:
     if args.skip_merge or args.task_num_shards > 1:
         print("[converted-merge] skipped; run again with --merge-only after all shards finish", flush=True)
     else:
-        merge_converted_chunk_outputs(tasks)
+        merge_converted_chunk_outputs(tasks, delete_parts=args.delete_merged_parts)
 
 
 if __name__ == "__main__":

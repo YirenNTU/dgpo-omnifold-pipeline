@@ -265,6 +265,14 @@ def reco_tau_observable_specs(requested: list[str] | None = None) -> list[tuple[
     return [(name, observable_latex_label(name)) for name in names]
 
 
+def visible_tau_observable_specs(requested: list[str] | None = None) -> list[tuple[str, str]]:
+    names = requested or [
+        *(f"lead_a_visible_{component}" for component in ("E", "px", "py", "pz", "pt", "eta", "phi", "mass")),
+        *(f"lead_b_visible_{component}" for component in ("E", "px", "py", "pz", "pt", "eta", "phi", "mass")),
+    ]
+    return [(name, observable_latex_label(name)) for name in names]
+
+
 def observable_latex_label(name: str) -> str:
     if name == "theta_cm":
         return r"$2\arccos|\cos\theta_{\mathrm{CM}}|/\pi$"
@@ -293,6 +301,12 @@ def observable_latex_label(name: str) -> str:
     if name.startswith("reco_tau_b_"):
         component = name.removeprefix("reco_tau_b_")
         return reco_tau_component_label("b", component)
+    if name.startswith("lead_a_visible_"):
+        component = name.removeprefix("lead_a_visible_")
+        return visible_tau_component_label("a", component)
+    if name.startswith("lead_b_visible_"):
+        component = name.removeprefix("lead_b_visible_")
+        return visible_tau_component_label("b", component)
     return name.replace("_", " ")
 
 
@@ -323,6 +337,21 @@ def reco_tau_component_label(leg: str, component: str) -> str:
     }
     rendered = label_map.get(component, component)
     return rf"${rendered}(\tau_{{{leg}}}^{{reco}})$"
+
+
+def visible_tau_component_label(leg: str, component: str) -> str:
+    label_map = {
+        "E": "E",
+        "px": "p_x",
+        "py": "p_y",
+        "pz": "p_z",
+        "pt": "p_T",
+        "eta": r"\eta",
+        "phi": r"\phi",
+        "mass": "m",
+    }
+    rendered = label_map.get(component, component)
+    return rf"${rendered}(\tau_{{{leg}}}^{{vis}})$"
 
 
 def is_spin_observable(name: str) -> bool:
@@ -673,6 +702,44 @@ def truth_tau_p4(events: ak.Array, leg: str) -> ak.Array | None:
     return None
 
 
+def truth_visible_p4(events: ak.Array, leg: str) -> ak.Array | None:
+    """
+    inputs:
+      events: ak.Array, exported parquet events.
+      leg: str, "a" or "b".
+    outputs:
+      Momentum4D array for truth visible tau p4, or None if unavailable.
+    goal:
+      Monitor the visible tau inputs independently from neutrino reconstruction.
+    """
+    field = f"truth_visible_{leg}_p4"
+    return events[field] if field in events.fields else None
+
+
+def reco_with_truth_neutrino_p4(events: ak.Array, leg: str) -> ak.Array | None:
+    """
+    inputs:
+      events: ak.Array, exported parquet events.
+      leg: str, "a" or "b".
+    outputs:
+      Momentum4D tau p4 built from current visible input plus truth neutrino.
+    goal:
+      Provide an upper-limit reconstruction that keeps visible-input effects
+      but removes neutrino-regression errors.
+    """
+    fields = set(events.fields)
+    visible_field = f"lead_{leg}_visible_p4"
+    if visible_field not in fields:
+        return None
+    truth_missing_field = f"truth_missing_{leg}_p4"
+    if truth_missing_field in fields:
+        return events[visible_field] + events[truth_missing_field]
+    remapped_missing = remapped_slot_p4(events, "target_invisible", leg)
+    if remapped_missing is not None:
+        return events[visible_field] + remapped_missing
+    return None
+
+
 def truth_tau_requirements(fields: set[str], leg: str) -> str:
     """
     inputs:
@@ -835,8 +902,8 @@ def render_grouped_truth_reco_panels(
       dict[(str, str), str], relative combined-plot path by group key.
     goal:
       Produce one diagnostic figure per similar channel and observable, with
-      the 1D truth/reco comparison on the left and the 2D truth-vs-reco view
-      on the right.
+      the 1D truth/reco comparison on the left and one 2D truth-vs-reco block
+      per method/region to the right.
     """
     combined_dir = output_root / "combined"
     combined_dir.mkdir(parents=True, exist_ok=True)
@@ -846,18 +913,31 @@ def render_grouped_truth_reco_panels(
         if not records:
             continue
 
-        fig, (ax1d, ax2d) = plt.subplots(
+        num_2d_blocks = max(1, len(records))
+        fig_width = max(13.2, 5.4 + 3.35 * num_2d_blocks)
+        fig, axes = plt.subplots(
             1,
-            2,
-            figsize=(13.2, 5.4),
+            1 + num_2d_blocks,
+            figsize=(fig_width, 5.4),
             dpi=180,
-            gridspec_kw={"width_ratios": [1.05, 1.0]},
+            gridspec_kw={"width_ratios": [1.25, *([1.0] * num_2d_blocks)]},
         )
+        ax1d = axes[0]
+        axes2d = list(axes[1:])
         all_lows = [record["limits"][0] for record in records if record.get("limits") is not None]
         all_highs = [record["limits"][1] for record in records if record.get("limits") is not None]
         plot_low = float(np.nanmin(all_lows)) if all_lows else -1.0
         plot_high = float(np.nanmax(all_highs)) if all_highs else 1.0
         xlabel = records[0]["xlabel"]
+        hist2d_max = max(
+            (
+                float(np.nanmax(record["hist2d"]))
+                for record in records
+                if record.get("hist2d") is not None and np.any(np.isfinite(record["hist2d"]))
+            ),
+            default=0.0,
+        )
+        colorbar_mesh = None
 
         legend_handles: list[Line2D] = []
         for index, record in enumerate(records):
@@ -887,33 +967,38 @@ def render_grouped_truth_reco_panels(
             )
 
             hist2d = record.get("hist2d")
+            ax2d = axes2d[index]
             if hist2d is not None and np.nanmax(hist2d) > 0:
-                x_centers = record["centers"]
-                y_centers = record["centers"]
-                positive = hist2d[hist2d > 0]
-                if positive.size > 0:
-                    if len(records) == 1:
-                        mesh = ax2d.pcolormesh(
-                            record["edges"],
-                            record["edges"],
-                            hist2d.T,
-                            cmap="Blues",
-                            shading="auto",
-                        )
-                        fig.colorbar(mesh, ax=ax2d, label="Normalized yield" if normalize else "Weighted yield")
-                    else:
-                        levels = np.quantile(positive, [0.55, 0.8])
-                        levels = np.unique(levels[levels > 0])
-                        if levels.size > 0:
-                            ax2d.contour(
-                                x_centers,
-                                y_centers,
-                                hist2d.T,
-                                levels=levels,
-                                colors=[color],
-                                linewidths=1.25,
-                                alpha=0.9,
-                            )
+                colorbar_mesh = ax2d.pcolormesh(
+                    record["edges"],
+                    record["edges"],
+                    hist2d.T,
+                    cmap="Blues",
+                    shading="auto",
+                    vmin=0.0,
+                    vmax=hist2d_max if hist2d_max > 0 else None,
+                )
+            else:
+                ax2d.text(
+                    0.5,
+                    0.5,
+                    "No 2D entries",
+                    transform=ax2d.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                )
+            ax2d.plot([plot_low, plot_high], [plot_low, plot_high], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.0)
+            ax2d.set_xlim(plot_low, plot_high)
+            ax2d.set_ylim(plot_low, plot_high)
+            ax2d.set_xlabel(f"Truth {xlabel}")
+            if index == 0:
+                ax2d.set_ylabel(f"Reco {xlabel}")
+            else:
+                ax2d.set_ylabel("")
+                ax2d.tick_params(labelleft=False)
+            ax2d.grid(alpha=0.18)
+            ax2d.set_title(label, fontsize=9)
             legend_handles.append(
                 Line2D(
                     [0],
@@ -932,18 +1017,19 @@ def render_grouped_truth_reco_panels(
         ax1d.plot([], [], color=OKABE_ITO_BLACK, linestyle="--", label="Truth")
         ax1d.plot([], [], color=OKABE_ITO_BLACK, linestyle="-", label="Reco")
 
-        ax2d.plot([plot_low, plot_high], [plot_low, plot_high], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.1)
-        ax2d.set_xlim(plot_low, plot_high)
-        ax2d.set_ylim(plot_low, plot_high)
-        ax2d.set_xlabel(f"Truth {xlabel}")
-        ax2d.set_ylabel(f"Reco {xlabel}")
-        ax2d.grid(alpha=0.18)
-        ax2d.set_title("2D truth vs reco")
+        if colorbar_mesh is not None:
+            fig.colorbar(
+                colorbar_mesh,
+                ax=axes2d,
+                label="Normalized yield" if normalize else "Weighted yield",
+                shrink=0.86,
+                pad=0.012,
+            )
 
         fig.suptitle(f"{broad_region_label(channel_group)}: {xlabel}", y=0.90)
         style_handles = [
             Line2D([0], [0], color=OKABE_ITO_BLACK, linestyle="--", linewidth=1.5, label="Truth 1D"),
-            Line2D([0], [0], color=OKABE_ITO_BLACK, linestyle="-", linewidth=1.5, label="Reco 1D / 2D contour"),
+            Line2D([0], [0], color=OKABE_ITO_BLACK, linestyle="-", linewidth=1.5, label="Reco 1D"),
         ]
         fig.legend(
             handles=style_handles + legend_handles,
@@ -1013,6 +1099,7 @@ def plot_truth_vs_reco_by_method_and_region(
     reco_observable_source: str,
     subdir_name: str = "truth_vs_reco",
     log_label: str = "truth-vs-reco",
+    require_reco_valid_flags: bool = True,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     truth_dir = output_dir / subdir_name
@@ -1097,7 +1184,7 @@ def plot_truth_vs_reco_by_method_and_region(
                 truth_mask = valid_truth_reco_mask(truth_values_full, truth_values_full, weights_full)
                 valid_mask = valid_truth_reco_mask(truth_values_full, reco_values_full, weights_full)
                 reco_event_mask = valid_reco_event_mask(events)
-                if reco_event_mask is not None:
+                if reco_event_mask is not None and require_reco_valid_flags:
                     truth_mask &= reco_event_mask
                     valid_mask &= reco_event_mask
                 if not np.any(truth_mask):
@@ -1231,24 +1318,72 @@ def run_truth_reco_plot_block(task: dict[str, Any]) -> tuple[str, dict[str, Any]
         reco_observable_source=task["reco_observable_source"],
         subdir_name=task["subdir_name"],
         log_label=task["log_label"],
+        require_reco_valid_flags=task.get("require_reco_valid_flags", True),
     )
     return task["key"], summary
 
 
 def truth_reco_observable_values(events: ak.Array, observable: str, source_mode: str = "auto") -> np.ndarray | None:
-    if source_mode not in {"auto", "stored", "recompute"}:
+    if source_mode not in {"auto", "stored", "recompute", "truth-neutrino"}:
         raise ValueError(f"Unsupported reco observable source mode '{source_mode}'.")
 
     if source_mode in {"auto", "stored"} and observable in events.fields:
         return to_numpy(events[observable], np.float64)
     if source_mode == "stored":
         return None
+    if source_mode == "truth-neutrino":
+        if observable.startswith("lead_") and "_missing_" in observable:
+            parts = observable.split("_")
+            if len(parts) >= 4:
+                leg = parts[1]
+                component = parts[-1]
+                field = f"truth_missing_{leg}_p4"
+                if field in events.fields:
+                    return missing_p4_component_values(events[field], component)
+                remapped = remapped_slot_p4(events, "target_invisible", leg)
+                if remapped is not None:
+                    return missing_p4_component_values(remapped, component)
+            return None
+        if observable.startswith("reco_tau_"):
+            parts = observable.split("_")
+            if len(parts) >= 4:
+                leg = parts[2]
+                component = parts[-1]
+                tau_p4 = reco_with_truth_neutrino_p4(events, leg)
+                if tau_p4 is not None:
+                    return missing_p4_component_values(tau_p4, component)
+            return None
+        required_visible = {"lead_a_visible_p4", "lead_b_visible_p4"}
+        if not required_visible.issubset(set(events.fields)):
+            return None
+        tau_a = reco_with_truth_neutrino_p4(events, "a")
+        tau_b = reco_with_truth_neutrino_p4(events, "b")
+        if tau_a is None or tau_b is None:
+            return None
+        observables = build_observables(
+            tau_a,
+            tau_b,
+            events["lead_a_visible_p4"],
+            events["lead_b_visible_p4"],
+        )
+        if observable not in observables:
+            return None
+        return to_numpy(observables[observable], np.float64)
     if observable.startswith("lead_") and "_missing_" in observable:
         parts = observable.split("_")
         if len(parts) >= 4:
             leg = parts[1]
             component = parts[-1]
             field = f"lead_{leg}_missing_p4"
+            if field in events.fields:
+                return missing_p4_component_values(events[field], component)
+        return None
+    if observable.startswith("lead_") and "_visible_" in observable:
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[1]
+            component = parts[-1]
+            field = f"lead_{leg}_visible_p4"
             if field in events.fields:
                 return missing_p4_component_values(events[field], component)
         return None
@@ -1292,6 +1427,15 @@ def truth_observable_values(events: ak.Array, observable: str) -> np.ndarray | N
             if remapped is not None:
                 return missing_p4_component_values(remapped, component)
         return None
+    if observable.startswith("lead_") and "_visible_" in observable:
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[1]
+            component = parts[-1]
+            truth_visible = truth_visible_p4(events, leg)
+            if truth_visible is not None:
+                return missing_p4_component_values(truth_visible, component)
+        return None
     if observable.startswith("reco_tau_"):
         parts = observable.split("_")
         if len(parts) >= 4:
@@ -1326,11 +1470,40 @@ def reco_observable_requirements(events: ak.Array, observable: str, source_mode:
         return "stored column available"
     if source_mode == "stored":
         return f"missing stored column '{observable}'"
+    if source_mode == "truth-neutrino":
+        if observable.startswith("lead_") and "_missing_" in observable:
+            parts = observable.split("_")
+            if len(parts) >= 4:
+                leg = parts[1]
+                field = f"truth_missing_{leg}_p4"
+                if field in fields:
+                    return f"truth-neutrino field '{field}' available"
+                missing = [field_name for field_name in target_invisible_slot_fields(leg) if field_name not in fields]
+                if missing:
+                    return f"missing truth-neutrino field '{field}' and slot fallback fields {missing}"
+                return f"using slot fallback target_invisible + source_slot_for_{leg}"
+        required = ["lead_a_visible_p4", "lead_b_visible_p4", "truth_missing_a_p4", "truth_missing_b_p4"]
+        missing = [field for field in required if field not in fields]
+        if missing:
+            slot_missing = [
+                field_name
+                for leg in ("a", "b")
+                for field_name in target_invisible_slot_fields(leg)
+                if field_name not in fields
+            ]
+            return f"missing truth-neutrino recompute fields {missing}; slot fallback missing {slot_missing}"
+        return "truth-neutrino recompute fields available"
     if observable.startswith("lead_") and "_missing_" in observable:
         parts = observable.split("_")
         if len(parts) >= 4:
             leg = parts[1]
             field = f"lead_{leg}_missing_p4"
+            return f"required field '{field}' {'available' if field in fields else 'missing'}"
+    if observable.startswith("lead_") and "_visible_" in observable:
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[1]
+            field = f"lead_{leg}_visible_p4"
             return f"required field '{field}' {'available' if field in fields else 'missing'}"
     if observable.startswith("reco_tau_"):
         parts = observable.split("_")
@@ -1361,6 +1534,12 @@ def truth_observable_requirements(events: ak.Array, observable: str) -> str:
             if missing:
                 return f"missing truth missing field '{field}' and slot fallback fields {missing}"
             return f"using slot fallback target_invisible + source_slot_for_{leg}"
+    if observable.startswith("lead_") and "_visible_" in observable:
+        parts = observable.split("_")
+        if len(parts) >= 4:
+            leg = parts[1]
+            field = f"truth_visible_{leg}_p4"
+            return f"required field '{field}' {'available' if field in fields else 'missing'}"
     if observable.startswith("reco_tau_"):
         parts = observable.split("_")
         if len(parts) >= 4:
@@ -1619,10 +1798,14 @@ def write_report(
     methods: dict[str, Path],
     truth_summary: dict[str, Any],
     truth_metric_summary: dict[str, Any],
+    truth_neutrino_summary: dict[str, Any],
+    truth_neutrino_metric_summary: dict[str, Any],
     missing_summary: dict[str, Any],
     missing_metric_summary: dict[str, Any],
     reco_tau_summary: dict[str, Any],
     reco_tau_metric_summary: dict[str, Any],
+    visible_tau_summary: dict[str, Any],
+    visible_tau_metric_summary: dict[str, Any],
     control_summary: dict[str, Any],
     method_regions: dict[str, list[str]],
 ) -> None:
@@ -1654,6 +1837,19 @@ def write_report(
     lines.extend(
         [
             "",
+            "## Truth-Neutrino Upper-Limit Coverage",
+            "",
+            "| Method | Region | Observables with plots |",
+            "|---|---|---:|",
+        ]
+    )
+    for method, method_info in truth_neutrino_summary.items():
+        for region, region_info in method_info.items():
+            lines.append(f"| {method} | {region} | {len(region_info)} |")
+
+    lines.extend(
+        [
+            "",
             "## Missing-Neutrino Truth-vs-Reco Coverage",
             "",
             "| Method | Region | Observables with plots |",
@@ -1677,6 +1873,19 @@ def write_report(
         for region, region_info in method_info.items():
             lines.append(f"| {method} | {region} | {len(region_info)} |")
 
+    lines.extend(
+        [
+            "",
+            "## Visible-Tau Input Truth-vs-Reco Coverage",
+            "",
+            "| Method | Region | Observables with plots |",
+            "|---|---|---:|",
+        ]
+    )
+    for method, method_info in visible_tau_summary.items():
+        for region, region_info in method_info.items():
+            lines.append(f"| {method} | {region} | {len(region_info)} |")
+
     control_count = 0
     for method_info in control_summary.values():
         for region_info in method_info.values():
@@ -1689,8 +1898,10 @@ def write_report(
             "",
             f"- Data-vs-MC control plots: {control_count}",
             f"- Truth summary plots: {len(truth_metric_summary)}",
+            f"- Truth-neutrino upper-limit summary plots: {len(truth_neutrino_metric_summary)}",
             f"- Missing-neutrino summary plots: {len(missing_metric_summary)}",
             f"- Reco-tau summary plots: {len(reco_tau_metric_summary)}",
+            f"- Visible-tau input summary plots: {len(visible_tau_metric_summary)}",
             "",
             "## Generated PNG Files",
             "",
@@ -1717,11 +1928,13 @@ def main() -> None:
     observable_specs = truth_observable_specs(args.truth_observables)
     missing_specs = missing_observable_specs()
     reco_tau_specs = reco_tau_observable_specs()
+    visible_tau_specs = visible_tau_observable_specs()
     print(f"[preunfolding] signal_sample={args.signal_sample_name}", flush=True)
     print(f"[preunfolding] method_regions={method_regions}", flush=True)
     print(f"[preunfolding] truth_observables={[name for name, _ in observable_specs]}", flush=True)
     print(f"[preunfolding] missing_observables={[name for name, _ in missing_specs]}", flush=True)
     print(f"[preunfolding] reco_tau_observables={[name for name, _ in reco_tau_specs]}", flush=True)
+    print(f"[preunfolding] visible_tau_observables={[name for name, _ in visible_tau_specs]}", flush=True)
     print(f"[preunfolding] num_workers={args.num_workers}", flush=True)
 
     plot_block_tasks = [
@@ -1736,6 +1949,20 @@ def main() -> None:
             "reco_observable_source": args.reco_observable_source,
             "subdir_name": "truth_vs_reco",
             "log_label": "truth-vs-reco",
+            "require_reco_valid_flags": True,
+        },
+        {
+            "key": "truth_neutrino",
+            "method_regions": method_regions,
+            "methods": methods,
+            "signal_sample_name": args.signal_sample_name,
+            "observable_specs": observable_specs,
+            "output_dir": args.output_dir,
+            "normalize": args.normalize_truth_reco,
+            "reco_observable_source": "truth-neutrino",
+            "subdir_name": "truth_neutrino_upper_limit",
+            "log_label": "truth-neutrino-upper-limit",
+            "require_reco_valid_flags": False,
         },
         {
             "key": "missing",
@@ -1748,6 +1975,7 @@ def main() -> None:
             "reco_observable_source": "recompute",
             "subdir_name": "missing_truth_vs_reco",
             "log_label": "missing-truth-vs-reco",
+            "require_reco_valid_flags": True,
         },
         {
             "key": "reco_tau",
@@ -1760,6 +1988,20 @@ def main() -> None:
             "reco_observable_source": "recompute",
             "subdir_name": "reco_tau_truth_vs_reco",
             "log_label": "reco-tau-truth-vs-reco",
+            "require_reco_valid_flags": True,
+        },
+        {
+            "key": "visible_tau",
+            "method_regions": method_regions,
+            "methods": methods,
+            "signal_sample_name": args.signal_sample_name,
+            "observable_specs": visible_tau_specs,
+            "output_dir": args.output_dir,
+            "normalize": args.normalize_truth_reco,
+            "reco_observable_source": "recompute",
+            "subdir_name": "visible_tau_truth_vs_reco",
+            "log_label": "visible-tau-truth-vs-reco",
+            "require_reco_valid_flags": False,
         },
     ]
     if args.num_workers > 1:
@@ -1776,16 +2018,20 @@ def main() -> None:
                 plot_block_results[key] = block_summary
                 print(f"[preunfolding] finished parallel block={key} methods={list(block_summary)}", flush=True)
         truth_summary = plot_block_results.get("truth", {})
+        truth_neutrino_summary = plot_block_results.get("truth_neutrino", {})
         missing_summary = plot_block_results.get("missing", {})
         reco_tau_summary = plot_block_results.get("reco_tau", {})
+        visible_tau_summary = plot_block_results.get("visible_tau", {})
     else:
         plot_block_results = {
             key: summary
             for key, summary in (run_truth_reco_plot_block(task) for task in plot_block_tasks)
         }
         truth_summary = plot_block_results["truth"]
+        truth_neutrino_summary = plot_block_results["truth_neutrino"]
         missing_summary = plot_block_results["missing"]
         reco_tau_summary = plot_block_results["reco_tau"]
+        visible_tau_summary = plot_block_results["visible_tau"]
 
     print(f"[preunfolding] finished truth-vs-reco methods={list(truth_summary)}", flush=True)
     truth_metric_summary = plot_truth_metric_summary(
@@ -1798,6 +2044,21 @@ def main() -> None:
         log_label="truth-summary",
     )
     print(f"[preunfolding] finished truth summary plots observables={list(truth_metric_summary)}", flush=True)
+    print(f"[preunfolding] finished truth-neutrino upper-limit methods={list(truth_neutrino_summary)}", flush=True)
+    truth_neutrino_metric_summary = plot_truth_metric_summary(
+        truth_summary=truth_neutrino_summary,
+        methods=methods,
+        observable_specs=observable_specs,
+        output_dir=args.output_dir,
+        metric="pearson",
+        subdir_name="truth_neutrino_upper_limit_summary",
+        log_label="truth-neutrino-upper-limit-summary",
+    )
+    print(
+        f"[preunfolding] finished truth-neutrino upper-limit summary plots "
+        f"observables={list(truth_neutrino_metric_summary)}",
+        flush=True,
+    )
     print(f"[preunfolding] finished missing truth-vs-reco methods={list(missing_summary)}", flush=True)
     missing_metric_summary = plot_truth_metric_summary(
         truth_summary=missing_summary,
@@ -1820,6 +2081,17 @@ def main() -> None:
         log_label="reco-tau-summary",
     )
     print(f"[preunfolding] finished reco-tau summary plots observables={list(reco_tau_metric_summary)}", flush=True)
+    print(f"[preunfolding] finished visible-tau truth-vs-reco methods={list(visible_tau_summary)}", flush=True)
+    visible_tau_metric_summary = plot_truth_metric_summary(
+        truth_summary=visible_tau_summary,
+        methods=methods,
+        observable_specs=visible_tau_specs,
+        output_dir=args.output_dir,
+        metric="pearson",
+        subdir_name="visible_tau_truth_vs_reco_summary",
+        log_label="visible-tau-summary",
+    )
+    print(f"[preunfolding] finished visible-tau summary plots observables={list(visible_tau_metric_summary)}", flush=True)
 
     print(
         f"[preunfolding] control-plot inputs data_sample={args.data_sample_name} "
@@ -1861,13 +2133,18 @@ def main() -> None:
         "truth_observables": [name for name, _ in observable_specs],
         "missing_observables": [name for name, _ in missing_specs],
         "reco_tau_observables": [name for name, _ in reco_tau_specs],
+        "visible_tau_observables": [name for name, _ in visible_tau_specs],
         "reco_observable_source": args.reco_observable_source,
         "truth_vs_reco": truth_summary,
         "truth_metric_summary": truth_metric_summary,
+        "truth_neutrino_upper_limit": truth_neutrino_summary,
+        "truth_neutrino_metric_summary": truth_neutrino_metric_summary,
         "missing_truth_vs_reco": missing_summary,
         "missing_metric_summary": missing_metric_summary,
         "reco_tau_truth_vs_reco": reco_tau_summary,
         "reco_tau_metric_summary": reco_tau_metric_summary,
+        "visible_tau_truth_vs_reco": visible_tau_summary,
+        "visible_tau_metric_summary": visible_tau_metric_summary,
         "data_mc_control": control_summary,
         "control_observable_defaults": control_observables,
     }
@@ -1878,10 +2155,14 @@ def main() -> None:
         methods,
         truth_summary,
         truth_metric_summary,
+        truth_neutrino_summary,
+        truth_neutrino_metric_summary,
         missing_summary,
         missing_metric_summary,
         reco_tau_summary,
         reco_tau_metric_summary,
+        visible_tau_summary,
+        visible_tau_metric_summary,
         control_summary,
         method_regions,
     )

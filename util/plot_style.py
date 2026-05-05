@@ -28,6 +28,9 @@ METHOD_COLORS = {
     "EveNet-Scratch": OKABE_ITO["bluish_green"],
     "Pretrain": OKABE_ITO["blue"],
     "Scratch": OKABE_ITO["bluish_green"],
+    "Truth": OKABE_ITO["orange"],
+    "TruthNeutrino": OKABE_ITO["orange"],
+    "EveNet-Truth": OKABE_ITO["orange"],
 }
 METHOD_COLOR_CYCLE = (
     OKABE_ITO["vermillion"],
