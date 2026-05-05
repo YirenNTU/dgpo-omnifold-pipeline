@@ -208,13 +208,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-steps",
         type=int,
-        default=None,
-        help="Optional override for TruthGeneration diffusion steps.",
+        default=200,
+        help="TruthGeneration diffusion sampling steps. Default: 200.",
     )
     parser.add_argument(
         "--disable-ema",
         action="store_true",
-        help="If set, load checkpoint state_dict instead of ema_state_dict.",
+        help="If set, load raw state_dict for diffusion instead of ema_state_dict. Classification always uses raw state_dict.",
     )
     parser.add_argument(
         "--unweighted-output",
@@ -592,13 +592,13 @@ def load_model_bundle(
     )
     model.eval()
 
-    if classification_path == diffusion_path:
+    if classification_path == diffusion_path and not use_ema:
         classification_model = model
     else:
         classification_model = build_evenet_model(device, normalization_dict)
         safe_load_state(
             classification_model,
-            checkpoint_state_dict(classification_path, use_ema=use_ema, device=device),
+            checkpoint_state_dict(classification_path, use_ema=False, device=device),
             verbose=False,
         )
         classification_model.eval()
@@ -614,6 +614,8 @@ def load_model_bundle(
         "checkpoint_path": str(checkpoint_path),
         "classification_checkpoint_path": str(classification_path),
         "diffusion_checkpoint_path": str(diffusion_path),
+        "classification_use_ema": False,
+        "diffusion_use_ema": bool(use_ema),
     }
 
 
@@ -1199,6 +1201,12 @@ def main() -> None:
         yaml.safe_dump(runtime_train_cfg_data, handle, sort_keys=False)
 
     checkpoint_path = resolve_checkpoint_path(runtime_train_config)
+    ema_cfg = runtime_train_cfg_data.get("options", {}).get("Training", {}).get("EMA", {})
+    diffusion_use_ema = (
+        bool(ema_cfg.get("enable", False))
+        and bool(ema_cfg.get("replace_model_after_load", False))
+        and not bool(args.disable_ema)
+    )
     classification_checkpoint_path = (
         resolve_checkpoint_path_value(args.classification_checkpoint, "classification checkpoint")
         if args.classification_checkpoint is not None
@@ -1254,6 +1262,9 @@ def main() -> None:
                 "class_weight_map": class_weight_map,
                 "converted_split_fraction": converted_split_fraction,
                 "disable_ema": bool(args.disable_ema),
+                "classification_use_ema": False,
+                "diffusion_use_ema": bool(diffusion_use_ema),
+                "num_steps": int(args.num_steps),
                 "use_weighted_output": not bool(args.unweighted_output),
             },
             handle,

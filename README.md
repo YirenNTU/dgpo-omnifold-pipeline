@@ -341,7 +341,7 @@ Check these paths before launching:
 - `options.Training.model_checkpoint_save_path`
 - `options.Training.pretrain_model_load_path`, only for the pretrain config
 
-For this analysis pipeline, the documented prediction commands use non-EMA weights by default via `--disable-ema`. This keeps standalone prediction closer to direct checkpoint validation unless an EMA comparison is explicitly intended.
+For this analysis pipeline, the documented prediction commands use non-EMA diffusion weights via `--disable-ema`. Classification prediction always uses raw `state_dict` weights; EMA is only allowed to affect the diffusion/neutrino sampler.
 
 The predictor can still use EMA weights when the training config has:
 
@@ -351,13 +351,16 @@ EMA:
   replace_model_after_load: true
 ```
 
-To run an EMA prediction intentionally, omit `--disable-ema`.
+To run an EMA diffusion prediction intentionally, omit `--disable-ema`.
 
 ## 4. Standalone EveNet Prediction
 
 `util/predict_evenet_from_raw_parquet.py` consumes converted parquet files or
 directories such as `evenet_train_mixed/test` and `evenet_train_mixed/data`. It no longer
 reads raw parquet files or reruns raw-side selection during prediction.
+
+The default diffusion sampling length is 200 steps. Use `--num-steps` only when
+you intentionally want to scan the sampling speed/quality tradeoff.
 
 For sharded preprocessing output, run MC/test and data prediction separately so
 the QI export can keep their outputs distinct:
@@ -373,6 +376,7 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
   --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
   --converted-split-fraction 0.5 \
+  --num-steps 200 \
   --batch-size 2048 \
   --num-gpus 4
 
@@ -384,6 +388,7 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --disable-ema \
   --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/data \
   --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
+  --num-steps 200 \
   --batch-size 2048 \
   --num-gpus 4
 ```
@@ -404,6 +409,7 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
   --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
   --converted-split-fraction 0.5 \
+  --num-steps 200 \
   --batch-size 2048 \
   --num-gpus 4
 ```
@@ -422,6 +428,7 @@ python3 util/predict_evenet_from_raw_parquet.py \
     /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert/test.parquet \
     /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_data/test.parquet \
   --converted-split-fraction 0.5 \
+  --num-steps 200 \
   --batch-size 2048 \
   --num-gpus 4
 ```
@@ -439,6 +446,7 @@ python3 util/predict_evenet_from_raw_parquet.py \
     /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert/test.parquet \
     /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_data/test.parquet \
   --converted-split-fraction 0.5 \
+  --num-steps 200 \
   --batch-size 2048 \
   --num-gpus 4
 ```
@@ -462,6 +470,7 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
   --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
   --converted-split-fraction 0.5 \
+  --num-steps 200 \
   --batch-size 2048 \
   --num-gpus 4 \
   --task-num-shards 4 \
@@ -929,7 +938,7 @@ Do not apply the split-weight correction twice:
 If standalone prediction looks worse than training validation plots, check:
 
 - The prediction command used the intended checkpoint and config.
-- EMA usage matches the intended evaluation. The documented workflow uses `--disable-ema`; omit it only for an explicit EMA prediction.
+- EMA usage matches the intended evaluation. `--disable-ema` affects only diffusion; classification is always loaded from raw `state_dict`.
 - Standalone neutrino prediction is conditioned on predicted class. Training validation monitoring may be conditioned on truth class.
 - The prediction parquet is regenerated and includes the self-contained truth/cut metadata required by export.
 - `analysis.yaml` `input_files` and `raw_files` come from the same central production.
