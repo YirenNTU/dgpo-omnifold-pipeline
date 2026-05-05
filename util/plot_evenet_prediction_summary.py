@@ -22,7 +22,7 @@ if str(EVENET_ROOT) not in sys.path:
 
 from build_evenet_input_from_parquet import merge_evenet_config, parse_config, read_yaml
 from ml_pipeline_config import parse_evenet_config
-from parquet_plot_common import OKABE_ITO, infer_luminosity, process_color, process_latex_label
+from parquet_plot_common import OKABE_ITO, process_color, process_latex_label
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "plots" / "prediction_summary"
@@ -93,11 +93,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--weight-source",
-        choices=["auto", "class", "evenet", "central", "event", "unit"],
+        choices=["auto", "evenet", "central", "event", "unit"],
         default="auto",
         help=(
-            "MC weight source. 'auto' prefers analysis-config class normalization and falls back to "
-            "central/evenet weights, 'evenet' uses prediction-parquet evenet_weight, "
+            "MC weight source. 'auto' prefers central_weight/weight and falls back to evenet_weight, "
+            "'evenet' uses prediction-parquet evenet_weight, "
             "'event' uses event_weight, and 'unit' ignores weights."
         ),
     )
@@ -151,39 +151,6 @@ def build_class_names_from_analysis(analysis_config_path: Path, evenet_config_pa
         else:
             class_names.append(sample.name)
     return class_names
-
-
-def sample_initial_total_num_events(sample) -> int:
-    values: list[int] = []
-    for pattern in sample.input_files:
-        matches = sorted(glob.glob(str(pattern)))
-        for path in matches if matches else [pattern]:
-            events = ak.from_parquet(path, columns=["initial_total_num_events"])
-            if len(events) == 0 or "initial_total_num_events" not in events.fields:
-                continue
-            values.append(int(ak.to_numpy(events["initial_total_num_events"][:1], allow_missing=False)[0]))
-    return max(values) if values else 0
-
-
-def build_analysis_class_weights(analysis_config_path: Path) -> dict[str, float]:
-    samples, subcategories, _ = parse_config(analysis_config_path)
-    luminosity = infer_luminosity(samples, None)
-    output: dict[str, float] = {}
-    for sample_key, sample in samples.items():
-        if sample.is_data or luminosity is None:
-            continue
-        initial_total_num_events = sample_initial_total_num_events(sample)
-        if initial_total_num_events <= 0:
-            continue
-        sample_weight = float(sample.norm_factor) / float(initial_total_num_events) * float(luminosity)
-        splits = subcategories.get(sample_key) or subcategories.get(sample.name)
-        if splits:
-            for split in splits:
-                output[split.name] = sample_weight
-            output[f"{sample.name}_others"] = sample_weight
-        else:
-            output[sample.name] = sample_weight
-    return output
 
 
 def latex_process_label(name: str) -> str:
@@ -251,28 +218,9 @@ def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     return output
 
 
-def class_normalized_weights(events: ak.Array, class_weight_map: dict[str, float]) -> np.ndarray:
-    weights = np.ones(len(events), dtype=np.float64)
-    if "evenet_truth_class_name" not in events.fields:
-        return weights
-    class_names = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
-    for class_name, class_weight in class_weight_map.items():
-        weights[class_names == class_name] = float(class_weight)
-    return weights
-
-
-def event_weights(
-    events: ak.Array,
-    use_weighted: bool,
-    weight_source: str = "auto",
-    class_weight_map: dict[str, float] | None = None,
-) -> np.ndarray:
+def event_weights(events: ak.Array, use_weighted: bool, weight_source: str = "auto") -> np.ndarray:
     if not use_weighted or weight_source == "unit":
         return np.ones(len(events), dtype=np.float64)
-
-    if weight_source == "class" or (weight_source == "auto" and class_weight_map):
-        if class_weight_map:
-            return class_normalized_weights(events, class_weight_map)
 
     field_priority = {
         "auto": ("central_weight", "weight", "event_weight", "evenet_weight"),
@@ -847,7 +795,6 @@ def plot_neutrino_grid(
     title_suffix: str,
     use_weighted: bool,
     weight_source: str,
-    class_weight_map: dict[str, float] | None,
 ) -> dict[str, dict[str, dict[str, float]]]:
     leg_data = extract_leg_components(events)
     if not leg_data:
@@ -861,7 +808,7 @@ def plot_neutrino_grid(
         axes = np.expand_dims(axes, axis=1)
 
     metrics: dict[str, dict[str, dict[str, float]]] = {}
-    weights = event_weights(events, use_weighted=use_weighted, weight_source=weight_source, class_weight_map=class_weight_map)
+    weights = event_weights(events, use_weighted=use_weighted, weight_source=weight_source)
     pred_name = np.asarray(ak.to_list(events["evenet_pred_class_name"]), dtype=object)
     truth_name = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
     class_match = pred_name == truth_name
@@ -950,7 +897,6 @@ def gather_neutrino_metrics(
     max_processes: int | None,
     use_weighted: bool,
     weight_source: str,
-    class_weight_map: dict[str, float] | None,
 ) -> dict[str, Any]:
     truth_name = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
     valid_truth = truth_name != DEFAULT_CLASS_NAME
@@ -974,7 +920,6 @@ def gather_neutrino_metrics(
         title_suffix="Four-Momentum (Cartesian)",
         use_weighted=use_weighted,
         weight_source=weight_source,
-        class_weight_map=class_weight_map,
     )
     summary["all_processes"]["kinematics"] = plot_neutrino_grid(
         all_events,
@@ -984,7 +929,6 @@ def gather_neutrino_metrics(
         title_suffix="Kinematics",
         use_weighted=use_weighted,
         weight_source=weight_source,
-        class_weight_map=class_weight_map,
     )
 
     for process_name in process_names_present:
@@ -1000,7 +944,6 @@ def gather_neutrino_metrics(
                 title_suffix="Four-Momentum (Cartesian)",
                 use_weighted=use_weighted,
                 weight_source=weight_source,
-                class_weight_map=class_weight_map,
             ),
             "kinematics": plot_neutrino_grid(
                 process_events,
@@ -1010,7 +953,6 @@ def gather_neutrino_metrics(
                 title_suffix="Kinematics",
                 use_weighted=use_weighted,
                 weight_source=weight_source,
-                class_weight_map=class_weight_map,
             ),
         }
 
@@ -1034,10 +976,9 @@ def plot_predicted_class_comparison(
     output_path: Path,
     use_weighted: bool,
     weight_source: str,
-    class_weight_map: dict[str, float] | None,
 ) -> None:
     mc_pred = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
-    mc_weight = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source, class_weight_map=class_weight_map)
+    mc_weight = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source)
     data_pred = np.asarray(ak.to_list(data_events["evenet_pred_class_name"]), dtype=object)
 
     mc_counts = np.array([float(np.sum(mc_weight[mc_pred == name])) for name in class_names], dtype=np.float64)
@@ -1064,11 +1005,10 @@ def plot_predicted_channel_purity(
     output_path: Path,
     use_weighted: bool,
     weight_source: str,
-    class_weight_map: dict[str, float] | None,
 ) -> dict[str, Any]:
     mc_pred = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
     mc_truth = np.asarray(ak.to_list(mc_events["evenet_truth_class_name"]), dtype=object)
-    mc_weight = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source, class_weight_map=class_weight_map)
+    mc_weight = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source)
 
     valid_mc = np.isfinite(mc_weight) & (mc_weight > 0)
     mc_pred = mc_pred[valid_mc]
@@ -1323,7 +1263,6 @@ def plot_region_kinematics(
     output_path: Path,
     use_weighted: bool,
     weight_source: str,
-    class_weight_map: dict[str, float] | None,
 ) -> dict[str, Any]:
     region_mc = mc_events[np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object) == region_name]
     region_data = None
@@ -1331,11 +1270,7 @@ def plot_region_kinematics(
         region_data = data_events[np.asarray(ak.to_list(data_events["evenet_pred_class_name"]), dtype=object) == region_name]
 
     truth_names_mc = np.asarray(ak.to_list(region_mc["evenet_truth_class_name"]), dtype=object)
-    base_mc_weights = (
-        event_weights(region_mc, use_weighted=use_weighted, weight_source=weight_source, class_weight_map=class_weight_map)
-        if len(region_mc) > 0
-        else np.array([], dtype=np.float64)
-    )
+    base_mc_weights = event_weights(region_mc, use_weighted=use_weighted, weight_source=weight_source) if len(region_mc) > 0 else np.array([], dtype=np.float64)
     truth_processes = [name for name in class_names if np.any(truth_names_mc == name)]
 
     mc_kin = build_full_tau_kinematics(region_mc) if len(region_mc) > 0 else None
@@ -1533,7 +1468,6 @@ def gather_region_kinematics_plots(
     max_processes: int | None,
     use_weighted: bool,
     weight_source: str,
-    class_weight_map: dict[str, float] | None,
 ) -> dict[str, Any]:
     predicted_names = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
     if data_events is not None:
@@ -1553,7 +1487,6 @@ def gather_region_kinematics_plots(
             output_path=output_dir / f"region_kinematics_{region_name}.png",
             use_weighted=use_weighted,
             weight_source=weight_source,
-            class_weight_map=class_weight_map,
         )
     return summary
 
@@ -1571,12 +1504,11 @@ def main() -> None:
     weight_source = "unit" if args.unweighted else args.weight_source
 
     class_names = build_class_names_from_analysis(args.analysis_config.resolve(), args.evenet_config.resolve())
-    class_weight_map = build_analysis_class_weights(args.analysis_config.resolve())
     summary_class_names = summary_channel_order(class_names)
 
     truth_idx = to_numpy(mc_events["evenet_truth_class_index"], np.int64)
     pred_idx = to_numpy(mc_events["evenet_pred_class_index"], np.int64)
-    weights = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source, class_weight_map=class_weight_map)
+    weights = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source)
     valid_class = (truth_idx >= 0) & (truth_idx < len(class_names)) & (pred_idx >= 0) & (pred_idx < len(class_names)) & np.isfinite(weights) & (weights > 0)
 
     confusion_metrics = plot_confusion_summary(
@@ -1597,7 +1529,6 @@ def main() -> None:
         max_processes=args.max_processes,
         use_weighted=use_weighted,
         weight_source=weight_source,
-        class_weight_map=class_weight_map,
     )
 
     if data_events is not None:
@@ -1608,7 +1539,6 @@ def main() -> None:
             output_path=output_dir / "predicted_class_data_vs_mc.png",
             use_weighted=use_weighted,
             weight_source=weight_source,
-            class_weight_map=class_weight_map,
         )
     purity_metrics = plot_predicted_channel_purity(
         mc_events=mc_events,
@@ -1617,7 +1547,6 @@ def main() -> None:
         output_path=output_dir / "predicted_channel_purity.png",
         use_weighted=use_weighted,
         weight_source=weight_source,
-        class_weight_map=class_weight_map,
     )
     region_kinematics_metrics = gather_region_kinematics_plots(
         mc_events=mc_events,
@@ -1627,7 +1556,6 @@ def main() -> None:
         max_processes=args.max_processes,
         use_weighted=use_weighted,
         weight_source=weight_source,
-        class_weight_map=class_weight_map,
     )
 
     metrics_payload = {
@@ -1638,7 +1566,6 @@ def main() -> None:
             "evenet_config": str(args.evenet_config.resolve()),
             "use_weighted": use_weighted,
             "weight_source": weight_source,
-            "class_weight_map": class_weight_map,
             "summary_channel_order": summary_class_names,
         },
         "classification": confusion_metrics,

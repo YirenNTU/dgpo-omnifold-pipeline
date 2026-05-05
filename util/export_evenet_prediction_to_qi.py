@@ -23,7 +23,6 @@ if str(REPO_ROOT) not in sys.path:
 from quantum.observables_builder import build_observables, get_observable_names
 from utils.common_functions import rebuild_p4
 from build_evenet_input_from_parquet import parse_config, preselection_mask, read_yaml
-from parquet_plot_common import infer_luminosity
 
 
 vector.register_awkward()
@@ -292,37 +291,6 @@ def load_concat_events(paths: list[str]) -> ak.Array:
         raise ValueError("No parquet paths were provided.")
     arrays = [load_events(Path(path)) for path in paths]
     return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
-
-
-def sample_initial_total_num_events(sample) -> int:
-    values: list[int] = []
-    for path in expand_paths(tuple(sample.input_files)):
-        events = ak.from_parquet(path, columns=["initial_total_num_events"])
-        if len(events) == 0 or "initial_total_num_events" not in events.fields:
-            continue
-        values.append(int(ak.to_numpy(events["initial_total_num_events"][:1], allow_missing=False)[0]))
-    return max(values) if values else 0
-
-
-def build_analysis_class_weights(analysis_config_path: Path) -> dict[str, float]:
-    samples, subcategories, _ = parse_config(analysis_config_path)
-    luminosity = infer_luminosity(samples, None)
-    output: dict[str, float] = {}
-    for sample_key, sample in samples.items():
-        if sample.is_data or luminosity is None:
-            continue
-        initial_total_num_events = sample_initial_total_num_events(sample)
-        if initial_total_num_events <= 0:
-            continue
-        sample_weight = float(sample.norm_factor) / float(initial_total_num_events) * float(luminosity)
-        splits = subcategories.get(sample_key) or subcategories.get(sample.name)
-        if splits:
-            for split in splits:
-                output[split.name] = sample_weight
-            output[f"{sample.name}_others"] = sample_weight
-        else:
-            output[sample.name] = sample_weight
-    return output
 
 
 def iter_parquet_event_batches(paths: list[str], batch_size: int):
@@ -851,7 +819,6 @@ def with_evenet_reconstruction(
     missing_prefix: str = "pred_invisible",
     method_name: str = "EveNet",
     prediction_weight_source: str = "auto",
-    prediction_class_weight_map: dict[str, float] | None = None,
 ) -> tuple[ak.Array, dict[str, Any]]:
     pred_values, metrics = build_predicted_reconstruction(
         central_pred_events,
@@ -870,7 +837,7 @@ def with_evenet_reconstruction(
         predicted_weight = None
         resolved_weight_source = prediction_weight_source
         if resolved_weight_source == "auto":
-            resolved_weight_source = "class" if prediction_class_weight_map else "central"
+            resolved_weight_source = "central"
         if resolved_weight_source == "evenet" and "evenet_weight" in pred_events.fields:
             predicted_weight = ak.to_numpy(pred_events["evenet_weight"], allow_missing=False).astype(np.float64)
             if len(predicted_weight) != len(full_indices):
@@ -882,12 +849,6 @@ def with_evenet_reconstruction(
             predicted_weight = ak.to_numpy(pred_events["event_weight"], allow_missing=False).astype(np.float64)
         elif resolved_weight_source == "unit":
             predicted_weight = np.ones(len(full_indices), dtype=np.float64)
-        elif resolved_weight_source == "class" and prediction_class_weight_map:
-            predicted_weight = np.ones(len(full_indices), dtype=np.float64)
-            if "evenet_truth_class_name" in pred_events.fields:
-                class_names = np.asarray(ak.to_list(pred_events["evenet_truth_class_name"]), dtype=object)
-                for class_name, class_weight in prediction_class_weight_map.items():
-                    predicted_weight[class_names == class_name] = float(class_weight)
         elif resolved_weight_source not in {"central", "class"}:
             raise ValueError(f"Unsupported prediction weight source: {prediction_weight_source}.")
         if predicted_weight is not None and len(predicted_weight) != len(full_indices):
@@ -1062,8 +1023,6 @@ class QIParquetChunkWriter:
         if writer_name == "raw":
             if self.raw_writer is None:
                 self.raw_writer = pq.ParquetWriter(path, table.schema, compression=self.compression)
-            else:
-                table = table.cast(self.raw_writer.schema, safe=False)
             self.raw_writer.write_table(table)
             return
 
@@ -1071,8 +1030,6 @@ class QIParquetChunkWriter:
         if writer is None:
             writer = pq.ParquetWriter(path, table.schema, compression=self.compression)
             self.region_writers[writer_name] = writer
-        else:
-            table = table.cast(writer.schema, safe=False)
         writer.write_table(table)
 
     def append(self, events: ak.Array) -> None:
@@ -1487,7 +1444,6 @@ def merge_prediction_group(
     pred_events: ak.Array,
     prediction_split_fraction: float | None,
     prediction_weight_source: str = "auto",
-    prediction_class_weight_map: dict[str, float] | None = None,
 ) -> tuple[ak.Array, dict[str, Any]]:
     full_indices = map_prediction_rows_to_full(full_events, source_events, allow_prefix_match=False)
     return with_evenet_reconstruction(
@@ -1497,7 +1453,6 @@ def merge_prediction_group(
         full_indices=full_indices,
         prediction_split_fraction=prediction_split_fraction,
         prediction_weight_source=prediction_weight_source,
-        prediction_class_weight_map=prediction_class_weight_map,
     )
 
 
@@ -1535,7 +1490,6 @@ def build_concat_prediction_rows(
     missing_prefix: str = "pred_invisible",
     method_name: str = "EveNet",
     prediction_weight_source: str = "auto",
-    prediction_class_weight_map: dict[str, float] | None = None,
 ) -> tuple[ak.Array, dict[str, Any]]:
     if len(pred_events) == 0:
         raise ValueError("Prediction parquet group is empty; cannot build concat rows.")
@@ -1561,7 +1515,6 @@ def build_concat_prediction_rows(
         missing_prefix=missing_prefix,
         method_name=method_name,
         prediction_weight_source=prediction_weight_source,
-        prediction_class_weight_map=prediction_class_weight_map,
     )
 
 
@@ -1581,7 +1534,6 @@ def build_concat_raw_complement_rows(
         zero_unpredicted_selected_mc=False,
         method_name=method_name,
         prediction_weight_source="central",
-        prediction_class_weight_map=None,
     )
 
 
@@ -1610,7 +1562,6 @@ def export_config_group(
     raw_batch_size: int,
     prediction_batch_size: int,
     prediction_weight_source: str,
-    prediction_class_weight_map: dict[str, float],
     truth_output_label: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     print(f"[export-evenet-to-qi] worker {os.getpid()} start {parent_name}", flush=True)
@@ -1644,7 +1595,6 @@ def export_config_group(
             prediction_split_fraction=split_fraction,
             is_data=group["is_data"],
             prediction_weight_source=prediction_weight_source,
-            prediction_class_weight_map=None if group["is_data"] else prediction_class_weight_map,
         )
         writer.append(predicted_events)
         predicted_rows_total += int(len(predicted_events))
@@ -1659,7 +1609,6 @@ def export_config_group(
                 missing_prefix=truth_missing_prefix,
                 method_name=truth_method_name,
                 prediction_weight_source=prediction_weight_source,
-                prediction_class_weight_map=None if group["is_data"] else prediction_class_weight_map,
             )
             truth_writer.append(truth_predicted_events)
             truth_predicted_rows_total += int(len(truth_predicted_events))
@@ -1776,7 +1725,7 @@ def export_config_group(
 
 
 def export_config_group_worker(
-    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, int, str, dict[str, float], str | None],
+    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, int, str, str | None],
 ) -> tuple[str, dict[str, Any]]:
     return export_config_group(*payload)
 
@@ -1795,7 +1744,6 @@ def export_config_prediction(
     raw_batch_size: int,
     prediction_batch_size: int,
     prediction_weight_source: str,
-    prediction_class_weight_map: dict[str, float],
     truth_output_label: str | None,
 ) -> dict[str, Any]:
     pred_paths = resolve_parquet_inputs(pred_path)
@@ -1863,7 +1811,6 @@ def export_config_prediction(
                 raw_batch_size=raw_batch_size,
                 prediction_batch_size=prediction_batch_size,
                 prediction_weight_source=prediction_weight_source,
-                prediction_class_weight_map=prediction_class_weight_map,
                 truth_output_label=truth_output_label,
             )
             summary["samples"][parent_name] = metrics
@@ -1881,7 +1828,6 @@ def export_config_prediction(
                 raw_batch_size,
                 prediction_batch_size,
                 prediction_weight_source,
-                prediction_class_weight_map,
                 truth_output_label,
             )
             for parent_name, group in group_items
@@ -1921,7 +1867,6 @@ def run_config_mode(args: argparse.Namespace) -> None:
     raw_batch_size = config_raw_batch_size(args, analysis_cfg)
     prediction_batch_size = config_prediction_batch_size(args, analysis_cfg, raw_batch_size)
     prediction_weight_source = config_prediction_weight_source(args, analysis_cfg)
-    prediction_class_weight_map = build_analysis_class_weights(args.analysis_config)
     write_truth_copy = config_write_truth_neutrino_copy(args, analysis_cfg)
     truth_output_label = config_truth_qi_method_label(args, analysis_cfg, output_label) if write_truth_copy else None
 
@@ -1941,7 +1886,6 @@ def run_config_mode(args: argparse.Namespace) -> None:
             raw_batch_size=raw_batch_size,
             prediction_batch_size=prediction_batch_size,
             prediction_weight_source=prediction_weight_source,
-            prediction_class_weight_map=prediction_class_weight_map,
             truth_output_label=truth_output_label,
         )
     if data_pred is not None:
@@ -1959,7 +1903,6 @@ def run_config_mode(args: argparse.Namespace) -> None:
             raw_batch_size=raw_batch_size,
             prediction_batch_size=prediction_batch_size,
             prediction_weight_source=prediction_weight_source,
-            prediction_class_weight_map=prediction_class_weight_map,
             truth_output_label=truth_output_label,
         )
     if not summaries:
