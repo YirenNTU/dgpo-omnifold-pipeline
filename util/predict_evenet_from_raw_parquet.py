@@ -435,13 +435,21 @@ def resolve_checkpoint_path_value(checkpoint_value: str | Path, label: str) -> P
     return checkpoint_path.resolve()
 
 
-def build_converted_tasks(converted_parquet: list[str], output_dir: Path, num_chunks_per_file: int) -> list[InferenceTask]:
+def build_converted_tasks(
+    converted_parquet: list[str],
+    output_dir: Path,
+    num_chunks_per_file: int,
+    max_events_per_chunk: int | None = None,
+) -> list[InferenceTask]:
     tasks: list[InferenceTask] = []
     for input_path in converted_parquet:
         input_file = Path(input_path).expanduser().resolve()
         final_output_path = output_dir / f"{input_file.stem}__evenet_pred.parquet"
         num_events = parquet_num_rows(input_file)
-        for shard_index, (start, stop) in enumerate(split_event_ranges(num_events, num_chunks_per_file)):
+        file_chunks = int(num_chunks_per_file)
+        if max_events_per_chunk is not None and max_events_per_chunk > 0:
+            file_chunks = min(file_chunks, max(1, math.ceil(num_events / max_events_per_chunk)))
+        for shard_index, (start, stop) in enumerate(split_event_ranges(num_events, file_chunks)):
             chunk_output_path = output_dir / f"{input_file.stem}__evenet_pred.part{shard_index:03d}.parquet"
             tasks.append(
                 InferenceTask(
@@ -1212,7 +1220,12 @@ def main() -> None:
     use_cuda = torch.cuda.is_available() and args.num_gpus > 0
     num_workers = min(args.num_gpus, torch.cuda.device_count()) if use_cuda else 1
     chunks_per_file = infer_chunks_per_file(args, num_workers)
-    all_tasks = build_converted_tasks(converted_parquets, output_dir, num_chunks_per_file=chunks_per_file)
+    all_tasks = build_converted_tasks(
+        converted_parquets,
+        output_dir,
+        num_chunks_per_file=chunks_per_file,
+        max_events_per_chunk=args.batch_size,
+    )
 
     if args.merge_only:
         merge_converted_chunk_outputs(all_tasks)
