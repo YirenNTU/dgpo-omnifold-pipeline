@@ -216,6 +216,16 @@ def parse_args() -> argparse.Namespace:
             "If omitted, use EveNetPrediction.raw_batch_size/export_raw_batch_size or 100000."
         ),
     )
+    parser.add_argument(
+        "--prediction-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Rows per prediction parquet batch in config-driven export. "
+            "If omitted, use EveNetPrediction.prediction_batch_size/export_prediction_batch_size "
+            "or min(raw_batch_size, 25000)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -293,6 +303,28 @@ def iter_parquet_event_batches(paths: list[str], batch_size: int):
         for batch_index, record_batch in enumerate(parquet.iter_batches(batch_size=batch_size)):
             events = rebuild_event_vectors(ak.from_arrow(record_batch))
             yield path, batch_index, events
+
+
+def iter_parquet_column_batches(paths: list[str] | list[Path], batch_size: int, columns: list[str]):
+    if batch_size < 1:
+        raise ValueError(f"batch size must be >= 1, got {batch_size}.")
+    for path_text in paths:
+        path = Path(path_text)
+        parquet = pq.ParquetFile(path)
+        available_columns = set(parquet.schema_arrow.names)
+        selected_columns = [column for column in columns if column in available_columns]
+        for batch_index, record_batch in enumerate(parquet.iter_batches(batch_size=batch_size, columns=selected_columns)):
+            yield path, batch_index, ak.from_arrow(record_batch)
+
+
+def iter_group_prediction_batches(group: dict[str, Any], batch_size: int):
+    source_indices = np.asarray(group["source_indices"], dtype=np.int64)
+    for pred_path, batch_index, pred_events in iter_parquet_event_batches(group["pred_paths"], batch_size):
+        require_source_columns(pred_events, pred_path)
+        batch_source_indices = ak.to_numpy(pred_events["source_sample_index"], allow_missing=False).astype(np.int64)
+        row_mask = np.isin(batch_source_indices, source_indices)
+        if np.any(row_mask):
+            yield pred_path, batch_index, pred_events[row_mask]
 
 
 def rebuild_vector(values: ak.Array) -> ak.Array:
@@ -1334,6 +1366,14 @@ def config_raw_batch_size(args: argparse.Namespace, analysis_cfg: dict) -> int:
     return max(1, int(value)) if value is not None else 100_000
 
 
+def config_prediction_batch_size(args: argparse.Namespace, analysis_cfg: dict, raw_batch_size: int) -> int:
+    if args.prediction_batch_size is not None:
+        return max(1, int(args.prediction_batch_size))
+    pred_cfg = analysis_cfg.get("EveNetPrediction", {})
+    value = pred_cfg.get("prediction_batch_size") or pred_cfg.get("export_prediction_batch_size")
+    return max(1, int(value)) if value is not None else min(raw_batch_size, 25_000)
+
+
 def config_worker_backend(args: argparse.Namespace, analysis_cfg: dict) -> str:
     if args.worker_backend is not None:
         return args.worker_backend
@@ -1459,6 +1499,20 @@ def build_concat_raw_complement_rows(
     )
 
 
+def summarize_prediction_stream_metrics(
+    total_rows: int,
+    valid_rows: int,
+    batch_count: int,
+    last_metrics: dict[str, Any] | None,
+) -> dict[str, Any]:
+    summary = dict(last_metrics or {})
+    summary["num_predicted_events"] = int(total_rows)
+    summary["valid_events"] = int(valid_rows)
+    summary["valid_fraction"] = float(valid_rows / total_rows) if total_rows else 0.0
+    summary["num_prediction_batches"] = int(batch_count)
+    return summary
+
+
 def export_config_group(
     parent_name: str,
     group: dict[str, Any],
@@ -1468,41 +1522,90 @@ def export_config_group(
     prediction_split_fraction: float | None,
     output_label: str,
     raw_batch_size: int,
+    prediction_batch_size: int,
     truth_output_label: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     print(f"[export-evenet-to-qi] worker {os.getpid()} start {parent_name}", flush=True)
     raw_files = sample_raw_files(analysis_cfg, group["parent_key"], parent_name)
     split_fraction = None if group["is_data"] else prediction_split_fraction
-    pred_group = ak.concatenate(group["pred_parts"], axis=0) if len(group["pred_parts"]) > 1 else group["pred_parts"][0]
-    predicted_events, predicted_metrics = build_concat_prediction_rows(
-        pred_events=pred_group,
-        prediction_split_fraction=split_fraction,
-        is_data=group["is_data"],
-    )
-    truth_predicted_events = None
-    truth_predicted_metrics = None
-    if truth_output_label is not None:
-        truth_missing_prefix = "pred_invisible" if group["is_data"] else "target_invisible"
-        truth_method_name = "TruthNeutrinoDataFallback" if group["is_data"] else "TruthNeutrino"
-        truth_predicted_events, truth_predicted_metrics = build_concat_prediction_rows(
-            pred_events=pred_group,
-            prediction_split_fraction=split_fraction,
-            is_data=group["is_data"],
-            missing_prefix=truth_missing_prefix,
-            method_name=truth_method_name,
-        )
-
     writer = QIParquetChunkWriter(output_root / output_label, parent_name, regions)
     truth_writer = (
         QIParquetChunkWriter(output_root / truth_output_label, parent_name, regions)
         if truth_output_label is not None
         else None
     )
+    truth_missing_prefix = "pred_invisible" if group["is_data"] else "target_invisible"
+    truth_method_name = "TruthNeutrinoDataFallback" if group["is_data"] else "TruthNeutrino"
+
+    pred_template_events: ak.Array | None = None
+    predicted_rows_total = 0
+    predicted_valid_total = 0
+    prediction_batch_count = 0
+    last_predicted_metrics: dict[str, Any] | None = None
+    truth_predicted_rows_total = 0
+    truth_valid_total = 0
+    truth_prediction_batch_count = 0
+    last_truth_predicted_metrics: dict[str, Any] | None = None
+
+    for pred_path, batch_index, pred_batch in iter_group_prediction_batches(group, prediction_batch_size):
+        prediction_batch_count += 1
+        if pred_template_events is None:
+            pred_template_events = pred_batch[:0]
+        predicted_events, predicted_metrics = build_concat_prediction_rows(
+            pred_events=pred_batch,
+            prediction_split_fraction=split_fraction,
+            is_data=group["is_data"],
+        )
+        writer.append(predicted_events)
+        predicted_rows_total += int(len(predicted_events))
+        predicted_valid_total += int(predicted_metrics.get("valid_events", 0))
+        last_predicted_metrics = predicted_metrics
+
+        if truth_writer is not None:
+            truth_predicted_events, truth_predicted_metrics = build_concat_prediction_rows(
+                pred_events=pred_batch,
+                prediction_split_fraction=split_fraction,
+                is_data=group["is_data"],
+                missing_prefix=truth_missing_prefix,
+                method_name=truth_method_name,
+            )
+            truth_writer.append(truth_predicted_events)
+            truth_predicted_rows_total += int(len(truth_predicted_events))
+            truth_valid_total += int(truth_predicted_metrics.get("valid_events", 0))
+            truth_prediction_batch_count += 1
+            last_truth_predicted_metrics = truth_predicted_metrics
+
+        if batch_index == 0 or prediction_batch_count % 25 == 0:
+            print(
+                f"[export-evenet-to-qi] worker {os.getpid()} prediction batch {parent_name} "
+                f"path={Path(pred_path).name} batch={batch_index} rows={len(pred_batch)}",
+                flush=True,
+            )
+
+    if pred_template_events is None:
+        raise ValueError(f"No prediction rows matched source indices {group['source_indices']} for {parent_name}.")
+
+    predicted_metrics = summarize_prediction_stream_metrics(
+        predicted_rows_total,
+        predicted_valid_total,
+        prediction_batch_count,
+        last_predicted_metrics,
+    )
+    truth_predicted_metrics = (
+        summarize_prediction_stream_metrics(
+            truth_predicted_rows_total,
+            truth_valid_total,
+            truth_prediction_batch_count,
+            last_truth_predicted_metrics,
+        )
+        if truth_writer is not None
+        else None
+    )
+
     raw_events_total = 0
     raw_selected_total = 0
     raw_outside_total = 0
     raw_batch_count = 0
-    wrote_predicted_rows = False
 
     for raw_path, batch_index, raw_events in iter_parquet_event_batches(raw_files, raw_batch_size):
         raw_batch_count += 1
@@ -1524,29 +1627,11 @@ def export_config_group(
 
         outside_events, _outside_metrics = build_concat_raw_complement_rows(
             raw_events=outside_raw,
-            pred_template_events=pred_group,
+            pred_template_events=pred_template_events,
         )
-        if not wrote_predicted_rows:
-            outside_events, predicted_events = align_fields_for_concat([outside_events, predicted_events])
-            writer.append(outside_events)
-            writer.append(predicted_events)
-            if truth_writer is not None and truth_predicted_events is not None:
-                truth_outside_events, truth_predicted_events = align_fields_for_concat(
-                    [outside_events, truth_predicted_events]
-                )
-                truth_writer.append(truth_outside_events)
-                truth_writer.append(truth_predicted_events)
-            wrote_predicted_rows = True
-        else:
-            writer.append(outside_events)
-            if truth_writer is not None:
-                truth_writer.append(outside_events)
-
-    if not wrote_predicted_rows:
-        writer.append(predicted_events)
-        if truth_writer is not None and truth_predicted_events is not None:
-            truth_writer.append(truth_predicted_events)
-        wrote_predicted_rows = True
+        writer.append(outside_events)
+        if truth_writer is not None:
+            truth_writer.append(outside_events)
 
     counts = writer.close()
     truth_counts = truth_writer.close() if truth_writer is not None else None
@@ -1554,12 +1639,15 @@ def export_config_group(
         "num_raw_events": int(raw_events_total),
         "num_raw_selected_for_prediction": int(raw_selected_total),
         "num_raw_outside_selected": int(raw_outside_total),
-        "num_predicted_events": int(len(predicted_events)),
+        "num_predicted_events": int(predicted_rows_total),
         "prediction_split_fraction": split_fraction,
-        "prediction_parquet_rows": int(len(pred_group)),
+        "prediction_parquet_rows": int(predicted_rows_total),
         "concat_mode": "streamed_raw_outside_selected_plus_prediction_rows",
         "raw_batch_size": int(raw_batch_size),
+        "prediction_batch_size": int(prediction_batch_size),
         "raw_num_batches": int(raw_batch_count),
+        "prediction_num_batches": int(prediction_batch_count),
+        "prediction_paths": group["pred_paths"],
         "raw_files": raw_files,
         "prediction_metrics": predicted_metrics,
         "truth_neutrino_oracle": (
@@ -1581,7 +1669,7 @@ def export_config_group(
     }
     print(
         f"[export-evenet-to-qi] worker {os.getpid()} streamed {parent_name} raw={raw_events_total} "
-        f"raw_outside={raw_outside_total} predicted={len(predicted_events)} "
+        f"raw_outside={raw_outside_total} predicted={predicted_rows_total} "
         f"total={counts.get('raw', 0)}",
         flush=True,
     )
@@ -1595,7 +1683,7 @@ def export_config_group(
 
 
 def export_config_group_worker(
-    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, str | None],
+    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, int, str | None],
 ) -> tuple[str, dict[str, Any]]:
     return export_config_group(*payload)
 
@@ -1612,46 +1700,56 @@ def export_config_prediction(
     num_workers: int,
     worker_backend: str,
     raw_batch_size: int,
+    prediction_batch_size: int,
     truth_output_label: str | None,
 ) -> dict[str, Any]:
-    pred_events = load_events(pred_path)
-    require_source_columns(pred_events, pred_path)
-
-    source_indices = ak.to_numpy(pred_events["source_sample_index"], allow_missing=False).astype(np.int64)
+    pred_paths = resolve_parquet_inputs(pred_path)
     summary: dict[str, Any] = {
         "prediction_parquet": str(pred_path),
+        "prediction_files": [str(path) for path in pred_paths],
         "output_label": output_label,
         "summary_label": summary_label,
         "samples": {},
     }
     grouped: dict[str, dict[str, Any]] = {}
 
-    for source_index in sorted(np.unique(source_indices).tolist()):
-        row_mask = source_indices == int(source_index)
-        pred_subset = pred_events[row_mask]
-        fallback_info = source_mapping.get(int(source_index))
-        source_info = infer_source_info_from_prediction(pred_subset, analysis_cfg, fallback_info)
-        if source_info is None:
-            raise ValueError(f"{pred_path} references source_sample_index={source_index}, absent from analysis.yaml expansion.")
-        parent_name = source_info["parent_name"]
-        parent_key = source_info["parent_key"]
+    metadata_columns = ["source_sample_index", "evenet_truth_class_name"]
+    for _scan_path, _batch_index, pred_metadata in iter_parquet_column_batches(pred_paths, prediction_batch_size, metadata_columns):
+        require_source_columns(pred_metadata, pred_path)
+        source_indices = ak.to_numpy(pred_metadata["source_sample_index"], allow_missing=False).astype(np.int64)
+        for source_index in sorted(np.unique(source_indices).tolist()):
+            row_mask = source_indices == int(source_index)
+            pred_subset = pred_metadata[row_mask]
+            fallback_info = source_mapping.get(int(source_index))
+            source_info = infer_source_info_from_prediction(pred_subset, analysis_cfg, fallback_info)
+            if source_info is None:
+                raise ValueError(f"{pred_path} references source_sample_index={source_index}, absent from analysis.yaml expansion.")
+            parent_name = source_info["parent_name"]
+            parent_key = source_info["parent_key"]
 
-        group = grouped.setdefault(
-            parent_name,
-            {
-                "parent_key": parent_key,
-                "parent_name": parent_name,
-                "is_data": source_info["is_data"],
-                "pred_parts": [],
-                "source_infos": [],
-                "expanded_samples": [],
-            },
-        )
-        group["pred_parts"].append(pred_subset)
-        group["source_infos"].append(source_info)
-        group["expanded_samples"].append(source_info["expanded_name"])
+            group = grouped.setdefault(
+                parent_name,
+                {
+                    "parent_key": parent_key,
+                    "parent_name": parent_name,
+                    "is_data": source_info["is_data"],
+                    "pred_paths": [str(path) for path in pred_paths],
+                    "source_indices": set(),
+                    "source_infos": [],
+                    "expanded_samples": [],
+                },
+            )
+            group["source_indices"].add(int(source_index))
+            if source_info["expanded_name"] not in group["expanded_samples"]:
+                group["source_infos"].append(source_info)
+                group["expanded_samples"].append(source_info["expanded_name"])
+
+    for group in grouped.values():
+        group["source_indices"] = sorted(group["source_indices"])
 
     group_items = list(grouped.items())
+    if not group_items:
+        raise ValueError(f"No prediction rows were found in {pred_path}.")
     total_groups = len(group_items)
     worker_count = min(max(1, int(num_workers)), max(total_groups, 1))
     backend = "process" if worker_backend == "process" else "thread"
@@ -1668,6 +1766,7 @@ def export_config_prediction(
                 prediction_split_fraction=prediction_split_fraction,
                 output_label=output_label,
                 raw_batch_size=raw_batch_size,
+                prediction_batch_size=prediction_batch_size,
                 truth_output_label=truth_output_label,
             )
             summary["samples"][parent_name] = metrics
@@ -1683,6 +1782,7 @@ def export_config_prediction(
                 prediction_split_fraction,
                 output_label,
                 raw_batch_size,
+                prediction_batch_size,
                 truth_output_label,
             )
             for parent_name, group in group_items
@@ -1720,6 +1820,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
     num_workers = config_num_workers(args, analysis_cfg)
     worker_backend = config_worker_backend(args, analysis_cfg)
     raw_batch_size = config_raw_batch_size(args, analysis_cfg)
+    prediction_batch_size = config_prediction_batch_size(args, analysis_cfg, raw_batch_size)
     write_truth_copy = config_write_truth_neutrino_copy(args, analysis_cfg)
     truth_output_label = config_truth_qi_method_label(args, analysis_cfg, output_label) if write_truth_copy else None
 
@@ -1737,6 +1838,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
             num_workers=num_workers,
             worker_backend=worker_backend,
             raw_batch_size=raw_batch_size,
+            prediction_batch_size=prediction_batch_size,
             truth_output_label=truth_output_label,
         )
     if data_pred is not None:
@@ -1752,6 +1854,7 @@ def run_config_mode(args: argparse.Namespace) -> None:
             num_workers=num_workers,
             worker_backend=worker_backend,
             raw_batch_size=raw_batch_size,
+            prediction_batch_size=prediction_batch_size,
             truth_output_label=truth_output_label,
         )
     if not summaries:

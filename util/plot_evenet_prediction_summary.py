@@ -91,6 +91,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If set, ignore evenet_weight and evaluate all MC events with unit weight.",
     )
+    parser.add_argument(
+        "--weight-source",
+        choices=["evenet", "central", "event", "unit"],
+        default="evenet",
+        help=(
+            "MC weight source. 'evenet' uses split-corrected evenet_weight, "
+            "'central' uses central_weight/weight without EveNet split correction, "
+            "'event' uses event_weight, and 'unit' ignores weights."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -208,9 +218,19 @@ def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     return output
 
 
-def event_weights(events: ak.Array, use_weighted: bool) -> np.ndarray:
-    if use_weighted and "evenet_weight" in events.fields:
-        weights = to_numpy(events["evenet_weight"], np.float64)
+def event_weights(events: ak.Array, use_weighted: bool, weight_source: str = "evenet") -> np.ndarray:
+    if not use_weighted or weight_source == "unit":
+        return np.ones(len(events), dtype=np.float64)
+
+    field_priority = {
+        "evenet": ("evenet_weight", "central_weight", "event_weight", "weight"),
+        "central": ("central_weight", "weight", "event_weight"),
+        "event": ("event_weight", "central_weight", "weight"),
+    }.get(weight_source, ("evenet_weight",))
+    for field in field_priority:
+        if field not in events.fields:
+            continue
+        weights = to_numpy(events[field], np.float64)
         valid = np.isfinite(weights) & (weights > 0)
         return np.where(valid, weights, 0.0)
     return np.ones(len(events), dtype=np.float64)
@@ -773,6 +793,7 @@ def plot_neutrino_grid(
     component_specs: list[tuple[str, str]],
     title_suffix: str,
     use_weighted: bool,
+    weight_source: str,
 ) -> dict[str, dict[str, dict[str, float]]]:
     leg_data = extract_leg_components(events)
     if not leg_data:
@@ -786,7 +807,7 @@ def plot_neutrino_grid(
         axes = np.expand_dims(axes, axis=1)
 
     metrics: dict[str, dict[str, dict[str, float]]] = {}
-    weights = event_weights(events, use_weighted=use_weighted)
+    weights = event_weights(events, use_weighted=use_weighted, weight_source=weight_source)
     pred_name = np.asarray(ak.to_list(events["evenet_pred_class_name"]), dtype=object)
     truth_name = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
     class_match = pred_name == truth_name
@@ -874,6 +895,7 @@ def gather_neutrino_metrics(
     output_dir: Path,
     max_processes: int | None,
     use_weighted: bool,
+    weight_source: str,
 ) -> dict[str, Any]:
     truth_name = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
     valid_truth = truth_name != DEFAULT_CLASS_NAME
@@ -896,6 +918,7 @@ def gather_neutrino_metrics(
         component_specs=cartesian_specs,
         title_suffix="Four-Momentum (Cartesian)",
         use_weighted=use_weighted,
+        weight_source=weight_source,
     )
     summary["all_processes"]["kinematics"] = plot_neutrino_grid(
         all_events,
@@ -904,6 +927,7 @@ def gather_neutrino_metrics(
         component_specs=kinematic_specs,
         title_suffix="Kinematics",
         use_weighted=use_weighted,
+        weight_source=weight_source,
     )
 
     for process_name in process_names_present:
@@ -918,6 +942,7 @@ def gather_neutrino_metrics(
                 component_specs=cartesian_specs,
                 title_suffix="Four-Momentum (Cartesian)",
                 use_weighted=use_weighted,
+                weight_source=weight_source,
             ),
             "kinematics": plot_neutrino_grid(
                 process_events,
@@ -926,6 +951,7 @@ def gather_neutrino_metrics(
                 component_specs=kinematic_specs,
                 title_suffix="Kinematics",
                 use_weighted=use_weighted,
+                weight_source=weight_source,
             ),
         }
 
@@ -948,9 +974,10 @@ def plot_predicted_class_comparison(
     class_names: list[str],
     output_path: Path,
     use_weighted: bool,
+    weight_source: str,
 ) -> None:
     mc_pred = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
-    mc_weight = event_weights(mc_events, use_weighted=use_weighted)
+    mc_weight = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source)
     data_pred = np.asarray(ak.to_list(data_events["evenet_pred_class_name"]), dtype=object)
 
     mc_counts = np.array([float(np.sum(mc_weight[mc_pred == name])) for name in class_names], dtype=np.float64)
@@ -976,10 +1003,11 @@ def plot_predicted_channel_purity(
     class_names: list[str],
     output_path: Path,
     use_weighted: bool,
+    weight_source: str,
 ) -> dict[str, Any]:
     mc_pred = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
     mc_truth = np.asarray(ak.to_list(mc_events["evenet_truth_class_name"]), dtype=object)
-    mc_weight = event_weights(mc_events, use_weighted=use_weighted)
+    mc_weight = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source)
 
     valid_mc = np.isfinite(mc_weight) & (mc_weight > 0)
     mc_pred = mc_pred[valid_mc]
@@ -1152,6 +1180,14 @@ def make_count_hist(values: np.ndarray, bins: np.ndarray) -> tuple[np.ndarray, n
     return counts, np.sqrt(counts)
 
 
+def make_data_hist(values: np.ndarray, bins: np.ndarray, weights: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    if weights is None:
+        return make_count_hist(values, bins)
+    counts = np.histogram(values, bins=bins, weights=weights)[0].astype(np.float64)
+    variance = np.histogram(values, bins=bins, weights=weights * weights)[0].astype(np.float64)
+    return counts, np.sqrt(variance)
+
+
 def plot_region_histogram_panel(
     ax,
     bins: np.ndarray,
@@ -1225,6 +1261,7 @@ def plot_region_kinematics(
     class_names: list[str],
     output_path: Path,
     use_weighted: bool,
+    weight_source: str,
 ) -> dict[str, Any]:
     region_mc = mc_events[np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object) == region_name]
     region_data = None
@@ -1232,7 +1269,7 @@ def plot_region_kinematics(
         region_data = data_events[np.asarray(ak.to_list(data_events["evenet_pred_class_name"]), dtype=object) == region_name]
 
     truth_names_mc = np.asarray(ak.to_list(region_mc["evenet_truth_class_name"]), dtype=object)
-    base_mc_weights = event_weights(region_mc, use_weighted=use_weighted) if len(region_mc) > 0 else np.array([], dtype=np.float64)
+    base_mc_weights = event_weights(region_mc, use_weighted=use_weighted, weight_source=weight_source) if len(region_mc) > 0 else np.array([], dtype=np.float64)
     truth_processes = [name for name in class_names if np.any(truth_names_mc == name)]
 
     mc_kin = build_full_tau_kinematics(region_mc) if len(region_mc) > 0 else None
@@ -1273,6 +1310,7 @@ def plot_region_kinematics(
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_pair"]["mass"] if data_kin is not None else None
             data_valid = data_kin["pred_pair"]["valid"] if data_kin is not None else None
+            data_weights_for_hist = None
             symmetric = False
         elif key == "delta_eta":
             mc_pred_values = mc_kin["pred_pair"]["delta_eta"]
@@ -1282,6 +1320,7 @@ def plot_region_kinematics(
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_pair"]["delta_eta"] if data_kin is not None else None
             data_valid = data_kin["pred_pair"]["valid"] if data_kin is not None else None
+            data_weights_for_hist = None
             symmetric = False
         elif key == "delta_phi":
             mc_pred_values = mc_kin["pred_pair"]["delta_phi"]
@@ -1291,6 +1330,7 @@ def plot_region_kinematics(
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_pair"]["delta_phi"] if data_kin is not None else None
             data_valid = data_kin["pred_pair"]["valid"] if data_kin is not None else None
+            data_weights_for_hist = None
             symmetric = False
         elif key == "vis_delta_eta":
             mc_pred_values = mc_kin["visible_pair"]["delta_eta"]
@@ -1300,6 +1340,7 @@ def plot_region_kinematics(
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["visible_pair"]["delta_eta"] if data_kin is not None else None
             data_valid = data_kin["visible_pair"]["valid"] if data_kin is not None else None
+            data_weights_for_hist = None
             symmetric = False
         elif key == "vis_delta_phi":
             mc_pred_values = mc_kin["visible_pair"]["delta_phi"]
@@ -1309,6 +1350,7 @@ def plot_region_kinematics(
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["visible_pair"]["delta_phi"] if data_kin is not None else None
             data_valid = data_kin["visible_pair"]["valid"] if data_kin is not None else None
+            data_weights_for_hist = None
             symmetric = False
         elif key == "invis_delta_eta":
             mc_pred_values = mc_kin["pred_invisible_pair"]["delta_eta"]
@@ -1318,6 +1360,7 @@ def plot_region_kinematics(
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_invisible_pair"]["delta_eta"] if data_kin is not None else None
             data_valid = data_kin["pred_invisible_pair"]["valid"] if data_kin is not None else None
+            data_weights_for_hist = None
             symmetric = False
         elif key == "invis_delta_phi":
             mc_pred_values = mc_kin["pred_invisible_pair"]["delta_phi"]
@@ -1327,6 +1370,7 @@ def plot_region_kinematics(
             mc_weights_for_hist = base_mc_weights
             data_values = data_kin["pred_invisible_pair"]["delta_phi"] if data_kin is not None else None
             data_valid = data_kin["pred_invisible_pair"]["valid"] if data_kin is not None else None
+            data_weights_for_hist = None
             symmetric = False
         else:
             component = key.split("_", 1)[1]
@@ -1343,11 +1387,13 @@ def plot_region_kinematics(
             if data_kin is not None:
                 data_values = np.concatenate([data_kin["pred_tau"][0][component], data_kin["pred_tau"][1][component]])
                 data_valid = np.concatenate([data_kin["pred_tau"][0]["valid"], data_kin["pred_tau"][1]["valid"]])
+                data_weights_for_hist = np.full(len(data_values), 0.5, dtype=np.float64)
             else:
                 data_values = None
                 data_valid = None
+                data_weights_for_hist = None
             symmetric = component in {"px", "py", "pz"}
-            mc_weights_for_hist = np.concatenate([base_mc_weights, base_mc_weights])
+            mc_weights_for_hist = 0.5 * np.concatenate([base_mc_weights, base_mc_weights])
         mc_reco_finite = mc_reco_valid & finite_mask(mc_pred_values, mc_weights_for_hist)
         mc_truth_finite = mc_truth_valid & finite_mask(mc_truth_values, mc_weights_for_hist)
         combined_for_bins = np.concatenate([
@@ -1376,7 +1422,8 @@ def plot_region_kinematics(
         if data_values is not None and data_valid is not None:
             data_mask = data_valid & finite_mask(data_values)
             if np.any(data_mask):
-                data_hist, data_err = make_count_hist(data_values[data_mask], bins)
+                data_weights = data_weights_for_hist[data_mask] if data_weights_for_hist is not None else None
+                data_hist, data_err = make_data_hist(data_values[data_mask], bins, weights=data_weights)
             elif region_data_count > 0:
                 data_note = "Data present, but no valid prediction\nstored for this observable"
 
@@ -1419,6 +1466,7 @@ def gather_region_kinematics_plots(
     output_dir: Path,
     max_processes: int | None,
     use_weighted: bool,
+    weight_source: str,
 ) -> dict[str, Any]:
     predicted_names = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
     if data_events is not None:
@@ -1437,6 +1485,7 @@ def gather_region_kinematics_plots(
             class_names=class_names,
             output_path=output_dir / f"region_kinematics_{region_name}.png",
             use_weighted=use_weighted,
+            weight_source=weight_source,
         )
     return summary
 
@@ -1451,13 +1500,14 @@ def main() -> None:
     mc_events = load_events(mc_paths)
     data_events = load_events(data_paths) if (data_paths and args.unblind) else None
     use_weighted = not args.unweighted
+    weight_source = "unit" if args.unweighted else args.weight_source
 
     class_names = build_class_names_from_analysis(args.analysis_config.resolve(), args.evenet_config.resolve())
     summary_class_names = summary_channel_order(class_names)
 
     truth_idx = to_numpy(mc_events["evenet_truth_class_index"], np.int64)
     pred_idx = to_numpy(mc_events["evenet_pred_class_index"], np.int64)
-    weights = event_weights(mc_events, use_weighted=use_weighted)
+    weights = event_weights(mc_events, use_weighted=use_weighted, weight_source=weight_source)
     valid_class = (truth_idx >= 0) & (truth_idx < len(class_names)) & (pred_idx >= 0) & (pred_idx < len(class_names)) & np.isfinite(weights) & (weights > 0)
 
     confusion_metrics = plot_confusion_summary(
@@ -1477,6 +1527,7 @@ def main() -> None:
         output_dir=output_dir,
         max_processes=args.max_processes,
         use_weighted=use_weighted,
+        weight_source=weight_source,
     )
 
     if data_events is not None:
@@ -1486,6 +1537,7 @@ def main() -> None:
             class_names=summary_class_names,
             output_path=output_dir / "predicted_class_data_vs_mc.png",
             use_weighted=use_weighted,
+            weight_source=weight_source,
         )
     purity_metrics = plot_predicted_channel_purity(
         mc_events=mc_events,
@@ -1493,6 +1545,7 @@ def main() -> None:
         class_names=summary_class_names,
         output_path=output_dir / "predicted_channel_purity.png",
         use_weighted=use_weighted,
+        weight_source=weight_source,
     )
     region_kinematics_metrics = gather_region_kinematics_plots(
         mc_events=mc_events,
@@ -1501,6 +1554,7 @@ def main() -> None:
         output_dir=output_dir,
         max_processes=args.max_processes,
         use_weighted=use_weighted,
+        weight_source=weight_source,
     )
 
     metrics_payload = {
@@ -1510,6 +1564,7 @@ def main() -> None:
             "analysis_config": str(args.analysis_config.resolve()),
             "evenet_config": str(args.evenet_config.resolve()),
             "use_weighted": use_weighted,
+            "weight_source": weight_source,
             "summary_channel_order": summary_class_names,
         },
         "classification": confusion_metrics,
