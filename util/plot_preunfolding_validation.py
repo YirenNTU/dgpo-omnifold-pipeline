@@ -1919,8 +1919,15 @@ def plot_truth_vs_reco_by_method_and_region(
         )
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [executor.submit(collect_truth_reco_region_ranges, task) for task in region_tasks]
+            completed = 0
             for future in as_completed(futures):
                 range_results.append(future.result())
+                completed += 1
+                if completed == 1 or completed % 5 == 0 or completed == len(region_tasks):
+                    print(
+                        f"[preunfolding] {log_label} range scan progress {completed}/{len(region_tasks)}",
+                        flush=True,
+                    )
     else:
         for task in region_tasks:
             range_results.append(collect_truth_reco_region_ranges(task))
@@ -1967,9 +1974,16 @@ def plot_truth_vs_reco_by_method_and_region(
         )
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [executor.submit(collect_truth_reco_region, task) for task in region_tasks]
+            completed = 0
             for future in as_completed(futures):
                 method, region, result = future.result()
                 store_region_result(method, region, result)
+                completed += 1
+                if completed == 1 or completed % 5 == 0 or completed == len(region_tasks):
+                    print(
+                        f"[preunfolding] {log_label} collect progress {completed}/{len(region_tasks)}",
+                        flush=True,
+                    )
     else:
         for task in region_tasks:
             method, region, result = collect_truth_reco_region(task)
@@ -2618,6 +2632,12 @@ def main() -> None:
     print(f"[preunfolding] reco_tau_observables={[name for name, _ in reco_tau_specs]}", flush=True)
     print(f"[preunfolding] visible_tau_observables={[name for name, _ in visible_tau_specs]}", flush=True)
     print(f"[preunfolding] num_workers={args.num_workers}", flush=True)
+    if args.load_batch_size > 0 and args.num_workers > 32:
+        print(
+            "[preunfolding] warning: high --num-workers on streamed parquet inputs can become I/O-bound "
+            "and appear stalled on shared storage. Around 8-24 workers is usually faster than 120.",
+            flush=True,
+        )
 
     plot_block_tasks = [
         {
