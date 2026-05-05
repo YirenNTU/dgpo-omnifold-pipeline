@@ -388,6 +388,26 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --num-gpus 4
 ```
 
+If classification and diffusion were trained as separate checkpoints, pass both
+explicitly. Classification logits come from `--classification-checkpoint`; the
+neutrino sampler comes from `--diffusion-checkpoint`. `--checkpoint` remains a
+legacy shortcut when both heads live in the same checkpoint.
+
+```bash
+python3 util/predict_evenet_from_raw_parquet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train_pretrain.yaml \
+  --classification-checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/cls/last.ckpt \
+  --diffusion-checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/diffusion/last.ckpt \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
+  --disable-ema \
+  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
+  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
+  --converted-split-fraction 0.5 \
+  --batch-size 2048 \
+  --num-gpus 4
+```
+
 Scratch example:
 
 ```bash
@@ -423,7 +443,44 @@ python3 util/predict_evenet_from_raw_parquet.py \
   --num-gpus 4
 ```
 
-`--num-gpus` is batch/event-chunk parallel. A single large parquet can be split across multiple GPUs.
+`--num-gpus` is batch/event-chunk parallel within one node. A single large
+parquet can be split across multiple GPUs on that node.
+
+For NERSC-style multi-node inference, run one prediction job per node and split
+the event chunks with `--task-num-shards` and `--task-shard-index`. For example,
+on 4 nodes with 4 GPUs per node:
+
+```bash
+srun --nodes=4 --ntasks-per-node=1 --gpus-per-task=4 bash -lc '
+python3 util/predict_evenet_from_raw_parquet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train_pretrain.yaml \
+  --classification-checkpoint /path/to/cls.ckpt \
+  --diffusion-checkpoint /path/to/diffusion.ckpt \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
+  --disable-ema \
+  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
+  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
+  --converted-split-fraction 0.5 \
+  --batch-size 2048 \
+  --num-gpus 4 \
+  --task-num-shards 4 \
+  --task-shard-index ${SLURM_PROCID}
+'
+```
+
+After all nodes finish, merge the `.part*.parquet` files once:
+
+```bash
+python3 util/predict_evenet_from_raw_parquet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train_pretrain.yaml \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
+  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
+  --task-num-shards 4 \
+  --num-gpus 4 \
+  --merge-only
+```
 
 `--converted-split-fraction` only affects `evenet_weight` in the prediction parquet, which is used by standalone data/MC plots. For example, if `test.parquet` represents 50 percent of the MC sample, pass `0.5` so MC `evenet_weight` is scaled by 2. Data is not split-reweighted.
 

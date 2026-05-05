@@ -103,7 +103,28 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         default=None,
-        help="Optional checkpoint override. If omitted, use options.Training.model_checkpoint_load_path from train config.",
+        help=(
+            "Legacy checkpoint override used for both classification and diffusion. "
+            "If omitted, use options.Training.model_checkpoint_load_path from train config."
+        ),
+    )
+    parser.add_argument(
+        "--classification-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional classification checkpoint. When set, classification is evaluated with this "
+            "checkpoint while neutrino diffusion uses --diffusion-checkpoint or --checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional diffusion/generation checkpoint. When set, neutrino sampling uses this "
+            "checkpoint while classification uses --classification-checkpoint or --checkpoint."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -140,6 +161,40 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Number of GPU workers. Falls back to CPU single-process if CUDA is unavailable.",
+    )
+    parser.add_argument(
+        "--task-num-shards",
+        type=int,
+        default=1,
+        help=(
+            "Split prediction tasks across independent jobs, for example one job per NERSC node. "
+            "Each job writes only its assigned part files."
+        ),
+    )
+    parser.add_argument(
+        "--task-shard-index",
+        type=int,
+        default=0,
+        help="Shard index for this independent prediction job. Must be in [0, --task-num-shards).",
+    )
+    parser.add_argument(
+        "--chunks-per-file",
+        type=int,
+        default=None,
+        help=(
+            "Number of event chunks to create for each converted parquet. Defaults to local GPU workers "
+            "for a single job, or --num-gpus * --task-num-shards for sharded multi-node jobs."
+        ),
+    )
+    parser.add_argument(
+        "--skip-merge",
+        action="store_true",
+        help="Keep .part*.parquet outputs and do not merge them into final prediction parquets.",
+    )
+    parser.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Merge existing .part*.parquet outputs and exit without loading checkpoints or running inference.",
     )
     parser.add_argument(
         "--converted-split-fraction",
@@ -356,11 +411,25 @@ def resolve_checkpoint_path(runtime_train_config: Path) -> Path:
     if checkpoint_value is None:
         raise ValueError("No checkpoint configured. Pass --checkpoint or set options.Training.model_checkpoint_load_path.")
 
+    return resolve_checkpoint_path_value(checkpoint_value, "model checkpoint")
+
+
+def resolve_checkpoint_path_value(checkpoint_value: str | Path, label: str) -> Path:
+    """
+    inputs:
+      checkpoint_value: str | Path, checkpoint file or directory.
+      label: str, diagnostic label.
+    outputs:
+      path: Path, concrete checkpoint file.
+    goal:
+      Resolve both legacy single-checkpoint and split classification/diffusion
+      checkpoint inputs consistently.
+    """
     checkpoint_path = Path(checkpoint_value).expanduser()
     if checkpoint_path.is_dir():
         candidates = sorted(checkpoint_path.glob("*.ckpt"), key=lambda path: path.stat().st_mtime)
         if not candidates:
-            raise FileNotFoundError(f"No .ckpt files found in checkpoint directory: {checkpoint_path}")
+            raise FileNotFoundError(f"No .ckpt files found in {label} directory: {checkpoint_path}")
         return candidates[-1].resolve()
     return checkpoint_path.resolve()
 
@@ -386,6 +455,49 @@ def build_converted_tasks(converted_parquet: list[str], output_dir: Path, num_ch
     return tasks
 
 
+def select_task_shard(tasks: list[InferenceTask], task_num_shards: int, task_shard_index: int) -> list[InferenceTask]:
+    """
+    inputs:
+      tasks: list[InferenceTask], all event chunks to run.
+      task_num_shards: int, number of independent jobs.
+      task_shard_index: int, current independent job index.
+    outputs:
+      shard_tasks: list[InferenceTask], tasks assigned to this job.
+    goal:
+      Let several scheduler jobs process one prediction campaign without
+      duplicating output files.
+    """
+    if task_num_shards < 1:
+        raise ValueError(f"--task-num-shards must be >= 1, got {task_num_shards}.")
+    if not (0 <= task_shard_index < task_num_shards):
+        raise ValueError(
+            f"--task-shard-index must be in [0, {task_num_shards}), got {task_shard_index}."
+        )
+    if task_num_shards == 1:
+        return tasks
+    return tasks[task_shard_index::task_num_shards]
+
+
+def infer_chunks_per_file(args: argparse.Namespace, num_workers: int) -> int:
+    """
+    inputs:
+      args: argparse.Namespace, CLI options.
+      num_workers: int, local GPU/CPU worker count.
+    outputs:
+      chunks_per_file: int, number of parquet pieces per input file.
+    goal:
+      Keep single-node behavior unchanged while allowing multi-node jobs to
+      create enough chunks for all participating GPUs.
+    """
+    if args.chunks_per_file is not None:
+        if args.chunks_per_file < 1:
+            raise ValueError(f"--chunks-per-file must be >= 1, got {args.chunks_per_file}.")
+        return int(args.chunks_per_file)
+    if args.task_num_shards > 1:
+        return max(1, int(args.num_gpus) * int(args.task_num_shards))
+    return max(1, int(num_workers))
+
+
 def parquet_num_rows(parquet_path: Path) -> int:
     return int(pq.ParquetFile(parquet_path).metadata.num_rows)
 
@@ -407,10 +519,35 @@ def to_torch_batch(batch: dict[str, np.ndarray], device: torch.device) -> dict[s
     return output
 
 
-def load_model_bundle(runtime_train_config: Path, checkpoint_path: Path, device: torch.device) -> dict[str, Any]:
-    global_config.load_yaml(runtime_train_config, current_dir=REPO_ROOT)
-    normalization_dict = torch.load(global_config.options.Dataset.normalization_file, map_location=device)
+def checkpoint_state_dict(checkpoint_path: Path, *, use_ema: bool, device: torch.device) -> dict[str, torch.Tensor]:
+    """
+    inputs:
+      checkpoint_path: Path, Lightning checkpoint.
+      use_ema: bool, prefer ema_state_dict when available.
+      device: torch.device, map_location.
+    outputs:
+      state_dict: dict[str, torch.Tensor], selected model weights.
+    goal:
+      Keep checkpoint selection identical for the legacy and split-checkpoint
+      prediction modes.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if use_ema and "ema_state_dict" in checkpoint:
+        return checkpoint["ema_state_dict"]
+    return checkpoint["state_dict"]
 
+
+def build_evenet_model(device: torch.device, normalization_dict: dict[str, Any]) -> EveNetModel:
+    """
+    inputs:
+      device: torch.device, target device.
+      normalization_dict: dict, loaded normalization.pt.
+    outputs:
+      model: EveNetModel, configured with enabled components from train config.
+    goal:
+      Build identical classification and diffusion models when split
+      checkpoints are used.
+    """
     components = global_config.options.Training.Components
     model = EveNetModel(
         config=global_config,
@@ -424,9 +561,19 @@ def load_model_bundle(runtime_train_config: Path, checkpoint_path: Path, device:
         segmentation=components.Segmentation.include,
         normalization_dict=normalization_dict,
     )
-    model = model.to(device=device)
+    return model.to(device=device)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+def load_model_bundle(
+    runtime_train_config: Path,
+    checkpoint_path: Path,
+    device: torch.device,
+    classification_checkpoint_path: Path | None = None,
+    diffusion_checkpoint_path: Path | None = None,
+) -> dict[str, Any]:
+    global_config.load_yaml(runtime_train_config, current_dir=REPO_ROOT)
+    normalization_dict = torch.load(global_config.options.Dataset.normalization_file, map_location=device)
+
     ema_cfg = global_config.options.Training.EMA
     prediction_cfg = global_config.options.get("prediction", {})
     use_ema = (
@@ -434,17 +581,39 @@ def load_model_bundle(runtime_train_config: Path, checkpoint_path: Path, device:
         and bool(ema_cfg.get("replace_model_after_load", False))
         and not bool(prediction_cfg.get("disable_ema", False))
     )
-    state_dict = checkpoint.get("ema_state_dict") if use_ema and "ema_state_dict" in checkpoint else checkpoint["state_dict"]
-    safe_load_state(model, state_dict, verbose=False)
+    diffusion_path = diffusion_checkpoint_path or checkpoint_path
+    classification_path = classification_checkpoint_path or checkpoint_path
+
+    model = build_evenet_model(device, normalization_dict)
+    safe_load_state(
+        model,
+        checkpoint_state_dict(diffusion_path, use_ema=use_ema, device=device),
+        verbose=False,
+    )
     model.eval()
+
+    if classification_path == diffusion_path:
+        classification_model = model
+    else:
+        classification_model = build_evenet_model(device, normalization_dict)
+        safe_load_state(
+            classification_model,
+            checkpoint_state_dict(classification_path, use_ema=use_ema, device=device),
+            verbose=False,
+        )
+        classification_model.eval()
 
     return {
         "model": model,
+        "classification_model": classification_model,
         "sampler": DDIMSampler(device=device),
         "class_names": list(global_config.event_info.class_label["EVENT"]["signal"][0]),
         "invisible_feature_names": list(global_config.event_info.invisible_feature_names),
         "feature_config": infer_feature_config(runtime_train_config),
         "num_steps": int(global_config.options.Training.Components.TruthGeneration.diffusion_steps),
+        "checkpoint_path": str(checkpoint_path),
+        "classification_checkpoint_path": str(classification_path),
+        "diffusion_checkpoint_path": str(diffusion_path),
     }
 
 
@@ -656,6 +825,7 @@ def predict_converted_events(
     class_names = model_bundle["class_names"]
     invisible_feature_names = model_bundle["invisible_feature_names"]
     model: EveNetModel = model_bundle["model"]
+    classification_model: EveNetModel = model_bundle.get("classification_model", model)
     sampler: DDIMSampler = model_bundle["sampler"]
     diffusion_steps = int(num_steps if num_steps is not None else model_bundle["num_steps"])
 
@@ -698,7 +868,7 @@ def predict_converted_events(
         batch_torch = to_torch_batch(batch_slice, device=device)
 
         with torch.no_grad():
-            cls_outputs = model.shared_step(
+            cls_outputs = classification_model.shared_step(
                 batch=batch_torch,
                 batch_size=stop - start,
                 train_parameters=None,
@@ -958,6 +1128,8 @@ def worker_main(
     tasks: list[InferenceTask],
     runtime_train_config: str,
     checkpoint_path: str,
+    classification_checkpoint_path: str | None,
+    diffusion_checkpoint_path: str | None,
     batch_size: int,
     num_steps: int | None,
     signal_class_names: set[str],
@@ -971,7 +1143,13 @@ def worker_main(
     if use_cuda:
         torch.cuda.set_device(rank)
 
-    model_bundle = load_model_bundle(Path(runtime_train_config), Path(checkpoint_path), device=device)
+    model_bundle = load_model_bundle(
+        Path(runtime_train_config),
+        Path(checkpoint_path),
+        device=device,
+        classification_checkpoint_path=Path(classification_checkpoint_path) if classification_checkpoint_path else None,
+        diffusion_checkpoint_path=Path(diffusion_checkpoint_path) if diffusion_checkpoint_path else None,
+    )
     validate_feature_alignment(model_bundle["feature_config"], model_bundle["class_names"])
 
     worker_tasks = tasks[rank::world_size] if world_size > 0 else tasks
@@ -998,6 +1176,15 @@ def main() -> None:
     converted_split_fraction = resolve_converted_split_fraction(args, pred_cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    use_cuda = torch.cuda.is_available() and args.num_gpus > 0
+    num_workers = min(args.num_gpus, torch.cuda.device_count()) if use_cuda else 1
+    chunks_per_file = infer_chunks_per_file(args, num_workers)
+    all_tasks = build_converted_tasks(converted_parquets, output_dir, num_chunks_per_file=chunks_per_file)
+
+    if args.merge_only:
+        merge_converted_chunk_outputs(all_tasks)
+        return
+
     runtime_train_config = prepare_runtime_train_config(
         train_config_path=args.train_config.resolve(),
         analysis_config_path=args.analysis_config.resolve(),
@@ -1012,8 +1199,16 @@ def main() -> None:
         yaml.safe_dump(runtime_train_cfg_data, handle, sort_keys=False)
 
     checkpoint_path = resolve_checkpoint_path(runtime_train_config)
-    use_cuda = torch.cuda.is_available() and args.num_gpus > 0
-    num_workers = min(args.num_gpus, torch.cuda.device_count()) if use_cuda else 1
+    classification_checkpoint_path = (
+        resolve_checkpoint_path_value(args.classification_checkpoint, "classification checkpoint")
+        if args.classification_checkpoint is not None
+        else checkpoint_path
+    )
+    diffusion_checkpoint_path = (
+        resolve_checkpoint_path_value(args.diffusion_checkpoint, "diffusion checkpoint")
+        if args.diffusion_checkpoint is not None
+        else checkpoint_path
+    )
     analysis_config_data = read_yaml(args.analysis_config.resolve())
     _, _, analysis_feature_config = parse_config(args.analysis_config.resolve())
     merged_evenet_config = parse_evenet_config(
@@ -1021,7 +1216,7 @@ def main() -> None:
         analysis_feature_config,
     )
     loaded_class_names = runtime_class_names(Path(runtime_train_config))
-    tasks = build_converted_tasks(converted_parquets, output_dir, num_chunks_per_file=max(1, num_workers))
+    tasks = select_task_shard(all_tasks, args.task_num_shards, args.task_shard_index)
     if not tasks:
         raise ValueError("No converted parquet tasks were found.")
 
@@ -1032,7 +1227,12 @@ def main() -> None:
         class_names=loaded_class_names,
     )
 
-    meta_path = output_dir / "prediction_metadata.yaml"
+    meta_name = (
+        f"prediction_metadata.shard{args.task_shard_index:03d}-of-{args.task_num_shards:03d}.yaml"
+        if args.task_num_shards > 1
+        else "prediction_metadata.yaml"
+    )
+    meta_path = output_dir / meta_name
     with meta_path.open("w") as handle:
         yaml.safe_dump(
             {
@@ -1041,7 +1241,13 @@ def main() -> None:
                 "train_config": str(args.train_config.resolve()),
                 "runtime_train_config": str(runtime_train_config.resolve()),
                 "checkpoint": str(checkpoint_path),
+                "classification_checkpoint": str(classification_checkpoint_path),
+                "diffusion_checkpoint": str(diffusion_checkpoint_path),
                 "num_tasks": len(tasks),
+                "total_tasks": len(all_tasks),
+                "task_num_shards": int(args.task_num_shards),
+                "task_shard_index": int(args.task_shard_index),
+                "chunks_per_file": int(chunks_per_file),
                 "signal_classes": sorted(signal_class_names),
                 "converted_parquet": [str(Path(path).resolve()) for path in converted_parquets],
                 "shape_metadata": str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
@@ -1061,7 +1267,9 @@ def main() -> None:
             tasks=tasks,
             runtime_train_config=str(runtime_train_config),
             checkpoint_path=str(checkpoint_path),
-            batch_size=args.batch_size  ,
+            classification_checkpoint_path=str(classification_checkpoint_path),
+            diffusion_checkpoint_path=str(diffusion_checkpoint_path),
+            batch_size=args.batch_size,
             num_steps=args.num_steps,
             signal_class_names=signal_class_names,
             use_weighted_output=not args.unweighted_output,
@@ -1069,7 +1277,10 @@ def main() -> None:
             class_weight_map=class_weight_map,
             converted_split_fraction=converted_split_fraction,
         )
-        merge_converted_chunk_outputs(tasks)
+        if args.skip_merge or args.task_num_shards > 1:
+            print("[converted-merge] skipped; run again with --merge-only after all shards finish", flush=True)
+        else:
+            merge_converted_chunk_outputs(tasks)
         return
 
     mp.spawn(
@@ -1079,6 +1290,8 @@ def main() -> None:
             tasks,
             str(runtime_train_config),
             str(checkpoint_path),
+            str(classification_checkpoint_path),
+            str(diffusion_checkpoint_path),
             args.batch_size,
             args.num_steps,
             signal_class_names,
@@ -1090,7 +1303,10 @@ def main() -> None:
         nprocs=num_workers,
         join=True,
     )
-    merge_converted_chunk_outputs(tasks)
+    if args.skip_merge or args.task_num_shards > 1:
+        print("[converted-merge] skipped; run again with --merge-only after all shards finish", flush=True)
+    else:
+        merge_converted_chunk_outputs(tasks)
 
 
 if __name__ == "__main__":
