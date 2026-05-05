@@ -105,7 +105,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Legacy checkpoint override used for both classification and diffusion. "
-            "If omitted, use options.Training.model_checkpoint_load_path from train config."
+            "If omitted, use options.Training.model_checkpoint_load_path from train config. "
+            "Not required when both --classification-checkpoint and --diffusion-checkpoint are set."
         ),
     )
     parser.add_argument(
@@ -1200,7 +1201,10 @@ def main() -> None:
     with runtime_train_config.open("w") as handle:
         yaml.safe_dump(runtime_train_cfg_data, handle, sort_keys=False)
 
-    checkpoint_path = resolve_checkpoint_path(runtime_train_config)
+    legacy_checkpoint_path = None
+    if args.checkpoint is not None or args.classification_checkpoint is None or args.diffusion_checkpoint is None:
+        legacy_checkpoint_path = resolve_checkpoint_path(runtime_train_config)
+
     ema_cfg = runtime_train_cfg_data.get("options", {}).get("Training", {}).get("EMA", {})
     diffusion_use_ema = (
         bool(ema_cfg.get("enable", False))
@@ -1210,13 +1214,19 @@ def main() -> None:
     classification_checkpoint_path = (
         resolve_checkpoint_path_value(args.classification_checkpoint, "classification checkpoint")
         if args.classification_checkpoint is not None
-        else checkpoint_path
+        else legacy_checkpoint_path
     )
     diffusion_checkpoint_path = (
         resolve_checkpoint_path_value(args.diffusion_checkpoint, "diffusion checkpoint")
         if args.diffusion_checkpoint is not None
-        else checkpoint_path
+        else legacy_checkpoint_path
     )
+    if classification_checkpoint_path is None or diffusion_checkpoint_path is None:
+        raise ValueError(
+            "No fallback checkpoint configured. Set both --classification-checkpoint and "
+            "--diffusion-checkpoint, pass --checkpoint, or set options.Training.model_checkpoint_load_path."
+        )
+    checkpoint_path = legacy_checkpoint_path or diffusion_checkpoint_path
     analysis_config_data = read_yaml(args.analysis_config.resolve())
     _, _, analysis_feature_config = parse_config(args.analysis_config.resolve())
     merged_evenet_config = parse_evenet_config(
@@ -1248,7 +1258,7 @@ def main() -> None:
                 "analysis_config": str(args.analysis_config.resolve()),
                 "train_config": str(args.train_config.resolve()),
                 "runtime_train_config": str(runtime_train_config.resolve()),
-                "checkpoint": str(checkpoint_path),
+                "checkpoint": str(legacy_checkpoint_path) if legacy_checkpoint_path is not None else None,
                 "classification_checkpoint": str(classification_checkpoint_path),
                 "diffusion_checkpoint": str(diffusion_checkpoint_path),
                 "num_tasks": len(tasks),
