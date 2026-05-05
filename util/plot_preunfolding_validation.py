@@ -1190,7 +1190,7 @@ def plot_truth_vs_reco_by_method_and_region(
                 flush=True,
             )
             try:
-                events = load_truth_reco_method_events(root, signal_sample_name, region)
+                events = load_truth_reco_method_events(root, signal_sample_name, region, args.max_entries)
             except Exception as error:
                 print(
                     f"    [error] failed to load events method={method} region={region}: {error}",
