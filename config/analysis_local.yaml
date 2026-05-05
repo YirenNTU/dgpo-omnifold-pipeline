@@ -15,7 +15,7 @@ Samples:
     norm_factor: 1458.9 # pb
     input_files:
       - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau/filtered___baseline.parquet"
-      raw_files:
+    raw_files:
       - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau/filtered___raw.parquet"
 
   Zll:
