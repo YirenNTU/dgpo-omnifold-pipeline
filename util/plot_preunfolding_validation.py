@@ -13,6 +13,7 @@ from typing import Any
 import awkward as ak
 import matplotlib.pyplot as plt
 import numpy as np
+import pyarrow.parquet as pq
 import vector
 from matplotlib.lines import Line2D
 
@@ -429,11 +430,12 @@ def expected_truth_classes_for_region(region: str) -> set[str]:
 
 def select_truth_reco_events(events: ak.Array, region: str) -> tuple[ak.Array, dict[str, Any]]:
     expected_classes = expected_truth_classes_for_region(region)
+    require_correct_assignment = region.startswith("Ztautau_")
     info = {
         "input_events": int(len(events)),
         "expected_truth_classes": sorted(expected_classes),
         "class_filter_applied": False,
-        "correct_assignment_required": False,
+        "correct_assignment_required": require_correct_assignment,
         "selected_events": int(len(events)),
     }
     if not expected_classes:
@@ -458,11 +460,10 @@ def select_truth_reco_events(events: ak.Array, region: str) -> tuple[ak.Array, d
     if truth_names is not None:
         mask &= np.isin(truth_names, list(expected_classes))
         info["class_filter_applied"] = True
-    if pred_names is not None and truth_names is not None:
+    if pred_names is not None and truth_names is not None and require_correct_assignment:
         mask &= pred_names == truth_names
-        info["correct_assignment_required"] = True
         info["class_filter_applied"] = True
-    elif pred_names is not None:
+    elif pred_names is not None and truth_names is None:
         mask &= np.isin(pred_names, list(expected_classes))
         info["class_filter_applied"] = True
 
@@ -912,6 +913,7 @@ def render_grouped_truth_reco_panels(
     for (channel_group, observable), records in sorted(records_by_group.items()):
         if not records:
             continue
+        records = deduplicate_grouped_records(records, channel_group, observable, log_label)
 
         num_2d_blocks = max(1, len(records))
         fig_width = max(13.2, 5.4 + 3.35 * num_2d_blocks)
@@ -1058,9 +1060,59 @@ def render_grouped_truth_reco_panels(
     return paths
 
 
+def deduplicate_grouped_records(
+    records: list[dict[str, Any]],
+    channel_group: str,
+    observable: str,
+    log_label: str,
+) -> list[dict[str, Any]]:
+    by_method: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_method.setdefault(record["method"], []).append(record)
+
+    selected: list[dict[str, Any]] = []
+    for method, method_records in by_method.items():
+        if len(method_records) == 1:
+            selected.append(method_records[0])
+            continue
+
+        def record_rank(record: dict[str, Any]) -> tuple[int, int, int]:
+            exact_group = record["region"] == channel_group
+            broad_region = not record["region"].startswith("Ztautau_")
+            num_events = int(record.get("num_events") or 0)
+            return (0 if exact_group else 1, 0 if broad_region else 1, -num_events)
+
+        chosen = sorted(method_records, key=record_rank)[0]
+        dropped = [record["region"] for record in method_records if record is not chosen]
+        print(
+            f"[preunfolding] deduplicate grouped {log_label} channel={channel_group} "
+            f"observable={observable} method={method} kept={chosen['region']} dropped={dropped}",
+            flush=True,
+        )
+        selected.append(chosen)
+
+    return sorted(selected, key=lambda record: (record["method_index"], record["region"]))
+
+
 def discover_method_regions(root: Path, sample_name: str, preferred_regions: list[str] | None = None) -> list[str]:
     discovered: list[str] = []
     sample_dir = root / sample_name
+    raw_candidate = parquet_for(root, sample_name, "raw")
+    if raw_candidate.exists():
+        try:
+            raw_fields = set(pq.ParquetFile(raw_candidate).schema_arrow.names)
+        except Exception as error:
+            print(f"[preunfolding] warning failed to inspect raw parquet schema path={raw_candidate}: {error}", flush=True)
+            raw_fields = set()
+        for field in sorted(raw_fields):
+            if not field.endswith("_cut"):
+                continue
+            region = field.removesuffix("_cut")
+            if region in {"raw", "baseline", "hadhad"} or region in IGNORED_CHANNEL_REGIONS:
+                continue
+            if expected_truth_classes_for_region(region):
+                discovered.append(region)
+
     if sample_dir.exists():
         for path in sorted(sample_dir.glob("filtered___*.parquet")):
             region = path.stem.removeprefix("filtered___")
@@ -1269,6 +1321,7 @@ def plot_truth_vs_reco_by_method_and_region(
                         "centers": centers2d,
                         "hist2d": hist2d,
                         "limits": limits2d,
+                        "num_events": int(np.count_nonzero(valid_mask)),
                     }
                 )
 
