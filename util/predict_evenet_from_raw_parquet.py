@@ -1244,7 +1244,7 @@ def main() -> None:
         converted_parquets,
         output_dir,
         num_chunks_per_file=chunks_per_file,
-        max_events_per_chunk=args.batch_size,
+        max_events_per_chunk=args.batch_size if args.chunks_per_file is None else None,
     )
 
     if args.merge_only:
@@ -1306,7 +1306,12 @@ def main() -> None:
     loaded_class_names = runtime_class_names(Path(runtime_train_config))
     tasks = select_task_shard(all_tasks, args.task_num_shards, args.task_shard_index)
     if not tasks:
-        raise ValueError("No converted parquet tasks were found.")
+        print(
+            f"[converted-task] no tasks assigned to shard {args.task_shard_index}/{args.task_num_shards}; "
+            f"total_tasks={len(all_tasks)}. Exiting cleanly.",
+            flush=True,
+        )
+        return
 
     signal_class_names = signal_class_names_from_analysis(args.analysis_config.resolve())
     class_weight_map = build_converted_class_weights(

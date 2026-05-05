@@ -578,6 +578,32 @@ python3 util/export_evenet_prediction_to_qi.py \
   --num-workers 4
 ```
 
+Production pretrain export with raw-parquet streaming and truth-neutrino oracle:
+
+```bash
+cd /path/to/lep_tree_ana/ml_pipeline
+python3 util/export_evenet_prediction_to_qi.py \
+  --analysis-config config/analysis.yaml \
+  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/prediction-evenet-pretrain \
+  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/prediction-evenet-pretrain/data-pred \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/prediction-evenet-pretrain \
+  --qi-method-label pretrain \
+  --write-truth-neutrino-copy \
+  --truth-qi-method-label truth \
+  --raw-batch-size 50000 \
+  --num-workers 1 \
+  --worker-backend thread
+```
+
+`--mc-pred-parquet` and `--data-pred-parquet` may point to either a single
+prediction parquet, a glob, or a directory. Directories are expanded to final
+`*__evenet_pred.parquet` files when present. `--raw-batch-size` streams the
+large central raw parquet files during export; lower it if memory pressure is
+high. `--write-truth-neutrino-copy` writes a second method tree that uses the
+MC target invisible neutrino directly, giving an upper-limit QI reference under
+`<output-dir>/truth/`. Data has no target neutrino, so the truth method keeps
+the nominal prediction for data rows.
+
 Output structure:
 
 ```text

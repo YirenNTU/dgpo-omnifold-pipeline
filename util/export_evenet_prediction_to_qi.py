@@ -22,7 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from quantum.observables_builder import build_observables, get_observable_names
 from utils.common_functions import rebuild_p4
-from build_evenet_input_from_parquet import apply_preselection, expand_samples, parse_config, preselection_mask, read_yaml
+from build_evenet_input_from_parquet import parse_config, preselection_mask, read_yaml
 
 
 vector.register_awkward()
@@ -1176,24 +1176,108 @@ def build_source_mapping(expanded_entries) -> dict[int, dict[str, Any]]:
     return mapping
 
 
+def config_source_mappings(
+    samples: dict[str, Any],
+    subcategories: dict[str, list[Any]],
+) -> tuple[dict[str, dict[int, dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """
+    inputs:
+      samples/subcategories: parsed analysis config definitions.
+    outputs:
+      source_mappings: approximate source_sample_index maps for MC and data.
+      class_mapping: exact class-name to parent-sample map for MC prediction rows.
+    goal:
+      Avoid loading selected input parquets just to recover source_sample_index
+      metadata during export. Prediction parquets already carry truth class names
+      for MC, which are used to correct any empty-split ambiguity.
+    """
+    entries: dict[str, list[dict[str, Any]]] = {"mc": [], "data": []}
+    class_mapping: dict[str, dict[str, Any]] = {}
+
+    for sample_key, sample in samples.items():
+        base_info = {
+            "parent_key": sample_key,
+            "parent_name": sample.name,
+            "is_data": bool(sample.is_data),
+        }
+        target = "data" if sample.is_data else "mc"
+        splits = subcategories.get(sample_key) or subcategories.get(sample.name)
+        if sample.is_data or not splits:
+            entry = {**base_info, "expanded_name": sample.name}
+            entries[target].append(entry)
+            if not sample.is_data:
+                class_mapping[sample.name] = entry
+            continue
+
+        for split in splits:
+            entry = {**base_info, "expanded_name": split.name}
+            entries["mc"].append(entry)
+            class_mapping[split.name] = entry
+
+        remainder_name = f"{sample.name}_others"
+        remainder_entry = {**base_info, "expanded_name": remainder_name}
+        entries["mc"].append(remainder_entry)
+        class_mapping[remainder_name] = remainder_entry
+
+    source_mappings = {
+        kind: {index: entry for index, entry in enumerate(kind_entries)}
+        for kind, kind_entries in entries.items()
+    }
+    return source_mappings, class_mapping
+
+
 def selected_events_by_source_index(analysis_config_path: Path) -> tuple[dict[str, dict[int, dict[str, Any]]], dict[str, Any]]:
     analysis_cfg = read_yaml(analysis_config_path)
     samples, subcategories, _ = parse_config(analysis_config_path)
-    selected_events = {
-        sample_key: apply_preselection(load_concat_events(expand_paths(sample.input_files)))
-        for sample_key, sample in samples.items()
-    }
-    expanded_samples = expand_samples(samples, selected_events, subcategories)
-    mc_entries = []
-    data_entries = []
-    for expanded_sample, events in expanded_samples:
-        parent_sample = samples[expanded_sample.key]
-        entry = (expanded_sample, events, parent_sample)
-        if parent_sample.is_data:
-            data_entries.append(entry)
-        else:
-            mc_entries.append(entry)
-    return {"mc": build_source_mapping(mc_entries), "data": build_source_mapping(data_entries)}, analysis_cfg
+    source_mappings, class_mapping = config_source_mappings(samples, subcategories)
+    analysis_cfg["_evenet_source_class_mapping"] = class_mapping
+    return source_mappings, analysis_cfg
+
+
+def infer_source_info_from_prediction(
+    pred_subset: ak.Array,
+    analysis_cfg: dict,
+    fallback_info: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """
+    inputs:
+      pred_subset: prediction rows for one source_sample_index value.
+      analysis_cfg: loaded analysis.yaml with internal class mapping metadata.
+      fallback_info: config-order source mapping for the source index.
+    outputs:
+      source info dictionary, or None if no mapping can be inferred.
+    goal:
+      Prefer prediction-embedded MC truth class names over approximate config-order
+      indices. This avoids reading the large selected raw parquets during export.
+    """
+    if "evenet_truth_class_name" not in pred_subset.fields:
+        return fallback_info
+
+    class_probe_size = min(len(pred_subset), 10_000)
+    class_names = np.asarray(ak.to_list(pred_subset["evenet_truth_class_name"][:class_probe_size]), dtype=object)
+    valid_names = [
+        str(name)
+        for name in class_names
+        if name is not None and str(name) not in {"", "None", "unselected"}
+    ]
+    if not valid_names:
+        return fallback_info
+
+    unique_names, counts = np.unique(np.asarray(valid_names, dtype=object), return_counts=True)
+    truth_class_name = str(unique_names[int(np.argmax(counts))])
+    class_mapping = analysis_cfg.get("_evenet_source_class_mapping", {})
+    inferred_info = class_mapping.get(truth_class_name)
+    if inferred_info is None:
+        return fallback_info
+
+    if fallback_info is not None and fallback_info.get("expanded_name") != inferred_info.get("expanded_name"):
+        print(
+            "[export-evenet-to-qi] source mapping corrected from prediction metadata: "
+            f"source_index fallback={fallback_info.get('expanded_name')} "
+            f"truth_class={truth_class_name}",
+            flush=True,
+        )
+    return inferred_info
 
 
 def require_source_columns(pred_events: ak.Array, pred_path: Path) -> None:
@@ -1543,13 +1627,14 @@ def export_config_prediction(
     grouped: dict[str, dict[str, Any]] = {}
 
     for source_index in sorted(np.unique(source_indices).tolist()):
-        if int(source_index) not in source_mapping:
-            raise ValueError(f"{pred_path} references source_sample_index={source_index}, absent from analysis.yaml expansion.")
-        source_info = source_mapping[int(source_index)]
-        parent_name = source_info["parent_name"]
-        parent_key = source_info["parent_key"]
         row_mask = source_indices == int(source_index)
         pred_subset = pred_events[row_mask]
+        fallback_info = source_mapping.get(int(source_index))
+        source_info = infer_source_info_from_prediction(pred_subset, analysis_cfg, fallback_info)
+        if source_info is None:
+            raise ValueError(f"{pred_path} references source_sample_index={source_index}, absent from analysis.yaml expansion.")
+        parent_name = source_info["parent_name"]
+        parent_key = source_info["parent_key"]
 
         group = grouped.setdefault(
             parent_name,
