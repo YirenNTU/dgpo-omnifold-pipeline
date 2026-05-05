@@ -330,6 +330,44 @@ def patch_qi_unfold_observables() -> None:
     )
 
 
+def patch_parquet_column_filter() -> None:
+    """
+    Patch DataLoader.load_events_from_parquet to skip nested struct columns
+    (p4 fields) that QI unfolding never reads.  This dramatically reduces
+    peak RSS when the pretrain parquet is large.
+    Disable by setting QI_PARQUET_COLUMN_FILTER=0 in the environment.
+    """
+    if os.environ.get("QI_PARQUET_COLUMN_FILTER", "1").lower() in {"0", "false", "no", "off"}:
+        return
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from processor import DataLoader as DataLoaderModule
+    except Exception:
+        return
+
+    original_load = DataLoaderModule.load_events_from_parquet
+
+    def _load_flat_columns_only(file_path, columns=None):
+        if columns is None:
+            try:
+                schema = pq.read_schema(file_path)
+                columns = [
+                    field.name for field in schema
+                    if not pa.types.is_struct(field.type)
+                ]
+            except Exception:
+                pass
+        return original_load(file_path, columns=columns)
+
+    DataLoaderModule.load_events_from_parquet = _load_flat_columns_only
+    print(
+        "[run-tree-ana-root-preload] parquet column filter active: "
+        "nested struct (p4) columns will not be loaded",
+        flush=True,
+    )
+
+
 def patch_preserve_parquet_weights() -> None:
     """
     inputs:
@@ -390,6 +428,7 @@ def main() -> None:
         ) from exc
     maybe_load_roounfold()
     patch_qi_unfold_observables()
+    patch_parquet_column_filter()
     patch_preserve_parquet_weights()
 
     sys.argv = [str(TREE_ANA), *build_tree_args(args, passthrough)]

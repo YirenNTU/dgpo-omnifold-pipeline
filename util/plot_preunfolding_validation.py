@@ -31,18 +31,41 @@ from plot_qi_method_comparison import (
     event_weights,
     is_background_like_region,
     json_safe,
-    load_events,
+    load_events as _load_events_base,
     method_color,
     method_display_name,
     parquet_for,
     physics_observable_specs,
     plot_physics_data_mc_comparisons,
+    rebuild_vector,
     sanitize_filename,
 )
 from quantum.observables_builder import build_observables, get_observable_names
 
 
 vector.register_awkward()
+
+# Column prefixes that appear in large EveNet exports but are never read by
+# this script.  Skipping them at load time avoids OOM on oversized parquets.
+_SKIP_COLUMN_PREFIXES = (
+    "pred_invisible_slot",
+    "tau_vis_prong_slot",
+    "tau_vis_target_slot",
+)
+
+
+def load_events(path: Path) -> ak.Array:
+    """Load a parquet, dropping heavy slot-level columns not used by this script."""
+    try:
+        schema = pq.read_schema(path)
+        columns = [f.name for f in schema if not f.name.startswith(_SKIP_COLUMN_PREFIXES)]
+    except Exception:
+        columns = None
+    events = ak.from_parquet(path, columns=columns)
+    for field in events.fields:
+        if field.endswith("_p4"):
+            events[field] = rebuild_vector(events[field])
+    return events
 
 
 DEFAULT_FLOAT = -99.0
