@@ -146,9 +146,9 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "central", "evenet", "event", "unit", "class"],
         default=None,
         help=(
-            "Weight source for predicted rows in config-driven export. 'auto' prefers central_weight/weight "
-            "from the prediction parquet and ignores stale split-corrected evenet_weight. Use 'evenet' only "
-            "to preserve prediction-parquet evenet_weight exactly."
+            "Weight source for predicted rows in config-driven export. 'auto' prefers split-aware "
+            "prediction weights when they are available; otherwise it falls back to central_weight/weight. "
+            "Use 'evenet' to preserve prediction-parquet evenet_weight exactly."
         ),
     )
     parser.add_argument(
@@ -837,7 +837,19 @@ def with_evenet_reconstruction(
         predicted_weight = None
         resolved_weight_source = prediction_weight_source
         if resolved_weight_source == "auto":
-            resolved_weight_source = "central"
+            split_corrected_evenet = False
+            if "evenet_weight_split_correction_applied" in pred_events.fields:
+                split_flags = ak.to_numpy(
+                    pred_events["evenet_weight_split_correction_applied"],
+                    allow_missing=False,
+                ).astype(bool)
+                split_corrected_evenet = bool(np.any(split_flags))
+            if split_corrected_evenet and "evenet_weight" in pred_events.fields:
+                resolved_weight_source = "evenet"
+            elif prediction_split_fraction is not None:
+                resolved_weight_source = "class"
+            else:
+                resolved_weight_source = "central"
         if resolved_weight_source == "evenet" and "evenet_weight" in pred_events.fields:
             predicted_weight = ak.to_numpy(pred_events["evenet_weight"], allow_missing=False).astype(np.float64)
             if len(predicted_weight) != len(full_indices):
@@ -1709,6 +1721,32 @@ def export_config_group(
             "valid_fraction": 0.0,
         },
     }
+    if (
+        not group["is_data"]
+        and raw_selected_total > 0
+        and predicted_rows_total < raw_selected_total
+    ):
+        coverage_fraction = float(predicted_rows_total / raw_selected_total)
+        warning = (
+            "Prediction coverage is smaller than the raw selected sample. "
+            "Selected raw rows without prediction are not exported in concat mode, "
+            "so reco yields will be low unless the prediction rows statistically represent "
+            "the missing fraction through split-aware weights."
+        )
+        metrics["warning_incomplete_prediction_coverage"] = {
+            "message": warning,
+            "coverage_fraction": coverage_fraction,
+            "num_raw_selected_for_prediction": int(raw_selected_total),
+            "num_predicted_events": int(predicted_rows_total),
+            "prediction_split_fraction": split_fraction,
+            "prediction_weight_source": prediction_weight_source,
+        }
+        print(
+            f"[export-evenet-to-qi] warning {parent_name}: prediction coverage "
+            f"{predicted_rows_total}/{raw_selected_total} ({coverage_fraction:.3f}) "
+            f"with weight_source={prediction_weight_source} split_fraction={split_fraction}",
+            flush=True,
+        )
     print(
         f"[export-evenet-to-qi] worker {os.getpid()} streamed {parent_name} raw={raw_events_total} "
         f"raw_outside={raw_outside_total} predicted={predicted_rows_total} "
