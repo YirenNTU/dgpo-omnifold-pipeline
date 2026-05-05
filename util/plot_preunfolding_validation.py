@@ -800,28 +800,12 @@ def canonical_summary_region(region: str) -> str:
 
 
 def comparison_channel_group(region: str) -> str:
-    """
-    inputs:
-      region: str, native region name from one method output.
-    outputs:
-      str, loose channel group used only for diagnostic comparison panels.
-    goal:
-      Draw broad and class-qualified versions of the same visible channel
-      together, e.g. ee and Ztautau_ee, without changing summary-row labels.
-    """
+    """Strip the Ztautau_ prefix so broad and class-qualified regions group together in comparison panels."""
     return region.removeprefix("Ztautau_")
 
 
 def broad_region_label(region: str) -> str:
-    """
-    inputs:
-      region: str, broad reconstruction region or grouped diagnostic channel.
-    outputs:
-      str, display label that does not imply a truth decay class.
-    goal:
-      Keep broad regions like ee/emu/mumu visually distinct from truth-class
-      labels like Ztautau_ee.
-    """
+    """Return a display label for a broad region that does not imply a truth decay class."""
     mapping = {
         "ee": r"$ee$",
         "emu": r"$e\mu$",
@@ -999,15 +983,7 @@ def build_momentum4d(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.
 
 
 def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
-    """
-    inputs:
-      pt/eta/phi: np.ndarray, invisible momentum coordinates.
-    outputs:
-      ak.Array Momentum4D, massless four-vector.
-    goal:
-      Support EveNet prediction/export parquets whose invisible target stores
-      only pt/eta/phi by reconstructing the neutrino energy.
-    """
+    """Build a massless four-vector from pt/eta/phi using E = pt * cosh(eta)."""
     return build_momentum4d(
         pt * np.cos(phi),
         pt * np.sin(phi),
@@ -1073,29 +1049,13 @@ def remapped_slot_p4(events: ak.Array, prefix: str, leg: str) -> ak.Array | None
 
 
 def truth_visible_field(fields: set[str], leg: str) -> str:
-    """
-    inputs:
-      fields: set[str], available parquet fields.
-      leg: str, "a" or "b".
-    outputs:
-      str, preferred visible-p4 field name for truth comparisons.
-    goal:
-      Use truth_visible_* when available, otherwise reuse central lead_*_visible_p4.
-    """
+    """Return the preferred visible-p4 field name, preferring truth_visible_* over lead_*_visible_p4."""
     direct = f"truth_visible_{leg}_p4"
     return direct if direct in fields else f"lead_{leg}_visible_p4"
 
 
 def target_invisible_slot_fields(leg: str) -> list[str]:
-    """
-    inputs:
-      leg: str, "a" or "b".
-    outputs:
-      list[str], slot-level target invisible fields needed for fallback truth p4.
-    goal:
-      Keep slot-fallback requirements in one place so skip messages and value
-      extraction stay aligned.
-    """
+    """Return the slot-level target_invisible field names required for truth-p4 slot fallback."""
     return [
         f"target_invisible_slot{slot}_{component}"
         for slot in (0, 1)
@@ -1104,16 +1064,7 @@ def target_invisible_slot_fields(leg: str) -> list[str]:
 
 
 def truth_tau_p4(events: ak.Array, leg: str) -> ak.Array | None:
-    """
-    inputs:
-      events: ak.Array, exported parquet events.
-      leg: str, "a" or "b".
-    outputs:
-      Momentum4D array for truth tau p4, or None if the parquet cannot supply it.
-    goal:
-      Resolve truth tau p4 using the cleanest available source:
-      truth_tau_* first, truth_missing_* + visible second, slot target fallback last.
-    """
+    """Resolve truth tau p4 from direct field, truth_missing + visible, or slot fallback; returns None if unavailable."""
     fields = set(events.fields)
     direct = f"truth_tau_{leg}_p4"
     if direct in fields:
@@ -1131,30 +1082,13 @@ def truth_tau_p4(events: ak.Array, leg: str) -> ak.Array | None:
 
 
 def truth_visible_p4(events: ak.Array, leg: str) -> ak.Array | None:
-    """
-    inputs:
-      events: ak.Array, exported parquet events.
-      leg: str, "a" or "b".
-    outputs:
-      Momentum4D array for truth visible tau p4, or None if unavailable.
-    goal:
-      Monitor the visible tau inputs independently from neutrino reconstruction.
-    """
+    """Return the truth_visible_{leg}_p4 array, or None if the field is absent."""
     field = f"truth_visible_{leg}_p4"
     return events[field] if field in events.fields else None
 
 
 def reco_with_truth_neutrino_p4(events: ak.Array, leg: str) -> ak.Array | None:
-    """
-    inputs:
-      events: ak.Array, exported parquet events.
-      leg: str, "a" or "b".
-    outputs:
-      Momentum4D tau p4 built from current visible input plus truth neutrino.
-    goal:
-      Provide an upper-limit reconstruction that keeps visible-input effects
-      but removes neutrino-regression errors.
-    """
+    """Build tau p4 from the current reco visible leg plus the truth neutrino, as an upper-limit reference."""
     fields = set(events.fields)
     visible_field = f"lead_{leg}_visible_p4"
     if visible_field not in fields:
@@ -1169,15 +1103,7 @@ def reco_with_truth_neutrino_p4(events: ak.Array, leg: str) -> ak.Array | None:
 
 
 def truth_tau_requirements(fields: set[str], leg: str) -> str:
-    """
-    inputs:
-      fields: set[str], available parquet fields.
-      leg: str, "a" or "b".
-    outputs:
-      str, human-readable reason describing which truth-tau source is available or missing.
-    goal:
-      Print concise skip/debug messages that mirror truth_tau_p4 resolution.
-    """
+    """Return a human-readable string describing which truth-tau source is available or missing."""
     direct = f"truth_tau_{leg}_p4"
     if direct in fields:
         return f"truth tau field '{direct}' available"
@@ -1258,18 +1184,7 @@ def weighted_hist2d(
     edges: np.ndarray,
     normalize: bool,
 ) -> np.ndarray:
-    """
-    inputs:
-      truth/reco: np.ndarray, matched truth and reconstructed values.
-      weights: np.ndarray, positive event weights.
-      edges: np.ndarray, common x/y bin edges.
-      normalize: bool, whether to normalize to unit area.
-    outputs:
-      np.ndarray, weighted 2D histogram indexed as truth-bin, reco-bin.
-    goal:
-      Cache compact 2D diagnostic content so grouped comparison figures do
-      not need to keep full event arrays alive.
-    """
+    """Compute a weighted 2D truth-vs-reco histogram with optional unit-area normalization."""
     hist = np.histogram2d(truth, reco, bins=[edges, edges], weights=weights)[0].astype(np.float64)
     if normalize:
         total = np.sum(hist)
@@ -1318,21 +1233,7 @@ def render_grouped_truth_reco_panels(
     normalize: bool,
     log_label: str,
 ) -> dict[tuple[str, str], str]:
-    """
-    inputs:
-      records_by_group: dict, keyed by (channel_group, observable), with
-        compact per-method/region histograms.
-      output_root: Path, directory for this plot block.
-      output_dir: Path, top-level output directory used for relative paths.
-      normalize: bool, whether histograms are unit-normalized.
-      log_label: str, human-readable block label for progress messages.
-    outputs:
-      dict[(str, str), str], relative combined-plot path by group key.
-    goal:
-      Produce one diagnostic figure per similar channel and observable, with
-      the 1D truth/reco comparison on the left and one 2D truth-vs-reco block
-      per method/region to the right.
-    """
+    """Render one combined 1D+2D diagnostic figure per (channel_group, observable) key."""
     combined_dir = output_root / "combined"
     combined_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[tuple[str, str], str] = {}
@@ -1838,15 +1739,7 @@ def plot_truth_vs_reco_by_method_and_region(
 
 
 def run_truth_reco_plot_block(task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """
-    inputs:
-      task: dict[str, Any], serializable arguments for one truth-vs-reco plot block.
-    outputs:
-      tuple(str, dict), block key and the generated summary.
-    goal:
-      Allow independent pre-unfolding validation blocks to run in separate
-      worker processes without sharing matplotlib state.
-    """
+    """Execute one truth-vs-reco plot block from a serializable task dict, returning the block key and summary."""
     summary = plot_truth_vs_reco_by_method_and_region(
         method_regions=task["method_regions"],
         methods=task["methods"],
@@ -2136,17 +2029,7 @@ def metric_precision(value: float, uncertainty: float) -> float:
 
 
 def deduplicate_summary_rows(rows: list[dict[str, Any]], observable: str, log_label: str) -> list[dict[str, Any]]:
-    """
-    inputs:
-      rows: list[dict], candidate rows for one observable summary plot.
-      observable: str, observable name for debug logging.
-      log_label: str, summary block label for debug logging.
-    outputs:
-      list[dict], at most one row per (method, displayed summary region).
-    goal:
-      Avoid drawing duplicate method markers when broad and fine native regions
-      collapse onto the same displayed summary channel.
-    """
+    """Keep at most one row per (method, summary_region) pair, preferring exact-region matches with more events."""
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault((row["method"], row["summary_region"]), []).append(row)
