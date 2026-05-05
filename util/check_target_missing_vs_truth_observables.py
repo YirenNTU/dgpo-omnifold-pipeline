@@ -147,6 +147,17 @@ def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray
     )
 
 
+def choose_component_by_slot(events: ak.Array, prefix: str, slot_indices: np.ndarray, component: str) -> np.ndarray | None:
+    slot0_name = f"{prefix}_slot0_{component}"
+    slot1_name = f"{prefix}_slot1_{component}"
+    fields = set(events.fields)
+    if slot0_name not in fields or slot1_name not in fields:
+        return None
+    slot0 = to_numpy(events[slot0_name], np.float64)
+    slot1 = to_numpy(events[slot1_name], np.float64)
+    return np.where(slot_indices == 0, slot0, slot1)
+
+
 def p4_from_slot_features(events: ak.Array, prefix: str, slot: int) -> ak.Array:
     energy = to_numpy(events[f"{prefix}_slot{slot}_energy"], np.float64)
     pt = to_numpy(events[f"{prefix}_slot{slot}_pt"], np.float64)
@@ -167,56 +178,75 @@ def massless_p4_from_slot_features(events: ak.Array, prefix: str, slot: int) -> 
     return massless_p4_from_pt_eta_phi(pt, eta, phi)
 
 
-def visible_tau_p4(events: ak.Array, slot: int) -> ak.Array:
+def remapped_slot_p4(events: ak.Array, prefix: str, leg: str) -> ak.Array | None:
+    slot_field = f"source_slot_for_{leg}"
+    if slot_field not in events.fields:
+        return None
+    slot_indices = to_numpy(events[slot_field], np.int64)
+
+    px = choose_component_by_slot(events, prefix, slot_indices, "px")
+    py = choose_component_by_slot(events, prefix, slot_indices, "py")
+    pz = choose_component_by_slot(events, prefix, slot_indices, "pz")
+    energy = choose_component_by_slot(events, prefix, slot_indices, "E")
+    if px is not None and py is not None and pz is not None and energy is not None:
+        return build_momentum4d(px, py, pz, energy)
+
+    energy = choose_component_by_slot(events, prefix, slot_indices, "energy")
+    pt = choose_component_by_slot(events, prefix, slot_indices, "pt")
+    eta = choose_component_by_slot(events, prefix, slot_indices, "eta")
+    phi = choose_component_by_slot(events, prefix, slot_indices, "phi")
+    if energy is not None and pt is not None and eta is not None and phi is not None:
+        return build_momentum4d(
+            pt * np.cos(phi),
+            pt * np.sin(phi),
+            pt * np.sinh(eta),
+            energy,
+        )
+    if pt is not None and eta is not None and phi is not None:
+        return massless_p4_from_pt_eta_phi(pt, eta, phi)
+    return None
+
+
+def remapped_slot_component(events: ak.Array, prefix: str, leg: str, component: str) -> np.ndarray:
+    slot_field = f"source_slot_for_{leg}"
+    if slot_field not in events.fields:
+        raise ValueError(f"Missing slot mapping field '{slot_field}'.")
+    slot_indices = to_numpy(events[slot_field], np.int64)
+    values = choose_component_by_slot(events, prefix, slot_indices, component)
+    if values is None:
+        raise ValueError(f"Missing component '{component}' for prefix '{prefix}'.")
+    return values
+
+
+def visible_tau_p4(events: ak.Array, leg: str) -> ak.Array:
     fields = set(events.fields)
-    direct_field = f"lead_{'a' if slot == 0 else 'b'}_visible_p4"
+    direct_field = f"lead_{leg}_visible_p4"
     if direct_field in fields:
         return rebuild_vector(events[direct_field])
-    required = {
-        f"tau_vis_prong_slot{slot}_energy",
-        f"tau_vis_prong_slot{slot}_pt",
-        f"tau_vis_prong_slot{slot}_eta",
-        f"tau_vis_prong_slot{slot}_phi",
-    }
-    missing = sorted(required - fields)
-    if missing:
-        raise ValueError(f"Missing visible-tau fields for slot {slot}: {missing}")
-    return p4_from_slot_features(events, "tau_vis_prong", slot)
+    remapped = remapped_slot_p4(events, "tau_vis_prong", leg)
+    if remapped is not None:
+        return remapped
+    raise ValueError(f"Missing visible-tau fields for leg '{leg}'.")
 
 
-def target_missing_p4(events: ak.Array, slot: int) -> ak.Array:
-    required = {
-        f"target_invisible_slot{slot}_pt",
-        f"target_invisible_slot{slot}_eta",
-        f"target_invisible_slot{slot}_phi",
-    }
-    fields = set(events.fields)
-    missing = sorted(required - fields)
-    if missing:
-        raise ValueError(f"Missing target-invisible fields for slot {slot}: {missing}")
-    return massless_p4_from_slot_features(events, "target_invisible", slot)
+def target_missing_p4(events: ak.Array, leg: str) -> ak.Array:
+    remapped = remapped_slot_p4(events, "target_invisible", leg)
+    if remapped is not None:
+        return remapped
+    raise ValueError(f"Missing target-invisible fields for leg '{leg}'.")
 
 
-def predicted_missing_p4(events: ak.Array, slot: int) -> ak.Array:
-    required = {
-        f"pred_invisible_slot{slot}_pt",
-        f"pred_invisible_slot{slot}_eta",
-        f"pred_invisible_slot{slot}_phi",
-    }
-    fields = set(events.fields)
-    missing = sorted(required - fields)
-    if missing:
-        raise ValueError(f"Missing pred-invisible fields for slot {slot}: {missing}")
-    return massless_p4_from_slot_features(events, "pred_invisible", slot)
+def predicted_missing_p4(events: ak.Array, leg: str) -> ak.Array:
+    remapped = remapped_slot_p4(events, "pred_invisible", leg)
+    if remapped is not None:
+        return remapped
+    raise ValueError(f"Missing pred-invisible fields for leg '{leg}'.")
 
 
-def flattened_slot_feature(events: ak.Array, prefix: str, component: str) -> np.ndarray:
+def flattened_leg_feature(events: ak.Array, prefix: str, component: str) -> np.ndarray:
     values = []
-    for slot in (0, 1):
-        field = f"{prefix}_slot{slot}_{component}"
-        if field not in events.fields:
-            raise ValueError(f"Missing field '{field}'.")
-        values.append(to_numpy(events[field], np.float64))
+    for leg in ("a", "b"):
+        values.append(remapped_slot_component(events, prefix, leg, component))
     return np.concatenate(values)
 
 
@@ -307,10 +337,10 @@ def truth_values(events: ak.Array, observable: str) -> np.ndarray:
 
 
 def target_reconstructed_values(events: ak.Array, observable: str) -> np.ndarray:
-    visible_a = visible_tau_p4(events, 0)
-    visible_b = visible_tau_p4(events, 1)
-    target_a = target_missing_p4(events, 0)
-    target_b = target_missing_p4(events, 1)
+    visible_a = visible_tau_p4(events, "a")
+    visible_b = visible_tau_p4(events, "b")
+    target_a = target_missing_p4(events, "a")
+    target_b = target_missing_p4(events, "b")
     tau_a = build_momentum4d_with_mass(visible_a + target_a, TAU_MASS)
     tau_b = build_momentum4d_with_mass(visible_b + target_b, TAU_MASS)
     observables = build_observables(
@@ -323,10 +353,10 @@ def target_reconstructed_values(events: ak.Array, observable: str) -> np.ndarray
 
 
 def predicted_reconstructed_values(events: ak.Array, observable: str) -> np.ndarray:
-    visible_a = visible_tau_p4(events, 0)
-    visible_b = visible_tau_p4(events, 1)
-    pred_a = predicted_missing_p4(events, 0)
-    pred_b = predicted_missing_p4(events, 1)
+    visible_a = visible_tau_p4(events, "a")
+    visible_b = visible_tau_p4(events, "b")
+    pred_a = predicted_missing_p4(events, "a")
+    pred_b = predicted_missing_p4(events, "b")
     tau_a = build_momentum4d_with_mass(visible_a + pred_a, TAU_MASS)
     tau_b = build_momentum4d_with_mass(visible_b + pred_b, TAU_MASS)
     observables = build_observables(
@@ -544,11 +574,11 @@ def main() -> None:
             weights = event_weights(selected, args.weight_field)
             try:
                 pred_neutrino_truth_batch = {
-                    component: flattened_slot_feature(selected, "target_invisible", component)
+                    component: flattened_leg_feature(selected, "target_invisible", component)
                     for component in ("pt", "eta", "phi")
                 }
                 pred_neutrino_pred_batch = {
-                    component: flattened_slot_feature(selected, "pred_invisible", component)
+                    component: flattened_leg_feature(selected, "pred_invisible", component)
                     for component in ("pt", "eta", "phi")
                 }
                 neutrino_weights_batch = np.repeat(weights, 2)
