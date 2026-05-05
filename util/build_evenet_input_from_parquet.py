@@ -10,6 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
+import sys, os
 
 import awkward as ak
 import matplotlib.pyplot as plt
@@ -49,6 +50,8 @@ from rich.table import Table
 console = Console()
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 GENERATED_EVENT_INFO_PATH = CONFIG_DIR / "generated_event_info.yaml"
+MOTHER_DIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(MOTHER_DIR))
 
 PREDICTION_PASSTHROUGH_EXACT_FIELDS = {
     "event_category",
