@@ -8,6 +8,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import awkward as ak
@@ -1578,6 +1579,7 @@ def export_config_group(
     raw_batch_size: int,
     prediction_batch_size: int,
     prediction_weight_source: str,
+    path_worker_count: int,
     truth_output_label: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     print(f"[export-evenet-to-qi] worker {os.getpid()} start {parent_name}", flush=True)
@@ -1591,6 +1593,8 @@ def export_config_group(
     )
     truth_missing_prefix = "pred_invisible" if group["is_data"] else "target_invisible"
     truth_method_name = "TruthNeutrinoDataFallback" if group["is_data"] else "TruthNeutrino"
+    writer_lock = Lock()
+    source_indices = np.asarray(group["source_indices"], dtype=np.int64)
 
     pred_template_events: ak.Array | None = None
     predicted_rows_total = 0
@@ -1602,42 +1606,108 @@ def export_config_group(
     truth_prediction_batch_count = 0
     last_truth_predicted_metrics: dict[str, Any] | None = None
 
-    for pred_path, batch_index, pred_batch in iter_group_prediction_batches(group, prediction_batch_size):
-        prediction_batch_count += 1
-        if pred_template_events is None:
-            pred_template_events = pred_batch[:0]
-        predicted_events, predicted_metrics = build_concat_prediction_rows(
-            pred_events=pred_batch,
-            prediction_split_fraction=split_fraction,
-            is_data=group["is_data"],
-            prediction_weight_source=prediction_weight_source,
-        )
-        writer.append(predicted_events)
-        predicted_rows_total += int(len(predicted_events))
-        predicted_valid_total += int(predicted_metrics.get("valid_events", 0))
-        last_predicted_metrics = predicted_metrics
+    def process_prediction_path(pred_path_text: str) -> dict[str, Any]:
+        local_template = None
+        local_rows_total = 0
+        local_valid_total = 0
+        local_batch_count = 0
+        local_last_metrics: dict[str, Any] | None = None
+        local_truth_rows_total = 0
+        local_truth_valid_total = 0
+        local_truth_batch_count = 0
+        local_last_truth_metrics: dict[str, Any] | None = None
 
-        if truth_writer is not None:
-            truth_predicted_events, truth_predicted_metrics = build_concat_prediction_rows(
+        for pred_path, batch_index, pred_events in iter_parquet_event_batches([pred_path_text], prediction_batch_size):
+            require_source_columns(pred_events, pred_path)
+            batch_source_indices = ak.to_numpy(pred_events["source_sample_index"], allow_missing=False).astype(np.int64)
+            row_mask = np.isin(batch_source_indices, source_indices)
+            if not np.any(row_mask):
+                continue
+            pred_batch = pred_events[row_mask]
+            local_batch_count += 1
+            if local_template is None:
+                local_template = pred_batch[:0]
+            predicted_events, predicted_metrics = build_concat_prediction_rows(
                 pred_events=pred_batch,
                 prediction_split_fraction=split_fraction,
                 is_data=group["is_data"],
-                missing_prefix=truth_missing_prefix,
-                method_name=truth_method_name,
                 prediction_weight_source=prediction_weight_source,
             )
-            truth_writer.append(truth_predicted_events)
-            truth_predicted_rows_total += int(len(truth_predicted_events))
-            truth_valid_total += int(truth_predicted_metrics.get("valid_events", 0))
-            truth_prediction_batch_count += 1
-            last_truth_predicted_metrics = truth_predicted_metrics
+            with writer_lock:
+                writer.append(predicted_events)
+                if truth_writer is not None:
+                    truth_predicted_events, truth_predicted_metrics = build_concat_prediction_rows(
+                        pred_events=pred_batch,
+                        prediction_split_fraction=split_fraction,
+                        is_data=group["is_data"],
+                        missing_prefix=truth_missing_prefix,
+                        method_name=truth_method_name,
+                        prediction_weight_source=prediction_weight_source,
+                    )
+                    truth_writer.append(truth_predicted_events)
+                else:
+                    truth_predicted_events = None
+                    truth_predicted_metrics = None
+            local_rows_total += int(len(predicted_events))
+            local_valid_total += int(predicted_metrics.get("valid_events", 0))
+            local_last_metrics = predicted_metrics
+            if truth_predicted_events is not None and truth_predicted_metrics is not None:
+                local_truth_rows_total += int(len(truth_predicted_events))
+                local_truth_valid_total += int(truth_predicted_metrics.get("valid_events", 0))
+                local_truth_batch_count += 1
+                local_last_truth_metrics = truth_predicted_metrics
+            if batch_index == 0 or local_batch_count % 25 == 0:
+                print(
+                    f"[export-evenet-to-qi] worker {os.getpid()} prediction batch {parent_name} "
+                    f"path={Path(pred_path).name} batch={batch_index} rows={len(pred_batch)}",
+                    flush=True,
+                )
 
-        if batch_index == 0 or prediction_batch_count % 25 == 0:
-            print(
-                f"[export-evenet-to-qi] worker {os.getpid()} prediction batch {parent_name} "
-                f"path={Path(pred_path).name} batch={batch_index} rows={len(pred_batch)}",
-                flush=True,
-            )
+        return {
+            "template": local_template,
+            "predicted_rows_total": local_rows_total,
+            "predicted_valid_total": local_valid_total,
+            "prediction_batch_count": local_batch_count,
+            "last_predicted_metrics": local_last_metrics,
+            "truth_predicted_rows_total": local_truth_rows_total,
+            "truth_valid_total": local_truth_valid_total,
+            "truth_prediction_batch_count": local_truth_batch_count,
+            "last_truth_predicted_metrics": local_last_truth_metrics,
+        }
+
+    prediction_path_workers = max(1, min(int(path_worker_count), len(group["pred_paths"])))
+    if prediction_path_workers > 1:
+        with ThreadPoolExecutor(max_workers=prediction_path_workers) as executor:
+            futures = [executor.submit(process_prediction_path, pred_path) for pred_path in group["pred_paths"]]
+            for future in as_completed(futures):
+                path_metrics = future.result()
+                if pred_template_events is None and path_metrics["template"] is not None:
+                    pred_template_events = path_metrics["template"]
+                predicted_rows_total += int(path_metrics["predicted_rows_total"])
+                predicted_valid_total += int(path_metrics["predicted_valid_total"])
+                prediction_batch_count += int(path_metrics["prediction_batch_count"])
+                if path_metrics["last_predicted_metrics"] is not None:
+                    last_predicted_metrics = path_metrics["last_predicted_metrics"]
+                truth_predicted_rows_total += int(path_metrics["truth_predicted_rows_total"])
+                truth_valid_total += int(path_metrics["truth_valid_total"])
+                truth_prediction_batch_count += int(path_metrics["truth_prediction_batch_count"])
+                if path_metrics["last_truth_predicted_metrics"] is not None:
+                    last_truth_predicted_metrics = path_metrics["last_truth_predicted_metrics"]
+    else:
+        for pred_path in group["pred_paths"]:
+            path_metrics = process_prediction_path(pred_path)
+            if pred_template_events is None and path_metrics["template"] is not None:
+                pred_template_events = path_metrics["template"]
+            predicted_rows_total += int(path_metrics["predicted_rows_total"])
+            predicted_valid_total += int(path_metrics["predicted_valid_total"])
+            prediction_batch_count += int(path_metrics["prediction_batch_count"])
+            if path_metrics["last_predicted_metrics"] is not None:
+                last_predicted_metrics = path_metrics["last_predicted_metrics"]
+            truth_predicted_rows_total += int(path_metrics["truth_predicted_rows_total"])
+            truth_valid_total += int(path_metrics["truth_valid_total"])
+            truth_prediction_batch_count += int(path_metrics["truth_prediction_batch_count"])
+            if path_metrics["last_truth_predicted_metrics"] is not None:
+                last_truth_predicted_metrics = path_metrics["last_truth_predicted_metrics"]
 
     if pred_template_events is None:
         raise ValueError(f"No prediction rows matched source indices {group['source_indices']} for {parent_name}.")
@@ -1664,31 +1734,61 @@ def export_config_group(
     raw_outside_total = 0
     raw_batch_count = 0
 
-    for raw_path, batch_index, raw_events in iter_parquet_event_batches(raw_files, raw_batch_size):
-        raw_batch_count += 1
-        raw_events_total += int(len(raw_events))
-        selected_mask = prediction_selection_mask(raw_events)
-        selected_count = int(np.sum(selected_mask))
-        raw_selected_total += selected_count
-        outside_raw = raw_events[~selected_mask]
-        raw_outside_total += int(len(outside_raw))
-        if batch_index == 0 or raw_batch_count % 25 == 0:
-            print(
-                f"[export-evenet-to-qi] worker {os.getpid()} raw batch {parent_name} "
-                f"path={Path(raw_path).name} batch={batch_index} rows={len(raw_events)} "
-                f"selected={selected_count} outside={len(outside_raw)}",
-                flush=True,
-            )
-        if len(outside_raw) == 0:
-            continue
+    def process_raw_path(raw_path_text: str) -> dict[str, int]:
+        local_raw_events_total = 0
+        local_raw_selected_total = 0
+        local_raw_outside_total = 0
+        local_raw_batch_count = 0
+        for raw_path, batch_index, raw_events in iter_parquet_event_batches([raw_path_text], raw_batch_size):
+            local_raw_batch_count += 1
+            local_raw_events_total += int(len(raw_events))
+            selected_mask = prediction_selection_mask(raw_events)
+            selected_count = int(np.sum(selected_mask))
+            local_raw_selected_total += selected_count
+            outside_raw = raw_events[~selected_mask]
+            local_raw_outside_total += int(len(outside_raw))
+            if batch_index == 0 or local_raw_batch_count % 25 == 0:
+                print(
+                    f"[export-evenet-to-qi] worker {os.getpid()} raw batch {parent_name} "
+                    f"path={Path(raw_path).name} batch={batch_index} rows={len(raw_events)} "
+                    f"selected={selected_count} outside={len(outside_raw)}",
+                    flush=True,
+                )
+            if len(outside_raw) == 0:
+                continue
 
-        outside_events, _outside_metrics = build_concat_raw_complement_rows(
-            raw_events=outside_raw,
-            pred_template_events=pred_template_events,
-        )
-        writer.append(outside_events)
-        if truth_writer is not None:
-            truth_writer.append(outside_events)
+            outside_events, _outside_metrics = build_concat_raw_complement_rows(
+                raw_events=outside_raw,
+                pred_template_events=pred_template_events,
+            )
+            with writer_lock:
+                writer.append(outside_events)
+                if truth_writer is not None:
+                    truth_writer.append(outside_events)
+        return {
+            "raw_events_total": local_raw_events_total,
+            "raw_selected_total": local_raw_selected_total,
+            "raw_outside_total": local_raw_outside_total,
+            "raw_batch_count": local_raw_batch_count,
+        }
+
+    raw_path_workers = max(1, min(int(path_worker_count), len(raw_files)))
+    if raw_path_workers > 1:
+        with ThreadPoolExecutor(max_workers=raw_path_workers) as executor:
+            futures = [executor.submit(process_raw_path, raw_path) for raw_path in raw_files]
+            for future in as_completed(futures):
+                path_metrics = future.result()
+                raw_events_total += int(path_metrics["raw_events_total"])
+                raw_selected_total += int(path_metrics["raw_selected_total"])
+                raw_outside_total += int(path_metrics["raw_outside_total"])
+                raw_batch_count += int(path_metrics["raw_batch_count"])
+    else:
+        for raw_path in raw_files:
+            path_metrics = process_raw_path(raw_path)
+            raw_events_total += int(path_metrics["raw_events_total"])
+            raw_selected_total += int(path_metrics["raw_selected_total"])
+            raw_outside_total += int(path_metrics["raw_outside_total"])
+            raw_batch_count += int(path_metrics["raw_batch_count"])
 
     counts = writer.close()
     truth_counts = truth_writer.close() if truth_writer is not None else None
@@ -1705,6 +1805,7 @@ def export_config_group(
         "prediction_weight_source": prediction_weight_source,
         "raw_num_batches": int(raw_batch_count),
         "prediction_num_batches": int(prediction_batch_count),
+        "path_worker_count": int(path_worker_count),
         "prediction_paths": group["pred_paths"],
         "raw_files": raw_files,
         "prediction_metrics": predicted_metrics,
@@ -1767,7 +1868,7 @@ def export_config_group(
 
 
 def export_config_group_worker(
-    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, int, str, str | None],
+    payload: tuple[str, dict[str, Any], dict, Path, list[str], float | None, str, int, int, str, int, str | None],
 ) -> tuple[str, dict[str, Any]]:
     return export_config_group(*payload)
 
@@ -1837,6 +1938,7 @@ def export_config_prediction(
         raise ValueError(f"No prediction rows were found in {pred_path}.")
     total_groups = len(group_items)
     worker_count = min(max(1, int(num_workers)), max(total_groups, 1))
+    path_worker_count = max(1, int(num_workers)) if total_groups == 1 else max(1, int(num_workers) // worker_count)
     backend = "process" if worker_backend == "process" else "thread"
     print_progress(f"{summary_label} export", 0, total_groups, f"workers={worker_count} backend={backend}")
     if worker_count == 1 or total_groups <= 1:
@@ -1853,6 +1955,7 @@ def export_config_prediction(
                 raw_batch_size=raw_batch_size,
                 prediction_batch_size=prediction_batch_size,
                 prediction_weight_source=prediction_weight_source,
+                path_worker_count=path_worker_count,
                 truth_output_label=truth_output_label,
             )
             summary["samples"][parent_name] = metrics
@@ -1870,6 +1973,7 @@ def export_config_prediction(
                 raw_batch_size,
                 prediction_batch_size,
                 prediction_weight_source,
+                path_worker_count,
                 truth_output_label,
             )
             for parent_name, group in group_items
