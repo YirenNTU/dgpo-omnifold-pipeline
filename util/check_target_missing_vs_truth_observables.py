@@ -143,10 +143,7 @@ def build_momentum4d_with_mass(obj: ak.Array, mass: float, E: float=None) -> ak.
     px = np.asarray(obj.px, dtype=np.float64)
     py = np.asarray(obj.py, dtype=np.float64)
     pz = np.asarray(obj.pz, dtype=np.float64)
-    if E is None:
-        energy = np.sqrt(px * px + py * py + pz * pz + mass * mass)
-    else:
-        energy = np.ones_like(px) * E / 2
+    energy = np.sqrt(px * px + py * py + pz * pz + mass * mass)
     return build_momentum4d(px, py, pz, energy)
 
 
