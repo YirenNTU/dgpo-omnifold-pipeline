@@ -20,9 +20,9 @@ EVENET_ROOT = ML_PIPELINE_ROOT / "EveNet-Full"
 if str(EVENET_ROOT) not in sys.path:
     sys.path.insert(0, str(EVENET_ROOT))
 
-from build_evenet_input_from_parquet import expand_input_files, merge_evenet_config, parse_config, read_yaml
+from build_evenet_input_from_parquet import merge_evenet_config, parse_config, read_yaml
 from ml_pipeline_config import parse_evenet_config
-from parquet_plot_common import OKABE_ITO, infer_luminosity, process_color, process_latex_label
+from parquet_plot_common import OKABE_ITO, process_color, process_latex_label
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "plots" / "prediction_summary"
@@ -93,14 +93,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--weight-source",
-        choices=["auto", "evenet", "central", "event", "class", "unit"],
+        choices=["evenet", "unit"],
         default="evenet",
         help=(
-            "MC weight source. 'auto' prefers prediction-parquet evenet_weight and falls back to "
-            "central/event/class normalization, "
-            "'evenet' uses prediction-parquet evenet_weight, "
-            "'class' recomputes analysis-config class normalization, "
-            "'event' uses event_weight, and 'unit' ignores weights."
+            "MC weight source. 'evenet' uses prediction-parquet evenet_weight only. "
+            "'unit' ignores weights."
         ),
     )
     return parser.parse_args()
@@ -150,60 +147,6 @@ def build_class_names_from_analysis(analysis_config_path: Path, evenet_config_pa
         else:
             class_names.append(sample.name)
     return class_names
-
-
-def build_class_to_sample_map(samples: dict, subcategories: dict, evenet_config) -> dict[str, Any]:
-    class_to_sample: dict[str, Any] = {}
-    for sample_key, sample in samples.items():
-        if sample.is_data:
-            continue
-        splits = subcategories.get(sample_key) or subcategories.get(sample.name)
-        if splits:
-            for split in splits:
-                class_to_sample[split.name] = sample
-        else:
-            class_to_sample[sample.name] = sample
-    return class_to_sample
-
-
-def sample_initial_total_num_events(sample) -> int:
-    parquet_files = expand_input_files(sample.input_files)
-    values: list[int] = []
-    for path in parquet_files:
-        events = ak.from_parquet(path, columns=["initial_total_num_events"])
-        if len(events) == 0 or "initial_total_num_events" not in events.fields:
-            continue
-        values.append(int(ak.to_numpy(events["initial_total_num_events"][:1], allow_missing=False)[0]))
-    if values:
-        return int(sum(values))
-    return 0
-
-
-def build_prediction_class_weights(
-    analysis_config_path: Path,
-    evenet_config_path: Path,
-    class_names: list[str],
-) -> dict[str, float]:
-    samples, subcategories, feature_config = parse_config(analysis_config_path)
-    merged_evenet = parse_evenet_config(
-        merge_evenet_config(read_yaml(evenet_config_path), read_yaml(analysis_config_path)),
-        feature_config,
-    )
-    luminosity = infer_luminosity(samples, None)
-    class_to_sample = build_class_to_sample_map(samples, subcategories, merged_evenet)
-
-    output: dict[str, float] = {}
-    for class_name in class_names:
-        sample = class_to_sample.get(class_name)
-        if sample is None or sample.is_data or luminosity is None:
-            output[class_name] = 1.0
-            continue
-        initial_total_num_events = sample_initial_total_num_events(sample)
-        if initial_total_num_events <= 0:
-            output[class_name] = 1.0
-            continue
-        output[class_name] = float(sample.norm_factor) / float(initial_total_num_events) * float(luminosity)
-    return output
 
 
 def latex_process_label(name: str) -> str:
@@ -271,55 +214,22 @@ def to_numpy(values: ak.Array, dtype=None) -> np.ndarray:
     return output
 
 
-def class_weight_array(events: ak.Array, class_weight_map: dict[str, float] | None) -> np.ndarray | None:
-    if not class_weight_map:
-        return None
-
-    class_names = None
-    if "evenet_truth_class_name" in events.fields:
-        class_names = np.asarray(ak.to_list(events["evenet_truth_class_name"]), dtype=object)
-    elif "evenet_pred_class_name" in events.fields:
-        class_names = np.asarray(ak.to_list(events["evenet_pred_class_name"]), dtype=object)
-    if class_names is None:
-        return None
-
-    weights = np.ones(len(events), dtype=np.float64)
-    for class_name, class_weight in class_weight_map.items():
-        weights[class_names == class_name] = float(class_weight)
-    return np.where(np.isfinite(weights) & (weights > 0), weights, 0.0)
-
-
 def event_weights(
     events: ak.Array,
     use_weighted: bool,
-    weight_source: str = "auto",
+    weight_source: str = "evenet",
     class_weight_map: dict[str, float] | None = None,
 ) -> np.ndarray:
     if not use_weighted or weight_source == "unit":
         return np.ones(len(events), dtype=np.float64)
-
-    if weight_source == "class":
-        class_weights = class_weight_array(events, class_weight_map)
-        return class_weights if class_weights is not None else np.ones(len(events), dtype=np.float64)
-
-    field_priority = {
-        "auto": ("evenet_weight", "central_weight", "weight", "event_weight"),
-        "evenet": ("evenet_weight", "central_weight", "weight", "event_weight"),
-        "central": ("central_weight", "weight", "event_weight"),
-        "event": ("event_weight", "central_weight", "weight"),
-    }.get(weight_source, ("evenet_weight",))
-    for field in field_priority:
-        if field not in events.fields:
-            continue
-        print(field)
-        weights = to_numpy(events[field], np.float64)
-        valid = np.isfinite(weights) & (weights > 0)
-        return np.where(valid, weights, 0.0)
-
-    class_weights = class_weight_array(events, class_weight_map)
-    if class_weights is not None:
-        return class_weights
-    return np.ones(len(events), dtype=np.float64)
+    if "evenet_weight" not in events.fields:
+        raise ValueError(
+            "Prediction summary requires evenet_weight in the prediction parquet. "
+            "This script no longer recalculates or falls back to other weight fields."
+        )
+    weights = to_numpy(events["evenet_weight"], np.float64)
+    valid = np.isfinite(weights) & (weights > 0)
+    return np.where(valid, weights, 0.0)
 
 
 def weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
@@ -1625,15 +1535,7 @@ def main() -> None:
 
     class_names = build_class_names_from_analysis(args.analysis_config.resolve(), args.evenet_config.resolve())
     summary_class_names = summary_channel_order(class_names)
-    class_weight_map = (
-        build_prediction_class_weights(
-            args.analysis_config.resolve(),
-            args.evenet_config.resolve(),
-            class_names,
-        )
-        if weight_source in {"auto", "class"}
-        else None
-    )
+    class_weight_map = None
 
     truth_idx = to_numpy(mc_events["evenet_truth_class_index"], np.int64)
     pred_idx = to_numpy(mc_events["evenet_pred_class_index"], np.int64)
@@ -1704,7 +1606,7 @@ def main() -> None:
             "evenet_config": str(args.evenet_config.resolve()),
             "use_weighted": use_weighted,
             "weight_source": weight_source,
-            "class_weight_map_enabled": class_weight_map is not None,
+            "class_weight_map_enabled": False,
             "summary_channel_order": summary_class_names,
         },
         "classification": confusion_metrics,
