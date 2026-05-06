@@ -45,7 +45,6 @@ from evenet.network.evenet_model import EveNetModel
 from evenet.utilities.diffusion_sampler import DDIMSampler
 from evenet.utilities.tool import safe_load_state
 from ml_pipeline_config import FeatureConfig, parse_evenet_config
-from parquet_plot_common import infer_luminosity
 
 
 vector.register_awkward()
@@ -229,12 +228,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--converted-weight-source",
-        choices=["auto", "central", "class", "event", "unit"],
-        default="auto",
+        choices=["event", "unit"],
+        default="event",
         help=(
-            "Weight source for converted prediction outputs. 'auto' uses central_weight from the "
-            "converted parquet when available, otherwise class weights. Split-fraction correction "
-            "is applied only to class weights."
+            "Weight source for converted prediction outputs. 'event' writes "
+            "evenet_weight = event_weight / split_factor when split-factor is provided. "
+            "'unit' writes evenet_weight = 1."
         ),
     )
     return parser.parse_args()
@@ -349,28 +348,6 @@ def sample_initial_total_num_events(sample) -> int:
     return 0
 
 
-def build_converted_class_weights(
-    analysis_config_path: Path,
-    evenet_config,
-    class_names: list[str],
-) -> dict[str, float]:
-    samples, subcategories, _ = parse_config(analysis_config_path)
-    luminosity = infer_luminosity(samples, None)
-    class_to_sample = build_class_to_sample_map(samples, subcategories, evenet_config)
-    output: dict[str, float] = {}
-    for class_name in class_names:
-        sample = class_to_sample.get(class_name)
-        if sample is None or sample.is_data or luminosity is None:
-            output[class_name] = 1.0
-            continue
-        initial_total_num_events = sample_initial_total_num_events(sample)
-        if initial_total_num_events <= 0:
-            output[class_name] = 1.0
-            continue
-        output[class_name] = float(sample.norm_factor) / float(initial_total_num_events) * float(luminosity)
-    return output
-
-
 def valid_positive_weight(values: np.ndarray) -> np.ndarray:
     weights = np.asarray(values, dtype=np.float32)
     return np.where(np.isfinite(weights) & (weights > 0), weights, 0.0).astype(np.float32)
@@ -378,66 +355,24 @@ def valid_positive_weight(values: np.ndarray) -> np.ndarray:
 
 def converted_physics_weight(
     batch_np: dict[str, np.ndarray],
-    target_class_name: np.ndarray,
-    valid_target_class: np.ndarray,
-    class_weight_map: dict[str, float] | None,
     converted_split_fraction: float | None,
     use_weighted_output: bool,
     weight_source: str,
 ) -> tuple[np.ndarray, str, bool]:
-    num_events = len(target_class_name)
+    num_events = int(batch_np["event_weight"].shape[0])
     if not use_weighted_output or weight_source == "unit":
         return np.ones(num_events, dtype=np.float32), "unit", False
 
-    resolved_source = weight_source
-    if resolved_source == "auto":
-        resolved_source = "central" if "central_weight" in batch_np else "class"
-
-    if resolved_source == "central":
-        if "central_weight" not in batch_np:
-            resolved_source = "class"
-        else:
-            physics_weight = valid_positive_weight(batch_np["central_weight"])
-            split_applied = False
-            if converted_split_fraction is not None:
-                if not (0.0 < converted_split_fraction <= 1.0):
-                    raise ValueError(
-                        f"converted_split_fraction must be in (0, 1], got {converted_split_fraction}."
-                    )
-                physics_weight[valid_target_class] = (
-                    physics_weight[valid_target_class] / np.float32(converted_split_fraction)
-                )
-                split_applied = True
-            return physics_weight.astype(np.float32), "central_weight", split_applied
-
-    if resolved_source == "event":
-        physics_weight = valid_positive_weight(batch_np["event_weight"])
-        split_applied = False
-        if converted_split_fraction is not None:
-            if not (0.0 < converted_split_fraction <= 1.0):
-                raise ValueError(
-                    f"converted_split_fraction must be in (0, 1], got {converted_split_fraction}."
-                )
-            physics_weight[valid_target_class] = (
-                physics_weight[valid_target_class] / np.float32(converted_split_fraction)
-            )
-            split_applied = True
-        return physics_weight.astype(np.float32), "event_weight", split_applied
-
-    physics_weight = np.ones(num_events, dtype=np.float32)
-    if class_weight_map is not None:
-        for class_name, class_weight in class_weight_map.items():
-            physics_weight[target_class_name == class_name] = np.float32(class_weight)
+    physics_weight = valid_positive_weight(batch_np["event_weight"])
     split_applied = False
     if converted_split_fraction is not None:
         if not (0.0 < converted_split_fraction <= 1.0):
             raise ValueError(
                 f"converted_split_fraction must be in (0, 1], got {converted_split_fraction}."
             )
-        mc_like_mask = valid_target_class
-        physics_weight[mc_like_mask] = physics_weight[mc_like_mask] / np.float32(converted_split_fraction)
+        physics_weight = physics_weight / np.float32(converted_split_fraction)
         split_applied = True
-    return physics_weight.astype(np.float32), "class_weight_map", split_applied
+    return physics_weight.astype(np.float32), "event_weight", split_applied
 
 
 def prepare_runtime_train_config(
@@ -868,10 +803,10 @@ def ensure_converted_batch_fields(
     if "classification" not in output:
         output["classification"] = np.full(num_events, -1, dtype=np.int64)
     if "event_weight" not in output:
-        if "central_weight" in output:
-            output["event_weight"] = np.asarray(output["central_weight"], dtype=np.float32)
-        else:
-            output["event_weight"] = np.ones(num_events, dtype=np.float32)
+        raise ValueError(
+            "Converted parquet must contain event_weight. "
+            "Prediction weighting no longer falls back to central_weight or class weights."
+        )
 
     return output
 
@@ -938,7 +873,6 @@ def predict_converted_events(
     signal_class_names: set[str],
     batch_size: int,
     num_steps: int | None,
-    class_weight_map: dict[str, float] | None,
     converted_split_fraction: float | None,
     use_weighted_output: bool,
     converted_weight_source: str,
@@ -1079,9 +1013,6 @@ def predict_converted_events(
     target_class_name[valid_target_class] = np.asarray(class_names, dtype=object)[target_class_index[valid_target_class]]
     physics_weight, weight_source_used, split_applied = converted_physics_weight(
         batch_np=batch_np,
-        target_class_name=target_class_name,
-        valid_target_class=valid_target_class,
-        class_weight_map=class_weight_map,
         converted_split_fraction=converted_split_fraction,
         use_weighted_output=use_weighted_output,
         weight_source=converted_weight_source,
@@ -1109,7 +1040,6 @@ def augment_converted_parquet_task(
     batch_size: int,
     num_steps: int | None,
     signal_class_names: set[str],
-    class_weight_map: dict[str, float] | None,
     converted_split_fraction: float | None,
     use_weighted_output: bool,
     converted_weight_source: str,
@@ -1139,7 +1069,6 @@ def augment_converted_parquet_task(
         signal_class_names=signal_class_names,
         batch_size=batch_size,
         num_steps=num_steps,
-        class_weight_map=class_weight_map,
         converted_split_fraction=converted_split_fraction,
         use_weighted_output=use_weighted_output,
         converted_weight_source=converted_weight_source,
@@ -1285,9 +1214,8 @@ def worker_main(
     signal_class_names: set[str],
     use_weighted_output: bool,
     shape_metadata_path: str | None = None,
-    class_weight_map: dict[str, float] | None = None,
     converted_split_fraction: float | None = None,
-    converted_weight_source: str = "auto",
+    converted_weight_source: str = "event",
 ) -> None:
     use_cuda = torch.cuda.is_available() and world_size > 0
     device = torch.device(f"cuda:{rank}" if use_cuda else "cpu")
@@ -1311,7 +1239,6 @@ def worker_main(
             batch_size=batch_size,
             num_steps=num_steps,
             signal_class_names=signal_class_names,
-            class_weight_map=class_weight_map,
             converted_split_fraction=converted_split_fraction,
             use_weighted_output=use_weighted_output,
             converted_weight_source=converted_weight_source,
@@ -1388,12 +1315,6 @@ def main() -> None:
             "--diffusion-checkpoint, pass --checkpoint, or set options.Training.model_checkpoint_load_path."
         )
     checkpoint_path = legacy_checkpoint_path or diffusion_checkpoint_path
-    analysis_config_data = read_yaml(args.analysis_config.resolve())
-    _, _, analysis_feature_config = parse_config(args.analysis_config.resolve())
-    merged_evenet_config = parse_evenet_config(
-        merge_evenet_config(read_yaml(args.evenet_config.resolve()), analysis_config_data),
-        analysis_feature_config,
-    )
     loaded_class_names = runtime_class_names(Path(runtime_train_config))
     tasks = select_task_shard(all_tasks, args.task_num_shards, args.task_shard_index)
     if not tasks:
@@ -1405,11 +1326,6 @@ def main() -> None:
         return
 
     signal_class_names = signal_class_names_from_analysis(args.analysis_config.resolve())
-    class_weight_map = build_converted_class_weights(
-        analysis_config_path=args.analysis_config.resolve(),
-        evenet_config=merged_evenet_config,
-        class_names=loaded_class_names,
-    )
 
     meta_name = (
         f"prediction_metadata.shard{args.task_shard_index:03d}-of-{args.task_num_shards:03d}.yaml"
@@ -1435,7 +1351,6 @@ def main() -> None:
                 "signal_classes": sorted(signal_class_names),
                 "converted_parquet": [str(Path(path).resolve()) for path in converted_parquets],
                 "shape_metadata": str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
-                "class_weight_map": class_weight_map,
                 "converted_split_fraction": converted_split_fraction,
                 "converted_weight_source": str(args.converted_weight_source),
                 "disable_ema": bool(args.disable_ema),
@@ -1462,7 +1377,6 @@ def main() -> None:
             signal_class_names=signal_class_names,
             use_weighted_output=not args.unweighted_output,
             shape_metadata_path=str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
-            class_weight_map=class_weight_map,
             converted_split_fraction=converted_split_fraction,
             converted_weight_source=args.converted_weight_source,
         )
@@ -1486,7 +1400,6 @@ def main() -> None:
             signal_class_names,
             not args.unweighted_output,
             str(args.shape_metadata.resolve()) if args.shape_metadata is not None else None,
-            class_weight_map,
             converted_split_fraction,
             args.converted_weight_source,
         ),
