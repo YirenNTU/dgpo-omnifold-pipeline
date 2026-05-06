@@ -311,6 +311,7 @@ def event_weights(
     for field in field_priority:
         if field not in events.fields:
             continue
+        print(field)
         weights = to_numpy(events[field], np.float64)
         valid = np.isfinite(weights) & (weights > 0)
         return np.where(valid, weights, 0.0)
