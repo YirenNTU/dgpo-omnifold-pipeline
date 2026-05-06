@@ -68,6 +68,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Normalize the 1D histograms to unit area.",
     )
+    parser.add_argument(
+        "--debug-chain",
+        action="store_true",
+        help=(
+            "Write extra Target-vs-Predicted debug-chain plots for remapped neutrino inputs, "
+            "mass-projected taus, and derived observables."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -369,6 +377,49 @@ def predicted_reconstructed_values(events: ak.Array, observable: str) -> np.ndar
     return np.asarray(observables[observable], dtype=np.float64)
 
 
+def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str, np.ndarray]:
+    if missing_kind == "target":
+        missing_a = target_missing_p4(events, "a")
+        missing_b = target_missing_p4(events, "b")
+        prefix = "target"
+    elif missing_kind == "pred":
+        missing_a = predicted_missing_p4(events, "a")
+        missing_b = predicted_missing_p4(events, "b")
+        prefix = "pred"
+    else:
+        raise ValueError(f"Unsupported missing kind '{missing_kind}'.")
+
+    visible_a = visible_tau_p4(events, "a")
+    visible_b = visible_tau_p4(events, "b")
+    tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS)
+    tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
+    observables = build_observables(
+        tau_a_p4=tau_a,
+        tau_b_p4=tau_b,
+        vis_a_p4=visible_a,
+        vis_b_p4=visible_b,
+    )
+    values: dict[str, np.ndarray] = {
+        f"{prefix}_nu_a_pt": np.asarray(missing_a.pt, dtype=np.float64),
+        f"{prefix}_nu_a_eta": np.asarray(missing_a.eta, dtype=np.float64),
+        f"{prefix}_nu_a_phi": np.asarray(missing_a.phi, dtype=np.float64),
+        f"{prefix}_nu_b_pt": np.asarray(missing_b.pt, dtype=np.float64),
+        f"{prefix}_nu_b_eta": np.asarray(missing_b.eta, dtype=np.float64),
+        f"{prefix}_nu_b_phi": np.asarray(missing_b.phi, dtype=np.float64),
+        f"{prefix}_tau_a_pt": np.asarray(tau_a.pt, dtype=np.float64),
+        f"{prefix}_tau_a_eta": np.asarray(tau_a.eta, dtype=np.float64),
+        f"{prefix}_tau_a_phi": np.asarray(tau_a.phi, dtype=np.float64),
+        f"{prefix}_tau_a_mass": np.asarray(tau_a.mass, dtype=np.float64),
+        f"{prefix}_tau_b_pt": np.asarray(tau_b.pt, dtype=np.float64),
+        f"{prefix}_tau_b_eta": np.asarray(tau_b.eta, dtype=np.float64),
+        f"{prefix}_tau_b_phi": np.asarray(tau_b.phi, dtype=np.float64),
+        f"{prefix}_tau_b_mass": np.asarray(tau_b.mass, dtype=np.float64),
+    }
+    for observable_name, observable_values in observables.items():
+        values[f"{prefix}_{observable_name}"] = np.asarray(observable_values, dtype=np.float64)
+    return values
+
+
 def observable_limits(observable: str, *value_arrays: np.ndarray) -> tuple[float, float]:
     if observable == "theta_cm":
         return 0.0, 1.0
@@ -421,6 +472,68 @@ def compare_summary(truth: np.ndarray, reco: np.ndarray) -> dict[str, float | in
 
 def weighted_hist2d(x: np.ndarray, y: np.ndarray, weights: np.ndarray, bins: np.ndarray) -> np.ndarray:
     return np.histogram2d(x, y, bins=[bins, bins], weights=weights)[0].astype(np.float64)
+
+
+def plot_chain_group(
+    output_path: Path,
+    title: str,
+    variables: list[tuple[str, str]],
+    target_chain: dict[str, np.ndarray],
+    pred_chain: dict[str, np.ndarray],
+    weights: np.ndarray,
+) -> dict[str, dict[str, float | int | None]]:
+    cols = 3
+    rows = math.ceil(len(variables) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(4.9 * cols, 4.3 * rows), dpi=180)
+    axes = np.asarray(axes).reshape(rows, cols)
+    summary: dict[str, dict[str, float | int | None]] = {}
+    for axis in axes.flat[len(variables):]:
+        axis.axis("off")
+
+    for axis, (label, base_name) in zip(axes.flat, variables):
+        target_values = np.asarray(target_chain[f"target_{base_name}"], dtype=np.float64)
+        pred_values = np.asarray(pred_chain[f"pred_{base_name}"], dtype=np.float64)
+        finite = np.isfinite(target_values) & np.isfinite(pred_values) & np.isfinite(weights) & (weights > 0.0)
+        if not np.any(finite):
+            axis.set_title(label)
+            axis.text(0.5, 0.5, "No valid entries", ha="center", va="center", transform=axis.transAxes)
+            axis.axis("off")
+            summary[base_name] = compare_summary(np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+            continue
+        x = target_values[finite]
+        y = pred_values[finite]
+        w = weights[finite]
+        summary[base_name] = compare_summary(x, y)
+        if base_name.endswith("_phi"):
+            low, high = -np.pi, np.pi
+        elif base_name.endswith("_eta"):
+            bound = max(float(np.nanpercentile(np.abs(np.concatenate([x, y])), 99.5)), 1.0)
+            low, high = -bound, bound
+        elif base_name.startswith("nu_") or base_name.startswith("tau_") or base_name == "mtautau":
+            low = 0.0
+            high = max(float(np.nanpercentile(np.concatenate([x, y]), 99.5)), 1.0)
+        elif base_name.startswith("cos_theta_") or base_name == "theta_cm":
+            low, high = observable_limits(base_name, x, y)
+        else:
+            low, high = observable_limits(base_name, x, y)
+        bins = np.linspace(low, high, 60)
+        hist2d = weighted_hist2d(x, y, w, bins)
+        mesh = axis.pcolormesh(bins, bins, hist2d.T, cmap="Blues", shading="auto", vmin=0.0)
+        fig.colorbar(mesh, ax=axis, fraction=0.046, pad=0.03, label="Entries")
+        axis.plot([low, high], [low, high], color="black", linestyle="--", linewidth=1.0)
+        axis.set_xlim(low, high)
+        axis.set_ylim(low, high)
+        axis.set_xlabel(f"Target {label}")
+        axis.set_ylabel(f"Predicted {label}")
+        axis.set_title(label)
+        axis.grid(alpha=0.16)
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+    return summary
 
 
 def plot_observable(
@@ -552,6 +665,19 @@ def main() -> None:
     collected_pred_neutrino_truth: dict[str, list[np.ndarray]] = {component: [] for component in ("pt", "eta", "phi")}
     collected_pred_neutrino_pred: dict[str, list[np.ndarray]] = {component: [] for component in ("pt", "eta", "phi")}
     collected_pred_neutrino_weights: list[np.ndarray] = []
+    chain_variable_names = [
+        "nu_a_pt", "nu_a_eta", "nu_a_phi",
+        "nu_b_pt", "nu_b_eta", "nu_b_phi",
+        "tau_a_pt", "tau_a_eta", "tau_a_phi",
+        "tau_b_pt", "tau_b_eta", "tau_b_phi",
+        "tau_a_mass", "tau_b_mass",
+        "theta_cm", "mtautau",
+        "cos_theta_A_n", "cos_theta_A_r", "cos_theta_A_k",
+        "cos_theta_B_n", "cos_theta_B_r", "cos_theta_B_k",
+    ]
+    collected_target_chain: dict[str, list[np.ndarray]] = {name: [] for name in chain_variable_names}
+    collected_pred_chain: dict[str, list[np.ndarray]] = {name: [] for name in chain_variable_names}
+    collected_chain_weights: list[np.ndarray] = []
     rows_seen = 0
     rows_used = 0
 
@@ -573,6 +699,21 @@ def main() -> None:
                 continue
             rows_used += len(selected)
             weights = event_weights(selected, args.weight_field)
+            if args.debug_chain:
+                try:
+                    target_chain_batch = reconstructed_chain_values(selected, "target")
+                    pred_chain_batch = reconstructed_chain_values(selected, "pred")
+                    chain_finite = np.isfinite(weights) & (weights > 0.0)
+                    for name in chain_variable_names:
+                        chain_finite &= np.isfinite(target_chain_batch[f"target_{name}"])
+                        chain_finite &= np.isfinite(pred_chain_batch[f"pred_{name}"])
+                    if np.any(chain_finite):
+                        for name in chain_variable_names:
+                            collected_target_chain[name].append(target_chain_batch[f"target_{name}"][chain_finite])
+                            collected_pred_chain[name].append(pred_chain_batch[f"pred_{name}"][chain_finite])
+                        collected_chain_weights.append(weights[chain_finite])
+                except Exception:
+                    pass
             try:
                 pred_neutrino_truth_batch = {
                     component: flattened_leg_feature(selected, "target_invisible", component)
@@ -640,6 +781,87 @@ def main() -> None:
         "weight_field": args.weight_field,
         "observables": {},
     }
+
+    if args.debug_chain and collected_chain_weights:
+        target_chain = {
+            name: np.concatenate(chunks) if chunks else np.array([], dtype=np.float64)
+            for name, chunks in collected_target_chain.items()
+        }
+        pred_chain = {
+            name: np.concatenate(chunks) if chunks else np.array([], dtype=np.float64)
+            for name, chunks in collected_pred_chain.items()
+        }
+        chain_weights = np.concatenate(collected_chain_weights)
+        chain_output_dir = output_dir / "debug_chain"
+        chain_summary = {
+            "neutrino": plot_chain_group(
+                chain_output_dir / "missing_neutrino_target_vs_pred.png",
+                "Missing neutrino: Target vs Predicted",
+                [
+                    ("nu_a_pt", "nu_a_pt"),
+                    ("nu_a_eta", "nu_a_eta"),
+                    ("nu_a_phi", "nu_a_phi"),
+                    ("nu_b_pt", "nu_b_pt"),
+                    ("nu_b_eta", "nu_b_eta"),
+                    ("nu_b_phi", "nu_b_phi"),
+                ],
+                target_chain,
+                pred_chain,
+                chain_weights,
+            ),
+            "tau": plot_chain_group(
+                chain_output_dir / "tau_projected_target_vs_pred.png",
+                "Tau after mass projection: Target vs Predicted",
+                [
+                    ("tau_a_pt", "tau_a_pt"),
+                    ("tau_a_eta", "tau_a_eta"),
+                    ("tau_a_phi", "tau_a_phi"),
+                    ("tau_b_pt", "tau_b_pt"),
+                    ("tau_b_eta", "tau_b_eta"),
+                    ("tau_b_phi", "tau_b_phi"),
+                ],
+                target_chain,
+                pred_chain,
+                chain_weights,
+            ),
+            "global": plot_chain_group(
+                chain_output_dir / "global_observables_target_vs_pred.png",
+                "Global observables: Target vs Predicted",
+                [
+                    ("tau_a_mass", "tau_a_mass"),
+                    ("tau_b_mass", "tau_b_mass"),
+                    ("theta_cm", "theta_cm"),
+                    ("mtautau", "mtautau"),
+                ],
+                target_chain,
+                pred_chain,
+                chain_weights,
+            ),
+            "angular": plot_chain_group(
+                chain_output_dir / "angular_observables_target_vs_pred.png",
+                "Angular observables: Target vs Predicted",
+                [
+                    ("cos_theta_A_n", "cos_theta_A_n"),
+                    ("cos_theta_A_r", "cos_theta_A_r"),
+                    ("cos_theta_A_k", "cos_theta_A_k"),
+                    ("cos_theta_B_n", "cos_theta_B_n"),
+                    ("cos_theta_B_r", "cos_theta_B_r"),
+                    ("cos_theta_B_k", "cos_theta_B_k"),
+                ],
+                target_chain,
+                pred_chain,
+                chain_weights,
+            ),
+        }
+        summary["debug_chain"] = {
+            "plots": {
+                "neutrino": str((chain_output_dir / "missing_neutrino_target_vs_pred.png").relative_to(output_dir)),
+                "tau": str((chain_output_dir / "tau_projected_target_vs_pred.png").relative_to(output_dir)),
+                "global": str((chain_output_dir / "global_observables_target_vs_pred.png").relative_to(output_dir)),
+                "angular": str((chain_output_dir / "angular_observables_target_vs_pred.png").relative_to(output_dir)),
+            },
+            "summary": chain_summary,
+        }
 
     for observable in observables:
         if not collected_target_truth[observable]:
