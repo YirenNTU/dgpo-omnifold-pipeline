@@ -179,7 +179,7 @@ def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float,
     phi = np.asarray(obj.phi, dtype=np.float64)
     pt = energy / np.cosh(eta)
     m = np.ones_like(eta, dtype=np.float64) * mass
-    ak.zip(
+    return ak.zip(
         {
             "pt": pt,
             "eta": eta,
@@ -190,7 +190,6 @@ def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float,
         with_name="Momentum4D",
     )
 
-    )
 
 
 def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
