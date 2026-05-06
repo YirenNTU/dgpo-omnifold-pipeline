@@ -27,6 +27,7 @@ from utils.common_functions import rebuild_p4
 vector.register_awkward()
 
 TAU_MASS = 1.777  # GeV
+CM_ENERGY = 91.2 # GeV
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,11 +139,14 @@ def build_momentum4d(px: np.ndarray, py: np.ndarray, pz: np.ndarray, energy: np.
     )
 
 
-def build_momentum4d_with_mass(obj: ak.Array, mass: float) -> ak.Array:
+def build_momentum4d_with_mass(obj: ak.Array, mass: float, E: float=None) -> ak.Array:
     px = np.asarray(obj.px, dtype=np.float64)
     py = np.asarray(obj.py, dtype=np.float64)
     pz = np.asarray(obj.pz, dtype=np.float64)
-    energy = np.sqrt(px * px + py * py + pz * pz + mass * mass)
+    if E is None:
+        energy = np.sqrt(px * px + py * py + pz * pz + mass * mass)
+    else:
+        energy = np.ones_like(px) * E / 2
     return build_momentum4d(px, py, pz, energy)
 
 
@@ -391,8 +395,8 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
 
     visible_a = visible_tau_p4(events, "a")
     visible_b = visible_tau_p4(events, "b")
-    tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS)
-    tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
+    tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS, CM_ENERGY)
+    # tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
 
     tau_b = -tau_a
 
