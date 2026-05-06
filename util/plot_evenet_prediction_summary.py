@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weight-source",
         choices=["auto", "evenet", "central", "event", "class", "unit"],
-        default="auto",
+        default="evenet",
         help=(
             "MC weight source. 'auto' prefers prediction-parquet evenet_weight and falls back to "
             "central/event/class normalization, "
