@@ -416,7 +416,12 @@ def predicted_reconstructed_values(events: ak.Array, observable: str) -> np.ndar
     # tau_b = build_momentum4d_with_mass(visible_b + pred_b, TAU_MASS)
 
     tau_a = build_momentum4d_with_energy_mass(visible_a + pred_a, CM_ENERGY, TAU_MASS)
-    tau_b = tau_a * -1
+    tau_b = build_momentum4d(
+        px=-tau_a.px,
+        py=-tau_a.py,
+        pz=-tau_a.pz,
+        energy=tau_a.energy,
+    )
 
     observables = build_observables(
         tau_a_p4=tau_a,
@@ -444,12 +449,12 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
     tau_a = build_momentum4d_with_energy_mass(visible_a + missing_a, CM_ENERGY, TAU_MASS)
     # tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
     print(f"replace b to be -a, {tau_a.x}, {tau_a.y}")
-    tau_b = build_momentum4d(px=-tau_a.x, py=-tau_a.y, pz=-tau_a.z, energy=-tau_a.energy)
+    tau_b = build_momentum4d(px=-tau_a.x, py=-tau_a.y, pz=-tau_a.z, energy=tau_a.energy)
     print("replace b to be -a [success]")
 
 
     cm_p4 = tau_a + tau_b
-    boost_to_cm = safe_boost_to_cm(cm_p4)
+    boost_to_cm = cm_p4.to_beta3()
     tau_a_cm = tau_a.boost(boost_to_cm)
     tau_b_cm = tau_b.boost(boost_to_cm)
     vis_a_cm = visible_a.boost(boost_to_cm)
