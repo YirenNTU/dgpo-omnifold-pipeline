@@ -412,8 +412,12 @@ def predicted_reconstructed_values(events: ak.Array, observable: str) -> np.ndar
     visible_b = visible_tau_p4(events, "b")
     pred_a = predicted_missing_p4(events, "a")
     pred_b = predicted_missing_p4(events, "b")
-    tau_a = build_momentum4d_with_mass(visible_a + pred_a, TAU_MASS)
-    tau_b = build_momentum4d_with_mass(visible_b + pred_b, TAU_MASS)
+    # tau_a = build_momentum4d_with_mass(visible_a + pred_a, TAU_MASS)
+    # tau_b = build_momentum4d_with_mass(visible_b + pred_b, TAU_MASS)
+
+    tau_a = build_momentum4d_with_energy_mass(visible_a + pred_a, CM_ENERGY, TAU_MASS)
+    tau_b = tau_a * -1
+
     observables = build_observables(
         tau_a_p4=tau_a,
         tau_b_p4=tau_b,
