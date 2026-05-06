@@ -174,6 +174,24 @@ def build_momentum4d_with_mass(obj: ak.Array, mass: float, E: float=None) -> ak.
     energy = np.sqrt(px * px + py * py + pz * pz + mass * mass)
     return build_momentum4d(px, py, pz, energy)
 
+def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float,) -> ak.Array:
+    eta = np.asarray(obj.eta, dtype=np.float64)
+    phi = np.asarray(obj.phi, dtype=np.float64)
+    pt = energy / np.cosh(eta)
+    m = np.ones_like(eta, dtype=np.float64) * mass
+    ak.zip(
+        {
+            "pt": pt,
+            "eta": eta,
+            "phi": phi,
+            "mass": m,
+
+        },
+        with_name="Momentum4D",
+    )
+
+    )
+
 
 def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
     return build_momentum4d(
@@ -420,7 +438,7 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
 
     visible_a = visible_tau_p4(events, "a")
     visible_b = visible_tau_p4(events, "b")
-    tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS, CM_ENERGY)
+    tau_a = build_momentum4d_with_energy_mass(visible_a + missing_a, CM_ENERGY, TAU_MASS)
     # tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
     print(f"replace b to be -a, {tau_a.x}, {tau_a.y}")
     tau_b = build_momentum4d(px=-tau_a.x, py=-tau_a.y, pz=-tau_a.z, energy=-tau_a.energy)
