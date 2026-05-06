@@ -810,7 +810,8 @@ def main() -> None:
                         collected_pred_neutrino_truth[component].append(pred_neutrino_truth_batch[component][neutrino_finite])
                         collected_pred_neutrino_pred[component].append(pred_neutrino_pred_batch[component][neutrino_finite])
                     collected_pred_neutrino_weights.append(neutrino_weights_batch[neutrino_finite])
-            except Exception:
+            except Exception as e:
+                print(e)
                 pass
             for observable in observables:
                 truth_field = f"truth_{observable}"
@@ -820,7 +821,8 @@ def main() -> None:
                 target_reco = target_reconstructed_values(selected, observable)
                 try:
                     pred_reco = predicted_reconstructed_values(selected, observable)
-                except Exception:
+                except Exception as e:
+                    print(e)
                     pred_reco = None
 
                 finite_target = np.isfinite(truth) & np.isfinite(target_reco) & np.isfinite(weights) & (weights > 0.0)
