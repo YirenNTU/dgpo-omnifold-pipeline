@@ -456,7 +456,7 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
         f"{prefix}_vis_b_rest_x": np.asarray(vis_b_rest.x, dtype=np.float64),
         f"{prefix}_vis_b_rest_y": np.asarray(vis_b_rest.y, dtype=np.float64),
         f"{prefix}_vis_b_rest_z": np.asarray(vis_b_rest.z, dtype=np.float64),
-        f"{prefix}_tautau_px": np.assarray(cm_p4.x, dtype=np.float64),
+        f"{prefix}_tautau_px": np.asarray(cm_p4.x, dtype=np.float64),
         f"{prefix}_tautau_py": np.asarray(cm_p4.y, dtype=np.float64),
         f"{prefix}_tautau_pz": np.asarray(cm_p4.z, dtype=np.float64),
     }
