@@ -394,6 +394,9 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
     tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS)
     tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
 
+    tau_b = -tau_a
+
+
     cm_p4 = tau_a + tau_b
     boost_to_cm = -cm_p4.to_beta3()
     tau_a_cm = tau_a.boost(boost_to_cm)
