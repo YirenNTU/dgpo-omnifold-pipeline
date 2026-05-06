@@ -777,7 +777,8 @@ def main() -> None:
                             collected_target_chain[name].append(target_chain_batch[f"target_{name}"][chain_finite])
                             collected_pred_chain[name].append(pred_chain_batch[f"pred_{name}"][chain_finite])
                         collected_chain_weights.append(weights[chain_finite])
-                except Exception:
+                except Exception as e:
+                    print(e)
                     pass
             try:
                 pred_neutrino_truth_batch = {
