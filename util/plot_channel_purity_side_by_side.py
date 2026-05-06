@@ -12,6 +12,7 @@ from zipfile import ZipFile
 
 import matplotlib.pyplot as plt
 import numpy as np
+import awkward as ak
 
 from plot_style import OKABE_ITO, channel_latex_label, method_color, process_color, process_latex_label
 
