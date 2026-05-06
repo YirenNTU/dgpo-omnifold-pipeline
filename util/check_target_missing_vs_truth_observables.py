@@ -174,22 +174,25 @@ def build_momentum4d_with_mass(obj: ak.Array, mass: float, E: float=None) -> ak.
     energy = np.sqrt(px * px + py * py + pz * pz + mass * mass)
     return build_momentum4d(px, py, pz, energy)
 
-def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float,) -> ak.Array:
+def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float) -> ak.Array:
     eta = np.asarray(obj.eta, dtype=np.float64)
     phi = np.asarray(obj.phi, dtype=np.float64)
-    pt = energy / np.cosh(eta)
-    m = np.ones_like(eta, dtype=np.float64) * mass
+
+    if energy <= mass:
+        raise ValueError(f"energy must be larger than mass, got energy={energy}, mass={mass}")
+
+    p = np.sqrt(energy * energy - mass * mass)
+    pt = p / np.cosh(eta)
+
     return ak.zip(
         {
             "pt": pt,
             "eta": eta,
             "phi": phi,
-            "mass": m,
-
+            "mass": np.full_like(eta, mass, dtype=np.float64),
         },
         with_name="Momentum4D",
     )
-
 
 
 def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
