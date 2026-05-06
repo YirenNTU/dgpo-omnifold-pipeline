@@ -398,7 +398,7 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
     tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS, CM_ENERGY)
     # tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
     print("replace b to be -a")
-    tau_b = -tau_a
+    tau_b = -1 * tau_a
 
 
     cm_p4 = tau_a + tau_b
