@@ -491,8 +491,8 @@ def plot_chain_group(
         axis.axis("off")
 
     for axis, (label, base_name) in zip(axes.flat, variables):
-        target_values = np.asarray(target_chain[f"target_{base_name}"], dtype=np.float64)
-        pred_values = np.asarray(pred_chain[f"pred_{base_name}"], dtype=np.float64)
+        target_values = np.asarray(target_chain[base_name], dtype=np.float64)
+        pred_values = np.asarray(pred_chain[base_name], dtype=np.float64)
         finite = np.isfinite(target_values) & np.isfinite(pred_values) & np.isfinite(weights) & (weights > 0.0)
         if not np.any(finite):
             axis.set_title(label)

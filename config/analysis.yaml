@@ -133,7 +133,7 @@ Inputs:
       - charged_E
       - missing_px
       - missing_py
-      - missing_pt
+      - missing_pz
       - isolation_angle
       - thrust_x
       - thrust_y
