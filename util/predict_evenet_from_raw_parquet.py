@@ -310,9 +310,6 @@ def build_training_class_labels(
         splits = subcategories.get(sample_key) or subcategories.get(sample.name)
         if splits:
             class_labels.extend(split.name for split in splits)
-            remainder_name = f"{sample.name}_others"
-            if remainder_name in evenet_config.process_topologies:
-                class_labels.append(remainder_name)
         else:
             class_labels.append(sample.name)
     return class_labels
@@ -327,9 +324,6 @@ def build_class_to_sample_map(samples: dict, subcategories: dict, evenet_config)
         if splits:
             for split in splits:
                 class_to_sample[split.name] = sample
-            remainder_name = f"{sample.name}_others"
-            if remainder_name in evenet_config.process_topologies:
-                class_to_sample[remainder_name] = sample
         else:
             class_to_sample[sample.name] = sample
     return class_to_sample

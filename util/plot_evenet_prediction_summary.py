@@ -135,7 +135,7 @@ def load_events(paths: list[str]) -> ak.Array:
 
 def build_class_names_from_analysis(analysis_config_path: Path, evenet_config_path: Path) -> list[str]:
     samples, subcategories, feature_config = parse_config(analysis_config_path)
-    merged_evenet = parse_evenet_config(
+    parse_evenet_config(
         merge_evenet_config(read_yaml(evenet_config_path), read_yaml(analysis_config_path)),
         feature_config,
     )
@@ -147,9 +147,6 @@ def build_class_names_from_analysis(analysis_config_path: Path, evenet_config_pa
         splits = subcategories.get(sample_key) or subcategories.get(sample.name)
         if splits:
             class_names.extend(split.name for split in splits)
-            remainder_name = f"{sample.name}_others"
-            if remainder_name in merged_evenet.process_topologies:
-                class_names.append(remainder_name)
         else:
             class_names.append(sample.name)
     return class_names
@@ -164,9 +161,6 @@ def build_class_to_sample_map(samples: dict, subcategories: dict, evenet_config)
         if splits:
             for split in splits:
                 class_to_sample[split.name] = sample
-            remainder_name = f"{sample.name}_others"
-            if remainder_name in evenet_config.process_topologies:
-                class_to_sample[remainder_name] = sample
         else:
             class_to_sample[sample.name] = sample
     return class_to_sample
