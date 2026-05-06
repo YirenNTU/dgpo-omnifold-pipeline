@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from quantum.observables_builder import build_observables, get_observable_names
+from quantum.observables_builder import build_observables, get_observable_names, helicity_basis
 from utils.common_functions import rebuild_p4
 
 
@@ -393,6 +393,36 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
     visible_b = visible_tau_p4(events, "b")
     tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS)
     tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
+
+    cm_p4 = tau_a + tau_b
+    boost_to_cm = -cm_p4.to_beta3()
+    tau_a_cm = tau_a.boost(boost_to_cm)
+    tau_b_cm = tau_b.boost(boost_to_cm)
+    vis_a_cm = visible_a.boost(boost_to_cm)
+    vis_b_cm = visible_b.boost(boost_to_cm)
+
+    basis_cm = helicity_basis(tau_a_cm)
+
+    boost_to_a_rest = -tau_a_cm.to_beta3()
+    boost_to_b_rest = -tau_b_cm.to_beta3()
+    vis_a_rest = vis_a_cm.boost(boost_to_a_rest).to_pxpypz().unit()
+    vis_b_rest = vis_b_cm.boost(boost_to_b_rest).to_pxpypz().unit()
+
+    basis_a_rest: dict[str, Any] = {}
+    basis_b_rest: dict[str, Any] = {}
+    for axis in ("n", "r", "k"):
+        axis_vector = basis_cm[axis]
+        basis_tmp = vector.zip(
+            {
+                "x": axis_vector.x,
+                "y": axis_vector.y,
+                "z": axis_vector.z,
+                "t": np.zeros_like(axis_vector.x),
+            }
+        )
+        basis_a_rest[axis] = basis_tmp.boost(boost_to_a_rest).to_pxpypz().unit()
+        basis_b_rest[axis] = basis_tmp.boost(boost_to_b_rest).to_pxpypz().unit()
+
     observables = build_observables(
         tau_a_p4=tau_a,
         tau_b_p4=tau_b,
@@ -414,7 +444,24 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
         f"{prefix}_tau_b_eta": np.asarray(tau_b.eta, dtype=np.float64),
         f"{prefix}_tau_b_phi": np.asarray(tau_b.phi, dtype=np.float64),
         f"{prefix}_tau_b_mass": np.asarray(tau_b.mass, dtype=np.float64),
+        f"{prefix}_tau_a_cm_costheta": np.asarray(tau_a_cm.costheta, dtype=np.float64),
+        f"{prefix}_tau_b_cm_costheta": np.asarray(tau_b_cm.costheta, dtype=np.float64),
+        f"{prefix}_tau_a_cm_phi": np.asarray(tau_a_cm.phi, dtype=np.float64),
+        f"{prefix}_tau_b_cm_phi": np.asarray(tau_b_cm.phi, dtype=np.float64),
+        f"{prefix}_vis_a_rest_x": np.asarray(vis_a_rest.x, dtype=np.float64),
+        f"{prefix}_vis_a_rest_y": np.asarray(vis_a_rest.y, dtype=np.float64),
+        f"{prefix}_vis_a_rest_z": np.asarray(vis_a_rest.z, dtype=np.float64),
+        f"{prefix}_vis_b_rest_x": np.asarray(vis_b_rest.x, dtype=np.float64),
+        f"{prefix}_vis_b_rest_y": np.asarray(vis_b_rest.y, dtype=np.float64),
+        f"{prefix}_vis_b_rest_z": np.asarray(vis_b_rest.z, dtype=np.float64),
     }
+    for axis in ("n", "r", "k"):
+        values[f"{prefix}_basis_a_rest_{axis}_x"] = np.asarray(basis_a_rest[axis].x, dtype=np.float64)
+        values[f"{prefix}_basis_a_rest_{axis}_y"] = np.asarray(basis_a_rest[axis].y, dtype=np.float64)
+        values[f"{prefix}_basis_a_rest_{axis}_z"] = np.asarray(basis_a_rest[axis].z, dtype=np.float64)
+        values[f"{prefix}_basis_b_rest_{axis}_x"] = np.asarray(basis_b_rest[axis].x, dtype=np.float64)
+        values[f"{prefix}_basis_b_rest_{axis}_y"] = np.asarray(basis_b_rest[axis].y, dtype=np.float64)
+        values[f"{prefix}_basis_b_rest_{axis}_z"] = np.asarray(basis_b_rest[axis].z, dtype=np.float64)
     for observable_name, observable_values in observables.items():
         values[f"{prefix}_{observable_name}"] = np.asarray(observable_values, dtype=np.float64)
     return values
@@ -509,6 +556,8 @@ def plot_chain_group(
         elif base_name.endswith("_eta"):
             bound = max(float(np.nanpercentile(np.abs(np.concatenate([x, y])), 99.5)), 1.0)
             low, high = -bound, bound
+        elif base_name.endswith("_x") or base_name.endswith("_y") or base_name.endswith("_z") or base_name.endswith("_costheta"):
+            low, high = -1.0, 1.0
         elif base_name.startswith("nu_") or base_name.startswith("tau_") or base_name == "mtautau":
             low = 0.0
             high = max(float(np.nanpercentile(np.concatenate([x, y]), 99.5)), 1.0)
@@ -671,6 +720,16 @@ def main() -> None:
         "tau_a_pt", "tau_a_eta", "tau_a_phi",
         "tau_b_pt", "tau_b_eta", "tau_b_phi",
         "tau_a_mass", "tau_b_mass",
+        "tau_a_cm_costheta", "tau_b_cm_costheta",
+        "tau_a_cm_phi", "tau_b_cm_phi",
+        "vis_a_rest_x", "vis_a_rest_y", "vis_a_rest_z",
+        "vis_b_rest_x", "vis_b_rest_y", "vis_b_rest_z",
+        "basis_a_rest_n_x", "basis_a_rest_n_y", "basis_a_rest_n_z",
+        "basis_a_rest_r_x", "basis_a_rest_r_y", "basis_a_rest_r_z",
+        "basis_a_rest_k_x", "basis_a_rest_k_y", "basis_a_rest_k_z",
+        "basis_b_rest_n_x", "basis_b_rest_n_y", "basis_b_rest_n_z",
+        "basis_b_rest_r_x", "basis_b_rest_r_y", "basis_b_rest_r_z",
+        "basis_b_rest_k_x", "basis_b_rest_k_y", "basis_b_rest_k_z",
         "theta_cm", "mtautau",
         "cos_theta_A_n", "cos_theta_A_r", "cos_theta_A_k",
         "cos_theta_B_n", "cos_theta_B_r", "cos_theta_B_k",
@@ -824,6 +883,70 @@ def main() -> None:
                 pred_chain,
                 chain_weights,
             ),
+            "cm_frame": plot_chain_group(
+                chain_output_dir / "cm_frame_target_vs_pred.png",
+                "CM-frame kinematics: Target vs Predicted",
+                [
+                    ("tau_a_cm_costheta", "tau_a_cm_costheta"),
+                    ("tau_b_cm_costheta", "tau_b_cm_costheta"),
+                    ("tau_a_cm_phi", "tau_a_cm_phi"),
+                    ("tau_b_cm_phi", "tau_b_cm_phi"),
+                ],
+                target_chain,
+                pred_chain,
+                chain_weights,
+            ),
+            "visible_rest": plot_chain_group(
+                chain_output_dir / "visible_rest_unit_target_vs_pred.png",
+                "Visible direction in tau rest frame: Target vs Predicted",
+                [
+                    ("vis_a_rest_x", "vis_a_rest_x"),
+                    ("vis_a_rest_y", "vis_a_rest_y"),
+                    ("vis_a_rest_z", "vis_a_rest_z"),
+                    ("vis_b_rest_x", "vis_b_rest_x"),
+                    ("vis_b_rest_y", "vis_b_rest_y"),
+                    ("vis_b_rest_z", "vis_b_rest_z"),
+                ],
+                target_chain,
+                pred_chain,
+                chain_weights,
+            ),
+            "basis_a_rest": plot_chain_group(
+                chain_output_dir / "basis_a_rest_target_vs_pred.png",
+                "Helicity basis in tau-A rest frame: Target vs Predicted",
+                [
+                    ("basis_a_rest_n_x", "basis_a_rest_n_x"),
+                    ("basis_a_rest_n_y", "basis_a_rest_n_y"),
+                    ("basis_a_rest_n_z", "basis_a_rest_n_z"),
+                    ("basis_a_rest_r_x", "basis_a_rest_r_x"),
+                    ("basis_a_rest_r_y", "basis_a_rest_r_y"),
+                    ("basis_a_rest_r_z", "basis_a_rest_r_z"),
+                    ("basis_a_rest_k_x", "basis_a_rest_k_x"),
+                    ("basis_a_rest_k_y", "basis_a_rest_k_y"),
+                    ("basis_a_rest_k_z", "basis_a_rest_k_z"),
+                ],
+                target_chain,
+                pred_chain,
+                chain_weights,
+            ),
+            "basis_b_rest": plot_chain_group(
+                chain_output_dir / "basis_b_rest_target_vs_pred.png",
+                "Helicity basis in tau-B rest frame: Target vs Predicted",
+                [
+                    ("basis_b_rest_n_x", "basis_b_rest_n_x"),
+                    ("basis_b_rest_n_y", "basis_b_rest_n_y"),
+                    ("basis_b_rest_n_z", "basis_b_rest_n_z"),
+                    ("basis_b_rest_r_x", "basis_b_rest_r_x"),
+                    ("basis_b_rest_r_y", "basis_b_rest_r_y"),
+                    ("basis_b_rest_r_z", "basis_b_rest_r_z"),
+                    ("basis_b_rest_k_x", "basis_b_rest_k_x"),
+                    ("basis_b_rest_k_y", "basis_b_rest_k_y"),
+                    ("basis_b_rest_k_z", "basis_b_rest_k_z"),
+                ],
+                target_chain,
+                pred_chain,
+                chain_weights,
+            ),
             "global": plot_chain_group(
                 chain_output_dir / "global_observables_target_vs_pred.png",
                 "Global observables: Target vs Predicted",
@@ -857,6 +980,10 @@ def main() -> None:
             "plots": {
                 "neutrino": str((chain_output_dir / "missing_neutrino_target_vs_pred.png").relative_to(output_dir)),
                 "tau": str((chain_output_dir / "tau_projected_target_vs_pred.png").relative_to(output_dir)),
+                "cm_frame": str((chain_output_dir / "cm_frame_target_vs_pred.png").relative_to(output_dir)),
+                "visible_rest": str((chain_output_dir / "visible_rest_unit_target_vs_pred.png").relative_to(output_dir)),
+                "basis_a_rest": str((chain_output_dir / "basis_a_rest_target_vs_pred.png").relative_to(output_dir)),
+                "basis_b_rest": str((chain_output_dir / "basis_b_rest_target_vs_pred.png").relative_to(output_dir)),
                 "global": str((chain_output_dir / "global_observables_target_vs_pred.png").relative_to(output_dir)),
                 "angular": str((chain_output_dir / "angular_observables_target_vs_pred.png").relative_to(output_dir)),
             },
