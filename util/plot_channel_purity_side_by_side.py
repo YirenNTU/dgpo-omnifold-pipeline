@@ -76,28 +76,6 @@ SIGNAL_CHANNEL_KEYS = {
     "mue",
 }
 
-STACK_PRIORITY = {
-    "Zqq": 0,
-    "Zll": 1,
-    "Ztautau_pipi": 2,
-    "Ztautau_pirho": 3,
-    "Ztautau_rhopi": 4,
-    "Ztautau_rhorho": 5,
-    "Ztautau_pie": 6,
-    "Ztautau_epi": 7,
-    "Ztautau_pimu": 8,
-    "Ztautau_mupi": 9,
-    "Ztautau_rhoe": 10,
-    "Ztautau_erho": 11,
-    "Ztautau_rhomu": 12,
-    "Ztautau_murho": 13,
-    "Ztautau_ee": 14,
-    "Ztautau_mumu": 15,
-    "Ztautau_emu": 16,
-    "Ztautau_mue": 17,
-    "Other": 18,
-}
-
 BASELINE_CHANNEL_ORDER = [
     "zee",
     "zmumu",
@@ -256,6 +234,18 @@ def signal_process_for_channel(channel: str) -> str | None:
     return None
 
 
+def is_background_like_process(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        name == DEFAULT_CLASS_NAME
+        or lowered in {"zll", "zqq"}
+        or lowered.endswith("_others")
+        or lowered == "others"
+        or lowered == "other"
+        or "background" in lowered
+    )
+
+
 def method_channel_order(methods: list[MethodPlotData], explicit_channels: list[str] | None) -> list[str]:
     if explicit_channels:
         return [canonical_channel_name(channel) or channel for channel in explicit_channels]
@@ -278,7 +268,15 @@ def method_channel_order(methods: list[MethodPlotData], explicit_channels: list[
 
 
 def stack_draw_order(process_names: list[str]) -> list[str]:
-    return sorted(process_names, key=lambda name: (STACK_PRIORITY.get(name, 999), name))
+    signal_names = [name for name in process_names if not is_background_like_process(name)]
+    background_names = [name for name in process_names if is_background_like_process(name)]
+    return signal_names + background_names
+
+
+def process_stack_color(process_name: str, index: int) -> str:
+    if is_background_like_process(process_name):
+        return BACKGROUND_COLOR
+    return process_color(process_name, index)
 
 
 def display_channel_label(channel: str) -> str:
@@ -505,11 +503,12 @@ def plot_comparison(
     group_width = min(0.84, 0.20 * num_methods + 0.18)
     bar_width = group_width / max(num_methods, 1)
 
-    fig = plt.figure(figsize=(max(13.5, 1.05 * len(channels) + 4.0), 10.8), dpi=220)
-    gs = fig.add_gridspec(3, 1, height_ratios=[5.3, 1.8, 1.8], hspace=0.08)
+    fig = plt.figure(figsize=(max(13.5, 1.05 * len(channels) + 4.0), 12.2), dpi=220)
+    gs = fig.add_gridspec(4, 1, height_ratios=[5.6, 1.55, 1.55, 1.55], hspace=0.08)
     ax_main = fig.add_subplot(gs[0, 0])
     ax_purity = fig.add_subplot(gs[1, 0], sharex=ax_main)
     ax_ratio = fig.add_subplot(gs[2, 0], sharex=ax_main)
+    ax_signal = fig.add_subplot(gs[3, 0], sharex=ax_main)
 
     component_legend_handles: list[Any] = []
     component_legend_labels: list[str] = []
@@ -524,6 +523,7 @@ def plot_comparison(
         x_offset = x - group_width / 2.0 + (method_index + 0.5) * bar_width
         bottoms = np.zeros(len(channels), dtype=np.float64)
 
+        signal_totals = np.zeros(len(channels), dtype=np.float64)
         for process_index, process_name in enumerate(process_names):
             values = np.array(
                 [method.stack_matrix.get(channel, {}).get(process_name, 0.0) for channel in channels],
@@ -531,13 +531,14 @@ def plot_comparison(
             )
             if not np.any(values > 0):
                 continue
+            bar_color = process_stack_color(process_name, process_index)
             bars = ax_main.bar(
                 x_offset,
                 values,
                 width=bar_width * 0.95,
                 bottom=bottoms,
-                color=BACKGROUND_COLOR if process_name == "Other" else process_color(process_name, process_index),
-                edgecolor=method_style["color"],
+                color=bar_color,
+                edgecolor=bar_color if method.is_baseline else "white",
                 linewidth=1.0,
                 alpha=method_style["alpha"],
                 hatch=method_style["hatch"],
@@ -547,6 +548,8 @@ def plot_comparison(
                 component_legend_handles.append(bars[0])
                 component_legend_labels.append(process_name)
             bottoms += values
+            if process_name.startswith("Ztautau_"):
+                signal_totals += values
 
         total_values = np.array([method.total_mc.get(channel, 0.0) for channel in channels], dtype=np.float64)
         data_values = np.array([method.data_yield.get(channel, np.nan) for channel in channels], dtype=np.float64)
@@ -563,7 +566,7 @@ def plot_comparison(
                 x_offset[data_mask],
                 data_values[data_mask],
                 s=18,
-                color=method_style["color"],
+                color=DATA_COLOR,
                 marker=method_style["marker"],
                 facecolors="white",
                 linewidths=1.0,
@@ -583,6 +586,16 @@ def plot_comparison(
         ax_ratio.plot(
             x,
             ratio_values,
+            color=method_style["color"],
+            linestyle=method_style["linestyle"],
+            marker=method_style["marker"],
+            linewidth=1.8,
+            markersize=4.0,
+            label=method.name,
+        )
+        ax_signal.plot(
+            x,
+            signal_totals,
             color=method_style["color"],
             linestyle=method_style["linestyle"],
             marker=method_style["marker"],
@@ -610,7 +623,7 @@ def plot_comparison(
     ax_main.set_title(title)
     ax_main.set_ylabel("Yield")
     ax_main.grid(axis="y", linestyle=":", alpha=0.28)
-    ax_main.set_ylim(0.0, max(1.0, max_yield) * 1.18)
+    ax_main.set_ylim(0.0, max(1.0, max_yield) * 1.30)
 
     ax_purity.set_ylabel("Purity")
     ax_purity.set_ylim(0.0, 1.05)
@@ -629,23 +642,33 @@ def plot_comparison(
     ax_ratio.axhline(1.0, color="gray", linestyle=":", linewidth=1.0, alpha=0.6)
     ax_ratio.grid(axis="y", linestyle=":", alpha=0.28)
 
+    ax_signal.set_ylabel("Signal")
+    ax_signal.grid(axis="y", linestyle=":", alpha=0.28)
+    ax_signal.set_ylim(bottom=0.0)
+
     ax_ratio.set_xticks(x)
     ax_ratio.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
-    ax_ratio.set_xlabel("Predicted channel")
+    ax_signal.set_xticks(x)
+    ax_signal.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
+    ax_signal.set_xlabel("Predicted channel")
     plt.setp(ax_main.get_xticklabels(), visible=False)
     plt.setp(ax_purity.get_xticklabels(), visible=False)
+    plt.setp(ax_ratio.get_xticklabels(), visible=False)
 
     component_labels_display = [process_latex_label(label) if label != "Other" else "Other bkg" for label in component_legend_labels]
     first_legend = ax_main.legend(
         component_legend_handles,
         component_labels_display,
-        loc="upper left",
-        bbox_to_anchor=(1.01, 1.0),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.995),
         frameon=False,
         title="MC truth components",
+        ncols=min(max(4, math.ceil(len(component_legend_labels) / 2)), len(component_legend_labels)),
+        fontsize=8.0,
+        title_fontsize=8.5,
     )
     ax_main.add_artist(first_legend)
-    ax_purity.legend(method_legend_handles, method_legend_labels, loc="upper left", ncols=max(1, len(method_legend_handles)), frameon=False)
+    ax_signal.legend(method_legend_handles, method_legend_labels, loc="upper left", ncols=max(1, len(method_legend_handles)), frameon=False)
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
