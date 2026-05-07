@@ -674,7 +674,7 @@ def plot_comparison(
     finite_ratio_values = np.asarray([value for value in ratio_values_all if np.isfinite(value)], dtype=np.float64)
     ratio_upper = 2.0 if finite_ratio_values.size == 0 else max(1.6, min(3.0, float(np.nanmax(finite_ratio_values) * 1.15)))
     ax_ratio.set_ylabel("Data/MC")
-    ax_ratio.set_ylim(0.0, ratio_upper)
+    ax_ratio.set_ylim(0.8, 1.2)
     ax_ratio.axhline(1.0, color="gray", linestyle=":", linewidth=1.0, alpha=0.6)
     ax_ratio.grid(axis="y", linestyle=":", alpha=0.28)
 
