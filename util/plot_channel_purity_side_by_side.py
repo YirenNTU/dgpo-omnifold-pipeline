@@ -13,6 +13,7 @@ from zipfile import ZipFile
 import matplotlib.pyplot as plt
 import numpy as np
 import awkward as ak
+from matplotlib.lines import Line2D
 import math
 
 from plot_style import OKABE_ITO, channel_latex_label, method_color, process_color, process_latex_label
@@ -24,6 +25,7 @@ DEFAULT_CLASS_NAME = "unselected"
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "plots" / "channel_purity_side_by_side.png"
 OPENXML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+METHOD_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "*", "h")
 
 BASELINE_PROCESS_COLUMN_MAP = {
     "C": "Zqq",
@@ -486,7 +488,7 @@ def style_for_method(method_name: str, method_index: int, is_baseline: bool) -> 
     return {
         "color": method_color(method_name, method_index),
         "linestyle": "--" if is_baseline else "-",
-        "marker": "o",
+        "marker": METHOD_MARKERS[method_index % len(METHOD_MARKERS)],
         "hatch": "///" if is_baseline else None,
         "alpha": 0.85 if is_baseline else 0.92,
     }
@@ -574,7 +576,7 @@ def plot_comparison(
                 zorder=4,
             )
 
-        purity_line, = ax_purity.plot(
+        ax_purity.plot(
             x,
             purity_values,
             color=method_style["color"],
@@ -604,7 +606,18 @@ def plot_comparison(
             markersize=4.0,
             label=method.name,
         )
-        method_legend_handles.append(purity_line)
+        method_legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=DATA_COLOR,
+                linestyle="None",
+                marker=method_style["marker"],
+                markerfacecolor="white",
+                markeredgecolor=DATA_COLOR,
+                markersize=6.0,
+            )
+        )
         method_legend_labels.append(method.name)
 
         summary["methods"][method.name] = {
@@ -669,7 +682,18 @@ def plot_comparison(
         title_fontsize=8.5,
     )
     ax_main.add_artist(first_legend)
-    ax_signal.legend(method_legend_handles, method_legend_labels, loc="upper left", ncols=max(1, len(method_legend_handles)), frameon=False)
+    second_legend = ax_main.legend(
+        method_legend_handles,
+        method_legend_labels,
+        loc="upper right",
+        bbox_to_anchor=(0.995, 0.995),
+        frameon=False,
+        title="Methods",
+        ncols=1,
+        fontsize=8.2,
+        title_fontsize=8.5,
+    )
+    ax_main.add_artist(second_legend)
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
