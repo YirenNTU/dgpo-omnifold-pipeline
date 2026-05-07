@@ -563,48 +563,70 @@ def plot_comparison(
         if np.any(np.isfinite(data_values)):
             max_yield = max(max_yield, float(np.nanmax(data_values)))
 
+        data_unc = np.sqrt(np.clip(data_values, a_min=0.0, a_max=None))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio_unc = np.divide(
+                data_unc,
+                total_values,
+                out=np.full_like(data_unc, np.nan, dtype=np.float64),
+                where=total_values > 0,
+            )
+
         data_mask = np.isfinite(data_values)
         if np.any(data_mask):
-            ax_main.scatter(
+            ax_main.errorbar(
                 x_offset[data_mask],
                 data_values[data_mask],
-                s=18,
+                yerr=data_unc[data_mask],
+                fmt=method_style["marker"],
                 color=DATA_COLOR,
-                marker=method_style["marker"],
-                facecolors="white",
-                linewidths=1.0,
+                ecolor=DATA_COLOR,
+                elinewidth=1.1,
+                capsize=2.5,
+                markersize=4.6,
+                markerfacecolor=DATA_COLOR,
+                markeredgecolor=DATA_COLOR,
                 zorder=4,
             )
 
-        ax_purity.plot(
-            x,
+        ax_purity.bar(
+            x_offset,
             purity_values,
+            width=bar_width * 0.82,
             color=method_style["color"],
-            linestyle=method_style["linestyle"],
-            marker=method_style["marker"],
-            linewidth=1.8,
-            markersize=4.0,
-            label=method.name,
+            edgecolor=method_style["color"],
+            linewidth=0.8,
+            alpha=0.78,
+            hatch=method_style["hatch"],
+            zorder=2,
         )
-        ax_ratio.plot(
-            x,
-            ratio_values,
-            color=method_style["color"],
-            linestyle=method_style["linestyle"],
-            marker=method_style["marker"],
-            linewidth=1.8,
-            markersize=4.0,
-            label=method.name,
-        )
-        ax_signal.plot(
-            x,
+        ratio_mask = np.isfinite(ratio_values)
+        if np.any(ratio_mask):
+            ax_ratio.errorbar(
+                x_offset[ratio_mask],
+                ratio_values[ratio_mask],
+                yerr=ratio_unc[ratio_mask],
+                fmt=method_style["marker"],
+                color=method_style["color"],
+                ecolor=method_style["color"],
+                elinewidth=1.0,
+                capsize=2.3,
+                markersize=4.4,
+                markerfacecolor=method_style["color"],
+                markeredgecolor=method_style["color"],
+                linestyle="None",
+                zorder=3,
+            )
+        ax_signal.bar(
+            x_offset,
             signal_totals,
+            width=bar_width * 0.82,
             color=method_style["color"],
-            linestyle=method_style["linestyle"],
-            marker=method_style["marker"],
-            linewidth=1.8,
-            markersize=4.0,
-            label=method.name,
+            edgecolor=method_style["color"],
+            linewidth=0.8,
+            alpha=0.78,
+            hatch=method_style["hatch"],
+            zorder=2,
         )
         method_legend_handles.append(
             Line2D(
@@ -613,7 +635,7 @@ def plot_comparison(
                 color=DATA_COLOR,
                 linestyle="None",
                 marker=method_style["marker"],
-                markerfacecolor="white",
+                markerfacecolor=DATA_COLOR,
                 markeredgecolor=DATA_COLOR,
                 markersize=6.0,
             )
