@@ -517,6 +517,8 @@ def plot_comparison(
     component_legend_labels: list[str] = []
     method_legend_handles: list[Any] = []
     method_legend_labels: list[str] = []
+    method_lower_legend_handles: list[Any] = []
+    method_lower_legend_labels: list[str] = []
 
     max_yield = 0.0
     summary: dict[str, Any] = {"channels": channels, "methods": {}}
@@ -590,7 +592,7 @@ def plot_comparison(
                 zorder=4,
             )
 
-        ax_purity.bar(
+        bars = ax_purity.bar(
             x_offset,
             purity_values,
             width=bar_width * 0.82,
@@ -601,6 +603,9 @@ def plot_comparison(
             hatch=method_style["hatch"],
             zorder=2,
         )
+
+        method_lower_legend_handles.append(bars[0])
+        method_lower_legend_labels.append(method.name)
         ratio_mask = np.isfinite(ratio_values)
         if np.any(ratio_mask):
             ax_ratio.errorbar(
@@ -719,25 +724,16 @@ def plot_comparison(
     )
     ax_main.add_artist(second_legend)
     ax_purity.legend(
-        method_legend_handles,
-        method_legend_labels,
-        loc="upper left",
+        method_lower_legend_handles,
+        method_lower_legend_labels,
+        loc="upper right",
         frameon=False,
-        title="Methods",
+        title=None,
         ncols=max(1, min(4, len(method_legend_handles))),
         fontsize=8.0,
         title_fontsize=8.3,
     )
-    ax_signal.legend(
-        method_legend_handles,
-        method_legend_labels,
-        loc="upper left",
-        frameon=False,
-        title="Methods",
-        ncols=max(1, min(4, len(method_legend_handles))),
-        fontsize=8.0,
-        title_fontsize=8.3,
-    )
+
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
