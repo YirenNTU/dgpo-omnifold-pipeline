@@ -262,11 +262,15 @@ def method_channel_order(methods: list[MethodPlotData], explicit_channels: list[
     ordered: list[str] = []
     seen: set[str] = set()
     for channel in BASELINE_CHANNEL_ORDER:
+        if channel not in SIGNAL_CHANNEL_KEYS:
+            continue
         if channel not in seen and any(channel in method.channel_order for method in methods):
             ordered.append(channel)
             seen.add(channel)
     for method in methods:
         for channel in method.channel_order:
+            if channel not in SIGNAL_CHANNEL_KEYS:
+                continue
             if channel not in seen:
                 ordered.append(channel)
                 seen.add(channel)
