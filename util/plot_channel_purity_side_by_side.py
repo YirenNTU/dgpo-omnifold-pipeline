@@ -526,7 +526,7 @@ def plot_comparison(
         x_offset = x - group_width / 2.0 + (method_index + 0.5) * bar_width
         bottoms = np.zeros(len(channels), dtype=np.float64)
 
-        signal_totals = np.zeros(len(channels), dtype=np.float64)
+        exact_signal_yields = np.zeros(len(channels), dtype=np.float64)
         for process_index, process_name in enumerate(process_names):
             values = np.array(
                 [method.stack_matrix.get(channel, {}).get(process_name, 0.0) for channel in channels],
@@ -551,8 +551,9 @@ def plot_comparison(
                 component_legend_handles.append(bars[0])
                 component_legend_labels.append(process_name)
             bottoms += values
-            if process_name.startswith("Ztautau_"):
-                signal_totals += values
+            for channel_index, channel in enumerate(channels):
+                if process_name == signal_process_for_channel(channel):
+                    exact_signal_yields[channel_index] = values[channel_index]
 
         total_values = np.array([method.total_mc.get(channel, 0.0) for channel in channels], dtype=np.float64)
         data_values = np.array([method.data_yield.get(channel, np.nan) for channel in channels], dtype=np.float64)
@@ -619,7 +620,7 @@ def plot_comparison(
             )
         ax_signal.bar(
             x_offset,
-            signal_totals,
+            exact_signal_yields,
             width=bar_width * 0.82,
             color=method_style["color"],
             edgecolor=method_style["color"],
@@ -650,6 +651,7 @@ def plot_comparison(
                     "total_mc_yield": float(method.total_mc.get(channel, 0.0)),
                     "data_yield": float(method.data_yield.get(channel, np.nan)),
                     "signal_purity": float(method.purity.get(channel, np.nan)),
+                    "exact_signal_yield": float(exact_signal_yields[channels.index(channel)]),
                     "data_over_mc": float(method.data_over_mc.get(channel, np.nan)),
                 }
                 for channel in channels
@@ -700,8 +702,8 @@ def plot_comparison(
         frameon=False,
         title="MC truth components",
         ncols=min(max(4, math.ceil(len(component_legend_labels) / 2)), len(component_legend_labels)),
-        fontsize=8.0,
-        title_fontsize=8.5,
+        fontsize=9.5,
+        title_fontsize=10.5,
     )
     ax_main.add_artist(first_legend)
     second_legend = ax_main.legend(
@@ -712,10 +714,30 @@ def plot_comparison(
         frameon=False,
         title="Methods",
         ncols=1,
-        fontsize=8.2,
-        title_fontsize=8.5,
+        fontsize=9.5,
+        title_fontsize=10.5,
     )
     ax_main.add_artist(second_legend)
+    ax_purity.legend(
+        method_legend_handles,
+        method_legend_labels,
+        loc="upper left",
+        frameon=False,
+        title="Methods",
+        ncols=max(1, min(4, len(method_legend_handles))),
+        fontsize=8.0,
+        title_fontsize=8.3,
+    )
+    ax_signal.legend(
+        method_legend_handles,
+        method_legend_labels,
+        loc="upper left",
+        frameon=False,
+        title="Methods",
+        ncols=max(1, min(4, len(method_legend_handles))),
+        fontsize=8.0,
+        title_fontsize=8.3,
+    )
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
