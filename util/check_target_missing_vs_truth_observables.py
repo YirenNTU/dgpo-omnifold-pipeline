@@ -186,7 +186,7 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
 
     px_shift = (px_a + px_b)
     py_shift = (py_a + py_b)
-    pz_shift = (pz_b + pz_b)
+    pz_shift = (pz_a + pz_b)
 
     px_a_corrected = px_a - (px_shift/2)
     px_b_corrected = px_b - (px_shift/2)
