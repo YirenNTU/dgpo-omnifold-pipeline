@@ -854,7 +854,7 @@ def main() -> None:
                 try:
                     pred_reco = predicted_reconstructed_values(selected, observable)
                 except Exception as e:
-                    print(e)
+                    print(e, "pred reco None")
                     pred_reco = None
 
                 finite_target = np.isfinite(truth) & np.isfinite(target_reco) & np.isfinite(weights) & (weights > 0.0)
