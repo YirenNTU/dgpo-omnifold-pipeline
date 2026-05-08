@@ -1052,6 +1052,9 @@ def main() -> None:
                     ("tautau_delta_pt", "tautau_delta_pt"),
                     ("tautau_delta_phi", "tautau_delta_phi"),
                     ("tautau_delta_eta", "tautau_delta_eta"),
+                    ("tautau_sum_pt", "tautau_sum_pt"),
+                    ("tautau_sum_phi", "tautau_sum_phi"),
+                    ("tautau_sum_eta", "tautau_sum_eta"),
 
                 ],
                 target_chain,
