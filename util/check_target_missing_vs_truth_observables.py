@@ -507,8 +507,13 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
     visible_a = visible_tau_p4(events, "a")
     visible_b = visible_tau_p4(events, "b")
     # tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS)
-    tau_a = build_momentum4d_with_energy_mass(visible_a + missing_a, CM_ENERGY/2, TAU_MASS)
-    tau_b = build_momentum4d_with_energy_mass(visible_b + missing_b, CM_ENERGY/2, TAU_MASS)
+
+    if missing_kind == "target":
+        tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS)
+        tau_b = build_momentum4d_with_mass(visible_b + missing_b, TAU_MASS)
+    else:
+        tau_a = build_momentum4d_with_energy_mass(visible_a + missing_a, CM_ENERGY/2, TAU_MASS)
+        tau_b = build_momentum4d_with_energy_mass(visible_b + missing_b, CM_ENERGY/2, TAU_MASS)
 
     # print(f"replace b to be -a, {tau_a.x}, {tau_a.y}")
     # tau_b = build_momentum4d(px=-tau_a.x, py=-tau_a.y, pz=-tau_a.z, energy=tau_a.energy)
@@ -581,6 +586,9 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
         f"{prefix}_tautau_px": np.asarray(cm_p4.x, dtype=np.float64),
         f"{prefix}_tautau_py": np.asarray(cm_p4.y, dtype=np.float64),
         f"{prefix}_tautau_pz": np.asarray(cm_p4.z, dtype=np.float64),
+        f"{prefix}_tautau_delta_pt": np.asarray(tau_a.pt-tau_b.pt, dtype=np.float64),
+        f"{prefix}_tautau_delta_eta": np.asarray(tau_a.eta-tau_b.eta, dtype=np.float64),
+        f"{prefix}_tautau_delta_phi": np.asarray(tau_a.phi-tau_b.pi, dtype=np.float64),
     }
     for axis in ("n", "r", "k"):
         values[f"{prefix}_basis_a_rest_{axis}_x"] = np.asarray(basis_a_rest[axis].x, dtype=np.float64)
@@ -852,6 +860,7 @@ def main() -> None:
         "vis_a_rest_x", "vis_a_rest_y", "vis_a_rest_z",
         "vis_b_rest_x", "vis_b_rest_y", "vis_b_rest_z",
         "tautau_px", "tautau_py", "tautau_pz",
+        "tautau_delta_pt", "tautau_delta_eta", "tautau_delta_phi",
         "basis_a_rest_n_x", "basis_a_rest_n_y", "basis_a_rest_n_z",
         "basis_a_rest_r_x", "basis_a_rest_r_y", "basis_a_rest_r_z",
         "basis_a_rest_k_x", "basis_a_rest_k_y", "basis_a_rest_k_z",
@@ -1036,6 +1045,9 @@ def main() -> None:
                     ("tautau_px", "tautau_px"),
                     ("tautau_py", "tautau_py"),
                     ("tautau_pz", "tautau_pz"),
+                    ("tautau_delta_pt", "tautau_delta_pt"),
+                    ("tautau_delta_phi", "tautau_delta_phi"),
+                    ("tautau_delta_eta", "tautau_delta_eta"),
 
                 ],
                 target_chain,
