@@ -864,6 +864,7 @@ def main() -> None:
         "vis_b_rest_x", "vis_b_rest_y", "vis_b_rest_z",
         "tautau_px", "tautau_py", "tautau_pz",
         "tautau_delta_pt", "tautau_delta_eta", "tautau_delta_phi",
+        "tautau_sum_pt", "tautau_sum_eta", "tautau_sum_phi",
         "basis_a_rest_n_x", "basis_a_rest_n_y", "basis_a_rest_n_z",
         "basis_a_rest_r_x", "basis_a_rest_r_y", "basis_a_rest_r_z",
         "basis_a_rest_k_x", "basis_a_rest_k_y", "basis_a_rest_k_z",
