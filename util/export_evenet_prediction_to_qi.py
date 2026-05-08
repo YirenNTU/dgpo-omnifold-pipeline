@@ -16,7 +16,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import vector
 
-import post_calibration import post_calibrate_tau_tau
+from post_calibration import post_calibrate_tau_tau
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
