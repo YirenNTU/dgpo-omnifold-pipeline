@@ -676,6 +676,18 @@ def method_marker(method: str, method_index: int) -> str:
     return METHOD_MARKERS[method_index % len(METHOD_MARKERS)]
 
 
+def source_display_name(source: str) -> str:
+    if source == "Unfolded":
+        return "Reco"
+    if source == "Truth":
+        return "Truth"
+    return source
+
+
+def series_label(method: str, source: str) -> str:
+    return f"{method} ({source_display_name(source)})"
+
+
 def channel_label(channel: str) -> str:
     if channel == COMBINED_CHANNEL_KEY:
         return r"$\bf{Combined}$"
@@ -709,6 +721,8 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
     plot_dir.mkdir(parents=True, exist_ok=True)
     methods = list(dict.fromkeys(row["method"] for row in rows))
     method_index = {method: index for index, method in enumerate(methods)}
+    series = list(dict.fromkeys((row["method"], row["source"]) for row in rows))
+    series_index = {series_key: index for index, series_key in enumerate(series)}
     groups = list(dict.fromkeys(row["group"] for row in sorted_rows(rows)))
     plot_summary: dict[str, Any] = {}
 
@@ -742,13 +756,14 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
             x_text_value = 1.025
             for key in channel_keys:
                 channel_rows = [row for row in parameter_rows if row["channel"] == key]
-                channel_rows.sort(key=lambda row: method_index[row["method"]])
+                channel_rows.sort(key=lambda row: series_index[(row["method"], row["source"])])
                 offsets = np.linspace(-0.24, 0.24, len(channel_rows)) if len(channel_rows) > 1 else np.array([0.0])
                 for offset, row in zip(offsets, channel_rows):
-                    index = method_index[row["method"]]
+                    method_i = method_index[row["method"]]
                     y = y_base[channel_index[key]] + offset
-                    color = method_color(row["method"], index)
-                    marker = method_marker(row["method"], index)
+                    color = method_color(row["method"], method_i)
+                    marker = method_marker(row["method"], method_i)
+                    is_truth = row["source"] == "Truth"
                     markersize = 8.5 if row.get("is_combined", False) else 6.5
                     linewidth = 1.6 if row.get("is_combined", False) else 1.2
                     ax.errorbar(
@@ -757,7 +772,7 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                         xerr=np.array([[row["err_down"]], [row["err_up"]]], dtype=np.float64),
                         fmt=marker,
                         color=color,
-                        markerfacecolor=color,
+                        markerfacecolor="white" if is_truth else color,
                         markeredgecolor=color,
                         capsize=2.8,
                         markersize=markersize,
@@ -802,19 +817,19 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                 plt.Line2D(
                     [0],
                     [0],
-                    marker=method_marker(method, index),
-                    color=method_color(method, index),
-                    markerfacecolor=method_color(method, index),
-                    markeredgecolor=method_color(method, index),
+                    marker=method_marker(method, method_index[method]),
+                    color=method_color(method, method_index[method]),
+                    markerfacecolor="white" if source == "Truth" else method_color(method, method_index[method]),
+                    markeredgecolor=method_color(method, method_index[method]),
                     markersize=7,
                     linestyle="None",
-                    label=method,
+                    label=series_label(method, source),
                 )
-                for method, index in method_index.items()
+                for method, source in series
             ]
             ax.legend(
                 handles=handles,
-                title="Methods",
+                title="Method / source",
                 frameon=False,
                 loc="upper center",
                 bbox_to_anchor=(0.5, 1.16),
@@ -829,6 +844,7 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                 "plot": str(plot_path),
                 "num_points": len(parameter_rows),
                 "methods": methods,
+                "series": [series_label(method, source) for method, source in series],
                 "channels": channel_keys,
             }
             print(f"[qi-final] wrote_plot={plot_path}", flush=True)

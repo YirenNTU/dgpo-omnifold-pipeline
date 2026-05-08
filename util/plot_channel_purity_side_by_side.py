@@ -733,6 +733,16 @@ def plot_comparison(
         fontsize=8.0,
         title_fontsize=8.3,
     )
+    ax_signal.legend(
+        method_lower_legend_handles,
+        method_lower_legend_labels,
+        loc="upper right",
+        frameon=False,
+        title=None,
+        ncols=max(1, min(4, len(method_legend_handles))),
+        fontsize=8.0,
+        title_fontsize=8.3,
+    )
 
 
     fig.tight_layout()

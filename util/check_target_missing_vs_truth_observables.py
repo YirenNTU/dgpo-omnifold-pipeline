@@ -29,33 +29,6 @@ vector.register_awkward()
 TAU_MASS = 1.777  # GeV
 CM_ENERGY = 91.2 # GeV
 
-def safe_boost_to_cm(cm_p4: ak.Array) -> ak.Array:
-    px = np.asarray(cm_p4.px, dtype=np.float64)
-    py = np.asarray(cm_p4.py, dtype=np.float64)
-    pz = np.asarray(cm_p4.pz, dtype=np.float64)
-    energy = np.asarray(cm_p4.energy, dtype=np.float64)
-
-    p2 = px * px + py * py + pz * pz
-
-    zero_or_bad = (
-        ~np.isfinite(energy)
-        | ~np.isfinite(px)
-        | ~np.isfinite(py)
-        | ~np.isfinite(pz)
-        | (np.abs(energy) < 1e-12)
-        | (p2 < 1e-24)
-    )
-
-    bx = np.zeros_like(px)
-    by = np.zeros_like(py)
-    bz = np.zeros_like(pz)
-
-    good = ~zero_or_bad
-    bx[good] = -px[good] / energy[good]
-    by[good] = -py[good] / energy[good]
-    bz[good] = -pz[good] / energy[good]
-
-    return vector.zip({"x": bx, "y": by, "z": bz})
 
 
 def parse_args() -> argparse.Namespace:
@@ -418,8 +391,8 @@ def predicted_reconstructed_values(events: ak.Array, observable: str) -> np.ndar
     # tau_a = build_momentum4d_with_mass(visible_a + pred_a, TAU_MASS)
     # tau_b = build_momentum4d_with_mass(visible_b + pred_b, TAU_MASS)
 
-    tau_a = build_momentum4d_with_energy_mass(visible_a + pred_a, CM_ENERGY, TAU_MASS)
-    tau_b = build_momentum4d_with_energy_mass(visible_b + pred_b, CM_ENERGY, TAU_MASS)
+    tau_a = build_momentum4d_with_energy_mass(visible_a + pred_a, CM_ENERGY/2, TAU_MASS)
+    tau_b = build_momentum4d_with_energy_mass(visible_b + pred_b, CM_ENERGY/2, TAU_MASS)
     #
     # tau_b = build_momentum4d(
     #     px=-tau_a.px,
