@@ -167,6 +167,57 @@ def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float)
         with_name="Momentum4D",
     )
 
+def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
+    energy = CM_ENERGY / 2
+    mass = TAU_MASS
+    p = (energy*energy - mass*mass)**0.5
+
+    # reconstruct pt
+
+    pt_a = p / np.cosh(tau_a.eta)
+    pt_b = p / np.cosh(tau_b.eta)
+
+    px_a = pt_a * np.cos(tau_a.phi)
+    py_a = pt_a * np.sin(tau_a.phi)
+    pz_a = pt_a * np.cosh(tau_a.eta)
+    px_b = pt_b * np.cos(tau_b.phi)
+    py_b = pt_b * np.sin(tau_b.phi)
+    pz_b = pt_b * np.cosh(tau_b.eta)
+
+    px_shift = (px_a + px_b)
+    py_shift = (py_a + py_b)
+    pz_shift = (pz_b + pz_b)
+
+    px_a_corrected = px_a - (px_shift/2)
+    px_b_corrected = px_b - (px_shift/2)
+
+    py_a_corrected = py_a - (py_shift / 2)
+    py_b_corrected = py_b - (py_shift / 2)
+
+    pz_a_corrected = pz_a - (pz_shift/2)
+    pz_b_corrected = pz_b - (pz_shift/2)
+
+
+    tau_a_reco = ak.zip(
+        {
+            "px": px_a_corrected,
+            "py": py_a_corrected,
+            "pz": px_a_corrected,
+            "E": np.full_like(px_a_corrected, energy, dtype=np.float64),
+        },
+        with_name="Momentum4D",
+    )
+    tau_b_reco = ak.zip(
+        {
+            "px": px_b_corrected,
+            "py": py_b_corrected,
+            "pz": px_b_corrected,
+            "E": np.full_like(px_b_corrected, energy, dtype=np.float64),
+        },
+        with_name="Momentum4D",
+    )
+
+    return tau_a_reco, tau_b_reco
 
 def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
     return build_momentum4d(
