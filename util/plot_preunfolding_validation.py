@@ -461,6 +461,7 @@ def finalize_streaming_summary(state: dict[str, Any]) -> dict[str, Any]:
         "reco_mean": float(reco_mean),
         "bias": float(bias),
         "mae": float(mae),
+        "mae_unc": 0,
         "rmse": float(rmse),
         "pearson": float(pearson),
         "pearson_unc": float(pearson_unc),
@@ -2411,7 +2412,7 @@ def plot_truth_metric_summary(
         xmin = float(np.nanmin(x_values))
         xmax = float(np.nanmax(x_values))
         span = xmax - xmin
-        pad = max(0.08 * span, 0.01 if metric == "pearson" else 1.0e-3)
+        pad = max(0.08 * span, 0.001 if metric == "pearson" else 1.0e-3)
         if x_unc.size > 0:
             pad += float(np.nanmax(x_unc))
         ax.set_xlim(xmin - pad, xmax + pad)
@@ -2761,6 +2762,15 @@ def main() -> None:
         visible_tau_summary = plot_block_results["visible_tau"]
 
     print(f"[preunfolding] finished truth-vs-reco methods={list(truth_summary)}", flush=True)
+    truth_metric_summary = plot_truth_metric_summary(
+        truth_summary=truth_summary,
+        methods=methods,
+        observable_specs=observable_specs,
+        output_dir=args.output_dir,
+        metric="mae",
+        subdir_name="truth_vs_reco_summary",
+        log_label="truth-summary",
+    )
     truth_metric_summary = plot_truth_metric_summary(
         truth_summary=truth_summary,
         methods=methods,
