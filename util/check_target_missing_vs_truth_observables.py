@@ -177,6 +177,9 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
     pt_a = tau_a.pt
     pt_b = tau_b.pt
 
+    pt_a = np.where(pt_a < p, pt_a, p)
+    pt_b = np.where(pt_b < p, p, p)
+
     eta_a = np.arccosh(p/pt_a)
     eta_b = np.arccosh(p/pt_b)
 
