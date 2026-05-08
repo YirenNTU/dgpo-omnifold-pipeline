@@ -168,7 +168,8 @@ def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float)
     )
 
 def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
-    energy = CM_ENERGY / 2
+    energy = (tau_a.energy + tau_b.energy) / 2
+    # energy = CM_ENERGY / 2
     mass = TAU_MASS
     p = (energy*energy - mass*mass)**0.5
 
