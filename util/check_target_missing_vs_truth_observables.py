@@ -179,10 +179,10 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
 
     px_a = pt_a * np.cos(tau_a.phi)
     py_a = pt_a * np.sin(tau_a.phi)
-    pz_a = pt_a * np.cosh(tau_a.eta)
+    pz_a = pt_a * np.sinh(tau_a.eta)
     px_b = pt_b * np.cos(tau_b.phi)
     py_b = pt_b * np.sin(tau_b.phi)
-    pz_b = pt_b * np.cosh(tau_b.eta)
+    pz_b = pt_b * np.sinh(tau_b.eta)
 
     px_shift = (px_a + px_b)
     py_shift = (py_a + py_b)
@@ -202,7 +202,7 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
         {
             "px": px_a_corrected,
             "py": py_a_corrected,
-            "pz": px_a_corrected,
+            "pz": pz_a_corrected,
             "E": np.full_like(px_a_corrected, energy, dtype=np.float64),
         },
         with_name="Momentum4D",
@@ -211,7 +211,7 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
         {
             "px": px_b_corrected,
             "py": py_b_corrected,
-            "pz": px_b_corrected,
+            "pz": pz_b_corrected,
             "E": np.full_like(px_b_corrected, energy, dtype=np.float64),
         },
         with_name="Momentum4D",
