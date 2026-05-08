@@ -41,7 +41,7 @@ from plot_qi_method_comparison import (
     sanitize_filename,
 )
 from quantum.observables_builder import build_observables, get_observable_names
-
+from post_calibration import post_calibrate_tau_tau
 
 vector.register_awkward()
 
@@ -2066,6 +2066,9 @@ def truth_reco_observable_values(events: ak.Array, observable: str, source_mode:
         tau_b = reco_with_truth_neutrino_p4(events, "b")
         if tau_a is None or tau_b is None:
             return None
+
+        tau_a, tau_b = post_calibrate_tau_tau(tau_a, tau_b)
+
         observables = build_observables(
             tau_a,
             tau_b,
