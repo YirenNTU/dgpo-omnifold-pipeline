@@ -188,36 +188,51 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
     py_shift = (py_a + py_b)
     pz_shift = (pz_a + pz_b)
 
-    px_a_corrected = px_a - (px_shift/2)
-    px_b_corrected = px_b - (px_shift/2)
+    px_a_corr = px_a - (px_shift/2)
+    px_b_corr = px_b - (px_shift/2)
 
-    py_a_corrected = py_a - (py_shift / 2)
-    py_b_corrected = py_b - (py_shift / 2)
+    py_a_corr = py_a - (py_shift / 2)
+    py_b_corr = py_b - (py_shift / 2)
 
-    pz_a_corrected = pz_a - (pz_shift/2)
-    pz_b_corrected = pz_b - (pz_shift/2)
+    pz_a_corr = pz_a - (pz_shift/2)
+    pz_b_corr = pz_b - (pz_shift/2)
 
+    # trust only corrected direction
+    pt_a_corr_dir = np.sqrt(px_a_corr ** 2 + py_a_corr ** 2)
+    pt_b_corr_dir = np.sqrt(px_b_corr ** 2 + py_b_corr ** 2)
 
-    tau_a_reco = ak.zip(
+    eta_a_corr = np.arcsinh(pz_a_corr / pt_a_corr_dir)
+    eta_b_corr = np.arcsinh(pz_b_corr / pt_b_corr_dir)
+
+    phi_a_corr = np.arctan2(py_a_corr, px_a_corr)
+    phi_b_corr = np.arctan2(py_b_corr, px_b_corr)
+
+    # rebuild with fixed energy and fixed tau mass
+    pt_a_final = p / np.cosh(eta_a_corr)
+    pt_b_final = p / np.cosh(eta_b_corr)
+
+    tau_a_final = ak.zip(
         {
-            "px": px_a_corrected,
-            "py": py_a_corrected,
-            "pz": pz_a_corrected,
-            "E": np.full_like(px_a_corrected, energy, dtype=np.float64),
+            "pt": pt_a_final,
+            "eta": eta_a_corr,
+            "phi": phi_a_corr,
+            "mass": mass,
         },
         with_name="Momentum4D",
     )
-    tau_b_reco = ak.zip(
+
+    tau_b_final = ak.zip(
         {
-            "px": px_b_corrected,
-            "py": py_b_corrected,
-            "pz": pz_b_corrected,
-            "E": np.full_like(px_b_corrected, energy, dtype=np.float64),
+            "pt": pt_b_final,
+            "eta": eta_b_corr,
+            "phi": phi_b_corr,
+            "mass": mass,
         },
         with_name="Momentum4D",
     )
 
-    return tau_a_reco, tau_b_reco
+
+    return tau_a_final, tau_b_final
 
 def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
     return build_momentum4d(
