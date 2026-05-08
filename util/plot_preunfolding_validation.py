@@ -306,7 +306,7 @@ def truth_reco_event_paths(root: Path, sample_name: str, region: str) -> list[Pa
     if method_paths and not region.startswith("Ztautau_"):
         return method_paths
 
-    raw_candidate = parquet_for(root, sample_name, "raw")
+    raw_candidate = parquet_for(root, sample_name, "baseline")
     if raw_candidate.exists() and expected_truth_classes_for_region(region):
         return [raw_candidate]
 
@@ -1825,7 +1825,7 @@ def deduplicate_grouped_records(
 def discover_method_regions(root: Path, sample_name: str, preferred_regions: list[str] | None = None) -> list[str]:
     discovered: list[str] = []
     sample_dir = root / sample_name
-    raw_candidate = parquet_for(root, sample_name, "raw")
+    raw_candidate = parquet_for(root, sample_name, "baseline")
     if raw_candidate.exists():
         try:
             raw_fields = set(pq.ParquetFile(raw_candidate).schema_arrow.names)
@@ -1844,7 +1844,7 @@ def discover_method_regions(root: Path, sample_name: str, preferred_regions: lis
     if sample_dir.exists():
         for path in sorted(sample_dir.glob("filtered___*.parquet")):
             region = path.stem.removeprefix("filtered___")
-            if region == "raw" or region in IGNORED_CHANNEL_REGIONS:
+            if region == "baseline" or region in IGNORED_CHANNEL_REGIONS:
                 continue
             discovered.append(region)
 
