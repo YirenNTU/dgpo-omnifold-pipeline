@@ -168,22 +168,24 @@ def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float)
     )
 
 def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
-    energy = (tau_a.energy + tau_b.energy) / 2
-    # energy = CM_ENERGY / 2
+    energy = CM_ENERGY / 2
     mass = TAU_MASS
     p = (energy*energy - mass*mass)**0.5
 
     # reconstruct pt
 
-    pt_a = p / np.cosh(tau_a.eta)
-    pt_b = p / np.cosh(tau_b.eta)
+    pt_a = tau_a.pt
+    pt_b = tau_b.pt
+
+    eta_a = np.arccosh(p/pt_a)
+    eta_b = np.arccosh(p/pt_b)
 
     px_a = pt_a * np.cos(tau_a.phi)
     py_a = pt_a * np.sin(tau_a.phi)
-    pz_a = pt_a * np.sinh(tau_a.eta)
+    pz_a = pt_a * np.sinh(eta_a)
     px_b = pt_b * np.cos(tau_b.phi)
     py_b = pt_b * np.sin(tau_b.phi)
-    pz_b = pt_b * np.sinh(tau_b.eta)
+    pz_b = pt_b * np.sinh(eta_b)
 
     px_shift = (px_a + px_b)
     py_shift = (py_a + py_b)
