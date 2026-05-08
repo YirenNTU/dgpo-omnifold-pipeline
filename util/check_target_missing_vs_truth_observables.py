@@ -589,6 +589,9 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
         f"{prefix}_tautau_delta_pt": np.asarray(tau_a.pt-tau_b.pt, dtype=np.float64),
         f"{prefix}_tautau_delta_eta": np.asarray(tau_a.eta-tau_b.eta, dtype=np.float64),
         f"{prefix}_tautau_delta_phi": np.asarray(tau_a.phi-tau_b.phi, dtype=np.float64),
+        f"{prefix}_tautau_sum_pt": np.asarray(tau_a.pt + tau_b.pt, dtype=np.float64),
+        f"{prefix}_tautau_sum_phi": np.asarray(tau_b.phi + tau_b.phi, dtype=np.float64),
+        f"{prefix}_tautau_sum_eta": np.asarray(tau_a.eta + tau_b.eta, dtype=np.float64),
     }
     for axis in ("n", "r", "k"):
         values[f"{prefix}_basis_a_rest_{axis}_x"] = np.asarray(basis_a_rest[axis].x, dtype=np.float64)
