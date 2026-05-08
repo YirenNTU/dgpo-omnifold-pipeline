@@ -769,7 +769,7 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                     ax.errorbar(
                         row["value"],
                         y,
-                        xerr=np.array([[max(row["err_down"],10)], [max(row["err_up"],10)]], dtype=np.float64),
+                        xerr=np.array([[max(row["err_down"],3)], [max(row["err_up"],3)]], dtype=np.float64),
                         fmt=marker,
                         color=color,
                         markerfacecolor="white" if is_truth else color,
