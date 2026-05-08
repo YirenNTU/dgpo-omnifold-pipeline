@@ -167,7 +167,7 @@ def build_momentum4d_with_energy_mass(obj: ak.Array, energy: float, mass: float)
         with_name="Momentum4D",
     )
 
-def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
+def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array, visible_a: ak.Array, visible_b: ak.Array) -> ak.Array:
     energy = CM_ENERGY / 2
     mass = TAU_MASS
     p = (energy*energy - mass*mass)**0.5
@@ -182,6 +182,9 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
 
     eta_a = np.arccosh(p/pt_a)
     eta_b = np.arccosh(p/pt_b)
+
+    eta_a = np.where(eta_a * visible_a > 0, eta_a, -eta_a)
+    eta_b = np.where(eta_b * visible_b > 0, eta_b, -eta_b)
 
     px_a = pt_a * np.cos(tau_a.phi)
     py_a = pt_a * np.sin(tau_a.phi)
@@ -471,7 +474,7 @@ def predicted_reconstructed_values(events: ak.Array, observable: str) -> np.ndar
     # tau_a = build_momentum4d_with_energy_mass(visible_a + pred_a, CM_ENERGY/2, TAU_MASS)
     # tau_b = build_momentum4d_with_energy_mass(visible_b + pred_b, CM_ENERGY/2, TAU_MASS)
     #
-    tau_a, tau_b = build_tau_tau_pair(visible_a + pred_a, visible_b + pred_b)
+    tau_a, tau_b = build_tau_tau_pair(visible_a + pred_a, visible_b + pred_b, visible_a, visible_b)
     #
     # tau_b = build_momentum4d(
     #     px=-tau_a.px,
@@ -508,7 +511,7 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
     # print(f"replace b to be -a, {tau_a.x}, {tau_a.y}")
     # tau_b = build_momentum4d(px=-tau_a.x, py=-tau_a.y, pz=-tau_a.z, energy=tau_a.energy)
     # print("replace b to be -a [success]")
-    tau_a, tau_b = build_tau_tau_pair(visible_a + missing_a, visible_b + missing_b)
+    tau_a, tau_b = build_tau_tau_pair(visible_a + missing_a, visible_b + missing_b, visible_a, visible_b)
 
 
     cm_p4 = tau_a + tau_b
