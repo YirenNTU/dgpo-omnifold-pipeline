@@ -424,8 +424,8 @@ def reconstructed_chain_values(events: ak.Array, missing_kind: str) -> dict[str,
 
     visible_a = visible_tau_p4(events, "a")
     visible_b = visible_tau_p4(events, "b")
-    tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS)
-    # tau_b = build_momentum4d_with_energy_mass(visible_b + missing_b, CM_ENERGY, TAU_MASS)
+    # tau_a = build_momentum4d_with_mass(visible_a + missing_a, TAU_MASS)
+    tau_a = build_momentum4d_with_energy_mass(visible_a + missing_a, CM_ENERGY/2, TAU_MASS)
     print(f"replace b to be -a, {tau_a.x}, {tau_a.y}")
     tau_b = build_momentum4d(px=-tau_a.x, py=-tau_a.y, pz=-tau_a.z, energy=tau_a.energy)
     print("replace b to be -a [success]")
