@@ -183,8 +183,8 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array, visible_a: ak.Array, vi
     eta_a = np.arccosh(p/pt_a)
     eta_b = np.arccosh(p/pt_b)
 
-    eta_a = np.where(eta_a * visible_a > 0, eta_a, -eta_a)
-    eta_b = np.where(eta_b * visible_b > 0, eta_b, -eta_b)
+    eta_a = np.where(eta_a * visible_a.eta > 0, eta_a, -eta_a)
+    eta_b = np.where(eta_b * visible_b.eta > 0, eta_b, -eta_b)
 
     px_a = pt_a * np.cos(tau_a.phi)
     py_a = pt_a * np.sin(tau_a.phi)
