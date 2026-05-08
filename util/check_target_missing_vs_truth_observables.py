@@ -189,13 +189,8 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
     pz_shift = (pz_a + pz_b)
 
     px_a_corr = px_a - (px_shift/2)
-    px_b_corr = px_b - (px_shift/2)
-
     py_a_corr = py_a - (py_shift / 2)
-    py_b_corr = py_b - (py_shift / 2)
-
     pz_a_corr = pz_a - (pz_shift/2)
-    pz_b_corr = pz_b - (pz_shift/2)
 
     # use corrected direction of tau_a only
     norm_a_corr = np.sqrt(px_a_corr ** 2 + py_a_corr ** 2 + pz_a_corr ** 2)
@@ -214,32 +209,22 @@ def build_tau_tau_pair(tau_a: ak.Array, tau_b: ak.Array) -> ak.Array:
     py_b_final = -py_a_final
     pz_b_final = -pz_a_final
 
-    # convert final cartesian back to pt, eta, phi
-    pt_a_final = np.sqrt(px_a_final ** 2 + py_a_final ** 2)
-    pt_b_final = np.sqrt(px_b_final ** 2 + py_b_final ** 2)
-
-    eta_a_final = np.arcsinh(pz_a_final / pt_a_final)
-    eta_b_final = np.arcsinh(pz_b_final / pt_b_final)
-
-    phi_a_final = np.arctan2(py_a_final, px_a_final)
-    phi_b_final = np.arctan2(py_b_final, px_b_final)
-
     tau_a_final = ak.zip(
         {
-            "pt": pt_a_final,
-            "eta": eta_a_final,
-            "phi": phi_a_final,
-            "mass": mass,
+            "px": px_a_final,
+            "py": py_a_final,
+            "pz": pz_a_final,
+            "energy": np.full_like(px_a_final, energy, dtype=np.float64),
         },
         with_name="Momentum4D",
     )
 
     tau_b_final = ak.zip(
         {
-            "pt": pt_b_final,
-            "eta": eta_b_final,
-            "phi": phi_b_final,
-            "mass": mass,
+            "px": px_b_final,
+            "py": py_b_final,
+            "pz": pz_b_final,
+            "energy": np.full_like(px_b_final, energy, dtype=np.float64),
         },
         with_name="Momentum4D",
     )
