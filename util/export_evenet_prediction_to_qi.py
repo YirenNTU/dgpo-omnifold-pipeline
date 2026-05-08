@@ -16,6 +16,8 @@ import numpy as np
 import pyarrow.parquet as pq
 import vector
 
+import post_calibration import post_calibrate_tau_tau
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -663,6 +665,8 @@ def build_predicted_reconstruction(
     reco_tau_b = lead_b_visible + lead_b_missing
     reco_tau_a = build_momentum4d_with_mass(reco_tau_a, mass=TAU_MASS)
     reco_tau_b = build_momentum4d_with_mass(reco_tau_b, mass=TAU_MASS)
+
+    reco_tau_a, reco_tau_b = post_calibrate_tau_tau(reco_tau_a, reco_tau_b)
 
     del central_pred_events
     delta_r_a = np.full(num_predicted_rows, np.nan, dtype=np.float32)
