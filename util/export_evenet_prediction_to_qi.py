@@ -1235,6 +1235,84 @@ def sample_raw_files(analysis_cfg: dict, sample_key: str, sample_name: str) -> l
     return expand_paths(tuple(raw_files))
 
 
+def read_file_initial_total_num_events(path: str) -> float | None:
+    parquet = pq.ParquetFile(path)
+    schema_names = {field.name for field in parquet.schema_arrow}
+    if "initial_total_num_events" not in schema_names:
+        return None
+    for record_batch in parquet.iter_batches(batch_size=1, columns=["initial_total_num_events"]):
+        values = ak.to_numpy(ak.from_arrow(record_batch)["initial_total_num_events"], allow_missing=False)
+        if len(values) == 0:
+            continue
+        return float(values[0])
+    return None
+
+
+def analysis_luminosity(analysis_cfg: dict) -> float | None:
+    total = 0.0
+    found = False
+    for sample_cfg in (analysis_cfg.get("Samples") or {}).values():
+        if bool(sample_cfg.get("is_data", False)) and sample_cfg.get("lumi") is not None:
+            total += float(sample_cfg["lumi"])
+            found = True
+    return total if found else None
+
+
+def raw_nominal_weight_info(
+    analysis_cfg: dict,
+    sample_key: str,
+    sample_name: str,
+    raw_files: list[str],
+) -> dict[str, Any]:
+    samples_cfg = analysis_cfg.get("Samples", {})
+    sample_cfg = samples_cfg.get(sample_key)
+    if sample_cfg is None:
+        for cfg in samples_cfg.values():
+            if cfg.get("name") == sample_name:
+                sample_cfg = cfg
+                break
+    if sample_cfg is None:
+        raise KeyError(f"Cannot find sample config for key/name '{sample_key}'/'{sample_name}'.")
+
+    is_data = bool(sample_cfg.get("is_data", False))
+    if is_data:
+        return {
+            "is_data": True,
+            "weight_scale": 1.0,
+            "total_initial_num_events": None,
+            "weight_source": "data_unit",
+        }
+
+    norm_factor = sample_cfg.get("norm_factor")
+    if norm_factor is None:
+        raise ValueError(f"MC sample '{sample_name}' is missing norm_factor in analysis.yaml.")
+    lumi = sample_cfg.get("lumi")
+    if lumi is None:
+        lumi = analysis_luminosity(analysis_cfg)
+    if lumi is None:
+        raise ValueError(
+            f"MC sample '{sample_name}' is missing luminosity. Set sample.lumi or provide data-sample lumi in analysis.yaml."
+        )
+
+    total_initial = 0.0
+    for raw_path in raw_files:
+        file_total = read_file_initial_total_num_events(raw_path)
+        if file_total is None:
+            raise ValueError(
+                f"MC sample '{sample_name}' raw file '{raw_path}' is missing initial_total_num_events."
+            )
+        total_initial += float(file_total)
+    if total_initial <= 0.0:
+        raise ValueError(f"MC sample '{sample_name}' has non-positive summed initial_total_num_events={total_initial}.")
+
+    return {
+        "is_data": False,
+        "weight_scale": float(lumi) * float(norm_factor) / float(total_initial),
+        "total_initial_num_events": float(total_initial),
+        "weight_source": "nominal_lumi_times_norm_over_total",
+    }
+
+
 def build_source_mapping(expanded_entries) -> dict[int, dict[str, Any]]:
     mapping: dict[int, dict[str, Any]] = {}
     for source_index, entry in enumerate(expanded_entries):
@@ -1542,9 +1620,25 @@ def build_concat_prediction_rows(
 def build_concat_raw_complement_rows(
     raw_events: ak.Array,
     pred_template_events: ak.Array,
+    nominal_weight_info: dict[str, Any],
     method_name: str = "EveNet_default",
 ) -> tuple[ak.Array, dict[str, Any]]:
     compact_raw = build_compact_base_events(raw_events)
+    if nominal_weight_info["is_data"]:
+        nominal_weight = np.ones(len(compact_raw), dtype=np.float32)
+    else:
+        nominal_weight = np.full(len(compact_raw), np.float32(nominal_weight_info["weight_scale"]), dtype=np.float32)
+    compact_raw["weight"] = nominal_weight
+    compact_raw["central_weight"] = nominal_weight
+    compact_raw["event_weight"] = nominal_weight
+    compact_raw["evenet_weight"] = nominal_weight
+    total_initial = nominal_weight_info.get("total_initial_num_events")
+    if total_initial is not None:
+        compact_raw["initial_total_num_events"] = np.full(
+            len(compact_raw),
+            int(round(float(total_initial))),
+            dtype=np.int64,
+        )
     return with_evenet_reconstruction(
         full_events=compact_raw,
         central_pred_events=pred_template_events[:0],
@@ -1588,6 +1682,7 @@ def export_config_group(
 ) -> tuple[str, dict[str, Any]]:
     print(f"[export-evenet-to-qi] worker {os.getpid()} start {parent_name}", flush=True)
     raw_files = sample_raw_files(analysis_cfg, group["parent_key"], parent_name)
+    nominal_weight_info = raw_nominal_weight_info(analysis_cfg, group["parent_key"], parent_name, raw_files)
     split_fraction = None if group["is_data"] else prediction_split_fraction
     writer = QIParquetChunkWriter(output_root / output_label, parent_name, regions)
     truth_writer = (
@@ -1764,6 +1859,7 @@ def export_config_group(
             outside_events, _outside_metrics = build_concat_raw_complement_rows(
                 raw_events=outside_raw,
                 pred_template_events=pred_template_events,
+                nominal_weight_info=nominal_weight_info,
             )
             with writer_lock:
                 writer.append(outside_events)
