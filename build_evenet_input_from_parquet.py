@@ -45,7 +45,7 @@ class Sample:
 def parse_samples(config: dict[str, Any], selected_keys: list[str] | None) -> list[Sample]:
     selected = set(selected_keys or [])
     samples: list[Sample] = []
-    for key, sample_cfg in config["Samples"].ietms():
+    for key, sample_cfg in config["Samples"].items():
         if selected and key not in selected:
             continue
         input_files = sample_cfg["input_files"]
