@@ -63,6 +63,7 @@ def parse_samples(config: dict[str, Any], selected_keys: list[str] | None) -> li
                 plot_label=process_latex_label(str(sample_cfg.get("name", key)))
             )
         )
+    return samples
 
 
 def read_file_initial_total_num_events(path: str) -> float | None:
