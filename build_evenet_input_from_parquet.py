@@ -100,6 +100,12 @@ def main() -> None:
         description="Build evenet input from parquet"
     )
     parser.add_argument(
+        "--analysis-config",
+        type=Path,
+        default=Path("ml_pipeline/config/analysis.yaml"),
+        help="Analysis YAML with Samples.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         required=True,
