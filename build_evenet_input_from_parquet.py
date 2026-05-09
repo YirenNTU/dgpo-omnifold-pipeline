@@ -112,6 +112,12 @@ def main() -> None:
         help="Directory for lite parquet shards and monitoring.",
     )
     parser.add_argument(
+        "--samples",
+        nargs="+",
+        default=None,
+        help="Optional subset of sample keys from analysis.yaml.",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=50000,
