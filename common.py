@@ -5,8 +5,6 @@ import numpy as np
 import awkward as ak
 from dataclasses import dataclass
 
-from ml_pipeline.util.evenet_parquet_common import MAX_PART_ENERGY_GEV
-
 PROCESS_LATEX_LABELS = {
     "data94": "Data",
     "data": "Data",
