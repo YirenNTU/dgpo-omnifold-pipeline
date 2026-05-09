@@ -186,6 +186,7 @@ def main() -> None:
                     input_part_mask = build_input_particle_mask(selected, remove_neutral_non_photon)
                     num_particles = ak.sum(input_part_mask, axis=1)
                     print(num_particles)
+                    print(max(num_particles))
                     if np.max(num_particles) > max_particles:
                         max_particles = num_particles
                 row_offset += len(events)
