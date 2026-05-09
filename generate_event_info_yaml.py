@@ -10,7 +10,6 @@ from typing import Any
 
 import yaml
 
-from ml_pipeline_lite.generate_event_info_yaml import build_grouped_sequential_config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
