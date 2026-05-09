@@ -382,3 +382,5 @@ def main() -> None:
     print(f"[ml_pipeline_lite] wrote {output_path}")
 
 
+if __name__ == "__main__":
+    main()
