@@ -104,11 +104,11 @@ Processes:
 
 Generations:
   Conditions:
-    - Event_totalChargedEnergy
-    - Event_totalEMEnergy
-    - Event_totalHadronicEnergy
+#    - Event_totalChargedEnergy
+#    - Event_totalEMEnergy
+#    - Event_totalHadronicEnergy
     - thrust_Mag
-    - charged_E
+#    - charged_E
     - missing_px
     - missing_py
     - missing_pt
