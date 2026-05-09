@@ -138,10 +138,10 @@ def normalize_group_node(name: str, raw_value: Any, *, top_level: bool) -> dict[
 def build_grouped_sequential_config(part_cfg: dict[str, Any]) -> tuple[dict[str, Any], tuple[str, ...], tuple[str, ...]] | None:
     grouped_roots = []
     for root_name, raw_value in part_cfg.items():
+        print(root_name, raw_value)
         if isinstance(raw_value, list):
             continue
         grouped_roots.append(normalize_group_node(root_name, raw_value, top_level=True))
-
     if not grouped_roots:
         return None
 
