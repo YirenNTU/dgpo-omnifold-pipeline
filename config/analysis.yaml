@@ -131,9 +131,6 @@ Inputs:
         - Part_charge
   Global:
     Fields:
-      - Event_totalChargedEnergy
-      - Event_totalEMEnergy
-      - Event_totalHadronicEnergy
       - thrust_Mag
       - charged_E
       - missing_px
@@ -147,22 +144,23 @@ Inputs:
 Subcategories:
   Ztautau:
     Ztautau_pipi: [11]
-    Ztautau_pirho: [12]
-    Ztautau_rhopi: [21]
-    Ztautau_pie: [13]
-    Ztautau_epi: [31]
-    Ztautau_pimu: [14]
-    Ztautau_mupi: [41]
-    Ztautau_rhoe: [23]
-    Ztautau_erho: [32]
-    Ztautau_rhomu: [42]
-    Ztautau_murho: [24]
-    Ztautau_rhorho: [22]
-    Ztautau_ee: [33]
-    Ztautau_mumu: [44]
-    Ztautau_emu: [34]
-    Ztautau_mue: [43]
-    Ztautau_others: [15, 51, 25, 52, 35, 53, 45, 54, 55]
+#    Ztautau_pirho: [12]
+#    Ztautau_rhopi: [21]
+#    Ztautau_pie: [13]
+#    Ztautau_epi: [31]
+#    Ztautau_pimu: [14]
+#    Ztautau_mupi: [41]
+#    Ztautau_rhoe: [23]
+#    Ztautau_erho: [32]
+#    Ztautau_rhomu: [42]
+#    Ztautau_murho: [24]
+#    Ztautau_rhorho: [22]
+#    Ztautau_ee: [33]
+#    Ztautau_mumu: [44]
+#    Ztautau_emu: [34]
+#    Ztautau_mue: [43]
+    Ztautau_others: [12, 21, 13, 31, 14, 41, 23, 32, 42, 24, 22, 33, 34, 43, 44,
+                    15, 51, 25, 52, 35, 53, 45, 54, 55]
 
 Normalization:
   Sequential:
@@ -189,11 +187,11 @@ Normalization:
     Part_sticNumTowers: normalize
   Global:
     default: none
-    Event_totalChargedEnergy: log_normalize
-    Event_totalEMEnergy: log_normalize
-    Event_totalHadronicEnergy: log_normalize
+#    Event_totalChargedEnergy: log_normalize
+#    Event_totalEMEnergy: log_normalize
+#    Event_totalHadronicEnergy: log_normalize
     thrust_Mag: normalize
-    charged_E: log_normalize
+#    charged_E: log_normalize
     missing_px: normalize
     missing_py: normalize
     missing_pz: normalize
@@ -203,6 +201,6 @@ Normalization:
     thrust_z: normalize
   Invisible:
     default: none
-    pt: normalize
+#    pt: normalize
     eta: normalize
     phi: normalize_uniform
