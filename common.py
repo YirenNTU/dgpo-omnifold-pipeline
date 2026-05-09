@@ -186,7 +186,7 @@ def to_numpy(values: Any, dtype=np.float64) -> np.ndarray:
 
 
 def event_preselection_mask(events: ak.Array) -> np.ndarray:
-    mask = np.ones(len(events), dtype=np.bool)
+    mask = np.ones(len(events), dtype=bool)
     mask &= to_numpy(events["nprong"], np.int64) == 2
     return mask
 
