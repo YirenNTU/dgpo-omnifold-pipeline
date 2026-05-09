@@ -143,7 +143,7 @@ def main() -> None:
 
     config = read_yaml(args.analysis_config)
     feature_config = parse_feature_config(config)
-    invisible_features = tuple(str(key) for key in config.get("Invisible"))
+    invisible_features = tuple(str(key) for key in config["Normalization"].get("Invisible"))
     remove_neutral_non_photon = args.remove_neutral_non_photon
     samples = attach_sample_total_intial_events(
         parse_samples(config, args.samples)
