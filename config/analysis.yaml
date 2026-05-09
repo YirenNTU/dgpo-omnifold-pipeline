@@ -15,12 +15,12 @@ Samples:
     norm_factor: 1458.9 # pb
     input_files:
       - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_0/filtered___baseline.parquet"
-      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_1/filtered___baseline.parquet"
-      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_2/filtered___baseline.parquet"
+#      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_1/filtered___baseline.parquet"
+#      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_2/filtered___baseline.parquet"
     raw_files:
       - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_0/filtered___raw.parquet"
-      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_1/filtered___raw.parquet"
-      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_2/filtered___raw.parquet"
+#      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_1/filtered___raw.parquet"
+#      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_2/filtered___raw.parquet"
 
 
   Zll:
@@ -75,6 +75,7 @@ EveNetPrediction:
     - Ztautau_mumu
     - Ztautau_emu
     - Ztautau_mue
+    - Ztautau_others
 
 EveNetInput:
   # false keeps the historical point-cloud collection.
@@ -85,16 +86,18 @@ EveNetInput:
 Inputs:
   Part:
     Momentum:
-      dim: 4
+      output_dim: 4
       index: [0, 1, 2, 3]
       input: [energy, pt, eta, phi]
     ObjectTag:
-      dim: 2
+      output_dim: 2
+      name: ObjectTag
       index: [4, 5]
       input:
         - Part_pdgId
         - hpc:
-            dim: 2
+            output_dim: 2
+            name: hpc
             input:
               - Part_hpcShowerEnergy
               - Part_hpcShowerTheta
@@ -103,7 +106,8 @@ Inputs:
               - Part_hpcNumAssociatedShowers
               - Part_hpcTotalShowerEnergy
         - hac:
-            dim: 2
+            output_dim: 2
+            name: hac
             input:
               - Part_hacShowerEnergy
               - Part_hacShowerTheta
@@ -112,7 +116,8 @@ Inputs:
               - Part_hacNumAssociatedShowers
               - Part_hacTotalShowerEnergy
         - stic:
-            dim: 2
+            output_dim: 2
+            name: stic
             input:
               - Part_sticShowerEnergy
               - Part_sticShowerTheta
@@ -120,7 +125,7 @@ Inputs:
               - Part_sticNumTowers
               - Part_sticChargedTag
     Charge:
-      dim: 1
+      output_dim: 1
       index: [6]
       input:
         - Part_charge
@@ -157,7 +162,7 @@ Subcategories:
     Ztautau_mumu: [44]
     Ztautau_emu: [34]
     Ztautau_mue: [43]
-#    Ztautau_piother: [15, 51]
+    Ztautau_others: [15, 51, 25, 52, 35, 53, 45, 54, 55]
 
 Normalization:
   Sequential:
@@ -191,7 +196,7 @@ Normalization:
     charged_E: log_normalize
     missing_px: normalize
     missing_py: normalize
-    missing_pt: normalize
+    missing_pz: normalize
     isolation_angle: normalize
     thrust_x: normalize
     thrust_y: normalize
