@@ -211,6 +211,7 @@ def build_grouped_sequential_config(part_cfg: dict[str, Any]) -> tuple[dict[str,
     return grouped_config, tuple(raw_sequential_fields), tuple(projected_feature_names)
 
 
+
 def parse_feature_config(config: dict[str, Any]) -> FeatureConfig:
     inputs_cfg = config.get("Inputs") or {}
     part_cfg = inputs_cfg.get("Part") or {}
@@ -256,11 +257,12 @@ def parse_evenet_config(schema_config: dict[str, Any], analysis_config: dict[str
         generation_conditions=tuple(generations_cfg.get("Conditions", feature_config.global_fields)),
         generation_global_targets=tuple(generations_cfg.get("GlobalTargets", ())),
         generation_events=tuple(generations_cfg.get("Events", feature_config.raw_sequential_fields)),
-        sequential_tags=merge_tags(feature_config.raw_sequential_fields,
-                                normalization_cfg.get("Sequential")),
-        global_tags=merge_tags(feature_config.global_fields, normalization_cfg.get("Global")),
+        sequential_tags=merge_tags({key: "none" for key in feature_config.raw_sequential_fields},
+                                    normalization_cfg.get("Sequential")),
+        global_tags=merge_tags({key: "none" for key in feature_config.global_fields},
+                                normalization_cfg.get("Global")),
         invisible_features=tuple(str(item) for item in invisible_features),
-        invisible_tags=merge_tags(tuple(str(item) for item in invisible_features),
+        invisible_tags=merge_tags({item: "none" for item in invisible_features},
                                 invisible_cfg),
     )
 
