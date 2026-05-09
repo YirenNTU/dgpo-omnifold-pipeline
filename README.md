@@ -1,1014 +1,305 @@
-# LEP EveNet ml_pipeline
+# ML Pipeline
 
-This directory contains the ML-side EveNet workflow for the LEP tau-pair analysis.
+This directory contains the ML pipeline scripts for the Ztautau analysis, including:
+- Build EveNet input parquet files from the baseline-selected parquet files
+- Generate the `generated_event_info.yaml` schema for EveNet training and prediction
+- Preprocess the EveNet input parquet files into train/val/test splits
+- Run EveNet prediction on the converted parquet files
+- Export the EveNet prediction into the central QI/unfolding parquet layout
+- Produce the pre-unfolding validation plots from the exported central-schema parquet trees
+- Run the unfolding / `tree_ana` preload workflow from the lite framework path
+- Extract the final QI measurements from `results.txt`, write JSON/CSV tables, and draw the per-channel comparison plots
+- Draw the prediction summary plots from the prediction parquet outputs
 
-Project rules:
 
-- Do not modify the central analysis or unfolding framework for EveNet-specific logic.
-- Keep EveNet input building, training, prediction, diagnostics, and adapters inside `ml_pipeline`.
-- When integrating with central QI or unfolding, export EveNet predictions into the central parquet schema.
-- The default working directory for commands in this document is `ml_pipeline`.
 
-## Directory Roles
+## `build_evenet_input_from_parquet.py`
 
-- `config/analysis.yaml`: Main ML pipeline configuration. It defines sample input and raw parquet paths, feature lists, normalization rules, and optional prediction/export defaults.
-- `config/evenet_schema.yaml`: EveNet process topology, classification labels, and truth-generation schema.
-- `config/preprocess_config.yaml`: EveNet preprocessing wrapper that points to the generated event info.
-- `config/train.yaml`: EveNet scratch training config.
-- `config/train_pretrain.yaml`: EveNet pretrain finetuning config.
-- `util/build_evenet_input_from_parquet.py`: Converts central/DataLoader parquet files into EveNet `.npz` input and monitoring plots.
-- `util/predict_evenet_from_raw_parquet.py`: Standalone EveNet inference. The filename is legacy; the current script only consumes EveNet converted parquet files.
-- `util/plot_evenet_prediction_summary.py`: Standalone EveNet prediction summary plots.
-- `util/export_evenet_prediction_to_qi.py`: Converts EveNet prediction parquet files back into the central/QI parquet schema.
-- `util/plot_qi_method_comparison.py`: Compares multiple central-schema methods such as Baseline, EveNet-Pretrain, and EveNet-Scratch.
-- `util/evenet_parquet_common.py`: Shared visible tau, truth invisible target, and source-event matching utilities.
+This rewrite keeps only the fields needed for later EveNet work:
 
-## Workflow Overview
+- filtered per-particle `Part_*` inputs needed by EveNet
+- `Global` condition features needed by EveNet
+- visible tau `a/b` four-vectors
+- truth tau `a/b` four-vectors for `Ztautau` only
+- target invisible slot `pt / eta / phi` for `Ztautau` only
+- classification target index / class name aligned with the generated EveNet class order
+- source slot mapping
+- simple event metadata and region cuts
+- recomputed truth angular observables
 
-```text
-central tree_ana
-  -> baseline/{sample}/filtered___raw.parquet
-  -> baseline/{sample}/filtered___baseline.parquet
+It is designed for large parquet inputs:
 
-ml_pipeline build_evenet_input
-  -> evenet_input.npz
-  -> generated_event_info.yaml
-  -> monitoring plots
+- batch-wise parquet streaming
+- one worker per input parquet
+- bounded-memory parquet shard outputs
+- worker-side histogram filling with merged monitoring plots at the end
+- `input_files` are used first, so the baseline-selected parquet is the default source
+- MC normalization uses the sample-level sum of `initial_total_num_events` across all parquet files in the sample
 
-EveNet preprocess
-  -> train.parquet / val.parquet / test.parquet / data.parquet
-  -> normalization.pt / shape_metadata.json
-
-EveNet train + predict
-  -> *__evenet_pred.parquet
-
-export_evenet_prediction_to_qi
-  -> qi_exports/{method}/{sample}/filtered___raw.parquet
-  -> qi_exports/{method}/{sample}/filtered___{region}.parquet
-
-central/QI evaluation or ml_pipeline summary plots
-  -> Baseline vs EveNet-Pretrain vs EveNet-Scratch comparison
-```
-
-## 0. Produce Central Baseline Parquet
-
-Run the central framework from the repository root. This step should not add EveNet-specific logic to the central code.
+### Example
 
 ```bash
-cd /path/to/lep_tree_ana
-python3 bin/tree_ana \
-  --config-yaml config/config.yaml \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline
-```
-
-Then point `ml_pipeline/config/analysis.yaml` at the central outputs:
-
-```yaml
-Samples:
-  Ztautau:
-    input_files:
-      - /pscratch/.../baseline/Ztautau/filtered___baseline.parquet
-    raw_files:
-      - /pscratch/.../baseline/Ztautau/filtered___raw.parquet
-```
-
-`input_files` are the selected event universe used for EveNet input conversion. `raw_files` are the full raw event universe used when exporting back to central/QI/unfolding. Events without EveNet predictions are kept in the exported raw tree with invalid default reconstruction fields.
-
-## 1. Build EveNet Input
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/build_evenet_input_from_parquet.py \
-  --config config/analysis.yaml \
-  --evenet-config config/evenet_schema.yaml \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset
-```
-
-For a faster/lower-memory production build, skip plots and avoid compressed NPZ
-writing:
-
-```bash
-python3 util/build_evenet_input_from_parquet.py \
-  --config config/analysis.yaml \
-  --evenet-config config/evenet_schema.yaml \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset \
-  --skip-monitoring \
-  --sharded-output \
-  --num-workers 3 \
-  --load-batch-size 50000 \
-  --no-compress-output
-```
-
-`--num-workers` parallelizes sample loading/preselection over parquet row groups
-when available, otherwise over files. Each worker loads one parquet chunk,
-writes selected temporary shards under the output directory, and exits. Within
-each worker, `--load-batch-size` streams the parquet chunk through pyarrow
-batches, which is important when a source parquet has only one very large row
-group.
-
-For very large selected samples, use `--sharded-output`. It writes
-`evenet_input_shards/*.npz`, optional `data_shards/*.npz`, and
-`evenet_input_shards_manifest.json` instead of building one huge
-`evenet_input.npz` in memory.
-
-Optional point-cloud collection filter:
-
-```bash
-python3 util/build_evenet_input_from_parquet.py \
-  --config config/analysis.yaml \
-  --evenet-config config/evenet_schema.yaml \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset \
-  --remove-neutral-non-photon
-```
-
-Equivalent config setting:
-
-```yaml
-EveNetInput:
-  remove_neutral_non_photon: true
-```
-
-When enabled, only the EveNet sequential input collection is filtered:
-charged particles are kept, photons are kept with `abs(Part_pdgId) == 21`,
-and other neutral particles are removed. The original parquet is not modified,
-and global features, truth targets, visible tau construction, and passthrough
-fields still come from the same selected events.
-
-Main outputs:
-
-- `/pscratch/.../dataset/evenet_input.npz`
-- `/pscratch/.../dataset/evenet_input_metadata.json`
-- `config/generated_event_info.yaml`
-- Monitoring plots under the output directory
-
-Step-1 monitoring includes:
-
-- `monitoring/vis_tau_vs_truth_visible_tau/<sample>.png`, reconstructed visible tau vs truth-visible tau in the central a/b basis.
-- `monitoring/target_missing_qi_vs_truth/<sample>/<observable>.png`, QI observables rebuilt from `visible tau + target missing` compared with the stored `truth_<observable>` fields.
-- `monitoring/truth_observable_origin_check/<sample>/<observable>.png`, direct three-way comparison between stored `truth_<observable>`, a fresh truth-p4 recalculation, and the target-invisible reconstruction used for EveNet inputs.
-- `monitoring/truth_observable_origin_check/<sample>/summary.json`, compact residual metrics for the same three-way truth-origin comparison.
-
-Monitoring uses at most `--monitor-max-events 50000` events per source sample by
-default. Use `--monitor-max-events 0` only for full-statistics diagnostic plots;
-it is slower and can require much more memory.
-
-Input preselection keeps events with `nprong == 2` and both reconstructed
-`tau_vis_prong` energies below the shared particle-energy sanity threshold
-(`91.25 GeV`).
-The QI export uses the same mask when deciding which raw events belong to the
-EveNet prediction universe, so events failing this selection are not silently
-reintroduced through the raw-complement path.
-
-Current target invisible definition:
-
-- Selected visible tau is prong plus photons within `dR < 0.3`.
-- `x_invisible = truth_tau - selected_visible_tau`.
-- Target features are `energy, pt, eta, phi`.
-- Invisible `energy` and `pt` use linear `normalize`, not `log_normalize`, so unusual negative-mass debug cases are not blocked by log scaling.
-- Truth tau naming is resolved in this order: central `truth_tau_a_p4/truth_tau_b_p4`, raw `GenPart_*` tau branches, then legacy `truth_tau_*` component fields.
-
-The builder also writes source provenance:
-
-- `source_sample_index`
-- `source_event_index`
-- `source_event_key`
-
-These fields are carried through preprocessing so prediction outputs can still be traced back to the selected-source universe. In the current no-matching concat workflow, config-mode export groups rows by `source_sample_index` and then concatenates predicted selected rows with raw rows outside the EveNet selection.
-
-### Slot Convention
-
-EveNet training slots are not central `lead_a/lead_b` slots. The ML input first identifies tau- and tau+ using tau charge, then canonicalizes the two visible/invisible slots by visible-particle kind:
-
-```text
-electron -> muon -> pion -> rho -> other
-```
-
-Therefore `x_invisible[:, 0]` and `x_invisible[:, 1]` are particle-kind slots, not fixed tau+ or tau- slots. This gives stable targets for channels such as `e rho`, `mu pi`, and `pi rho`.
-
-When exporting back to central/QI/unfolding, `export_evenet_prediction_to_qi.py` restores the central leg convention directly from the prediction parquet slot metadata:
-
-```text
-lead_a = tau+
-lead_b = tau-
-```
-
-No event-id matching or visible-p4 `deltaR` matching is performed in this workflow. The contract is that the prediction parquet is already the self-contained representation of the EveNet-selected universe.
-
-## 2. EveNet Preprocessing
-
-Common split mode:
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 EveNet-Full/preprocessing/preprocess.py \
-  --config config/preprocess_config.yaml \
-  --file /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset/evenet_input.npz \
-  --split_ratio 0.4,0.1,0.5 \
-  --store_dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert
+python3 build_evenet_input_from_parquet.py   \
+  --analysis-config config/analysis.yaml   \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/  \
+  --batch-size 50000  \
+  --rows-per-shard 100000 \
+  --num-workers 4
 ```
 
 Outputs:
 
-- `train.parquet`
-- `val.parquet`
-- `test.parquet`
-- `normalization.pt`
-- `shape_metadata.json`
+- `shards/<sample>/*.parquet`
+- `monitoring/<sample>/*.png`
+- `monitoring/comparison/*.png` for data vs stacked MC control plots
+- `manifest.json`
 
-For large sharded step-1 output, preprocess the NPZ shards directly. This reads
-one NPZ shard at a time, writes one parquet shard at a time, and accumulates a
-single shared training normalization file:
+The output parquet stores:
 
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/preprocess_evenet_shards.py \
-  --config config/preprocess_config.yaml \
-  --manifest /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/dataset/evenet_input_shards_manifest.json \
-  --store-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train \
-  --split-ratio 0.4,0.1,0.5 \
-  --num-workers 4
-```
+- the filtered sequential EveNet inputs as `Part_*` jagged columns
+- the global condition inputs as flat scalar columns
+- `classification`
+- `classification_target_index`
+- `classification_target_name`
 
-Sharded preprocessing outputs:
+with the same class ordering used by `generated_event_info.yaml`.
 
-- `/pscratch/.../ml_based/evenet_train/train_*.parquet`
-- `/pscratch/.../ml_based/evenet_train/val/val_*.parquet`
-- `/pscratch/.../ml_based/evenet_train/test/test_*.parquet`
-- `/pscratch/.../ml_based/evenet_train/data/data_*.parquet`
-- `/pscratch/.../ml_based/evenet_train/normalization.pt`
-- `/pscratch/.../ml_based/evenet_train/shape_metadata.json`
+If a required `Global` feature is not stored directly, `missing_p4` is used for
+the nominal fallback, including `missing_pz`.
 
-The training configs point `data_parquet_dir` at the train shard directory and
-`data_parquet_val_dir` at the validation shard directory, while both splits use
-the same `normalization.pt`.
 
-If the train shards are process-ordered, mix them before training. This keeps
-the same shared `normalization.pt` and `shape_metadata.json`, copies
-`val/`, `test/`, and `data/`, and rewrites only the train parquet shards:
+## `generate_event_info_yaml.py`
+
+Generate the `generated_event_info.yaml` schema consumed by:
+
+- `ml_pipeline/config/preprocess_config.yaml`
+- `ml_pipeline/config/train.yaml`
+- `ml_pipeline/config/train_pretrain.yaml`
+
+Example:
 
 ```bash
-python3 util/mix_evenet_train_parquets.py \
-  --input-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed \
-  --rows-per-output 100000 \
-  --read-batch-size 8192 \
-  --seed 42
-```
-
-Mixed preprocessing outputs:
-
-- `/pscratch/.../ml_based/evenet_train_mixed/train_*.parquet`
-- `/pscratch/.../ml_based/evenet_train_mixed/val/val_*.parquet`
-- `/pscratch/.../ml_based/evenet_train_mixed/test/test_*.parquet`
-- `/pscratch/.../ml_based/evenet_train_mixed/data/data_*.parquet`
-- `/pscratch/.../ml_based/evenet_train_mixed/normalization.pt`
-- `/pscratch/.../ml_based/evenet_train_mixed/shape_metadata.json`
-- `/pscratch/.../ml_based/evenet_train_mixed/mix_evenet_train_parquets_summary.json`
-
-For training with the mixed output, set:
-
-```yaml
-platform:
-  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed
-  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/val
-
-options:
-  Dataset:
-    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/normalization.pt
-```
-
-After preprocessing or mixing, run a lightweight parquet monitor before
-training:
-
-```bash
-python3 util/monitor_evenet_preprocessed_parquets.py \
-  --input-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/monitoring \
-  --shard-manifest /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/dataset/evenet_input_shards_manifest.json \
-  --splits train val test data \
-  --max-rows-per-file 20000 \
-  --max-rows-per-split 200000
+python3 ml_pipeline_lite/generate_event_info_yaml.py \
+  --analysis-config ml_pipeline/config/analysis.yaml \
+  --evenet-config ml_pipeline/config/evenet_schema.yaml \
+  --output ml_pipeline_lite/generated_event_info.yaml
 ```
 
 This writes:
 
-- `preprocessed_monitor_summary.json`
-- `train/rows_per_file.png`
-- `train/class_counts.png`
-- `train/class_fraction_per_file.png`
-- `*/numeric_hists/*.png`
-- `structured/x_mask_multiplicity.png`
-- `structured/x_features/*.png`
-- `structured/x_invisible_features/*.png`
-- `structured/conditions/*.png`
+- `generated_event_info.yaml`
+- `generated_event_info.summary.json`
 
-The `class_fraction_per_file.png` plot is the quickest check that mixed train
-parquets contain a healthy process mixture rather than process-ordered shards.
-The `structured/` plots are split-overlay distributions reconstructed from
-`shape_metadata.json`, so they are closer to the original preprocessing ntuple
-monitoring than raw flattened-column checks.
 
-For data-only inference conversion, a practical workaround is:
+## `preprocess_evenet_parquet.py`
 
-```bash
-python3 EveNet-Full/preprocessing/preprocess.py \
-  --config config/preprocess_config.yaml \
-  --train /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset/data.npz \
-  --test /pscratch/sd/t/tihsu/database/ZtautauAnalysis/dataset/data.npz \
-  --store_dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_data
-```
+Preprocess the lite parquet shards into shuffled train/val/test parquet files
+using the standard EveNet preprocessing logic.
 
-Use this only as an inference conversion workaround. Do not treat it as a formal train/test split.
+This stage is intentionally simple:
 
-## 3. Train Scratch or Pretrain
+- read the lite shard manifest
+- use all non-data shards as training input
+- optionally preprocess data shards into `store-dir/data`
+- event-level split inside each shard
+- shuffle rows per written parquet file
+- keep `event_weight` unchanged
 
-Scratch:
+Example:
 
 ```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 EveNet-Full/scripts/train.py config/train.yaml
+python3 preprocess_evenet_parquet.py  \
+  --manifest /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/manifest.json \
+  --config config/preprocess_config.yaml  \
+  --store-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/evenet_input  \
+  --split-ratio 0.4,0.1,0.5  \
+  --num-workers 4  \
+  --verbose
 ```
 
-Pretrain finetuning:
+Outputs:
+
+- `train_*.parquet`
+- `val/val_*.parquet`
+- `test/test_*.parquet`
+- `data/data_*.parquet`
+- `shape_metadata.json`
+- `normalization.pt`
+- `preprocess_manifest.json`
+
+
+## `predict_evenet_from_raw_parquet.py`
+
+Run EveNet prediction on the converted parquet files with the nominal weight rule:
+
+- `evenet_weight = event_weight`
+- if a split fraction is provided, scale by `1 / split_fraction`
+
+This lite entry keeps only the converted-parquet workflow and the chunk/shard
+controls needed for large-scale production.
+
+Example:
 
 ```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 EveNet-Full/scripts/train.py config/train_pretrain.yaml
-```
-
-Check these paths before launching:
-
-- `platform.data_parquet_dir`
-- `options.Dataset.normalization_file`
-- `options.Training.model_checkpoint_save_path`
-- `options.Training.pretrain_model_load_path`, only for the pretrain config
-
-For this analysis pipeline, the documented prediction commands use non-EMA diffusion weights via `--disable-ema`. Classification prediction always uses raw `state_dict` weights; EMA is only allowed to affect the diffusion/neutrino sampler.
-
-The predictor can still use EMA weights when the training config has:
-
-```yaml
-EMA:
-  enable: true
-  replace_model_after_load: true
-```
-
-To run an EMA diffusion prediction intentionally, omit `--disable-ema`.
-
-## 4. Standalone EveNet Prediction
-
-`util/predict_evenet_from_raw_parquet.py` consumes converted parquet files or
-directories such as `evenet_train_mixed/test` and `evenet_train_mixed/data`. It no longer
-reads raw parquet files or reruns raw-side selection during prediction.
-
-The default diffusion sampling length is 200 steps. Use `--num-steps` only when
-you intentionally want to scan the sampling speed/quality tradeoff.
-
-For sharded preprocessing output, run MC/test and data prediction separately so
-the QI export can keep their outputs distinct:
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/predict_evenet_from_raw_parquet.py \
+python3 predict_evenet_from_raw_parquet.py \
   --analysis-config config/analysis.yaml \
   --train-config config/train_pretrain.yaml \
-  --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/pretrain/last.ckpt \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
-  --disable-ema \
-  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
-  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
+  --classification-checkpoint /path/to/checkpoint-pretrain-cls/best.ckpt \
+  --diffusion-checkpoint /path/to/checkpoint-pretrain-diffusion/best.ckpt \
+  --converted-parquet /path/to/evenet_input/test \
+  --shape-metadata /path/to/evenet_input/shape_metadata.json \
+  --output-dir /path/to/prediction-evenet-pretrain \
   --converted-split-fraction 0.5 \
-  --num-steps 200 \
-  --batch-size 2048 \
-  --num-gpus 4
-
-python3 util/predict_evenet_from_raw_parquet.py \
-  --analysis-config config/analysis.yaml \
-  --train-config config/train_pretrain.yaml \
-  --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/pretrain/last.ckpt \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data-pred \
-  --disable-ema \
-  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/data \
-  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
-  --num-steps 200 \
-  --batch-size 2048 \
-  --num-gpus 4
-```
-
-If classification and diffusion were trained as separate checkpoints, pass both
-explicitly. Classification logits come from `--classification-checkpoint`; the
-neutrino sampler comes from `--diffusion-checkpoint`. `--checkpoint` remains a
-legacy shortcut when both heads live in the same checkpoint.
-
-```bash
-python3 util/predict_evenet_from_raw_parquet.py \
-  --analysis-config config/analysis.yaml \
-  --train-config config/train_pretrain.yaml \
-  --classification-checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/cls/last.ckpt \
-  --diffusion-checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/diffusion/last.ckpt \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
-  --disable-ema \
-  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
-  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
-  --converted-split-fraction 0.5 \
-  --num-steps 200 \
-  --batch-size 2048 \
-  --num-gpus 4
-```
-
-Scratch example:
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/predict_evenet_from_raw_parquet.py \
-  --analysis-config config/analysis.yaml \
-  --train-config config/train.yaml \
-  --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/scratch/last.ckpt \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch \
-  --disable-ema \
-  --converted-parquet \
-    /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert/test.parquet \
-    /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_data/test.parquet \
-  --converted-split-fraction 0.5 \
-  --num-steps 200 \
-  --batch-size 2048 \
-  --num-gpus 4
-```
-
-Pretrain example:
-
-```bash
-python3 util/predict_evenet_from_raw_parquet.py \
-  --analysis-config config/analysis.yaml \
-  --train-config config/train_pretrain.yaml \
-  --checkpoint /pscratch/sd/t/tihsu/database/ZtautauAnalysis/checkpoint/pretrain/last.ckpt \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-pretrain \
-  --disable-ema \
-  --converted-parquet \
-    /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_convert/test.parquet \
-    /pscratch/sd/t/tihsu/database/ZtautauAnalysis/evenet_data/test.parquet \
-  --converted-split-fraction 0.5 \
-  --num-steps 200 \
-  --batch-size 2048 \
-  --num-gpus 4
-```
-
-`--num-gpus` is batch/event-chunk parallel within one node. A single large
-parquet can be split across multiple GPUs on that node.
-
-For NERSC-style multi-node inference, run one prediction job per node and split
-the event chunks with `--task-num-shards` and `--task-shard-index`. For example,
-on 4 nodes with 4 GPUs per node:
-
-```bash
-srun --nodes=4 --ntasks-per-node=1 --gpus-per-task=4 bash -lc '
-python3 util/predict_evenet_from_raw_parquet.py \
-  --analysis-config config/analysis.yaml \
-  --train-config config/train_pretrain.yaml \
-  --classification-checkpoint /path/to/cls.ckpt \
-  --diffusion-checkpoint /path/to/diffusion.ckpt \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
-  --disable-ema \
-  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
-  --shape-metadata /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/shape_metadata.json \
-  --converted-split-fraction 0.5 \
-  --num-steps 200 \
-  --batch-size 2048 \
+  --batch-size 8192 \
   --num-gpus 4 \
   --task-num-shards 4 \
-  --task-shard-index ${SLURM_PROCID}
-'
+  --task-shard-index 0
 ```
 
-After all nodes finish, merge the `.part*.parquet` files once:
+
+## `export_evenet_prediction_to_qi.py`
+
+Export prediction parquet files into the central QI/unfolding parquet layout.
+
+The core behavior is intentionally simple:
+
+- use the prediction-parquet `evenet_weight` directly
+- rebuild the predicted baseline-selected rows with calibrated tau and QI observables
+- keep the raw complement outside the selected baseline rows and append it with default invalid reco fields
+- optionally write a truth-neutrino oracle tree
+
+Example:
 
 ```bash
-python3 util/predict_evenet_from_raw_parquet.py \
+python3 export_evenet_prediction_to_qi.py \
   --analysis-config config/analysis.yaml \
-  --train-config config/train_pretrain.yaml \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
-  --converted-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/test \
-  --task-num-shards 4 \
-  --num-gpus 4 \
-  --merge-only
-```
-
-`--converted-split-fraction` only affects `evenet_weight` in the prediction parquet, which is used by standalone data/MC plots. For example, if `test.parquet` represents 50 percent of the MC sample, pass `0.5` so MC `evenet_weight` is scaled by 2. Data is not split-reweighted.
-
-For training/validation alignment checks, use:
-
-```bash
---unweighted-output
-```
-
-Do not use this for physics data/MC comparisons unless unit-weight MC is explicitly intended.
-
-Prediction parquet files are self-contained for downstream plotting and export. They include:
-
-- Classification prediction and truth labels
-- Predicted invisible slots
-- Target invisible truth slots
-- Visible tau slots
-- Central truth / cut metadata needed by unfolding export
-- `event_weight` and `evenet_weight`
-- `source_sample_index`, `source_event_index`, and `source_event_key`
-
-## 5. Standalone EveNet Summary Plots
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/plot_evenet_prediction_summary.py \
-  --analysis-config config/analysis.yaml \
-  --evenet-config config/evenet_schema.yaml \
-  --mc-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/test__evenet_pred.parquet \
-  --data-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/data__evenet_pred.parquet \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/predict-evenet-scratch/analysis-summary \
-  --unblind
-```
-
-Typical outputs:
-
-- Weighted classification confusion matrix
-- Row-normalized confusion matrix
-- Predicted-channel purity stacked yield plot
-- Data/MC predicted-channel comparison
-- Neutrino truth vs prediction in `E, px, py, pz`
-- Neutrino truth vs prediction in `energy, pt, eta, phi`
-- Region kinematics plots with reconstructed tau, visible tau, and invisible tau
-- `summary_metrics.yaml`
-
-This summary is an EveNet standalone diagnostic. Its regions can be based on EveNet predicted class and do not need to match central cut-based regions.
-
-## 6. Export EveNet Prediction to Central/QI Schema
-
-This step uses the no-matching concat workflow for central/QI/unfolding:
-
-- Start from full central `filtered___raw.parquet`
-- Define the EveNet-selected universe with `baseline_cut && nprong == 2`
-- Keep the raw complement `raw[~selected_mask]`
-- Build predicted rows directly from the self-contained prediction parquet
-- Concatenate `raw outside selected + predicted selected rows`
-
-The exporter does not map predictions back onto full-raw row identities. Instead, the prediction parquet is treated as the authoritative representation of the selected universe, and raw rows outside the EveNet selection are preserved with:
-
-- `flags_valid = false`
-- Invalid/default missing p4
-- `mmc_likelihood = 0`
-
-Scratch export:
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/export_evenet_prediction_to_qi.py \
-  --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/test__evenet_pred.parquet \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/data__evenet_pred.parquet \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch \
-  --qi-method-label qi-export \
-  --num-workers 4
-```
-
-Pretrain export:
-
-```bash
-python3 util/export_evenet_prediction_to_qi.py \
-  --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/mc-pred \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data-pred \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain \
-  --qi-method-label qi-export \
-  --num-workers 4
-```
-
-Production pretrain export with raw-parquet streaming and truth-neutrino oracle:
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/export_evenet_prediction_to_qi.py \
-  --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/prediction-evenet-pretrain \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/prediction-evenet-pretrain/data-pred \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/prediction-evenet-pretrain \
+  --mc-pred-parquet /path/to/prediction-evenet-pretrain \
+  --data-pred-parquet /path/to/prediction-evenet-pretrain/data-pred \
+  --output-dir /path/to/prediction-evenet-pretrain/qi-export \
   --qi-method-label pretrain \
   --write-truth-neutrino-copy \
   --truth-qi-method-label truth \
-  --prediction-weight-source class \
-  --prediction-split-fraction 0.5 \
   --raw-batch-size 50000 \
-  --num-workers 1 \
+  --prediction-batch-size 25000 \
+  --num-workers 4 \
   --worker-backend thread
 ```
 
-Use `--prediction-weight-source class` when the prediction parquet only covers a
-test split or any other fraction of the EveNet-selected MC universe and you
-need the export to recover the full MC normalization. In that mode the export
-recalculates the predicted-row weight from `analysis.yaml` sample
-`norm_factor`, `initial_total_num_events`, luminosity, and
-`--prediction-split-fraction`.
+Outputs:
 
-Use `--prediction-weight-source evenet` only when the prediction parquet
-already contains the final split-aware `evenet_weight` you want to preserve
-exactly. The current `auto` mode prefers split-aware prediction weights when
-they are explicitly marked in the prediction parquet; otherwise it falls back
-to `class` when `--prediction-split-fraction` is provided, and to
-`central_weight` only when no split information is available.
+- `<output-dir>/<qi-method-label>/<sample>/filtered___raw.parquet`
+- `<output-dir>/<qi-method-label>/<sample>/filtered___<region>.parquet`
+- optionally `<output-dir>/<truth-qi-method-label>/<sample>/...`
+- `<output-dir>/<qi-method-label>__qi_export_summary.json`
 
-`--mc-pred-parquet` and `--data-pred-parquet` may point to either a single
-prediction parquet, a glob, or a directory. Directories are expanded to final
-`*__evenet_pred.parquet` files when present. `--raw-batch-size` streams the
-large central raw parquet files during export; lower it if memory pressure is
-high. `--write-truth-neutrino-copy` writes a second method tree that uses the
-MC target invisible neutrino directly, giving an upper-limit QI reference under
-`<output-dir>/truth/`. Data has no target neutrino, so the truth method keeps
-the nominal prediction for data rows.
 
-Output structure:
+## `plot_preunfolding_validation.py`
 
-```text
-/pscratch/.../ml_based/predict-evenet-scratch/qi-export/
-    data94/filtered___raw.parquet
-    data94/filtered___Ztautau_pipi.parquet
-    Ztautau/filtered___raw.parquet
-    Ztautau/filtered___Ztautau_pipi.parquet
-    Zll/filtered___raw.parquet
-    Zqq/filtered___raw.parquet
-```
+Produce the lite pre-unfolding validation plots from the exported central-schema
+parquet trees.
 
-For current prediction parquets, the central/QI export reads `evenet_weight` from the prediction parquet and writes it into the exported `weight` field for predicted rows. This means the MC split correction should already be applied by `predict_evenet_from_raw_parquet.py --converted-split-fraction`. Raw rows outside the EveNet selected universe keep their original central weight.
+This rewrite keeps only the nominal summary path:
 
-`--num-workers` parallelizes the config-driven export over parent samples and prints progress bars such as `mc export [####----] 1/3 Ztautau`. The default backend is thread-based so large awkward arrays are shared instead of copied into subprocesses. Keep it at `1` if memory pressure is high. Use `--worker-backend process` only when enough memory is available.
+- stored reco observables only
+- truth-vs-reco panels
+- truth-vs-reco summary plots
+- optional data-vs-MC control plots
 
-For the ML-based QIProcessor configs in the repository, write the export directly to the method-specific root:
+It intentionally does not run:
+
+- recomputed reco observables
+- truth-neutrino upper-limit plots
+- missing-neutrino / reco-tau / visible-tau validation branches
+
+Example:
 
 ```bash
-python3 util/export_evenet_prediction_to_qi.py \
-  --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/test__evenet_pred.parquet \
-  --data-pred-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/data__evenet_pred.parquet \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain \
-  --qi-method-label qi-export \
-  --num-workers 4
-```
-
-This produces files under `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/{sample}/`. The scratch method uses the same pattern with `predict-evenet-scratch`.
-
-The export writes both central cut-based files such as `filtered___hadhad.parquet` and ML dedicated files such as `filtered___Ztautau_pirho.parquet`. The ML dedicated files are selected by `evenet_pred_class_name`, while central files are selected by their original central cut flags.
-
-The export preserves central fields such as:
-
-- `lead_a_visible_p4`
-- `lead_b_visible_p4`
-
-## 7. Pre-Unfolding Validation
-
-Use the exported method trees to make pre-unfolding validation plots:
-
-- MC truth-vs-reco plots for:
-  - `theta_cm`, `mtautau`, and all `cos_theta_*`
-  - `lead_a/b_missing_{E,px,py,pz,pt,eta,phi}`
-  - `reco_tau_a/b_{E,px,py,pz,pt,eta,phi,mass}`
-- Method-summary Pearson plots for the same truth-vs-reco observables
-- Stacked MC vs data control plots for reco/visible tau observables
-
-The truth-vs-reco comparison now uses only correctly assigned signal events:
-
-- `evenet_truth_class_name` must match the target signal region
-- `evenet_pred_class_name == evenet_truth_class_name`
-
-This keeps the EveNet truth-vs-reco comparison aligned with the Baseline interpretation.
-
-`theta_cm` follows the nominal central QI definition from `quantum/observables_builder.py`:
-`theta_cm = 2 * arccos(abs(cos(theta_CM))) / pi`, so its plotting and QI-selection range is `[0, 1]`.
-
-Example command:
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/plot_preunfolding_validation.py \
-  --method Baseline:/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260427-baseline/neutrino_solutions \
-  --method EveNet-Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export \
-  --method EveNet-Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/qi-export \
+python3 plot_preunfolding_validation.py \
+  --method Baseline:/path/to/baseline/qi-export \
+  --method EveNet-Pretrain:/path/to/pretrain/qi-export \
   --signal-sample-name Ztautau \
   --data-sample-name data94 \
   --mc-sample-names Ztautau Zll Zqq \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/preunfolding-validation \
-  --reco-observable-source recompute \
-  --num-workers 3
+  --output-dir /path/to/preunfolding-validation \
+  --num-workers 8 \
+  --load-batch-size 50000
 ```
-
-Useful options:
-
-- `--reco-observable-source stored`
-  - use the scalar `theta_cm/mtautau/cos_theta_*` already stored in parquet
-- `--reco-observable-source recompute`
-  - force `theta_cm/mtautau/cos_theta_*` to be rebuilt from stored `reco_tau_a_p4`, `reco_tau_b_p4`, `lead_a_visible_p4`, `lead_b_visible_p4`
-- `--normalize-truth-reco`
-  - normalize truth-vs-reco histograms to unit area
-- `--num-workers N`
-  - run independent truth/reco validation blocks in parallel; `3` is enough for the current truth, missing-neutrino, and reco-tau blocks
-- `--regions ee emu mumu pipi pirho rhopi Ztautau_pipi Ztautau_pirho Ztautau_rhopi Ztautau_rhorho`
-  - limit the validation to a subset of native regions/channels
-
-For Baseline, the validation helper understands both legacy `neutrino_reco/`
-and current `neutrino_solutions/` layouts. In the current layout, fine channels
-are read directly from paths such as
-`neutrino_solutions/pipi/Ztautau_pipi_reconstructed_neutrinos.parquet`; the
-broad `hadhad` directory is not needed for the summary plots.
-The `pirho` and `rhopi` channels are kept as separate summary rows, matching
-their separate baseline `neutrino_solutions/` directories.
-
-Typical outputs:
-
-- `truth_vs_reco/`
-  - truth-vs-reco plots and 2D truth-vs-reco maps for `theta_cm` and `cos_theta_*`
-- `truth_vs_reco_summary/`
-  - Pearson summary plots for spin observables
-- `missing_truth_vs_reco/`
-  - truth-vs-reco plots for `lead_a/b_missing_*`
-- `missing_truth_vs_reco_summary/`
-  - Pearson summary plots for neutrino-missing observables
-- `reco_tau_truth_vs_reco/`
-  - truth-vs-reco plots for `reco_tau_a/b_*`
-- `reco_tau_truth_vs_reco_summary/`
-  - Pearson summary plots for reconstructed tau observables
-- `physics_data_mc_<method>/`
-  - stacked MC vs data control plots, including visible tau observables
-- `preunfolding_validation_summary.json`
-- `preunfolding_validation_report.md`
-- Region cut flags
-- `event_category`
-- `weight`
-- MC truth QI fields
-
-The export replaces or adds reconstruction-facing fields:
-
-- `lead_a_missing_p4`
-- `lead_b_missing_p4`
-- `reco_tau_a_p4`
-- `reco_tau_b_p4`
-- `flags_valid`
-- `mmc_likelihood`
-- `theta_cm` and other QI observables
-- `evenet_has_prediction`
-- `evenet_slot_for_a`
-- `evenet_slot_for_b`
-- `evenet_leg_match_deltaR_a`
-- `evenet_leg_match_deltaR_b`
-- `neutrino_method`
-
-EveNet converted slots are not central `lead_a/lead_b`. The adapter uses visible-object matching to map EveNet neutrino slots to central tau legs and avoid a tau+ / tau- semantic swap.
-
-## 7. Central/QI Evaluation
-
-This step runs the central `QIProcessor` on the EveNet-exported parquet trees. It is intentionally separate from the standalone ML summary plots.
-
-The important convention is:
-
-- Central cut-based regions are still available: `baseline`, `hadhad`, `ee`, `mumu`, `emu`.
-- ML dedicated QI regions are EveNet predicted fine channels: `Ztautau_pipi`, `Ztautau_pirho`, `Ztautau_rhopi`, `Ztautau_pie`, `Ztautau_pimu`, `Ztautau_rhoe`, `Ztautau_rhomu`, `Ztautau_rhorho`, `Ztautau_ee`, `Ztautau_mumu`, `Ztautau_emu`, `Ztautau_mue`.
-- The QIProcessor configs in `config/config_qi_evenet_pretrain.yaml` and `config/config_qi_evenet_scratch.yaml` use the ML dedicated regions, not the central broad regions.
-
-First run the Step 6 export for each method. For the QIProcessor configs below, the exported roots must be:
-
-- Pretrain: `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export`
-- Scratch: `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/qi-export`
-
-Each exported root should contain:
-
-```text
-/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/
-  data94/filtered___raw.parquet
-  data94/filtered___Ztautau_pipi.parquet
-  ...
-  Ztautau/filtered___raw.parquet
-  Ztautau/filtered___Ztautau_pipi.parquet
-  ...
-  Zll/...
-  Zqq/...
-```
-
-The raw parquet also contains matching cut flags such as `Ztautau_pipi_cut`, which QIProcessor needs when building response matrices.
-
-Then run QIProcessor from the repository root, not from `ml_pipeline`.
-For EveNet final metrics, prefer the ml_pipeline wrapper so ROOT is preloaded,
-the parquet-export event weights are preserved, and non-SDM observables such
-as `mtautau` are excluded from RooUnfold without editing the nominal QIProcessor
-or DataLoader:
-
-```bash
-cd /path/to/lep_tree_ana
-python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
-python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_scratch.yaml
-```
-
-Use `--num-workers N` to split the QI regions over independent Python/ROOT
-processes. This parallelizes over regions, not over threads inside one ROOT
-process:
-
-```bash
-cd /path/to/lep_tree_ana
-python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml --num-workers 4
-```
-
-By default the wrapper sets `QI_EXCLUDE_UNFOLD_OBSERVABLES=mtautau` and
-`QI_PRESERVE_PARQUET_WEIGHTS=1`. The latter is important for EveNet test-split
-normalization: if prediction/export wrote a split-corrected `weight` to parquet,
-the wrapper keeps that value as `weight_nominal` instead of letting DataLoader
-replace it with `norm_factor / initial_total_num_events`. To restore the nominal
-observable list for a special cross-check, run with an empty value:
-
-```bash
-cd /path/to/lep_tree_ana
-QI_EXCLUDE_UNFOLD_OBSERVABLES= python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
-```
-
-To deliberately use nominal DataLoader weight recomputation for a cross-check,
-turn off parquet-weight preservation:
-
-```bash
-cd /path/to/lep_tree_ana
-QI_PRESERVE_PARQUET_WEIGHTS=0 python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
-```
-
-If `QIProcessor` fails with `AttributeError: Failed to get attribute RooUnfoldResponse from ROOT`,
-ROOT is available but the external RooUnfold library is not loaded. In that case, set the full path
-before running the wrapper:
-
-```bash
-export ROOUNFOLD_LIB=/full/path/to/libRooUnfold.so
-python3 ml_pipeline/util/run_tree_ana_root_preload.py -c config/config_qi_evenet_pretrain.yaml
-```
-
-The repository notebook `notebook/unfolding_discussion.ipynb` also expects an explicit
-`ROOT.gSystem.Load("/path/to/libRooUnfold.so")`, so this is a central unfolding environment
-requirement rather than an EveNet export-format issue.
-
-Expected QIProcessor outputs:
-
-```text
-/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/QI_analysis/
-  results.txt
-  response_Ztautau_pipi.root
-  response_Ztautau_pirho.root
-  ...
-  Ztautau_pipi/
-    plots/
-    unfolding/
-  Ztautau_pirho/
-    plots/
-    unfolding/
-```
-
-`results.txt` is the central text output containing the final unfolded `B_i`, `C_ij`,
-and quantum-summary values. To turn it into table files:
-
-```bash
-python3 ml_pipeline/util/extract_qi_final_measurements.py \
-  --results-txt /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/QI_analysis/results.txt \
-  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/QI_analysis/final_measurements
-```
-
-This writes:
-
-```text
-final_measurements.json
-final_measurements.csv
-final_measurements_summary_plots/
-final_measurements_summary_plots.json
-```
-
-Each row contains `region`, `signal`, `source`, `group`, `parameter`, `value`,
-`err_up`, and `err_down`. By default only the unfolded measurement is kept; add
-`--keep-truth` if you also want the central truth reference rows.
-
-To make final-measurement summary plots in the same style as the pre-unfolding
-summary plots, pass multiple methods:
-
-```bash
-python3 ml_pipeline/util/extract_qi_final_measurements.py \
-  --method Baseline:/global/cfs/cdirs/m5019/Ztautau_LEP/preselected_parquets/20260427-baseline/QI_analysis/results.txt \
-  --method Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-pretrain/qi-export/QI_analysis/results.txt \
-  --method Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/predict-evenet-scratch/qi-export/QI_analysis/results.txt \
-  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison/final_measurements
-```
-
-The plots group channels/regions on the y-axis, use method-specific markers,
-and annotate the right side with `value ± unc.`.
-The broad `hadhad` region is ignored by default so Baseline can use fine
-channels such as `pipi`, `pirho`, `rhopi`, and `rhorho`; add `--keep-hadhad` only if you
-intentionally want the broad hadhad result.
-As in the pre-unfolding plots, `pirho`, `rhopi`, `emu`, and `mue` are kept as
-separate summary rows when the QIProcessor config writes them separately.
-
-`extract_qi_final_measurements.py` accepts the historical central output format
-(`value +err_up/-err_down`) and updated nominal-style symmetric lines
-(`value ± err` or `value +/- err`). Section labels such as `Final metrics` or
-`Nominal Quantum results` are normalized into the same output tables as the
-historical `Unfolded Quantum results` blocks.
-
-If you want the central broad-region QIProcessor instead, use the normal central config style and regions such as `hadhad`, `ee`, `mumu`, and `emu`. Do not mix that with the ML dedicated configs unless the comparison explicitly calls for it.
-
-For older central-style exports, point the central config input/output tree at the exported method directory. For example:
-
-```text
-default_output_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export/evenet_scratch
-```
-
-The baseline tree is the normal central output:
-
-```text
-/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline
-```
-
-With this layout, the central framework does not need to know whether neutrinos came from MMC, the algebraic solution, EveNet-Pretrain, or EveNet-Scratch. It only sees a consistent parquet schema.
-
-## 8. Baseline vs EveNet-Pretrain vs EveNet-Scratch
-
-`plot_qi_method_comparison.py` supports multiple central-schema method trees:
-
-```bash
-cd /path/to/lep_tree_ana/ml_pipeline
-python3 util/plot_qi_method_comparison.py \
-  --method Baseline:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline \
-  --method EveNet-Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export/evenet_pretrain \
-  --method EveNet-Scratch:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-evenet-export/evenet_scratch \
-  --sample-name Ztautau \
-  --data-sample-name data94 \
-  --mc-sample-names Ztautau Zll Zqq \
-  --metric-grouping evenet-channel \
-  --metrics-only \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/final-method-comparison
-```
-
-Use `--metric-grouping evenet-channel` to make the final metric summary y-axis follow the actual EveNet predicted classes such as `Ztautau_pipi`, `Ztautau_pirho`, `Ztautau_pie`, and `Ztautau_others`. Use `--metric-grouping region` if you intentionally want central cut-based files such as `hadhad`, `ee`, `mumu`, and `emu`.
-Use `--metrics-only` when you only want the final metric summary; omit it to also draw optional data-vs-MC control histograms.
 
 Outputs:
 
-- `qi_metric_<observable>.png`, one channel-vs-method plot per metric or QI observable
-- `qi_method_comparison_combined_metrics.{json,csv,md}`, final cross-channel metrics combined with inverse-variance weights while treating channels as uncorrelated
-- `physics_data_mc_<method>/<region>_<observable>.png`, optional data-vs-stacked-MC physics distributions
-- `physics_data_mc_<method>/<region>_<observable>_log.png`, optional log-y companion plots
-- `neutrino_truth_vs_pred_<region>.png`
-- `cut_based_vs_evenet_region_matrix.png`, comparing central cut-based regions against EveNet fine predicted channels when the raw parquet contains EveNet predicted class labels
-- `qi_method_comparison_metrics.json`
-- `qi_method_comparison_audit.json`
-- `qi_method_comparison_report.md`
+- `truth_vs_reco/*.png`
+- `truth_vs_reco_summary/*.png`
+- `preunfolding_validation_summary.json`
+- `preunfolding_validation_report.md`
+- optionally the standard data-vs-MC control-plot PNGs
 
-The audit JSON and Markdown report are meant for process validation. They list method input roots, per-channel parquet coverage, event counts, weighted yields, valid fractions, QI acceptance, available metric keys, generated diagnostic plots, and physics data-vs-MC plot coverage.
 
-By default, the data-vs-MC plots use `data94` as data and `Ztautau Zll Zqq` as MC. Override those with `--data-sample-name` and `--mc-sample-names`. Use `--physics-observables` to restrict the plotted observable list.
+## `run_tree_ana_root_preload.py`
 
-Baseline means the central traditional reconstruction:
+Run the unfolding / `tree_ana` preload workflow from the lite framework path.
 
-- `ee`, `mumu`, and `emu` use MMC.
-- Other non-MMC regions use the central algebraic neutrino solution.
+This rewrite keeps the preload and region-parallel unfolding control in
+`ml_pipeline_lite`, while still launching the shared `tree_ana` executable.
 
-EveNet methods come from `export_evenet_prediction_to_qi.py` method trees.
+Example:
 
-## Weighting Rules
+```bash
+python3 run_tree_ana_root_preload.py \
+  -c /path/to/config_qi.yaml \
+  --num-workers 4 \
+  --root-step-size 20000 \
+  --raw-batch-size 25000
+```
 
-Do not apply the split-weight correction twice:
 
-- `predict_evenet_from_raw_parquet.py --converted-split-fraction`: writes `evenet_weight` in the prediction parquet for standalone EveNet plots.
-- `export_evenet_prediction_to_qi.py --prediction-weight-source evenet`: preserves prediction-parquet `evenet_weight` exactly for predicted rows.
-- `export_evenet_prediction_to_qi.py --prediction-weight-source class --prediction-split-fraction F`: recomputes predicted-row weight from `norm_factor / initial_total_num_events * luminosity / F`. This is the recommended export mode when prediction only covers a test split such as `F = 0.5`.
-- `export_evenet_prediction_to_qi.py --prediction-weight-source auto`: prefers split-aware prediction weights when available, otherwise falls back to `class` if `--prediction-split-fraction` is provided, and only then falls back to central weights.
-- Data is never MC split-reweighted.
-- If the MC test split is 0.5, pass `--converted-split-fraction 0.5` during prediction to recover full MC yield in data/MC comparisons.
-- Raw-only rows without EveNet predictions do not receive the split factor.
-- In the current concat export, if `num_predicted_events` is smaller than `num_raw_selected_for_prediction`, the selected raw rows without prediction are not exported. In that case the reco yield will be low unless the predicted rows statistically represent the missing selected fraction through split-aware weighting.
+## `extract_qi_final_measurements.py`
 
-## Alignment Checklist
+Extract the final QI measurements from `results.txt`, write JSON/CSV tables,
+and draw the per-channel comparison plots.
 
-If standalone prediction looks worse than training validation plots, check:
+This rewrite lives fully in `ml_pipeline_lite` and keeps the
+Truth/Reconstruction comparison support.
 
-- The prediction command used the intended checkpoint and config.
-- EMA usage matches the intended evaluation. `--disable-ema` affects only diffusion; classification is always loaded from raw `state_dict`.
-- Standalone neutrino prediction is conditioned on predicted class. Training validation monitoring may be conditioned on truth class.
-- The prediction parquet is regenerated and includes the self-contained truth/cut metadata required by export.
-- `analysis.yaml` `input_files` and `raw_files` come from the same central production.
-- `--converted-split-fraction` and `--prediction-split-fraction` are only used in their intended steps.
-- The comparison uses the same sample, central schema, and luminosity normalization.
+Example:
 
-## FAQ
+```bash
+python3 extract_qi_final_measurements.py \
+  --method Baseline:/path/to/baseline/results.txt \
+  --method EveNet-Pretrain:/path/to/pretrain/results.txt \
+  --output-prefix /path/to/qi_compare \
+  --keep-truth
+```
 
-### Why can old prediction parquet files fail export?
 
-They may not contain the self-contained metadata required by concat export, such as `source_sample_index`, visible tau slots, or unfolding truth/cut fields. Regenerate the EveNet input, preprocess outputs, and prediction parquet with the updated `ml_pipeline` scripts.
+## `plot_evenet_prediction_summary.py`
 
-### Does data without truth fail?
+Draw the prediction summary plots from the prediction parquet outputs.
 
-No. Prediction and export allow data without truth fields. Truth metrics are computed only for MC.
+This rewrite lives in `ml_pipeline_lite` and defaults the config paths to:
 
-### What happens to raw events outside EveNet selection?
+- `ml_pipeline_lite/config/analysis.yaml`
+- `ml_pipeline_lite/config/evenet_schema.yaml`
 
-The export keeps them with invalid defaults. This is important for unfolding, because truth-region events that fail reconstruction still need to enter the response matrix as missed events.
+Example:
 
-### Do EveNet regions need to match cut-based regions?
+```bash
+python3 plot_evenet_prediction_summary.py \
+  --mc-parquet /path/to/prediction-evenet-pretrain \
+  --data-parquet /path/to/prediction-evenet-pretrain/data-pred \
+  --output-dir /path/to/prediction-evenet-pretrain/summary \
+  --weight-source evenet \
+  --unblind
+```
 
-No. Central/QI export `filtered___{region}.parquet` files use central cut flags. Standalone EveNet summaries can use predicted class regions separately.
-
-### Can Pretrain, Scratch, and Baseline be compared together?
-
-Yes. Export each EveNet run with a different `--qi-method-label`, then pass each central-schema tree to `plot_qi_method_comparison.py --method Label:path`.
+## Shuffle the processed EveNet input files
+This is an optional step to further shuffle the preprocessed EveNet input files. 
+This is useful for training stability when the number of input files is small and each file contains a large number of events. 
+The shuffling is done by reading the input parquet files in batches and writing out new parquet files with shuffled rows.
+```bash
+python3 mix_evenet_train_parquets.py \
+  --input-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/evenet_input/ \
+  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/evenet_input_shuffled \
+  --rows-per-output 100000 \
+  --read-batch-size 8192  \
+  --seed 42
+```
