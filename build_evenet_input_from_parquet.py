@@ -57,8 +57,8 @@ def parse_samples(config: dict[str, Any], selected_keys: list[str] | None) -> li
                 is_signal=bool(sample_cfg.get("is_signal", False)),
                 files=tuple(str(item) for item in input_files),
                 file_source="input_files",
-                norm_factor=float(sample_cfg.get("norm_factor", None)),
-                lumi=float(sample_cfg.get("lumi", None)),
+                norm_factor=float(sample_cfg.get("norm_factor", 1)),
+                lumi=float(sample_cfg.get("lumi", 1)),
                 total_initial_num_events=None,
                 plot_label=process_latex_label(str(sample_cfg.get("name", key)))
             )
