@@ -365,7 +365,37 @@ def build_output_events(
         "num_sequential_vectors": num_sequential_vectors.astype(np.float32),
         "x_invisible": to_numpy(delta_invisible_input, np.float32),
         "x_invisible_mask": to_numpy(delta_invisible_mask, np.float32),
+        "lead_a_visible_p4": visible_a.astype(np.float32),
+        "lead_b_visible_p4": visible_b.astype(np.float32),
+        "target_a_invisible_p4": invisible_a.astype(np.float32),
+        "target_b_invisible_p4": invisible_b.astype(np.float32),
+        "truth_tau_a_p4": truth_tau_a.astype(np.float32),
+        "truth_tau_b_p4": truth_tau_b.astype(np.float32),
     }
+
+    if sample.total_initial_num_events is not None:
+        fields["initial_num_events"] = np.full(
+            len(selected_events),
+            sample.total_initial_num_events,
+            dtype=np.float64
+        )
+
+    if "nprong" in selected_events.fields:
+        fields["nprong"] = to_numpy(selected_events["nprong"], np.int32)
+
+    passthrough = {
+        "event_category",
+        "truth_QI_region",
+        "analyzing_power",
+        "analyzing_power_a",
+        "analyzing_power_b",
+        "weight",
+        "central_weight"
+    }
+    passthrough.update(name for name in selected_events.fields if name.endswith("_cut"))
+    for field in sorted(passthrough):
+        if field in selected_events.fields and field not in fields:
+            fields[field] = selected_events[field]
 
     for field_name, values in list(fields.items()):
         if isinstance(values, np.ndarray):
