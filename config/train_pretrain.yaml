@@ -1,5 +1,5 @@
 platform:
-  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed
+  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/evenet_input/before_shuffle/train-diffusion
   data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/val
   number_of_workers: 16
   resources_per_worker: {

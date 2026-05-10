@@ -146,7 +146,8 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
                 "analyzing_power_a",
                 "analyzing_power_b",
                 "mmc_likelihood",
-                "theta_cm"
+                "theta_cm",
+                "flags_valid"
             }
         )
         columns.update(name for name in schema_names if name.startswith("truth_"))
