@@ -51,7 +51,7 @@ class Sample:
 
 
 
-def parse_samples(config: dict[str, Any], selected_keys: list[str] | None) -> list[Sample]:
+def parse_samples(config: dict[str, Any], selected_keys: list[str] | None = None) -> list[Sample]:
     selected = set(selected_keys or [])
     samples: list[Sample] = []
     neutrino_cfg = config["NeutrinoPrediction"]
