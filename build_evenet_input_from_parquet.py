@@ -320,10 +320,7 @@ def build_output_events(
         lookup=classification_lookup,
     )
 
-    print(sample.predict_neutrino)
-    print(classification_names)
     predict_neutrino = ak.from_numpy(np.array([str(name) in sample.predict_neutrino for name in classification_names]))
-    print(predict_neutrino)
 
 
     if "central_weight" in selected_events.fields:
@@ -358,7 +355,6 @@ def build_output_events(
     delta_invisible = ak.concatenate([delta_invisible_a[:, np.newaxis], delta_invisible_b[:, np.newaxis]], axis=1)
     delta_invisible_input = features_from_p4_local(delta_invisible, invisible_features)
     delta_invisible_mask = ak.ones_like(delta_invisible.px) * predict_neutrino[:, np.newaxis]
-    print("delta_invisible_mask", delta_invisible_mask)
 
 
     num_invisible_raw = np.full(len(selected_events), 2, dtype=np.int64)
