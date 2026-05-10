@@ -213,7 +213,7 @@ def _p4_component(p4: ak.Array, component: str) -> ak.Array:
 def resolve_global_feature(events: ak.Array, field_name: str) -> ak.Array:
     if field_name in events.fields:
         return events[field_name]
-    field_four_momentum = "_".join(field_name.split("_")[:-1])
+    field_four_momentum = "_".join(field_name.split("_")[:-1]) + "_p4"
     if field_four_momentum in events.fields:
         four_momentum = events[field_four_momentum]
         if "px" in field_name:
