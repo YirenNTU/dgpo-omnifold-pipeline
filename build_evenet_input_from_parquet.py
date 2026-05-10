@@ -213,20 +213,36 @@ def _p4_component(p4: ak.Array, component: str) -> ak.Array:
 def resolve_global_feature(events: ak.Array, field_name: str) -> ak.Array:
     if field_name in events.fields:
         return events[field_name]
-    if "missing_p4" in events.fields:
-        missing_p4 = events["missing_p4"]
-        if field_name == "missing_px":
-            return _p4_component(missing_p4, "px")
-        if field_name == "missing_py":
-            return _p4_component(missing_p4, "py")
-        if field_name == "missing_pz":
-            return _p4_component(missing_p4, "pz")
-        if field_name in {"missing_E", "missing_energy"}:
-            return _p4_component(missing_p4, "E")
-        if field_name == "missing_pt":
-            px = _p4_component(missing_p4, "px")
-            py = _p4_component(missing_p4, "py")
-            return np.sqrt(px * px + py * py)
+    field_four_momentum = "_".join(field_name.split("_")[:-1])
+    if field_four_momentum in events.fields:
+        four_momentum = events[field_four_momentum]
+        if "px" in field_name:
+            return _p4_component(four_momentum, "px")
+        if "py" in field_name:
+            return _p4_component(four_momentum, "py")
+        if "pz" in field_name:
+            return _p4_component(four_momentum, "pz")
+        if "pt" in field_name:
+            px = _p4_component(four_momentum, "px")
+            py = _p4_component(four_momentum, "py")
+            return np.sqrt(px*px + py*py)
+        if "E" in field_name or "energy" in field_name:
+            return _p4_component(four_momentum, "E")
+
+    # if "missing_p4" in events.fields:
+    #     missing_p4 = events["missing_p4"]
+    #     if field_name == "missing_px":
+    #         return _p4_component(missing_p4, "px")
+    #     if field_name == "missing_py":
+    #         return _p4_component(missing_p4, "py")
+    #     if field_name == "missing_pz":
+    #         return _p4_component(missing_p4, "pz")
+    #     if field_name in {"missing_E", "missing_energy"}:
+    #         return _p4_component(missing_p4, "E")
+    #     if field_name == "missing_pt":
+    #         px = _p4_component(missing_p4, "px")
+    #         py = _p4_component(missing_p4, "py")
+    #         return np.sqrt(px * px + py * py)
     preview = ", ".join(events.fields[:25])
     suffix = " ..." if len(events.fields) > 25 else ""
     raise KeyError(f"Global feature '{field_name}' is missing. Available fields include: {preview}{suffix}")

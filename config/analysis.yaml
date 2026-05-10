@@ -129,6 +129,12 @@ Inputs:
       index: [6]
       input:
         - Part_charge
+        - Part_dR_to_lead_a
+        - Part_dR_to_lead_b
+        - Part_angle_to_lead_a
+        - Part_angle_to_lead_b
+        - Part_in_hemisphere_a
+        - Part_in_hemisphere_b
   Global:
     Fields:
       - thrust_Mag
@@ -188,6 +194,12 @@ Normalization:
     Part_sticShowerTheta: normalize
     Part_sticShowerPhi: normalize
     Part_sticNumTowers: normalize
+    Part_in_hemisphere_a: none
+    Part_in_hemisphere_b: none
+    Part_dR_to_lead_a: normalize
+    Part_dR_to_lead_a: normalize
+    Part_angle_to_lead_a: normalize
+    Part_angle_to_lead_b: normalize
   Global:
 #    Event_totalChargedEnergy: log_normalize
 #    Event_totalEMEnergy: log_normalize
@@ -197,6 +209,12 @@ Normalization:
     missing_px: normalize
     missing_py: normalize
     missing_pz: normalize
+    lead_a_px: normalize
+    lead_a_py: normalize
+    lead_a_pz: normalize
+    lead_b_px: normalize
+    lead_b_py: normalize
+    lead_b_pz: normalize
     isolation_angle: normalize
     thrust_x: normalize
     thrust_y: normalize
