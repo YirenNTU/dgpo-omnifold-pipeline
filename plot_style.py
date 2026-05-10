@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,237 @@ def save_figure(fig: Any, output_path: str | Path) -> None:
         fig.savefig(output_path.with_suffix(".pdf"))
 
 
+def _flat_finite_pair(
+    truth: Any,
+    pred: Any,
+    weight: Any | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    truth_values = to_numpy(truth)
+    pred_values = to_numpy(pred)
+    n_values = min(len(truth_values), len(pred_values))
+    truth_values = truth_values[:n_values]
+    pred_values = pred_values[:n_values]
+    mask = np.isfinite(truth_values) & np.isfinite(pred_values)
+    weights = None
+    if weight is not None:
+        weights = to_numpy(weight)[:n_values]
+        mask &= np.isfinite(weights)
+        weights = weights[mask]
+    return truth_values[mask], pred_values[mask], weights
+
+
+def _weighted_mean(values: np.ndarray, weights: np.ndarray | None) -> float:
+    if values.size == 0:
+        return float("nan")
+    if weights is None:
+        return float(np.mean(values))
+    weight_sum = float(np.sum(weights))
+    if weight_sum == 0:
+        return float("nan")
+    return float(np.sum(weights * values) / weight_sum)
+
+
+def prediction_metrics(
+    truth: Any,
+    pred: Any,
+    *,
+    bins: int | np.ndarray = 60,
+    weight: Any | None = None,
+) -> dict[str, float]:
+    truth_values, pred_values, weights = _flat_finite_pair(truth, pred, weight)
+    if truth_values.size == 0:
+        return {"entries": 0.0, "mae": float("nan"), "rmse": float("nan"), "pearson": float("nan"), "jsd": float("nan")}
+
+    residual = pred_values - truth_values
+    mae = _weighted_mean(np.abs(residual), weights)
+    rmse = math.sqrt(_weighted_mean(residual * residual, weights))
+    if weights is None:
+        pearson = float(np.corrcoef(truth_values, pred_values)[0, 1]) if truth_values.size > 1 else float("nan")
+    else:
+        mean_truth = _weighted_mean(truth_values, weights)
+        mean_pred = _weighted_mean(pred_values, weights)
+        weight_sum = float(np.sum(weights))
+        cov = float(np.sum(weights * (truth_values - mean_truth) * (pred_values - mean_pred)) / weight_sum)
+        var_truth = float(np.sum(weights * (truth_values - mean_truth) ** 2) / weight_sum)
+        var_pred = float(np.sum(weights * (pred_values - mean_pred) ** 2) / weight_sum)
+        pearson = cov / math.sqrt(var_truth * var_pred) if var_truth > 0 and var_pred > 0 else float("nan")
+
+    edges = auto_bins([truth_values, pred_values], n_bins=bins) if isinstance(bins, int) else np.asarray(bins, dtype=float)
+    truth_hist, _ = np.histogram(truth_values, bins=edges, weights=weights)
+    pred_hist, _ = np.histogram(pred_values, bins=edges, weights=weights)
+    truth_prob = truth_hist.astype(float)
+    pred_prob = pred_hist.astype(float)
+    if np.sum(truth_prob) > 0:
+        truth_prob /= np.sum(truth_prob)
+    if np.sum(pred_prob) > 0:
+        pred_prob /= np.sum(pred_prob)
+    mixture = 0.5 * (truth_prob + pred_prob)
+    truth_terms = truth_prob > 0
+    pred_terms = pred_prob > 0
+    kl_truth = float(np.sum(truth_prob[truth_terms] * np.log(truth_prob[truth_terms] / mixture[truth_terms])))
+    kl_pred = float(np.sum(pred_prob[pred_terms] * np.log(pred_prob[pred_terms] / mixture[pred_terms])))
+    jsd = 0.5 * (kl_truth + kl_pred)
+
+    return {
+        "entries": float(truth_values.size),
+        "mae": float(mae),
+        "rmse": float(rmse),
+        "pearson": float(pearson),
+        "jsd": float(jsd),
+    }
+
+
+def plot_truth_prediction_bundle(
+    truth: Any,
+    pred: Any,
+    output_dir: str | Path,
+    name: str,
+    *,
+    bins: int | np.ndarray = 60,
+    weight: Any | None = None,
+    truth_label: str = "Truth",
+    pred_label: str = "Prediction",
+    xaxis_label: str | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Write 2D, 1D, residual, relative residual, and profile plots for one truth/pred pair."""
+    import json
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    set_plot_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    xaxis_label = xaxis_label or name
+    title = title or name
+    truth_values, pred_values, weights = _flat_finite_pair(truth, pred, weight)
+    metrics = prediction_metrics(truth_values, pred_values, bins=bins, weight=weights)
+    if truth_values.size == 0:
+        metrics_path = output_dir / f"{name}_metrics.json"
+        metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
+        return {"metrics": metrics, "metrics_json": str(metrics_path), "plots": {}}
+
+    edges = auto_bins([truth_values, pred_values], n_bins=bins) if isinstance(bins, int) else np.asarray(bins, dtype=float)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    paths: dict[str, str] = {}
+
+    fig, axis = plt.subplots(figsize=(8.1, 5.8))
+    counts, x_edges, y_edges = np.histogram2d(truth_values, pred_values, bins=(edges, edges), weights=weights)
+    mesh = axis.pcolormesh(x_edges, y_edges, np.ma.masked_where(counts.T <= 0, counts.T), cmap="viridis")
+    axis.plot([edges[0], edges[-1]], [edges[0], edges[-1]], color="white", linestyle="--", linewidth=1.1)
+    axis.set_xlabel(truth_label)
+    axis.set_ylabel(pred_label)
+    axis.set_title(f"{title}: 2D", loc="left")
+    metric_text = "\n".join(
+        [
+            f"entries = {int(metrics['entries'])}",
+            f"MAE = {metrics['mae']:.4g}",
+            f"RMSE = {metrics['rmse']:.4g}",
+            f"Pearson = {metrics['pearson']:.4g}",
+            f"JSD = {metrics['jsd']:.4g}",
+        ]
+    )
+    axis.text(
+        1.03,
+        0.98,
+        metric_text,
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "0.8"},
+    )
+    colorbar = fig.colorbar(mesh, ax=axis, pad=0.02)
+    colorbar.set_label("Weighted entries")
+    fig.subplots_adjust(right=0.78)
+    output_path = output_dir / f"{name}_2d.png"
+    save_figure(fig, output_path)
+    plt.close(fig)
+    paths["2d"] = str(output_path)
+
+    fig, (axis, ratio_axis) = plt.subplots(
+        2,
+        1,
+        figsize=(6.8, 6.0),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3.0, 1.0], "hspace": 0.06},
+    )
+    truth_counts, _ = np.histogram(truth_values, bins=edges, weights=weights)
+    pred_counts, _ = np.histogram(pred_values, bins=edges, weights=weights)
+    axis.hist(truth_values, bins=edges, weights=weights, histtype="step", linewidth=1.5, label=truth_label)
+    axis.hist(pred_values, bins=edges, weights=weights, histtype="step", linewidth=1.5, label=pred_label)
+    ratio = np.divide(pred_counts, truth_counts, out=np.full_like(pred_counts, np.nan, dtype=float), where=truth_counts != 0)
+    ratio_axis.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
+    ratio_axis.plot(centers, ratio, "o-", markersize=2.5, linewidth=0.8)
+    axis.set_ylabel("Weighted entries")
+    axis.set_title(f"{title}: 1D", loc="left")
+    axis.legend(frameon=False)
+    ratio_axis.set_ylabel(f"{pred_label}\n/ {truth_label}")
+    ratio_axis.set_xlabel(xaxis_label)
+    ratio_axis.grid(axis="y", alpha=0.25)
+    output_path = output_dir / f"{name}_1d.png"
+    save_figure(fig, output_path)
+    plt.close(fig)
+    paths["1d"] = str(output_path)
+
+    residual = pred_values - truth_values
+    relative = np.divide(residual, truth_values, out=np.full_like(residual, np.nan), where=np.abs(truth_values) > 1e-12)
+    for key, values, xlabel in (
+        ("residual", residual, f"{pred_label} - {truth_label}"),
+        ("relative_residual", relative, f"({pred_label} - {truth_label}) / {truth_label}"),
+    ):
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            continue
+        fig, axis = plt.subplots(figsize=(6.8, 4.8))
+        axis.hist(values[finite], bins=auto_bins([values[finite]], n_bins=bins), weights=None if weights is None else weights[finite], histtype="stepfilled", alpha=0.75)
+        axis.axvline(0.0, color="gray", linestyle="--", linewidth=0.9)
+        axis.set_xlabel(xlabel)
+        axis.set_ylabel("Weighted entries")
+        axis.set_title(f"{title}: {key.replace('_', ' ')}", loc="left")
+        output_path = output_dir / f"{name}_{key}.png"
+        save_figure(fig, output_path)
+        plt.close(fig)
+        paths[key] = str(output_path)
+
+    profile_mean = np.full(len(centers), np.nan)
+    profile_err = np.full(len(centers), np.nan)
+    for index in range(len(centers)):
+        in_bin = (truth_values >= edges[index]) & (truth_values < edges[index + 1])
+        if index == len(centers) - 1:
+            in_bin = (truth_values >= edges[index]) & (truth_values <= edges[index + 1])
+        if not np.any(in_bin):
+            continue
+        bin_residual = residual[in_bin]
+        bin_weights = None if weights is None else weights[in_bin]
+        profile_mean[index] = _weighted_mean(bin_residual, bin_weights)
+        if bin_weights is None:
+            profile_err[index] = np.nanstd(bin_residual) / math.sqrt(max(np.sum(np.isfinite(bin_residual)), 1))
+        else:
+            mean = profile_mean[index]
+            weight_sum = np.sum(bin_weights)
+            variance = np.sum(bin_weights * (bin_residual - mean) ** 2) / weight_sum if weight_sum > 0 else np.nan
+            profile_err[index] = math.sqrt(variance / max(np.sum(in_bin), 1)) if np.isfinite(variance) else np.nan
+
+    valid = np.isfinite(profile_mean)
+    fig, axis = plt.subplots(figsize=(6.8, 4.8))
+    axis.axhline(0.0, color="gray", linestyle="--", linewidth=0.9)
+    axis.errorbar(centers[valid], profile_mean[valid], yerr=profile_err[valid], fmt="o-", markersize=3, linewidth=0.9)
+    axis.set_xlabel(truth_label)
+    axis.set_ylabel(f"{pred_label} - {truth_label}")
+    axis.set_title(f"{title}: residual profile", loc="left")
+    output_path = output_dir / f"{name}_profile.png"
+    save_figure(fig, output_path)
+    plt.close(fig)
+    paths["profile"] = str(output_path)
+
+    metrics_path = output_dir / f"{name}_metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
+    return {"metrics": metrics, "metrics_json": str(metrics_path), "plots": paths}
+
+
 def plot_data_mc_histogram_from_counts(
     bins: np.ndarray,
     data_counts: np.ndarray,
@@ -50,6 +282,9 @@ def plot_data_mc_histogram_from_counts(
     xlabel: str,
     ylabel: str = "Weighted entries",
 ) -> str:
+    import matplotlib
+
+    matplotlib.use("Agg")
     from matplotlib import pyplot as plt
 
     set_plot_style()
@@ -141,6 +376,9 @@ def plot_2d_histogram_comparison(
     correlation: float | None = None,
     zlabel: str = "Weighted entries",
 ) -> str:
+    import matplotlib
+
+    matplotlib.use("Agg")
     from matplotlib import pyplot as plt
     from matplotlib.colors import LogNorm
 

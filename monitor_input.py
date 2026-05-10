@@ -19,7 +19,8 @@ except ModuleNotFoundError:
     yaml = None
 
 from generate_event_info_yaml import parse_feature_config
-from plot_style import plot_2d_histogram_comparison, plot_data_mc_histogram_from_counts
+from common import build_classification_lookup, channel_latex_label, process_latex_label
+from plot_style import plot_data_mc_histogram_from_counts, plot_truth_prediction_bundle
 from quantum.observables_builder import build_observables, get_observable_names
 
 DEFAULT_SAMPLE_LIMIT = 200_000
@@ -70,6 +71,78 @@ def build_sample_map(paths: list[Path], default_label: str, combine: bool) -> di
             label = f"{label}_{index}"
         samples[label] = parquet_files([path])
     return samples
+
+
+def display_process_label(label: str) -> str:
+    if label in {"Data", "data", "data94"}:
+        return "Data"
+    if label.startswith("Ztautau_"):
+        return channel_latex_label(label)
+    return process_latex_label(label)
+
+
+def category_lookup_payload(config: dict[str, Any]) -> dict[str, Any]:
+    lookup = build_classification_lookup(config)
+    return {
+        "sample_default_label": lookup.sample_default_label,
+        "sample_event_category_to_label": lookup.sample_event_category_to_label,
+    }
+
+
+def neutrino_prediction_labels(config: dict[str, Any]) -> set[str]:
+    prediction_cfg = config.get("NeutrinoPrediction") or {}
+    labels: set[str] = set()
+    for raw_value in prediction_cfg.values():
+        if isinstance(raw_value, dict):
+            for nested_value in raw_value.values():
+                if isinstance(nested_value, list):
+                    labels.update(str(item) for item in nested_value)
+                elif nested_value is not None:
+                    labels.add(str(nested_value))
+        elif isinstance(raw_value, list):
+            labels.update(str(item) for item in raw_value)
+        elif raw_value is not None:
+            labels.add(str(raw_value))
+    return labels
+
+
+def event_process_labels(
+    events: ak.Array,
+    sample_name: str,
+    is_data: bool,
+    label_lookup: dict[str, Any],
+) -> np.ndarray:
+    if is_data:
+        return np.asarray(["Data"] * len(events), dtype=object)
+    if "classification_target_name" in events.fields:
+        labels = np.asarray(ak.to_numpy(events["classification_target_name"], allow_missing=False), dtype=str)
+        return np.asarray([display_process_label(label) for label in labels], dtype=object)
+
+    category_map = label_lookup.get("sample_event_category_to_label", {}).get(sample_name)
+    if category_map and "event_category" in events.fields:
+        categories = to_numpy(events["event_category"], np.int64)
+        labels = [category_map.get(int(category), sample_name) for category in categories]
+        return np.asarray([display_process_label(label) for label in labels], dtype=object)
+
+    default_label = label_lookup.get("sample_default_label", {}).get(sample_name, sample_name)
+    return np.asarray([display_process_label(default_label)] * len(events), dtype=object)
+
+
+def raw_event_process_labels(
+    events: ak.Array,
+    sample_name: str,
+    label_lookup: dict[str, Any],
+) -> np.ndarray:
+    if "classification_target_name" in events.fields:
+        return np.asarray(ak.to_numpy(events["classification_target_name"], allow_missing=False), dtype=str)
+
+    category_map = label_lookup.get("sample_event_category_to_label", {}).get(sample_name)
+    if category_map and "event_category" in events.fields:
+        categories = to_numpy(events["event_category"], np.int64)
+        return np.asarray([category_map.get(int(category), "") for category in categories], dtype=str)
+
+    default_label = label_lookup.get("sample_default_label", {}).get(sample_name, sample_name)
+    return np.asarray([default_label] * len(events), dtype=str)
 
 
 def available_columns(file_name: str) -> set[str] | None:
@@ -240,6 +313,7 @@ def sample_feature_values(
 
 def needed_columns(feature_kind: str, weight_column: str | None) -> list[str]:
     columns = ["conditions"] if feature_kind == "global" else ["x", "x_mask"]
+    columns.extend(["classification_target_name", "event_category"])
     if weight_column:
         columns.append(weight_column)
     return columns
@@ -288,14 +362,14 @@ def histogram_feature(
     weight_column: str | None,
     max_events: int | None,
     row_groups_per_chunk: int,
+    *,
+    is_data: bool,
+    label_lookup: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     histograms: dict[str, dict[str, Any]] = {}
     columns = needed_columns(feature_kind, weight_column)
     for sample_name, files in sample_files.items():
-        counts = np.zeros(len(bins) - 1, dtype=np.float64)
-        sumw2 = np.zeros(len(bins) - 1, dtype=np.float64)
         rows = 0
-        weighted = False
         remaining = max_events
         for file_name in files:
             for row_groups in row_group_chunks(file_name, row_groups_per_chunk):
@@ -307,32 +381,54 @@ def histogram_feature(
                 if remaining is not None and len(events) > remaining:
                     events = events[:remaining]
                 values, weights = sample_feature_values(events, feature_kind, feature_idx, weight_column)
+                event_labels = event_process_labels(events, sample_name, is_data, label_lookup)
+                if feature_kind == "sequential":
+                    x_mask = to_numpy(events["x_mask"], bool)
+                    labels = np.broadcast_to(event_labels[:, None], x_mask.shape)[x_mask]
+                else:
+                    labels = event_labels
 
                 finite = np.isfinite(values)
                 if weights is not None:
                     finite &= np.isfinite(weights)
-                    weight_values = weights[finite]
-                    weighted = True
-                    counts += np.histogram(values[finite], bins=bins, weights=weight_values)[0]
-                    sumw2 += np.histogram(values[finite], bins=bins, weights=weight_values * weight_values)[0]
-                else:
-                    counts_chunk = np.histogram(values[finite], bins=bins)[0].astype(np.float64)
-                    counts += counts_chunk
-                    sumw2 += counts_chunk
+                finite_values = values[finite]
+                finite_labels = labels[finite]
+                finite_weights = None if weights is None else weights[finite]
+                for label in np.unique(finite_labels):
+                    label_mask = finite_labels == label
+                    state = histograms.setdefault(
+                        str(label),
+                        {
+                            "counts": np.zeros(len(bins) - 1, dtype=np.float64),
+                            "sumw2": np.zeros(len(bins) - 1, dtype=np.float64),
+                            "rows": 0,
+                            "weighted": False,
+                        },
+                    )
+                    if finite_weights is None:
+                        counts_chunk = np.histogram(finite_values[label_mask], bins=bins)[0].astype(np.float64)
+                        state["counts"] += counts_chunk
+                        state["sumw2"] += counts_chunk
+                    else:
+                        label_weights = finite_weights[label_mask]
+                        state["weighted"] = True
+                        state["counts"] += np.histogram(finite_values[label_mask], bins=bins, weights=label_weights)[0]
+                        state["sumw2"] += np.histogram(
+                            finite_values[label_mask],
+                            bins=bins,
+                            weights=label_weights * label_weights,
+                        )[0]
+                    state["rows"] += int(np.sum(label_mask))
 
                 rows += int(len(events))
                 if remaining is not None:
                     remaining -= int(len(events))
-                del events, values, weights
+                del events, values, weights, labels
                 gc.collect()
             if remaining is not None and remaining <= 0:
                 break
-        histograms[sample_name] = {
-            "counts": counts,
-            "sumw2": sumw2,
-            "rows": rows,
-            "weighted": weighted,
-        }
+        if rows == 0:
+            continue
     return histograms
 
 
@@ -385,6 +481,8 @@ def process_control_feature(payload: dict[str, Any]) -> dict[str, Any]:
         payload["weight_column"],
         payload["max_events"],
         payload["row_groups_per_chunk"],
+        is_data=True,
+        label_lookup=payload["label_lookup"],
     )
     mc_histograms = histogram_feature(
         payload["mc_files"],
@@ -394,6 +492,8 @@ def process_control_feature(payload: dict[str, Any]) -> dict[str, Any]:
         payload["weight_column"],
         payload["max_events"],
         payload["row_groups_per_chunk"],
+        is_data=False,
+        label_lookup=payload["label_lookup"],
     )
     plot_path = plot_control_histograms(
         feature_name,
@@ -538,105 +638,25 @@ def observable_values(
     return to_numpy(events[field], np.float64)
 
 
-def empty_comparison_state(x_edges: np.ndarray, y_edges: np.ndarray) -> dict[str, Any]:
-    return {
-        "counts": np.zeros((len(x_edges) - 1, len(y_edges) - 1), dtype=np.float64),
-        "sumw": 0.0,
-        "sumx": 0.0,
-        "sumy": 0.0,
-        "sumxx": 0.0,
-        "sumyy": 0.0,
-        "sumxy": 0.0,
-        "entries": 0,
-    }
-
-
-def update_comparison_state(
-    state: dict[str, Any],
-    x_values: np.ndarray,
-    y_values: np.ndarray,
-    weights: np.ndarray | None,
-    x_edges: np.ndarray,
-    y_edges: np.ndarray,
-) -> None:
-    finite = np.isfinite(x_values) & np.isfinite(y_values)
-    if weights is not None:
-        finite &= np.isfinite(weights)
-        weight_values = weights[finite]
-    else:
-        weight_values = None
-    x = x_values[finite]
-    y = y_values[finite]
-    if x.size == 0:
-        return
-    state["counts"] += np.histogram2d(x, y, bins=(x_edges, y_edges), weights=weight_values)[0]
-    w = np.ones_like(x, dtype=np.float64) if weight_values is None else weight_values.astype(np.float64)
-    state["sumw"] += float(np.sum(w))
-    state["sumx"] += float(np.sum(w * x))
-    state["sumy"] += float(np.sum(w * y))
-    state["sumxx"] += float(np.sum(w * x * x))
-    state["sumyy"] += float(np.sum(w * y * y))
-    state["sumxy"] += float(np.sum(w * x * y))
-    state["entries"] += int(x.size)
-
-
-def comparison_statistics(state: dict[str, Any]) -> dict[str, float]:
-    sumw = float(state["sumw"])
-    if sumw <= 0:
-        return {"mean_x": math.nan, "mean_y": math.nan, "corr": math.nan}
-    mean_x = state["sumx"] / sumw
-    mean_y = state["sumy"] / sumw
-    var_x = max(state["sumxx"] / sumw - mean_x * mean_x, 0.0)
-    var_y = max(state["sumyy"] / sumw - mean_y * mean_y, 0.0)
-    cov = state["sumxy"] / sumw - mean_x * mean_y
-    corr = cov / math.sqrt(var_x * var_y) if var_x > 0 and var_y > 0 else math.nan
-    return {"mean_x": mean_x, "mean_y": mean_y, "corr": corr}
-
-
-def plot_2d_comparison(
-    observable: str,
-    comparison_name: str,
-    x_label: str,
-    y_label: str,
-    x_edges: np.ndarray,
-    y_edges: np.ndarray,
-    state: dict[str, Any],
-    output_dir: Path,
-) -> str:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stats = comparison_statistics(state)
-    plot_path = output_dir / f"{observable}__{comparison_name}.png"
-    return plot_2d_histogram_comparison(
-        x_edges,
-        y_edges,
-        state["counts"],
-        plot_path,
-        title=f"{comparison_name}: {observable}",
-        xlabel=x_label,
-        ylabel=y_label,
-        entries=int(state["entries"]),
-        correlation=stats["corr"],
-    )
-
-
 def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
     observable = payload["observable"]
     low, high = QUANTUM_RANGES.get(observable, (-1.0, 1.0))
-    x_edges = np.linspace(low, high, payload["bins_2d"] + 1)
-    y_edges = np.linspace(low, high, payload["bins_2d"] + 1)
+    bins = np.linspace(low, high, payload["bins_2d"] + 1)
     comparisons = {
         "truth_vs_target": ("truth", "target", "Stored truth", "Target"),
         "truth_vs_baseline": ("truth", "baseline", "Stored truth", "Baseline"),
         "baseline_vs_target": ("baseline", "target", "Baseline", "Target"),
     }
-    states = {
-        name: empty_comparison_state(x_edges, y_edges)
+    values: dict[str, dict[str, list[np.ndarray]]] = {
+        name: {"x": [], "y": [], "weight": []}
         for name in comparisons
     }
     columns = quantum_columns(observable, payload["weight_column"])
+    columns.extend(["classification_target_name", "event_category"])
     sample_files = {**payload["data_files"], **payload["mc_files"]}
+    allowed_labels = set(payload["neutrino_prediction_labels"])
 
-    for files in sample_files.values():
+    for sample_name, files in sample_files.items():
         remaining = payload["max_events"]
         for file_name in files:
             for row_groups in row_group_chunks(file_name, payload["row_groups_per_chunk"]):
@@ -647,6 +667,14 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
                     continue
                 if remaining is not None and len(events) > remaining:
                     events = events[:remaining]
+                labels = raw_event_process_labels(events, sample_name, payload["label_lookup"])
+                keep = np.asarray([label in allowed_labels for label in labels], dtype=bool)
+                if not np.any(keep):
+                    if remaining is not None:
+                        remaining -= int(len(events))
+                    del events, labels
+                    gc.collect()
+                    continue
                 target_observables = build_target_observables(events)
                 weights = event_weights(events, payload["weight_column"])
                 for comparison_name, (x_source, y_source, _, _) in comparisons.items():
@@ -654,33 +682,41 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
                     y_values = observable_values(events, y_source, observable, target_observables)
                     if x_values is None or y_values is None:
                         continue
-                    update_comparison_state(states[comparison_name], x_values, y_values, weights, x_edges, y_edges)
+                    values[comparison_name]["x"].append(x_values[keep])
+                    values[comparison_name]["y"].append(y_values[keep])
+                    if weights is not None:
+                        values[comparison_name]["weight"].append(weights[keep])
                 if remaining is not None:
                     remaining -= int(len(events))
-                del events, target_observables, weights
+                del events, target_observables, weights, labels, keep
                 gc.collect()
             if remaining is not None and remaining <= 0:
                 break
 
-    plots = {}
+    results = {}
     output_dir = Path(payload["output_dir"])
     for comparison_name, (_, _, x_label, y_label) in comparisons.items():
-        if states[comparison_name]["entries"] == 0:
+        if not values[comparison_name]["x"]:
             continue
-        plots[comparison_name] = plot_2d_comparison(
+        truth_values = np.concatenate(values[comparison_name]["x"])
+        pred_values = np.concatenate(values[comparison_name]["y"])
+        weights = np.concatenate(values[comparison_name]["weight"]) if values[comparison_name]["weight"] else None
+        results[comparison_name] = plot_truth_prediction_bundle(
+            truth_values,
+            pred_values,
+            output_dir / comparison_name,
             observable,
-            comparison_name,
-            x_label,
-            y_label,
-            x_edges,
-            y_edges,
-            states[comparison_name],
-            output_dir,
+            bins=bins,
+            weight=weights,
+            truth_label=x_label,
+            pred_label=y_label,
+            xaxis_label=observable,
+            title=f"{comparison_name}: {observable}",
         )
     return {
         "observable": observable,
-        "plots": plots,
-        "entries": {name: int(state["entries"]) for name, state in states.items()},
+        "plots": {name: result["plots"] for name, result in results.items()},
+        "metrics": {name: result["metrics"] for name, result in results.items()},
     }
 
 
@@ -708,7 +744,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("monitor_plots"))
     parser.add_argument("--max-events", type=int, default=None)
-    parser.add_argument("--num-workers", type=int, default=max(1, (os.cpu_count() or 1) // 2))
+    parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--bins", type=int, default=60)
     parser.add_argument("--bins-2d", type=int, default=70)
     parser.add_argument("--max-integer-bins", type=int, default=120)
@@ -733,6 +769,7 @@ def main() -> None:
         "max_integer_bins": args.max_integer_bins,
         "weight_column": args.weight_column or None,
         "row_groups_per_chunk": args.row_groups_per_chunk,
+        "label_lookup": category_lookup_payload(config),
     }
 
     all_results: dict[str, Any] = {
@@ -740,6 +777,7 @@ def main() -> None:
         "mc_samples": {name: len(files) for name, files in mc_files.items()},
         "max_events": args.max_events,
         "weight_column": args.weight_column,
+        "neutrino_prediction_labels": sorted(neutrino_prediction_labels(config)),
     }
 
     if not args.skip_global:
@@ -790,6 +828,7 @@ def main() -> None:
                 "observable": observable,
                 "bins_2d": args.bins_2d,
                 "output_dir": str(quantum_dir),
+                "neutrino_prediction_labels": sorted(neutrino_prediction_labels(config)),
             }
             for observable in get_observable_names()
         ]
@@ -797,13 +836,16 @@ def main() -> None:
         quantum_results = run_tasks(quantum_tasks, args.num_workers, process_quantum_observable, "observable")
         all_results["quantum_2d"] = {
             result["observable"]: {
-                name: str(Path(path).relative_to(args.output_dir))
-                for name, path in result["plots"].items()
+                comparison: {
+                    plot_name: str(Path(plot_path).relative_to(args.output_dir))
+                    for plot_name, plot_path in plots.items()
+                }
+                for comparison, plots in result["plots"].items()
             }
             for result in quantum_results
         }
-        all_results["quantum_2d_entries"] = {
-            result["observable"]: result["entries"]
+        all_results["quantum_metrics"] = {
+            result["observable"]: result["metrics"]
             for result in quantum_results
         }
 
