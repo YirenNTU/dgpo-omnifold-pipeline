@@ -162,6 +162,8 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
         elif field_name.startswith("missing_") or field_name in {"missing_pt", "missing_E", "missing_energy"}:
             columns.add("missing_p4")
     columns.update(name for name in schema_names if name.endswith("_cut"))
+    columns.update(name for name in schema_names if name.endswith("_p4"))
+    columns.update(name for name in schema_names if name.startswith("truth_"))
     return sorted(name for name in columns if name in schema_names)
 
 def build_point_cloud(
