@@ -217,6 +217,7 @@ def plot_truth_prediction_bundle(
 
     residual = pred_values - truth_values
     relative = np.divide(residual, truth_values, out=np.full_like(residual, np.nan), where=np.abs(truth_values) > 1e-12)
+    residual_n_bins = bins if isinstance(bins, int) else max(len(np.asarray(bins, dtype=float)) - 1, 1)
     for key, values, xlabel in (
         ("residual", residual, f"{pred_label} - {truth_label}"),
         ("relative_residual", relative, f"({pred_label} - {truth_label}) / {truth_label}"),
@@ -225,7 +226,13 @@ def plot_truth_prediction_bundle(
         if not np.any(finite):
             continue
         fig, axis = plt.subplots(figsize=(6.8, 4.8))
-        axis.hist(values[finite], bins=auto_bins([values[finite]], n_bins=bins), weights=None if weights is None else weights[finite], histtype="stepfilled", alpha=0.75)
+        axis.hist(
+            values[finite],
+            bins=auto_bins([values[finite]], n_bins=residual_n_bins),
+            weights=None if weights is None else weights[finite],
+            histtype="stepfilled",
+            alpha=0.75,
+        )
         axis.axvline(0.0, color="gray", linestyle="--", linewidth=0.9)
         axis.set_xlabel(xlabel)
         axis.set_ylabel("Weighted entries")
