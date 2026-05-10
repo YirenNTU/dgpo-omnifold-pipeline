@@ -338,13 +338,16 @@ def build_output_events(
 
     visible_a = rebuild_vector(selected_events["lead_a_visible_p4"])
     visible_b = rebuild_vector(selected_events["lead_b_visible_p4"])
-    truth_visible_a = rebuild_vector(selected_events["truth_visible_a_p4"])
-    truth_visible_b = rebuild_vector(selected_events["truth_visible_b_p4"])
 
     if sample.is_signal:
         truth_tau_a = rebuild_vector(selected_events["truth_tau_a_p4"])
         truth_tau_b = rebuild_vector(selected_events["truth_tau_b_p4"])
+        truth_visible_a = rebuild_vector(selected_events["truth_visible_a_p4"])
+        truth_visible_b = rebuild_vector(selected_events["truth_visible_b_p4"])
+
     else:
+        truth_visible_a = visible_a * 0
+        truth_visible_b = visible_b * 0
         truth_tau_a = visible_a * 0 # meaningless stuff
         truth_tau_b = visible_b * 0 # meaningless stuff
 
