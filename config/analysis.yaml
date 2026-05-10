@@ -138,7 +138,7 @@ Inputs:
   Global:
     Fields:
       - thrust_Mag
-      - charged_E
+#      - charged_E
       - missing_px
       - missing_py
       - missing_pz
