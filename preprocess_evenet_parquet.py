@@ -228,7 +228,7 @@ def process_training_shard_worker(payload: dict[str, Any]) -> dict[str, Any]:
         gc.collect()
         if split_name == "train":
             diffusion_indices = select_diffusion_train_indices(data, indices)
-
+            print(len(diffusion_indices))
             if len(diffusion_indices) > 0:
                 diffusion_pdict = slice_event_dict(data, diffusion_indices, n_events)
                 diffusion_chunks: list[pa.Table] = []
