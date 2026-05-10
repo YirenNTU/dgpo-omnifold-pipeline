@@ -426,7 +426,7 @@ def build_output_events(
     if "nprong" in selected_events.fields:
         fields["nprong"] = to_numpy(selected_events["nprong"], np.int32)
 
-    passthrough = [
+    passthrough = {
         "event_category",
         "truth_QI_region",
         "analyzing_power",
@@ -434,10 +434,10 @@ def build_output_events(
         "analyzing_power_b",
         "weight",
         "central_weight",
-    ]
-    passthrough.extend([f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"]])
-    passthrough.extend([f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"]])
-    passthrough.extend([f"truth_cos_theta_A_{r}_times_cos_theta_B_{l}" for r in ["k", "n", "r"] for l in ["k", "n", "r"]])
+    }
+    passthrough.update({f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"]})
+    passthrough.update({f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"]})
+    passthrough.update({f"truth_cos_theta_A_{r}_times_cos_theta_B_{l}" for r in ["k", "n", "r"] for l in ["k", "n", "r"]})
 
     passthrough.update(name for name in selected_events.fields if name.endswith("_cut"))
     for field in sorted(passthrough):
