@@ -612,7 +612,7 @@ def build_target_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
 
 def quantum_columns(observable: str, weight_column: str | None) -> list[str]:
     columns = target_visible_columns()
-    columns.extend([f"truth_{observable}", f"baseline_{observable}"])
+    columns.extend([f"truth_{observable}", f"baseline_{observable}", "baseline_mmc_likelihood", "mmc_likelihood"])
     if weight_column:
         columns.append(weight_column)
     return list(dict.fromkeys(columns))
@@ -638,19 +638,24 @@ def observable_values(
     return to_numpy(events[field], np.float64)
 
 
+def baseline_valid_mask(events: ak.Array) -> np.ndarray:
+    for field in ("baseline_mmc_likelihood", "mmc_likelihood"):
+        if field in events.fields:
+            likelihood = to_numpy(events[field], np.float64)
+            return np.isfinite(likelihood) & (likelihood > 0.0)
+    return np.ones(len(events), dtype=bool)
+
+
 def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
     observable = payload["observable"]
     low, high = QUANTUM_RANGES.get(observable, (-1.0, 1.0))
     bins = np.linspace(low, high, payload["bins_2d"] + 1)
     comparisons = {
-        "truth_vs_target": ("truth", "target", "Stored truth", "Target"),
-        "truth_vs_baseline": ("truth", "baseline", "Stored truth", "Baseline"),
-        "baseline_vs_target": ("baseline", "target", "Baseline", "Target"),
+        "truth_vs_target": ("truth", "target", "Stored truth", "Target", {"Baseline": "baseline"}),
+        "target_vs_baseline": ("target", "baseline", "Target", "Baseline", {"Stored truth": "truth"}),
+        "truth_vs_baseline": ("truth", "baseline", "Stored truth", "Baseline", {"Target": "target"}),
     }
-    values: dict[str, dict[str, list[np.ndarray]]] = {
-        name: {"x": [], "y": [], "weight": []}
-        for name in comparisons
-    }
+    process_values: dict[str, dict[str, Any]] = {}
     columns = quantum_columns(observable, payload["weight_column"])
     columns.extend(["classification_target_name", "event_category"])
     sample_files = {**payload["data_files"], **payload["mc_files"]}
@@ -677,46 +682,81 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
                     continue
                 target_observables = build_target_observables(events)
                 weights = event_weights(events, payload["weight_column"])
-                for comparison_name, (x_source, y_source, _, _) in comparisons.items():
-                    x_values = observable_values(events, x_source, observable, target_observables)
-                    y_values = observable_values(events, y_source, observable, target_observables)
-                    if x_values is None or y_values is None:
-                        continue
-                    values[comparison_name]["x"].append(x_values[keep])
-                    values[comparison_name]["y"].append(y_values[keep])
+                source_values = {
+                    "truth": observable_values(events, "truth", observable, target_observables),
+                    "target": observable_values(events, "target", observable, target_observables),
+                    "baseline": observable_values(events, "baseline", observable, target_observables),
+                }
+                if source_values["baseline"] is not None:
+                    baseline_values = source_values["baseline"].copy()
+                    baseline_values[~baseline_valid_mask(events)] = np.nan
+                    source_values["baseline"] = baseline_values
+
+                for process_name in np.unique(labels[keep]):
+                    process_mask = keep & (labels == process_name)
+                    state = process_values.setdefault(
+                        str(process_name),
+                        {"truth": [], "target": [], "baseline": [], "weight": [], "total": 0},
+                    )
+                    state["total"] += int(np.sum(process_mask))
+                    for source_name, values_array in source_values.items():
+                        if values_array is not None:
+                            state[source_name].append(values_array[process_mask])
                     if weights is not None:
-                        values[comparison_name]["weight"].append(weights[keep])
+                        state["weight"].append(weights[process_mask])
                 if remaining is not None:
                     remaining -= int(len(events))
-                del events, target_observables, weights, labels, keep
+                del events, target_observables, weights, labels, keep, source_values
                 gc.collect()
             if remaining is not None and remaining <= 0:
                 break
 
     results = {}
     output_dir = Path(payload["output_dir"])
-    for comparison_name, (_, _, x_label, y_label) in comparisons.items():
-        if not values[comparison_name]["x"]:
-            continue
-        truth_values = np.concatenate(values[comparison_name]["x"])
-        pred_values = np.concatenate(values[comparison_name]["y"])
-        weights = np.concatenate(values[comparison_name]["weight"]) if values[comparison_name]["weight"] else None
-        results[comparison_name] = plot_truth_prediction_bundle(
-            truth_values,
-            pred_values,
-            output_dir / comparison_name,
-            observable,
-            bins=bins,
-            weight=weights,
-            truth_label=x_label,
-            pred_label=y_label,
-            xaxis_label=observable,
-            title=f"{comparison_name}: {observable}",
-        )
+    for comparison_name, (x_source, y_source, x_label, y_label, extra_sources) in comparisons.items():
+        for process_name, state in process_values.items():
+            if not state[x_source] or not state[y_source]:
+                continue
+            x_values = np.concatenate(state[x_source])
+            y_values = np.concatenate(state[y_source])
+            weights = np.concatenate(state["weight"]) if state["weight"] else None
+            extra_predictions = {
+                extra_label: np.concatenate(state[source_name])
+                for extra_label, source_name in extra_sources.items()
+                if state[source_name]
+            }
+            process_result = plot_truth_prediction_bundle(
+                x_values,
+                y_values,
+                output_dir / comparison_name / process_name,
+                observable,
+                bins=bins,
+                weight=weights,
+                truth_label=x_label,
+                pred_label=y_label,
+                xaxis_label=observable,
+                title=f"{comparison_name}: {observable}",
+                summary_title=f"{display_process_label(process_name)} summary",
+                total_entries=state["total"],
+                extra_predictions=extra_predictions,
+            )
+            results.setdefault(comparison_name, {})[process_name] = process_result
     return {
         "observable": observable,
-        "plots": {name: result["plots"] for name, result in results.items()},
-        "metrics": {name: result["metrics"] for name, result in results.items()},
+        "plots": {
+            comparison_name: {
+                process_name: result["plots"]
+                for process_name, result in process_results.items()
+            }
+            for comparison_name, process_results in results.items()
+        },
+        "metrics": {
+            comparison_name: {
+                process_name: result["metrics"]
+                for process_name, result in process_results.items()
+            }
+            for comparison_name, process_results in results.items()
+        },
     }
 
 
@@ -837,10 +877,13 @@ def main() -> None:
         all_results["quantum_2d"] = {
             result["observable"]: {
                 comparison: {
-                    plot_name: str(Path(plot_path).relative_to(args.output_dir))
-                    for plot_name, plot_path in plots.items()
+                    process_name: {
+                        plot_name: str(Path(plot_path).relative_to(args.output_dir))
+                        for plot_name, plot_path in process_plots.items()
+                    }
+                    for process_name, process_plots in comparison_plots.items()
                 }
-                for comparison, plots in result["plots"].items()
+                for comparison, comparison_plots in result["plots"].items()
             }
             for result in quantum_results
         }

@@ -132,8 +132,14 @@ def plot_truth_prediction_bundle(
     pred_label: str = "Prediction",
     xaxis_label: str | None = None,
     title: str | None = None,
+    summary_title: str | None = None,
+    total_entries: int | None = None,
+    extra_predictions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Write 2D, 1D, residual, relative residual, and profile plots for one truth/pred pair."""
+    """Write summary and diagnostics plots for one truth/pred pair.
+
+    extra_predictions are overlaid only in the 1D, residual, relative residual, and profile panels.
+    """
     import json
     import matplotlib
 
@@ -145,8 +151,14 @@ def plot_truth_prediction_bundle(
     output_dir.mkdir(parents=True, exist_ok=True)
     xaxis_label = xaxis_label or name
     title = title or name
+    summary_title = summary_title or f"{title} summary"
+    total_entries = int(total_entries) if total_entries is not None else min(len(to_numpy(truth)), len(to_numpy(pred)))
     truth_values, pred_values, weights = _flat_finite_pair(truth, pred, weight)
     metrics = prediction_metrics(truth_values, pred_values, bins=bins, weight=weights)
+    valid_entries = int(metrics["entries"])
+    metrics["total_entries"] = float(total_entries)
+    metrics["valid_entries"] = float(valid_entries)
+    metrics["valid_ratio"] = float(valid_entries / total_entries) if total_entries else float("nan")
     if truth_values.size == 0:
         metrics_path = output_dir / f"{name}_metrics.json"
         metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
@@ -156,122 +168,194 @@ def plot_truth_prediction_bundle(
     centers = 0.5 * (edges[:-1] + edges[1:])
     paths: dict[str, str] = {}
 
-    fig, axis = plt.subplots(figsize=(8.1, 5.8))
+    fig, (axis, text_axis) = plt.subplots(
+        1,
+        2,
+        figsize=(10.2, 5.8),
+        gridspec_kw={"width_ratios": [3.2, 1.35], "wspace": 0.16},
+    )
     counts, x_edges, y_edges = np.histogram2d(truth_values, pred_values, bins=(edges, edges), weights=weights)
     mesh = axis.pcolormesh(x_edges, y_edges, np.ma.masked_where(counts.T <= 0, counts.T), cmap="viridis")
     axis.plot([edges[0], edges[-1]], [edges[0], edges[-1]], color="white", linestyle="--", linewidth=1.1)
     axis.set_xlabel(truth_label)
     axis.set_ylabel(pred_label)
-    axis.set_title(f"{title}: 2D", loc="left")
-    metric_text = "\n".join(
-        [
-            f"entries = {int(metrics['entries'])}",
-            f"MAE = {metrics['mae']:.4g}",
-            f"RMSE = {metrics['rmse']:.4g}",
-            f"Pearson = {metrics['pearson']:.4g}",
-            f"JSD = {metrics['jsd']:.4g}",
-        ]
-    )
-    axis.text(
-        1.03,
-        0.98,
-        metric_text,
-        transform=axis.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9,
-        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "0.8"},
-    )
+    axis.set_title(title, loc="left")
     colorbar = fig.colorbar(mesh, ax=axis, pad=0.02)
     colorbar.set_label("Weighted entries")
-    fig.subplots_adjust(right=0.78)
-    output_path = output_dir / f"{name}_2d.png"
-    save_figure(fig, output_path)
-    plt.close(fig)
-    paths["2d"] = str(output_path)
-
-    fig, (axis, ratio_axis) = plt.subplots(
-        2,
-        1,
-        figsize=(6.8, 6.0),
-        sharex=True,
-        gridspec_kw={"height_ratios": [3.0, 1.0], "hspace": 0.06},
+    text_axis.axis("off")
+    text_axis.text(0.0, 0.98, summary_title, ha="left", va="top", fontsize=14, fontweight="bold")
+    text_axis.text(
+        0.0,
+        0.80,
+        "\n".join(
+            [
+                f"Total entries: {total_entries}",
+                f"Valid entries: {valid_entries}",
+                f"Valid ratio: {metrics['valid_ratio']:.3f}",
+            ]
+        ),
+        ha="left",
+        va="top",
+        fontsize=11,
+        linespacing=1.45,
     )
-    truth_counts, _ = np.histogram(truth_values, bins=edges, weights=weights)
-    pred_counts, _ = np.histogram(pred_values, bins=edges, weights=weights)
-    axis.hist(truth_values, bins=edges, weights=weights, histtype="step", linewidth=1.5, label=truth_label)
-    axis.hist(pred_values, bins=edges, weights=weights, histtype="step", linewidth=1.5, label=pred_label)
-    ratio = np.divide(pred_counts, truth_counts, out=np.full_like(pred_counts, np.nan, dtype=float), where=truth_counts != 0)
-    ratio_axis.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
-    ratio_axis.plot(centers, ratio, "o-", markersize=2.5, linewidth=0.8)
-    axis.set_ylabel("Weighted entries")
-    axis.set_title(f"{title}: 1D", loc="left")
-    axis.legend(frameon=False)
-    ratio_axis.set_ylabel(f"{pred_label}\n/ {truth_label}")
-    ratio_axis.set_xlabel(xaxis_label)
-    ratio_axis.grid(axis="y", alpha=0.25)
-    output_path = output_dir / f"{name}_1d.png"
+    text_axis.text(0.0, 0.56, "Metrics", ha="left", va="top", fontsize=12, fontweight="bold")
+    text_axis.text(
+        0.0,
+        0.45,
+        "\n".join(
+            [
+                f"RMSE: {metrics['rmse']:.4g}",
+                f"MAE: {metrics['mae']:.4g}",
+                f"Pearson: {metrics['pearson']:.4g}",
+                f"JSD: {metrics['jsd']:.4g}",
+            ]
+        ),
+        ha="left",
+        va="top",
+        fontsize=11,
+        linespacing=1.45,
+    )
+    output_path = output_dir / f"{name}_summary.png"
     save_figure(fig, output_path)
     plt.close(fig)
-    paths["1d"] = str(output_path)
+    paths["summary"] = str(output_path)
 
-    residual = pred_values - truth_values
-    relative = np.divide(residual, truth_values, out=np.full_like(residual, np.nan), where=np.abs(truth_values) > 1e-12)
+    extra_predictions = extra_predictions or {}
+    prediction_map = {pred_label: pred}
+    prediction_map.update(extra_predictions)
+    clean_predictions: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None]] = {
+        label: _flat_finite_pair(truth, values, weight)
+        for label, values in prediction_map.items()
+    }
+    all_distribution_values = [truth_values]
+    all_distribution_values.extend(values for _, values, _ in clean_predictions.values())
+    distribution_edges = auto_bins(all_distribution_values, n_bins=bins) if isinstance(bins, int) else edges
+
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(12.0, 8.2),
+        gridspec_kw={"height_ratios": [1.0, 1.0], "wspace": 0.28, "hspace": 0.34},
+    )
+    dist_axis, residual_axis = axes[0]
+    profile_axis, relative_axis = axes[1]
+
+    dist_axis.hist(truth_values, bins=distribution_edges, weights=weights, histtype="step", linewidth=1.6, label=truth_label)
+    for label, (_, values, clean_weight) in clean_predictions.items():
+        dist_axis.hist(values, bins=distribution_edges, weights=clean_weight, histtype="step", linewidth=1.4, label=label)
+    dist_axis.set_ylabel("Weighted entries")
+    dist_axis.set_title("1D distributions", loc="left")
+    dist_axis.legend(frameon=False, fontsize=9)
+
     residual_n_bins = bins if isinstance(bins, int) else max(len(np.asarray(bins, dtype=float)) - 1, 1)
-    for key, values, xlabel in (
-        ("residual", residual, f"{pred_label} - {truth_label}"),
-        ("relative_residual", relative, f"({pred_label} - {truth_label}) / {truth_label}"),
-    ):
-        finite = np.isfinite(values)
-        if not np.any(finite):
-            continue
-        fig, axis = plt.subplots(figsize=(6.8, 4.8))
-        axis.hist(
-            values[finite],
-            bins=auto_bins([values[finite]], n_bins=residual_n_bins),
-            weights=None if weights is None else weights[finite],
-            histtype="stepfilled",
-            alpha=0.75,
+    residual_lines = []
+    relative_lines = []
+    for label, (clean_truth, clean_pred, clean_weight) in clean_predictions.items():
+        residual = clean_pred - clean_truth
+        relative = np.divide(residual, clean_truth, out=np.full_like(residual, np.nan), where=np.abs(clean_truth) > 1e-12)
+        finite_residual = np.isfinite(residual)
+        if np.any(finite_residual):
+            residual_axis.hist(
+                residual[finite_residual],
+                bins=auto_bins([residual[finite_residual]], n_bins=residual_n_bins),
+                weights=None if clean_weight is None else clean_weight[finite_residual],
+                histtype="step",
+                linewidth=1.3,
+                label=label,
+            )
+            residual_lines.append(
+                f"{label}: mean={np.nanmean(residual[finite_residual]):.3g}, std={np.nanstd(residual[finite_residual]):.3g}"
+            )
+        finite_relative = np.isfinite(relative)
+        if np.any(finite_relative):
+            relative_axis.hist(
+                relative[finite_relative],
+                bins=auto_bins([relative[finite_relative]], n_bins=residual_n_bins),
+                weights=None if clean_weight is None else clean_weight[finite_relative],
+                histtype="step",
+                linewidth=1.3,
+                label=label,
+            )
+            relative_lines.append(
+                f"{label}: mean={np.nanmean(relative[finite_relative]):.3g}, std={np.nanstd(relative[finite_relative]):.3g}"
+            )
+
+        profile_mean = np.full(len(centers), np.nan)
+        profile_err = np.full(len(centers), np.nan)
+        for index in range(len(centers)):
+            in_bin = (clean_truth >= edges[index]) & (clean_truth < edges[index + 1])
+            if index == len(centers) - 1:
+                in_bin = (clean_truth >= edges[index]) & (clean_truth <= edges[index + 1])
+            if not np.any(in_bin):
+                continue
+            bin_residual = residual[in_bin]
+            bin_weights = None if clean_weight is None else clean_weight[in_bin]
+            profile_mean[index] = _weighted_mean(bin_residual, bin_weights)
+            if bin_weights is None:
+                profile_err[index] = np.nanstd(bin_residual) / math.sqrt(max(np.sum(np.isfinite(bin_residual)), 1))
+            else:
+                mean = profile_mean[index]
+                weight_sum = np.sum(bin_weights)
+                variance = np.sum(bin_weights * (bin_residual - mean) ** 2) / weight_sum if weight_sum > 0 else np.nan
+                profile_err[index] = math.sqrt(variance / max(np.sum(in_bin), 1)) if np.isfinite(variance) else np.nan
+        valid_profile = np.isfinite(profile_mean)
+        if np.any(valid_profile):
+            profile_axis.errorbar(
+                centers[valid_profile],
+                profile_mean[valid_profile],
+                yerr=profile_err[valid_profile],
+                fmt="o",
+                markersize=3,
+                linewidth=0.9,
+                label=label,
+            )
+
+    residual_axis.axvline(0.0, color="gray", linestyle="--", linewidth=0.9)
+    residual_axis.set_xlabel(f"Prediction - {truth_label}")
+    residual_axis.set_ylabel("Weighted entries")
+    residual_axis.set_title("Residuals", loc="left")
+    residual_axis.legend(frameon=False, fontsize=9)
+    if residual_lines:
+        residual_axis.text(
+            0.98,
+            0.96,
+            "\n".join(residual_lines),
+            transform=residual_axis.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8.5,
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.85", "alpha": 0.9},
         )
-        axis.axvline(0.0, color="gray", linestyle="--", linewidth=0.9)
-        axis.set_xlabel(xlabel)
-        axis.set_ylabel("Weighted entries")
-        axis.set_title(f"{title}: {key.replace('_', ' ')}", loc="left")
-        output_path = output_dir / f"{name}_{key}.png"
-        save_figure(fig, output_path)
-        plt.close(fig)
-        paths[key] = str(output_path)
 
-    profile_mean = np.full(len(centers), np.nan)
-    profile_err = np.full(len(centers), np.nan)
-    for index in range(len(centers)):
-        in_bin = (truth_values >= edges[index]) & (truth_values < edges[index + 1])
-        if index == len(centers) - 1:
-            in_bin = (truth_values >= edges[index]) & (truth_values <= edges[index + 1])
-        if not np.any(in_bin):
-            continue
-        bin_residual = residual[in_bin]
-        bin_weights = None if weights is None else weights[in_bin]
-        profile_mean[index] = _weighted_mean(bin_residual, bin_weights)
-        if bin_weights is None:
-            profile_err[index] = np.nanstd(bin_residual) / math.sqrt(max(np.sum(np.isfinite(bin_residual)), 1))
-        else:
-            mean = profile_mean[index]
-            weight_sum = np.sum(bin_weights)
-            variance = np.sum(bin_weights * (bin_residual - mean) ** 2) / weight_sum if weight_sum > 0 else np.nan
-            profile_err[index] = math.sqrt(variance / max(np.sum(in_bin), 1)) if np.isfinite(variance) else np.nan
+    profile_axis.axhline(0.0, color="gray", linestyle="--", linewidth=0.9)
+    profile_axis.set_xlabel(truth_label)
+    profile_axis.set_ylabel(f"Prediction - {truth_label}")
+    profile_axis.set_title("Residual profile", loc="left")
+    profile_axis.legend(frameon=False, fontsize=9)
 
-    valid = np.isfinite(profile_mean)
-    fig, axis = plt.subplots(figsize=(6.8, 4.8))
-    axis.axhline(0.0, color="gray", linestyle="--", linewidth=0.9)
-    axis.errorbar(centers[valid], profile_mean[valid], yerr=profile_err[valid], fmt="o-", markersize=3, linewidth=0.9)
-    axis.set_xlabel(truth_label)
-    axis.set_ylabel(f"{pred_label} - {truth_label}")
-    axis.set_title(f"{title}: residual profile", loc="left")
-    output_path = output_dir / f"{name}_profile.png"
+    relative_axis.axvline(0.0, color="gray", linestyle="--", linewidth=0.9)
+    relative_axis.set_xlabel(f"(Prediction - {truth_label}) / {truth_label}")
+    relative_axis.set_ylabel("Weighted entries")
+    relative_axis.set_title("Relative residuals", loc="left")
+    relative_axis.legend(frameon=False, fontsize=9)
+    if relative_lines:
+        relative_axis.text(
+            0.98,
+            0.96,
+            "\n".join(relative_lines),
+            transform=relative_axis.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8.5,
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.85", "alpha": 0.9},
+        )
+
+    fig.suptitle(title, x=0.08, ha="left", fontsize=13, fontweight="bold")
+    output_path = output_dir / f"{name}_diagnostics.png"
     save_figure(fig, output_path)
     plt.close(fig)
-    paths["profile"] = str(output_path)
+    paths["diagnostics"] = str(output_path)
 
     metrics_path = output_dir / f"{name}_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
