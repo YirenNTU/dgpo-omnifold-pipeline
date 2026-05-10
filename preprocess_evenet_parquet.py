@@ -25,6 +25,19 @@ from preprocessing.helper import (
     slice_event_dict,
 )
 
+
+def select_diffusion_train_indices(data: dict[str, np.ndarray], train_indices: np.ndarray) -> np.ndarray:
+    if "num_invisible_valid" not in data:
+        raise KeyError("Cannot build train-diffusion: missing field num_invisible_valid")
+
+    values = np.asarray(data["num_invisible_valid"][train_indices])
+
+    # Robust to shape (N,), (N, 1), or similar.
+    values = values.reshape(len(train_indices), -1)
+
+    keep = np.any(values > 0, axis=1)
+    return train_indices[keep]
+
 def ensure_global_config_loaded(config_path: Path) -> None:
     if not getattr(global_config, "loaded", False):
         global_config.load_yaml(str(config_path))
@@ -188,7 +201,7 @@ def process_training_shard_worker(payload: dict[str, Any]) -> dict[str, Any]:
     data = load_parquet_numeric_dict(shard_path, reference_schema, is_data=False)
     n_events = len(data["x"])
     split_indices = dict(zip(("train", "val", "test"), event_split_indices(n_events, split_ratio, rng)))
-    result = {"shard_index": shard_index, "train": [], "val": [], "test": [], "shape_metadata": None, "train_stats": train_stats}
+    result = {"shard_index": shard_index, "train": [], "val": [], "test": [], "train-diffusion": [], "shape_metadata": None, "train_stats": train_stats}
 
     for split_name, indices in split_indices.items():
         if len(indices) == 0:
@@ -213,6 +226,23 @@ def process_training_shard_worker(payload: dict[str, Any]) -> dict[str, Any]:
         )
         del pdict, chunks
         gc.collect()
+        if split_name == "train":
+            diffusion_indices = select_diffusion_train_indices(data, indices)
+
+            if len(diffusion_indices) > 0:
+                diffusion_pdict = slice_event_dict(data, diffusion_indices, n_events)
+                diffusion_chunks: list[pa.Table] = []
+                diffusion_out_path = split_output_path(store_dir, "train-diffusion", shard_index)
+                result["train-diffusion"].append(
+                    write_chunk_table(
+                        diffusion_chunks,
+                        diffusion_out_path,
+                        shuffle_seed=int(payload["shuffle_seed"]) + shard_index,
+                    )
+                )
+                del diffusion_pdict, diffusion_chunks
+                gc.collect()
+
     del data, split_indices
     gc.collect()
     result["train_stats"] = train_stats
@@ -288,6 +318,7 @@ def preprocess_shards(
     (store_dir / "train").mkdir(parents=True, exist_ok=True)
     (store_dir / "val").mkdir(parents=True, exist_ok=True)
     (store_dir / "test").mkdir(parents=True, exist_ok=True)
+    (store_dir / "train-diffusion").mkdir(parents=True, exist_ok=True)
     (store_dir / "data").mkdir(parents=True, exist_ok=True)
 
     reference_schema = build_reference_schema(training_shards)
@@ -297,6 +328,7 @@ def preprocess_shards(
         "train": [],
         "val": [],
         "test": [],
+        "train-diffusion": [],
         "data": []
     }
 
@@ -325,7 +357,7 @@ def preprocess_shards(
             shape_metadata = result["shape_metadata"]
         elif result["shape_metadata"] is not None and shape_metadata != result["shape_metadata"]:
             raise AssertionError("Shape metadata mismatch across worker results.")
-        for split_name in ("train", "val", "test"):
+        for split_name in ("train", "val", "test", "train-diffusion"):
             summary[split_name].extend(result[split_name])
 
     data_payloads = [
