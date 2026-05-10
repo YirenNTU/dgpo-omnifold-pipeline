@@ -449,19 +449,31 @@ def build_output_events(
         "analyzing_power_b",
         "weight",
         "central_weight",
+        "truth_theta_cm",
+        "truth_mtautau"
     }
     passthrough.update(f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"])
     passthrough.update(f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"])
     passthrough.update(f"truth_cos_theta_A_{r}_times_cos_theta_B_{l}" for r in ["k", "n", "r"] for l in ["k", "n", "r"])
     passthrough.update(name for name in selected_events.fields if name.endswith("_cut"))
 
-    print(passthrough)
+
+    baseline_passthrough = {
+        "mmc_likelihood",
+        "theta_cm",
+        "mtautau",
+    }
+    baseline_passthrough.update(f"cos_theta_A_{r}" for r in ["k", "n", "r"])
+    baseline_passthrough.update(f"cos_theta_B_{r}" for r in ["k", "n", "r"])
+    baseline_passthrough.update(f"cos_theta_A_{r}_times_cos_theta_B_{l}" for r in ["k", "n", "r"] for l in ["k", "n", "r"])
 
     for field in sorted(passthrough):
-        print(field, field in selected_events.fields)
         if field in selected_events.fields and field not in fields:
             fields[field] = selected_events[field]
 
+    for field in sorted(baseline_passthrough):
+        if field in selected_events.fields and f"baseline_{field}" not in fields:
+            fields[f"baseline_{field}"] = selected_events[field]
     for field_name, values in list(fields.items()):
         if isinstance(values, np.ndarray):
             fields[field_name] = np.ascontiguousarray(values)
