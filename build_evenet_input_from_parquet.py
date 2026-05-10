@@ -283,7 +283,7 @@ def features_from_p4_local(p4: ak.Array, feature_names: tuple[str, ...]) -> np.n
         elif feature_name == "eta":
             values = ak.to_numpy(p4.eta, allow_missing=False)
         elif feature_name == "phi":
-            values = ak.to_numpy(p4.eta, allow_missing=False)
+            values = ak.to_numpy(p4.phi, allow_missing=False)
         elif feature_name == "mass":
             values = ak.to_numpy(p4.mass, allow_missing=False)
         else:

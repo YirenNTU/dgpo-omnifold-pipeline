@@ -31,7 +31,6 @@ def select_diffusion_train_indices(data: dict[str, np.ndarray], train_indices: n
         raise KeyError("Cannot build train-diffusion: missing field num_invisible_valid")
 
     values = np.asarray(data["num_invisible_valid"][train_indices])
-    print(values)
     # Robust to shape (N,), (N, 1), or similar.
     keep = values > 0
     return train_indices[keep]
