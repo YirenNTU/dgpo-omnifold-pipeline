@@ -319,7 +319,7 @@ def make_delta_invisible_input(
             f"{target_invisible.shape} vs {baseline_invisible.shape}"
         )
 
-    if target_invisible.ndim != 1:
+    if target_invisible.ndim != 2:
         raise ValueError(f"invisible input must be rank-2, got {target_invisible.shape}")
 
     if target_invisible.shape[-1] != len(invisible_features):
