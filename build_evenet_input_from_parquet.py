@@ -320,7 +320,9 @@ def build_output_events(
         lookup=classification_lookup,
     )
 
-    predict_neutrino = ak.from_numpy(np.array([name in sample.predict_neutrino for name in classification_names]))
+    print(sample.predict_neutrino)
+    print(classification_names)
+    predict_neutrino = ak.from_numpy(np.array([str(name) in sample.predict_neutrino for name in classification_names]))
     print(predict_neutrino)
 
 
