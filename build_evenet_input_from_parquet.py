@@ -456,6 +456,7 @@ def build_output_events(
     print(passthrough)
 
     for field in sorted(passthrough):
+        print(field, field in selected_events.fields)
         if field in selected_events.fields and field not in fields:
             fields[field] = selected_events[field]
 
