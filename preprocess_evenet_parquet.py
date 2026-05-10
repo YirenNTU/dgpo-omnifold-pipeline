@@ -389,6 +389,11 @@ def preprocess_shards(
 
     with (store_dir / "shape_metadata.json").open("w") as stream:
         json.dump(shape_metadata, stream)
+
+    for split in ("train", "val", "test", "train-diffusion", "test-diffusion", "val-diffusion"):
+        Path(store_dir / split).mkdir(parents=True, exist_ok=True)
+        with (store_dir / split / "shape_metadata.json").open("w") as stream:
+            json.dump(shape_metadata, stream)
     PostProcessor.merge(train_stats, saved_results_path=store_dir)
 
     summary_path = store_dir / "preprocess_manifest.json"
