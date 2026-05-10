@@ -232,6 +232,25 @@ def process_training_shard_worker(payload: dict[str, Any]) -> dict[str, Any]:
             if len(diffusion_indices) > 0:
                 diffusion_pdict = slice_event_dict(data, diffusion_indices, n_events)
                 diffusion_chunks: list[pa.Table] = []
+
+                diffusion_shape_metadata = process_dict(
+                    diffusion_pdict,
+                    global_config=global_config,
+                    unique_process_ids=unique_process_ids,
+                    assignment_keys=assignment_keys,
+                    log_scale_plan=log_scale_plan,
+                    statistics=None,  # Important: do not affect normalization
+                    shape_metadata=result["shape_metadata"],
+                    store_chunks=diffusion_chunks,
+                )
+
+                if (
+                        diffusion_shape_metadata is not None
+                        and result["shape_metadata"] is not None
+                        and diffusion_shape_metadata != result["shape_metadata"]
+                ):
+                    raise AssertionError("Shape metadata mismatch for train-diffusion.")
+
                 diffusion_out_path = split_output_path(store_dir, "train-diffusion", shard_index)
                 result["train-diffusion"].append(
                     write_chunk_table(
