@@ -464,6 +464,7 @@ def build_output_events(
     baseline_passthrough = {
         "mmc_likelihood",
         "theta_cm",
+        "flags_valid"
     }
     baseline_passthrough.update(f"cos_theta_A_{r}" for r in ["k", "n", "r"])
     baseline_passthrough.update(f"cos_theta_B_{r}" for r in ["k", "n", "r"])

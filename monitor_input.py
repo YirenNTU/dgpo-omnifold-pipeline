@@ -639,11 +639,8 @@ def observable_values(
 
 
 def baseline_valid_mask(events: ak.Array) -> np.ndarray:
-    for field in ("baseline_mmc_likelihood", "mmc_likelihood"):
-        if field in events.fields:
-            likelihood = to_numpy(events[field], np.float64)
-            return np.isfinite(likelihood) & (likelihood > 0.0)
-    return np.ones(len(events), dtype=bool)
+    baseline_valid = to_numpy(events["baseline_flags_valid"], bool)
+    return baseline_valid
 
 
 def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
