@@ -39,6 +39,152 @@ def save_figure(fig: Any, output_path: str | Path) -> None:
         fig.savefig(output_path.with_suffix(".pdf"))
 
 
+def plot_data_mc_histogram_from_counts(
+    bins: np.ndarray,
+    data_counts: np.ndarray,
+    data_sumw2: np.ndarray,
+    mc_counts: dict[str, np.ndarray],
+    output_path: str | Path,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str = "Weighted entries",
+) -> str:
+    from matplotlib import pyplot as plt
+
+    set_plot_style()
+    bins = np.asarray(bins, dtype=float)
+    data_counts = np.asarray(data_counts, dtype=float)
+    data_sumw2 = np.asarray(data_sumw2, dtype=float)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    widths = np.diff(bins)
+
+    fig, (axis, ratio_axis) = plt.subplots(
+        2,
+        1,
+        figsize=(7.0, 6.0),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3.5, 1.1], "hspace": 0.05},
+    )
+
+    cmap = plt.get_cmap(process_color_map)
+    colors = cmap(np.linspace(0.0, 1.0, max(len(mc_counts), 1)))
+    mc_sum = np.zeros_like(data_counts, dtype=float)
+    stack_base = np.zeros_like(data_counts, dtype=float)
+
+    for color, (label, counts) in zip(colors, mc_counts.items()):
+        counts = np.asarray(counts, dtype=float)
+        axis.bar(
+            bins[:-1],
+            counts,
+            width=widths,
+            bottom=stack_base,
+            align="edge",
+            alpha=0.82,
+            color=color,
+            edgecolor="black",
+            linewidth=0.25,
+            label=label,
+        )
+        stack_base += counts
+        mc_sum += counts
+
+    data_errors = np.sqrt(np.clip(data_sumw2, 0.0, None))
+    axis.errorbar(
+        centers,
+        data_counts,
+        yerr=data_errors,
+        fmt="o",
+        color="black",
+        markersize=3.5,
+        linewidth=0.9,
+        label="data",
+    )
+
+    ratio = np.divide(data_counts, mc_sum, out=np.full_like(data_counts, np.nan), where=mc_sum != 0)
+    ratio_error = np.divide(data_errors, mc_sum, out=np.full_like(data_errors, np.nan), where=mc_sum != 0)
+    ratio_axis.axhline(1.0, color="black", linestyle="--", linewidth=0.9)
+    ratio_axis.errorbar(
+        centers,
+        ratio,
+        yerr=ratio_error,
+        fmt="o",
+        color="black",
+        markersize=3.0,
+        linewidth=0.8,
+    )
+
+    axis.set_ylabel(ylabel)
+    axis.set_title(title, loc="left")
+    axis.grid(axis="y", alpha=0.22)
+    axis.legend(frameon=False, fontsize=8, ncol=2)
+    ratio_axis.set_ylabel("Data / MC")
+    ratio_axis.set_xlabel(xlabel)
+    ratio_axis.set_ylim(0.0, 2.0)
+    ratio_axis.grid(axis="y", alpha=0.22)
+
+    save_figure(fig, output_path)
+    plt.close(fig)
+    return str(output_path)
+
+
+def plot_2d_histogram_comparison(
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+    counts: np.ndarray,
+    output_path: str | Path,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    entries: int | None = None,
+    correlation: float | None = None,
+    zlabel: str = "Weighted entries",
+) -> str:
+    from matplotlib import pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    set_plot_style()
+    counts = np.asarray(counts, dtype=float).T
+    masked_counts = np.ma.masked_where(counts <= 0, counts)
+
+    fig, axis = plt.subplots(figsize=(6.6, 5.8))
+    mesh = axis.pcolormesh(x_edges, y_edges, masked_counts, cmap="viridis", norm=LogNorm())
+    low = max(float(x_edges[0]), float(y_edges[0]))
+    high = min(float(x_edges[-1]), float(y_edges[-1]))
+    axis.plot([low, high], [low, high], color="white", linestyle="--", linewidth=1.1, alpha=0.9)
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel(ylabel)
+    axis.set_title(title, loc="left")
+    axis.set_xlim(x_edges[0], x_edges[-1])
+    axis.set_ylim(y_edges[0], y_edges[-1])
+    axis.set_aspect("equal", adjustable="box")
+
+    stat_lines = []
+    if entries is not None:
+        stat_lines.append(f"entries={entries}")
+    if correlation is not None and np.isfinite(correlation):
+        stat_lines.append(f"r={correlation:.3f}")
+    if stat_lines:
+        axis.text(
+            0.03,
+            0.97,
+            "\n".join(stat_lines),
+            transform=axis.transAxes,
+            ha="left",
+            va="top",
+            fontsize=9,
+            color="black",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "none", "alpha": 0.82},
+        )
+
+    colorbar = fig.colorbar(mesh, ax=axis, pad=0.02)
+    colorbar.set_label(zlabel)
+    save_figure(fig, output_path)
+    plt.close(fig)
+    return str(output_path)
+
+
 def to_numpy(x: Any) -> np.ndarray:
     if isinstance(x, ak.Array):
         x = ak.to_numpy(ak.flatten(x, axis=None))
