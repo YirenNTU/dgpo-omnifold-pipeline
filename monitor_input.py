@@ -639,7 +639,7 @@ def observable_values(
 
 
 def baseline_valid_mask(events: ak.Array) -> np.ndarray:
-    if "baseline_flags_valid" in events:
+    if "baseline_flags_valid" in events.fields:
         baseline_valid = to_numpy(events["baseline_flags_valid"], bool)
         return baseline_valid
     else:
