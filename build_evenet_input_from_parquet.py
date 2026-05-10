@@ -390,6 +390,30 @@ def build_output_events(
         "target_b_invisible_p4": invisible_b,
         "truth_tau_a_p4": truth_tau_a,
         "truth_tau_b_p4": truth_tau_b,
+        "lead_a_visible_px": visible_a.px,
+        "lead_a_visible_py": visible_a.py,
+        "lead_a_visible_pz": visible_a.pz,
+        "lead_a_visible_E": visible_a.E,
+        "lead_b_visible_px": visible_b.px,
+        "lead_b_visible_py": visible_b.py,
+        "lead_b_visible_pz": visible_b.pz,
+        "lead_b_visible_E": visible_b.E,
+        "truth_tau_a_px": truth_tau_a.px,
+        "truth_tau_b_px": truth_tau_b.px,
+        "truth_tau_a_py": truth_tau_a.py,
+        "truth_tau_b_py": truth_tau_b.py,
+        "truth_tau_a_pz": truth_tau_a.pz,
+        "truth_tau_b_pz": truth_tau_b.pz,
+        "truth_tau_a_E": truth_tau_a.E,
+        "truth_tau_b_E": truth_tau_b.E,
+        "target_a_invisible_px": invisible_a.px,
+        "target_a_invisible_py": invisible_a.py,
+        "target_a_invisible_pz": invisible_a.pz,
+        "target_a_invisible_E": invisible_a.E,
+        "target_b_invisible_px": invisible_b.px,
+        "target_b_invisible_py": invisible_b.py,
+        "target_b_invisible_pz": invisible_b.pz,
+        "target_b_invisible_E": invisible_b.E,
     }
 
     if sample.total_initial_num_events is not None:
@@ -409,8 +433,12 @@ def build_output_events(
         "analyzing_power_a",
         "analyzing_power_b",
         "weight",
-        "central_weight"
+        "central_weight",
     }
+    passthrough.extend([f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"]])
+    passthrough.extend([f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"]])
+    passthrough.extend([f"truth_cos_theta_A_{r}_times_cos_theta_B_{l}" for r in ["k", "n", "r"] for l in ["k", "n", "r"]])
+
     passthrough.update(name for name in selected_events.fields if name.endswith("_cut"))
     for field in sorted(passthrough):
         if field in selected_events.fields and field not in fields:
