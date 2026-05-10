@@ -145,7 +145,6 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
                 "analyzing_power",
                 "analyzing_power_a",
                 "analyzing_power_b",
-                "mtautau",
                 "mmc_likelihood",
                 "theta_cm"
             }
@@ -465,7 +464,6 @@ def build_output_events(
     baseline_passthrough = {
         "mmc_likelihood",
         "theta_cm",
-        "mtautau",
     }
     baseline_passthrough.update(f"cos_theta_A_{r}" for r in ["k", "n", "r"])
     baseline_passthrough.update(f"cos_theta_B_{r}" for r in ["k", "n", "r"])
