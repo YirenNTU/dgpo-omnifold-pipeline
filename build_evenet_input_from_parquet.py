@@ -430,11 +430,21 @@ def build_output_events(
     delta_invisible_a = make_delta_invisible_input(invisible_a_for_delta, visible_a_for_delta, invisible_features)
     delta_invisible_b = make_delta_invisible_input(invisible_b_for_delta, visible_b_for_delta, invisible_features)
 
-    delta_invisible_input = ak.concatenate([delta_invisible_a[:, np.newaxis], delta_invisible_b[:, np.newaxis]], axis=1)
-    delta_invisible_mask = ak.ones_like(invisible_a.px) * predict_neutrino[:, np.newaxis]
+    delta_invisible_input = np.stack(
+        [delta_invisible_a, delta_invisible_b],
+        axis=1,
+    ).astype(np.float32)
+
+    predict_neutrino_np = ak.to_numpy(predict_neutrino, allow_missing=False).astype(bool)
+
+    delta_invisible_mask = np.repeat(
+        predict_neutrino_np[:, None],
+        2,
+        axis=1,
+    ).astype(bool)
 
     num_invisible_raw = np.full(len(selected_events), 2, dtype=np.int64)
-    num_invisible_valid = np.sum(ak.to_numpy(delta_invisible_mask, allow_missing=False).astype(np.int64), axis=1).astype(np.int64)
+    num_invisible_valid = delta_invisible_mask.sum(axis=1).astype(np.int64)
 
     fields: dict[str, Any] = {
         "sample_key": ak.Array([sample.key] * len(selected_events)),
