@@ -72,7 +72,7 @@ def parse_samples(config: dict[str, Any], selected_keys: list[str] | None) -> li
                 lumi=float(sample_cfg.get("lumi", 1)),
                 total_initial_num_events=None,
                 plot_label=process_latex_label(str(sample_cfg.get("name", key))),
-                predict_neutrino=neutrino_cfg[key],
+                predict_neutrino=neutrino_cfg[key] if key in neutrino_cfg else [],
             )
         )
     return samples
