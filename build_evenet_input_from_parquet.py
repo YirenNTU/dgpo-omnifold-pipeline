@@ -339,6 +339,9 @@ def build_output_events(
 
     visible_a = rebuild_vector(selected_events["lead_a_visible_p4"])
     visible_b = rebuild_vector(selected_events["lead_b_visible_p4"])
+    truth_visible_a = rebuild_vector(selected_events["truth_visible_a_p4"])
+    truth_visible_b = rebuild_vector(selected_events["truth_visible_b_p4"])
+
     if sample.is_signal:
         truth_tau_a = rebuild_vector(selected_events["truth_tau_a_p4"])
         truth_tau_b = rebuild_vector(selected_events["truth_tau_b_p4"])
@@ -390,6 +393,8 @@ def build_output_events(
         "target_b_invisible_p4": invisible_b,
         "truth_tau_a_p4": truth_tau_a,
         "truth_tau_b_p4": truth_tau_b,
+        "truth_a_invisible_p4": truth_visible_a,
+        "truth_b_invisible_p4": truth_visible_b,
         "lead_a_visible_px": visible_a.px,
         "lead_a_visible_py": visible_a.py,
         "lead_a_visible_pz": visible_a.pz,
@@ -398,6 +403,14 @@ def build_output_events(
         "lead_b_visible_py": visible_b.py,
         "lead_b_visible_pz": visible_b.pz,
         "lead_b_visible_E": visible_b.E,
+        "truth_a_visible_px": truth_visible_a.px,
+        "truth_b_visible_px": truth_visible_b.px,
+        "truth_a_visible_py": truth_visible_a.py,
+        "truth_b_visible_py": truth_visible_b.py,
+        "truth_a_visible_pz": truth_visible_a.pz,
+        "truth_b_visible_pz": truth_visible_b.pz,
+        "truth_a_visible_E": truth_visible_a.E,
+        "truth_b_visible_E": truth_visible_b.E,
         "truth_tau_a_px": truth_tau_a.px,
         "truth_tau_b_px": truth_tau_b.px,
         "truth_tau_a_py": truth_tau_a.py,
@@ -435,11 +448,13 @@ def build_output_events(
         "weight",
         "central_weight",
     }
-    passthrough.update({f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"]})
-    passthrough.update({f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"]})
-    passthrough.update({f"truth_cos_theta_A_{r}_times_cos_theta_B_{l}" for r in ["k", "n", "r"] for l in ["k", "n", "r"]})
-
+    passthrough.update(f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"])
+    passthrough.update(f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"])
+    passthrough.update(f"truth_cos_theta_A_{r}_times_cos_theta_B_{l}" for r in ["k", "n", "r"] for l in ["k", "n", "r"])
     passthrough.update(name for name in selected_events.fields if name.endswith("_cut"))
+
+    print(passthrough)
+
     for field in sorted(passthrough):
         if field in selected_events.fields and field not in fields:
             fields[field] = selected_events[field]
