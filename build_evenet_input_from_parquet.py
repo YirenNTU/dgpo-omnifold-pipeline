@@ -388,7 +388,7 @@ def worker_process_file(
 ):
     sample = Sample(**sample_payload)
     output_root = Path(output_dir)
-    parquet = pq.ParquetFile(sample.file_source)
+    parquet = pq.ParquetFile(file_path)
     schema_names = {field.name for field in parquet.schema_arrow}
     columns = required_columns(schema_names, feature_config, sample)
 
@@ -616,7 +616,7 @@ def main() -> None:
             row_written = sum(int(item["rows"]) for item in result["shards"])
             print(
                 f"[ml_pipeline_lite] finished sample={sample_key} file={file_path} "
-                f"shards={len(result['shards'])} rows={rows_written}"
+                f"shards={len(result['shards'])} rows={row_written}"
             )
 
 
