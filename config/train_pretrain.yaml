@@ -1,6 +1,6 @@
 platform:
   data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/evenet_input/before_shuffle/train-diffusion
-  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/val
+  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/evenet_input/before_shuffle/val-diffusion
   number_of_workers: 16
   resources_per_worker: {
     "CPU": 20,
@@ -28,7 +28,7 @@ options:
   Training:
     total_epochs: 500
     epochs: 500
-    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/checkpoint-pretrain-diffusion
+    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/checkpoint-pretrain-diffusion
     model_checkpoint_load_path: null
     pretrain_model_load_path: /global/homes/t/tihsu/CMSOpenData-GridStudy/pretrain-weights/checkpoints.20M.a4.last.ckpt
     freeze_modules: []
@@ -37,10 +37,10 @@ options:
     eval_metrics_every_n_epochs: 1
     apply_event_weight: false
 
-    learning_rate: &lr 0.0001
-    learning_rate_body: &lr_body 0.00001
-    learning_rate_classification: &lr_classification 0.0001
-    learning_rate_median: &lr_median 0.0001
+    learning_rate: &lr 0.0003
+    learning_rate_body: &lr_body 0.00003
+    learning_rate_classification: &lr_classification 0.0003
+    learning_rate_median: &lr_median 0.0003
 
     Components:
       InvisibleInputProjector:
@@ -133,7 +133,7 @@ options:
 
   Dataset:
     dataset_limit: 1.0
-    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/normalization.pt
+    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/evenet_input/before_shuffle/normalization.pt
     val_split: [0.8, 1.0]
 
   Metrics:
