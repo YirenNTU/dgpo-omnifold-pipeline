@@ -319,10 +319,16 @@ def build_output_events(
     )
     conditions, conditions_mask, codition_names = build_global_conditions(selected_events, feature_config)
     num_vectors = num_sequential_vectors + ak.to_numpy(ak.values_astype(conditions_mask[:, 0], np.float32), allow_missing=False)
+
     visible_a = rebuild_vector(selected_events["lead_a_visible_p4"])
     visible_b = rebuild_vector(selected_events["lead_b_visible_p4"])
-    truth_tau_a = rebuild_vector(selected_events["truth_tau_a_p4"])
-    truth_tau_b = rebuild_vector(selected_events["truth_tau_b_p4"])
+    if sample.is_signal:
+        truth_tau_a = rebuild_vector(selected_events["truth_tau_a_p4"])
+        truth_tau_b = rebuild_vector(selected_events["truth_tau_b_p4"])
+    else:
+        truth_tau_a = visible_a * 0
+        truth_tau_b = visible_b * 0
+
     invisible_a = truth_tau_a - visible_a
     invisible_b = truth_tau_b - visible_b
 
