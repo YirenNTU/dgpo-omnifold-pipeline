@@ -67,7 +67,7 @@ def parse_samples(config: dict[str, Any], selected_keys: list[str] | None) -> li
                 is_data=bool(sample_cfg.get("is_data", False)),
                 is_signal=bool(sample_cfg.get("is_signal", False)),
                 files=tuple(str(item) for item in input_files),
-                file_source="input_files",
+                file_source=sample_cfg["input_files"],
                 norm_factor=float(sample_cfg.get("norm_factor", 1)),
                 lumi=float(sample_cfg.get("lumi", 1)),
                 total_initial_num_events=None,
