@@ -326,8 +326,8 @@ def build_output_events(
         truth_tau_a = rebuild_vector(selected_events["truth_tau_a_p4"])
         truth_tau_b = rebuild_vector(selected_events["truth_tau_b_p4"])
     else:
-        truth_tau_a = visible_a * 0
-        truth_tau_b = visible_b * 0
+        truth_tau_a = visible_a * 0 # meaningless stuff
+        truth_tau_b = visible_b * 0 # meaningless stuff
 
     invisible_a = truth_tau_a - visible_a
     invisible_b = truth_tau_b - visible_b
@@ -336,6 +336,7 @@ def build_output_events(
     delta_invisible_b = invisible_b - visible_b
 
     delta_invisible = ak.concatenate([delta_invisible_a[:, np.newaxis], delta_invisible_b[:, np.newaxis]], axis=1)
+    print(invisible_features)
     delta_invisible_input = features_from_p4_local(delta_invisible, invisible_features)
     delta_invisible_mask = ak.ones_like(delta_invisible.px) * predict_neutrino[:, np.newaxis]
 
