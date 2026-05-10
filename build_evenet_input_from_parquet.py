@@ -421,6 +421,51 @@ def build_output_events(
 
 
 
+def write_manifest(
+    output_dir: Path,
+    args: argparse.Namespace,
+    samples: list[Sample],
+    luminosity: float | None,
+    classification_lookup,
+    feature_config,
+    invisible_features: tuple[str, ...],
+    max_particles: int,
+    remove_neutral_non_photon: bool,
+    worker_results: list[dict[str, Any]],
+) -> None:
+    sample_manifest: dict[str, Any] = {}
+    for sample in samples:
+        sample_manifest[sample.key] = {
+            "name": sample.name,
+            "is_data": sample.is_data,
+            "is_signal": sample.is_signal,
+            "file_source": sample.file_source,
+            "plot_label": sample.plot_label,
+            "files": sample.files,
+            "total_initial_num_events": sample.total_initial_num_events,
+        }
+    shards_by_sample: dict[str, list[dict[str, Any]]] = {sample.key: [] for sample in samples}
+    for result in worker_results:
+        shards_by_sample[result["sample_key"]].extend(result["shards"])
+    payload = {
+        "format": "ml_pipeline_lite_evenet_input_v2",
+        "analysis_config": str(args.analysis_config),
+        "batch_size": args.batch_size,
+        "rows_per_shard": args.rows_per_shard,
+        "num_workers": args.num_workers,
+        "luminosity": luminosity,
+        "max_particles": max_particles,
+        "remove_neutral_non_photon": remove_neutral_non_photon,
+        "class_labels": list(classification_lookup.class_labels),
+        "sequential_features": list(feature_config.all_sequential_fields),
+        "global_condition_features": list(feature_config.global_fields),
+        "invisible_features": list(invisible_features),
+        "samples": sample_manifest,
+        "shards": shards_by_sample,
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"[ml_pipeline_lite] wrote {manifest_path}")
 
 
 
@@ -676,6 +721,18 @@ def main() -> None:
                 f"[ml_pipeline_lite] finished sample={sample_key} file={file_path} "
                 f"shards={len(result['shards'])} rows={row_written}"
             )
+    write_manifest(
+        output_dir,
+        args,
+        samples,
+        luminosity,
+        classification_lookup,
+        feature_config,
+        invisible_features,
+        max_particles,
+        remove_neutral_non_photon,
+        worker_results,
+    )
 
 
 
