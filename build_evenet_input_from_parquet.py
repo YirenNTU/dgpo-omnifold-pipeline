@@ -358,12 +358,16 @@ def build_output_events(
     invisible_a = truth_tau_a - visible_a
     invisible_b = truth_tau_b - visible_b
 
-    delta_invisible_a = invisible_a - visible_a
-    delta_invisible_b = invisible_b - visible_b
+    invisible_a_for_delta = features_from_p4_local(invisible_a, invisible_features)
+    invisible_b_for_delta = features_from_p4_local(invisible_b, invisible_features)
+    visible_a_for_delta =  features_from_p4_local(visible_a, invisible_features)
+    visible_b_for_delta =  features_from_p4_local(visible_b, invisible_features)
 
-    delta_invisible = ak.concatenate([delta_invisible_a[:, np.newaxis], delta_invisible_b[:, np.newaxis]], axis=1)
-    delta_invisible_input = features_from_p4_local(delta_invisible, invisible_features)
-    delta_invisible_mask = ak.ones_like(delta_invisible.px) * predict_neutrino[:, np.newaxis]
+    delta_invisible_a = invisible_a_for_delta - visible_a_for_delta
+    delta_invisible_b = invisible_b_for_delta - visible_b_for_delta
+
+    delta_invisible_input = ak.concatenate([delta_invisible_a[:, np.newaxis], delta_invisible_b[:, np.newaxis]], axis=1)
+    delta_invisible_mask = ak.ones_like(invisible_a.px) * predict_neutrino[:, np.newaxis]
 
 
     num_invisible_raw = np.full(len(selected_events), 2, dtype=np.int64)

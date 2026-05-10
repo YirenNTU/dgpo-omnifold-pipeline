@@ -198,12 +198,150 @@ def prepare_runtime_train_config(
             checkpoint_override.resolve()
         )
 
-    print(train_cfg)
     runtime_dir = Path(tempfile.mkdtemp(prefix="evenet_predict_cfg_"))
     runtime_train_cfg = runtime_dir / "train_runtime.yaml"
     with runtime_train_cfg.open("w") as handle:
         yaml.safe_dump(train_cfg, handle, sort_keys=False)
     return runtime_train_cfg
+
+
+def select_task_shard(tasks: list[InferenceTask], task_num_shards: int, task_shard_index: int) -> list[InferenceTask]:
+    """
+    inputs:
+      tasks: list[InferenceTask], all event chunks to run.
+      task_num_shards: int, number of independent jobs.
+      task_shard_index: int, current independent job index.
+    outputs:
+      shard_tasks: list[InferenceTask], tasks assigned to this job.
+    goal:
+      Let several scheduler jobs process one prediction campaign without
+      duplicating output files.
+    """
+    if task_num_shards < 1:
+        raise ValueError(f"--task-num-shards must be >= 1, got {task_num_shards}.")
+    if not (0 <= task_shard_index < task_num_shards):
+        raise ValueError(
+            f"--task-shard-index must be in [0, {task_num_shards}), got {task_shard_index}."
+        )
+    if task_num_shards == 1:
+        return tasks
+    return tasks[task_shard_index::task_num_shards]
+
+def load_flat_parquet_dict(
+    parquet_path: Path,
+    event_start: int | None = None,
+    event_stop: int | None = None,
+) -> dict[str, np.ndarray]:
+    table = pq.read_table(parquet_path)
+    if event_start is not None or event_stop is not None:
+        start = 0 if event_start is None else int(event_start)
+        stop = table.num_rows if event_stop is None else int(event_stop)
+        table = table.slice(start, max(0, stop - start))
+    pydict = table.to_pydict()
+    return {key: np.asarray(value) for key, value in pydict.items()}
+
+def ensure_converted_batch_fields(
+    batch_np: dict[str, np.ndarray],
+    invisible_dim: int,
+    default_num_tokens: int = 2,
+) -> dict[str, np.ndarray]:
+    output = dict(batch_np)
+    reference_key = next((key for key in ["x", "conditions", "num_vectors"] if key in output), None)
+    if reference_key is None:
+        raise ValueError("Converted parquet is missing reference tensors such as x/conditions/num_vectors.")
+    num_events = int(output[reference_key].shape[0])
+
+    if "x_invisible" not in output:
+        output["x_invisible"] = np.zeros((num_events, default_num_tokens, invisible_dim), dtype=np.float32)
+    if "x_invisible_mask" not in output:
+        output["x_invisible_mask"] = np.ones((num_events, output["x_invisible"].shape[1]), dtype=bool)
+
+    if "classification" not in output:
+        output["classification"] = np.full(num_events, -1, dtype=np.int64)
+    if "event_weight" not in output:
+        raise ValueError(
+            "Converted parquet must contain event_weight. "
+            "Prediction weighting no longer falls back to central_weight or class weights."
+        )
+
+    return output
+
+def predict_converted_events(
+    batch_np: dict[str, np.ndarray],
+    model_bundle: dict[str, Any],
+    batch_size: int,
+    num_steps: int | None,
+    converted_split_fraction: float | None,
+    device: torch.device,
+    ):
+
+    invisible_feature_names = model_bundle["invisible_feature_names"]
+    diffusion_model = model_bundle["diffusion_model"]
+    classification_model = model_bundle["classification_model"]
+    sampler = model_bundle["sampler"]
+    diffusion_steps = num_steps
+
+    batch_np = ensure_converted_batch_fields(batch_np, invisible_dim=len(invisible_feature_names))
+    num_events = int(batch_np["x"].shape[0])
+    num_invisibles = int(batch_np["x_invisible"].shape[1])
+
+    pred_class_index = np.full(num_events, -1, dtype=np.int64)
+    pred_class_prob  = np.full(num_events, -1, dtype=np.float32)
+
+    valid_signal_prediction = np.zeros(num_events, dtype=bool)
+    pred_invisible = np.zeros((num_events, num_invisibles, len(invisible_feature_names)), dtype=np.float32)
+    target_invisible = np.zeros((num_events, len(invisible_feature_names)), dtype=np.float32)
+    total_batches = max(1, math.ceil(num_events / batch_size))
+    target_mask = batch_np["x_invisible_mask"].astype(bool)
+
+
+
+def load_converted_batch(
+    parquet_path: Path,
+    shape_metadata_path: Path,
+    event_start: int | None = None,
+    event_stop: int | None = None,
+) -> dict[str, np.ndarray]:
+    with shape_metadata_path.open() as handle:
+        shape_metadata = json.load(handle)
+
+    flat_batch = load_flat_parquet_dict(parquet_path, event_start=event_start, event_stop=event_stop)
+    return unflatten_dict(flat_batch, shape_metadata, drop_column_prefix=None)
+
+
+def augment_converted_parquet_task(
+    task: InferenceTask,
+    model_bundle: dict[str, Any],
+    batch_size: int,
+    num_steps: int | None,
+    converted_split_fraction: float | None,
+    shape_metadata_path: Path | None,
+    device: torch.device,
+) -> None:
+    input_path = Path(task.input_path).resolve()
+    print(f"[converted-task] loading {input_path}", flush=True)
+    metadata_path = Path(shape_metadata_path).resolve()
+    batch_np = load_converted_batch(
+        input_path=str(input_path),
+        metadata_path=metadata_path,
+        event_start=task.event_start,
+        event_stop=task.event_stop,
+    )
+    print(
+        f"[converted-task] loaded {input_path.name} "
+        f"events={int(batch_np['x'].shape[0])} "
+        f"range=[{task.event_start if task.event_start is not None else 0},"
+        f"{task.event_stop if task.event_stop is not None else int(batch_np['x'].shape[0])}) "
+        f"shape_metadata={metadata_path}",
+        flush=True,
+    )
+
+
+
+
+
+
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -391,6 +529,24 @@ def main() -> None:
         checkpoint_override=args.checkpoint.resolve() if args.checkpoint is not None else None,
     )
 
+    runtime_train_cfg_data = read_yaml(runtime_train_config)
+    runtime_train_cfg_data["_analysis_config_path"] = str(args.analysis_config.resolve())
+    runtime_train_cfg_data.setdefault("options", {}).setdefault("prediction", {})["disable_ema"] = bool(args.disable_ema)
+    with runtime_train_config.open("w") as handle:
+        yaml.safe_dump(runtime_train_cfg_data, handle, sort_keys=False)
+
+    diffusion_use_ema = not args.disable_ema
+    if args.classification_checkpoint is not None:
+        classification_check_point = args.classification_checkpoint
+    else:
+        classification_check_point = args.checkpoint.resolve()
+
+    if args.diffusion_checkpoint is not None:
+        diffusion_check_point = args.diffusion_checkpoint
+    else:
+        diffusion_check_point = args.checkpoint.resolve()
+
+    tasks = select_task_shard(all_tasks, args.task_num_shards, args.task_shard_index)
 
 if __name__ == "__main__":
     main()
