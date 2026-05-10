@@ -367,6 +367,12 @@ def build_output_events(
         "x_invisible_mask": to_numpy(delta_invisible_mask, np.float32),
     }
 
+    for field_name, values in list(fields.items()):
+        if isinstance(values, np.ndarray):
+            fields[field_name] = np.ascontiguousarray(values)
+
+    return ak.Array(fields)
+
 
 
 
