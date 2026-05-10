@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import awkward as ak
 from dataclasses import dataclass
+import vector
 
 PROCESS_LATEX_LABELS = {
     "data94": "Data",
@@ -142,6 +143,28 @@ def build_classification_lookup(
     )
 
 
+def cast_array_like(values: Any, dtype=np.float64):
+    if isinstance(values, ak.Array):
+        return ak.values_astype(values, dtype)
+    return np.asarray(values, dtype=dtype)
+def pad_and_flatten_part_feature(values: ak.Array, max_particles: int) -> ak.Array:
+    padded = ak.pad_none(values, max_particles, axis=1, clip=True)
+    filled = ak.fill_none(padded, 0)
+    regular = ak.to_regular(filled, axis=1)
+    return ak.values_astype(regular, np.float32)[..., np.newaxis]
+
+
+def build_momentum4d(px: Any, py: Any, pz: Any, energy: Any) -> ak.Array:
+    return ak.zip(
+        {
+            "px": cast_array_like(px, np.float64),
+            "py": cast_array_like(py, np.float64),
+            "pz": cast_array_like(pz, np.float64),
+            "E": cast_array_like(energy, np.float64),
+        },
+        with_name="Momentum4D",
+    )
+
 def classification_targets_for_sample(
     sample_key: str,
     sample_name: str,
@@ -201,3 +224,12 @@ def build_input_particle_mask(
     abs_pdg_id = abs(events["Part_pdgId"])
     keep_particle = (charge != 0) | (abs_pdg_id == 21)
     return mask & keep_particle
+
+def rebuild_vector(values: ak.Array) -> ak.Array:
+    fields = set(getattr(values, "fields", []))
+    if {"px", "py", "pz", "E"}.issubset(fields):
+        return vector.zip({"px": values["px"], "py": values["py"], "pz": values["pz"], "E": values["E"]})
+    if {"x", "y", "z", "t"}.issubset(fields):
+        return vector.zip({"px": values["x"], "py": values["y"], "pz": values["z"], "E": values["t"]})
+    raise ValueError(f"Unsupported four-vector fields: {sorted(fields)}")
+

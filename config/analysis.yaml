@@ -143,7 +143,7 @@ Inputs:
 
 Subcategories:
   Ztautau:
-    Ztautau_pipi: [11]
+#    Ztautau_pipi: [11]
 #    Ztautau_pirho: [12]
 #    Ztautau_rhopi: [21]
 #    Ztautau_pie: [13]
@@ -154,13 +154,17 @@ Subcategories:
 #    Ztautau_erho: [32]
 #    Ztautau_rhomu: [42]
 #    Ztautau_murho: [24]
-#    Ztautau_rhorho: [22]
+    Ztautau_rhorho: [22]
 #    Ztautau_ee: [33]
 #    Ztautau_mumu: [44]
 #    Ztautau_emu: [34]
 #    Ztautau_mue: [43]
-    Ztautau_others: [12, 21, 13, 31, 14, 41, 23, 32, 42, 24, 22, 33, 34, 43, 44,
+    Ztautau_others: [11, 12, 21, 13, 31, 14, 41, 23, 32, 42, 24, 33, 34, 43, 44,
                     15, 51, 25, 52, 35, 53, 45, 54, 55]
+
+NeutrinoPrediction:
+  Ztautau:
+    - Ztautau_pipi
 
 Normalization:
   Sequential:
