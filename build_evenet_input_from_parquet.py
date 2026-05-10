@@ -294,6 +294,48 @@ def features_from_p4_local(p4: ak.Array, feature_names: tuple[str, ...]) -> np.n
         components.append(values.astype(np.float32))
     return np.stack(components, axis=-1).astype(np.float32)
 
+def wrap_phi(phi: np.ndarray) -> np.ndarray:
+    return np.arctan2(np.sin(phi), np.cos(phi))
+
+
+def make_delta_invisible_input(
+    target_invisible: np.ndarray,
+    baseline_invisible: np.ndarray,
+    invisible_features: list[str],
+) -> np.ndarray:
+    """
+    target_invisible:   (N, n_invisible, n_features)
+    baseline_invisible: (N, n_invisible, n_features)
+
+    returns:
+      delta_invisible_input with same shape.
+    """
+    target_invisible = np.asarray(target_invisible, dtype=np.float32)
+    baseline_invisible = np.asarray(baseline_invisible, dtype=np.float32)
+
+    if target_invisible.shape != baseline_invisible.shape:
+        raise ValueError(
+            f"target/baseline invisible shape mismatch: "
+            f"{target_invisible.shape} vs {baseline_invisible.shape}"
+        )
+
+    if target_invisible.ndim != 3:
+        raise ValueError(f"invisible input must be rank-3, got {target_invisible.shape}")
+
+    if target_invisible.shape[-1] != len(invisible_features):
+        raise ValueError(
+            f"last dim {target_invisible.shape[-1]} does not match "
+            f"invisible_features={invisible_features}"
+        )
+
+    delta = target_invisible - baseline_invisible
+
+    for i, name in enumerate(invisible_features):
+        if name == "phi":
+            delta[..., i] = wrap_phi(delta[..., i])
+
+    return delta.astype(np.float32)
+
 def build_output_events(
     selected_events: ak.Array,
     sample: Sample,
@@ -363,12 +405,11 @@ def build_output_events(
     visible_a_for_delta =  features_from_p4_local(visible_a, invisible_features)
     visible_b_for_delta =  features_from_p4_local(visible_b, invisible_features)
 
-    delta_invisible_a = invisible_a_for_delta - visible_a_for_delta
-    delta_invisible_b = invisible_b_for_delta - visible_b_for_delta
+    delta_invisible_a = make_delta_invisible_input(invisible_a_for_delta, visible_a_for_delta, invisible_features)
+    delta_invisible_b = make_delta_invisible_input(invisible_b_for_delta, visible_b_for_delta, invisible_features)
 
     delta_invisible_input = ak.concatenate([delta_invisible_a[:, np.newaxis], delta_invisible_b[:, np.newaxis]], axis=1)
     delta_invisible_mask = ak.ones_like(invisible_a.px) * predict_neutrino[:, np.newaxis]
-
 
     num_invisible_raw = np.full(len(selected_events), 2, dtype=np.int64)
     num_invisible_valid = np.sum(ak.to_numpy(delta_invisible_mask, allow_missing=False).astype(np.int64), axis=1).astype(np.int64)

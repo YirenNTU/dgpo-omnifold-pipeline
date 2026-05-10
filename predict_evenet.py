@@ -49,6 +49,9 @@ from evenet.utilities.tool import safe_load_state
 
 vector.register_awkward()
 
+PROGRESS_PRINT_EVERY = 10
+
+
 @dataclass(frozen=True)
 class InferenceTask:
     sample_name: str
@@ -266,12 +269,44 @@ def ensure_converted_batch_fields(
 
     return output
 
+
+def fill_invisible_feature_outputs(
+    output_columns: dict[str, np.ndarray],
+    prefix: str,
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    feature_names: list[str],
+    target_indices: np.ndarray,
+) -> None:
+    name_order = ["a", "b"]
+    for slot in range(values.shape[1]):
+        name = name_order[slot]
+        output_columns[f"{prefix}_{name}_valid"][target_indices] = valid_mask[:, slot]
+        for feature_index, feature_name in enumerate(feature_names):
+            slot_values = values[:, slot, feature_index].astype(np.float32)
+            masked_values = np.where(valid_mask[:, slot], slot_values, 0).astype(np.float32)
+            output_columns[f"{prefix}_{name}_{feature_name}"][target_indices] = masked_values
+            if feature_name.startswith("log_"):
+                linear_name = feature_name[4:]
+                linear_values = np.where(valid_mask[:, slot], np.expm1(slot_values), 0).astype(np.float32)
+                output_columns[f"{prefix}_{name}_{linear_name}"][target_indices] = linear_values
+
+def to_torch_batch(batch: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
+    output: dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        tensor = torch.from_numpy(value)
+        if tensor.dtype == torch.float64:
+            tensor = tensor.to(torch.float32)
+        output[key] = tensor.to(device=device)
+    return output
+
 def predict_converted_events(
     batch_np: dict[str, np.ndarray],
     model_bundle: dict[str, Any],
     batch_size: int,
     num_steps: int | None,
     converted_split_fraction: float | None,
+    skip_classification: bool,
     device: torch.device,
     ):
 
@@ -293,8 +328,66 @@ def predict_converted_events(
     target_invisible = np.zeros((num_events, len(invisible_feature_names)), dtype=np.float32)
     total_batches = max(1, math.ceil(num_events / batch_size))
     target_mask = batch_np["x_invisible_mask"].astype(bool)
+    fill_invisible_feature_outputs(
+        target_invisible,
+        prefix="target_invisible",
+        values=batch_np["x_invisible"].astype(np.float32),
+        valid_mask=target_mask,
+        feature_names=invisible_feature_names,
+        target_indices=np.arange(num_events, dtype=np.int64),
+    )
 
+    for start in range(0, num_events, batch_size):
+        stop = min(start + batch_size, num_events)
+        batch_id = start // batch_size + 1
+        if batch_id == 1 or batch_id == total_batches or batch_id % PROGRESS_PRINT_EVERY == 0:
+            print(
+                f"[converted-predict] classification batch {batch_id}/{total_batches} "
+                f"events={start}:{stop}",
+                flush=True,
+            )
+        batch_slice = {
+            key: value[start:stop]
+            for key, value in batch_np.items()
+            if isinstance(value, np.ndarray)
+        }
+        batch_torch = to_torch_batch(batch_slice, device=device)
+        with torch.no_grad():
+            if skip_classification:
+                pred_class_index[start:stop] = batch_np["classification"]
+                pred_class_prob[start:stop] = 1.0
+            else:
+                cls_outputs = classification_model.shared_step(
+                    batch=batch_torch,
+                    batch_size = stop - start,
+                    train_parameters=None,
+                    schedules=[
+                        ("generation", False),
+                        ("neutrion_generation", False),
+                        ("deterministic", True)
+                    ],
+                )
+                classification_outputs = cls_outputs.get("classification")
+                if not classification_outputs:
+                    raise RuntimeError(
+                        "Classification model produced no classification outputs. "
+                        "Use a train config/checkpoint with options.Training.Components.Classification.include=true, "
+                        "or pass --classification-checkpoint for split classification/diffusion prediction."
+                    )
+                logits = next(iter(classification_outputs.values()))
+                probs = torch.softmax(logits, dim=-1)
+                batch_pred_index = torch.argmax(probs, dim=-1)
+                batch_pred_prob = torch.gather(probs, -1, batch_pred_index.unsqueeze(-1)).squeeze(-1)
 
+                batch_pred_index_np = batch_pred_index.detach().cpu().numpy().astype(np.int64)
+                batch_pred_prob_np = batch_pred_prob.detach().cpu().numpy().astype(np.float32)
+
+                pred_class_index[start:stop] = batch_pred_index_np
+                pred_class_prob[start:stop] = batch_pred_prob_np
+    return {
+        "pred_class_index": pred_class_index,
+        "pred_class_prob": pred_class_prob,
+    }
 
 def load_converted_batch(
     parquet_path: Path,
@@ -316,6 +409,7 @@ def augment_converted_parquet_task(
     num_steps: int | None,
     converted_split_fraction: float | None,
     shape_metadata_path: Path | None,
+    skip_classification: bool,
     device: torch.device,
 ) -> None:
     input_path = Path(task.input_path).resolve()
@@ -335,7 +429,16 @@ def augment_converted_parquet_task(
         f"shape_metadata={metadata_path}",
         flush=True,
     )
-
+    outputs = predict_converted_events(
+        batch_np=batch_np,
+        model_bundle=model_bundle,
+        batch_size=batch_size,
+        num_steps=num_steps,
+        converted_split_fraction=converted_split_fraction,
+        device=device,
+        skip_classification=skip_classification,
+    )
+    num_events = int(batch_np["x"].shape[0])
 
 
 
