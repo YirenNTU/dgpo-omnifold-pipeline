@@ -440,9 +440,9 @@ def worker_process_file(
         if sample.is_signal:
             vector_fields.extend(["truth_tau_a_p4", "truth_tau_b_p4"])
             if "truth_visible_a_p4" in events.fields:
-                vector_fields.remove("truth_visible_a_p4")
+                vector_fields.append("truth_visible_a_p4")
             if "truth_visible_b_p4" in events.fields:
-                vector_fields.remove("truth_visible_b_p4")
+                vector_fields.append("truth_visible_b_p4")
         if "missing_p4" in events.fields:
             vector_fields.append("missing_p4")
         for field in vector_fields:
