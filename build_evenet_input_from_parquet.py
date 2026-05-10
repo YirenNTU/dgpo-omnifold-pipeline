@@ -365,12 +365,12 @@ def build_output_events(
         "num_sequential_vectors": num_sequential_vectors.astype(np.float32),
         "x_invisible": to_numpy(delta_invisible_input, np.float32),
         "x_invisible_mask": to_numpy(delta_invisible_mask, np.float32),
-        "lead_a_visible_p4": visible_a.astype(np.float32),
-        "lead_b_visible_p4": visible_b.astype(np.float32),
-        "target_a_invisible_p4": invisible_a.astype(np.float32),
-        "target_b_invisible_p4": invisible_b.astype(np.float32),
-        "truth_tau_a_p4": truth_tau_a.astype(np.float32),
-        "truth_tau_b_p4": truth_tau_b.astype(np.float32),
+        "lead_a_visible_p4": visible_a,
+        "lead_b_visible_p4": visible_b,
+        "target_a_invisible_p4": invisible_a,
+        "target_b_invisible_p4": invisible_b,
+        "truth_tau_a_p4": truth_tau_a,
+        "truth_tau_b_p4": truth_tau_b,
     }
 
     if sample.total_initial_num_events is not None:
