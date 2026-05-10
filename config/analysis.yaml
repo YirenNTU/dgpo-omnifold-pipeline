@@ -226,6 +226,6 @@ Normalization:
     thrust_y: normalize
     thrust_z: normalize
   Invisible:
-#    pt: normalize
+    pt: normalize
     eta: normalize
-    phi: normalize_uniform
+    phi: normalize
