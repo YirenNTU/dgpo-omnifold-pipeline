@@ -39,10 +39,10 @@ def parquet_files(paths: list[Path]) -> list[str]:
         raise FileNotFoundError(f"No parquet files found in: {paths}")
     return files
 
-def read_events(paths: list[Path], max_events: int) -> ak.Array:
+def read_events(paths: list[Path], max_events: int, columns: list[str] | None = None) -> ak.Array:
     arrays = []
     for file_name in parquet_files(paths):
-        arrays.append(ak.from_parquet(file_name))
+        arrays.append(ak.from_parquet(file_name, columns=columns))
     events = ak.concatenate(arrays)
     if max_events is not None:
         events = events[:max_events]
@@ -58,10 +58,12 @@ def main() -> None:
     parser.add_argument("--max-events", type=int, default=None)
     args = parser.parse_args()
 
-    # events = read_events(args.data_dir + args.mc_dir, args.max_events)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config = load_config(args.config)
     feature_config = parse_feature_config(config)
+
+    events = read_events(args.data_dir + args.mc_dir, args.max_events, columns = ["conditions"])
+
     for global_name in feature_config.global_fields:
         print(global_name)
 
