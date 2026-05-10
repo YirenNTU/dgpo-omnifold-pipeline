@@ -168,7 +168,6 @@ NeutrinoPrediction:
 
 Normalization:
   Sequential:
-    default: none
     Part_energy: log_normalize
     Part_pt: log_normalize
     Part_eta: normalize
@@ -190,7 +189,6 @@ Normalization:
     Part_sticShowerPhi: normalize
     Part_sticNumTowers: normalize
   Global:
-    default: none
 #    Event_totalChargedEnergy: log_normalize
 #    Event_totalEMEnergy: log_normalize
 #    Event_totalHadronicEnergy: log_normalize
@@ -204,7 +202,6 @@ Normalization:
     thrust_y: normalize
     thrust_z: normalize
   Invisible:
-    default: none
 #    pt: normalize
     eta: normalize
     phi: normalize_uniform

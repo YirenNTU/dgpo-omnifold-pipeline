@@ -336,7 +336,6 @@ def build_output_events(
     delta_invisible_b = invisible_b - visible_b
 
     delta_invisible = ak.concatenate([delta_invisible_a[:, np.newaxis], delta_invisible_b[:, np.newaxis]], axis=1)
-    print(invisible_features)
     delta_invisible_input = features_from_p4_local(delta_invisible, invisible_features)
     delta_invisible_mask = ak.ones_like(delta_invisible.px) * predict_neutrino[:, np.newaxis]
 
