@@ -147,10 +147,8 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
                 "analyzing_power_b",
             }
         )
-        if "truth_visible_a_p4" in schema_names:
-            columns.add("truth_visible_a_p4")
-        if "truth_visible_b_p4" in schema_names:
-            columns.add("truth_visible_b_p4")
+        columns.update(name for name in schema_names if name.startswith("truth_"))
+
     for feature_name in feature_config.all_sequential_fields:
         if feature_name in {"Part_energy", "Part_pt", "Part_eta", "Part_phi"}:
             columns.update(PART_MOMENTUM_SOURCE_FIELDS)
@@ -163,7 +161,6 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
             columns.add("missing_p4")
     columns.update(name for name in schema_names if name.endswith("_cut"))
     columns.update(name for name in schema_names if name.endswith("_p4"))
-    columns.update(name for name in schema_names if name.startswith("truth_"))
     return sorted(name for name in columns if name in schema_names)
 
 def build_point_cloud(
