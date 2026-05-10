@@ -145,9 +145,13 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
                 "analyzing_power",
                 "analyzing_power_a",
                 "analyzing_power_b",
+                "mtautau",
+                "mmc_likelihood",
+                "theta_cm"
             }
         )
         columns.update(name for name in schema_names if name.startswith("truth_"))
+        columns.update(name for name in schema_names if name.startswith("cos_"))
 
     for feature_name in feature_config.all_sequential_fields:
         if feature_name in {"Part_energy", "Part_pt", "Part_eta", "Part_phi"}:
