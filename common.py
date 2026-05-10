@@ -233,3 +233,26 @@ def rebuild_vector(values: ak.Array) -> ak.Array:
         return vector.zip({"px": values["x"], "py": values["y"], "pz": values["z"], "E": values["t"]})
     raise ValueError(f"Unsupported four-vector fields: {sorted(fields)}")
 
+def make_json_serializable(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): make_json_serializable(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [make_json_serializable(v) for v in obj]
+
+    if isinstance(obj, tuple):
+        return [make_json_serializable(v) for v in obj]
+
+    if isinstance(obj, np.integer):
+        return int(obj)
+
+    if isinstance(obj, np.floating):
+        return float(obj)
+
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    return obj

@@ -23,7 +23,7 @@ from common import (
     event_preselection_mask, build_input_particle_mask,
     rebuild_vector, to_numpy,
     classification_targets_for_sample, build_momentum4d,
-    pad_and_flatten_part_feature
+    pad_and_flatten_part_feature, make_json_serializable
 )
 from generate_event_info_yaml import parse_feature_config
 
@@ -464,6 +464,7 @@ def write_manifest(
         "shards": shards_by_sample,
     }
     manifest_path = output_dir / "manifest.json"
+    payload = make_json_serializable(payload)
     manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"[ml_pipeline_lite] wrote {manifest_path}")
 
