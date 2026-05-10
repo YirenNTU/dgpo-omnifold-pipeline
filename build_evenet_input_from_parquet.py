@@ -49,7 +49,29 @@ class Sample:
     plot_label: str
     predict_neutrino: dict[str, Any]
 
+@dataclass(frozen=True)
+class ShardTask:
+    sample_payload: dict[str, Any]
+    sample_key: str
+    file_path: str
+    source_file_index: int
+    source_sample_index: int
+    row_start: int
+    row_stop: int
+    shard_index: int
 
+
+def parquet_num_rows(path: str | Path) -> int:
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
+def split_row_ranges(num_rows: int, rows_per_task: int) -> list[tuple[int, int]]:
+    if rows_per_task <= 0:
+        raise ValueError(f"rows_per_task must be > 0, got {rows_per_task}")
+    return [
+        (start, min(start + rows_per_task, num_rows))
+        for start in range(0, num_rows, rows_per_task)
+    ]
 
 def parse_samples(config: dict[str, Any], selected_keys: list[str] | None = None) -> list[Sample]:
     selected = set(selected_keys or [])
@@ -585,77 +607,68 @@ def write_shard(events: ak.Array, path: Path) -> None:
     ak.to_parquet(events, path, compression="snappy")
 
 
-def worker_process_file(
-    sample_payload: dict[str, Any],
+def worker_process_shard(
+    task: ShardTask,
     luminosity: float | None,
     classification_lookup,
     feature_config,
     invisible_features: tuple[str, ...],
     max_particles: int,
     remove_neutral_non_photon: bool,
-    source_sample_index: int,
-    file_path: str,
-    source_file_index: int,
     output_dir: str,
     batch_size: int,
-    rows_per_shard: int,
 ):
-    sample = Sample(**sample_payload)
+    sample = Sample(**task.sample_payload)
     output_root = Path(output_dir)
-    parquet = pq.ParquetFile(file_path)
+
+    parquet = pq.ParquetFile(task.file_path)
     schema_names = {field.name for field in parquet.schema_arrow}
     columns = required_columns(schema_names, feature_config, sample)
 
     shard_buffers: list[ak.Array] = []
-    selected_in_buffer = 0
-    written_shards: list[dict[str, Any]] = []
-    row_offset = 0
-    shard_index = 0
+    selected_rows = 0
 
-    def flush_buffer() -> None:
-        nonlocal shard_buffers, selected_in_buffer, shard_index
-        if not shard_buffers:
-            return
-        shard_events = shard_buffers[0] if len(shard_buffers) == 1 else  ak.concatenate(shard_buffers, axis=0)
-        shard_path = (
-            output_root
-            / "shards"
-            / sample.key
-            / f"{sample.key}__file{source_file_index:03d}__shard{shard_index:05d}.parquet"
-        )
-        write_shard(shard_events, shard_path)
-        written_shards.append(
-            {
-                "path": str(shard_path.relative_to(output_root)),
-                "rows": int(len(shard_events)),
-                "source_file": file_path,
-                "source_file_index": source_file_index,
-            }
-        )
-        shard_index += 1
-        shard_buffers = []
-        selected_in_buffer = 0
+    row_offset = 0
 
     for record_batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
+        batch_start = row_offset
+        batch_stop = row_offset + record_batch.num_rows
+        row_offset = batch_stop
+
+        overlap_start = max(task.row_start, batch_start)
+        overlap_stop = min(task.row_stop, batch_stop)
+
+        if overlap_start >= overlap_stop:
+            continue
+
+        local_start = overlap_start - batch_start
+        local_length = overlap_stop - overlap_start
+
+        record_batch = record_batch.slice(local_start, local_length)
         events = ak.from_arrow(record_batch)
+
         vector_fields = ["lead_a_visible_p4", "lead_b_visible_p4"]
+
         if sample.is_signal:
             vector_fields.extend(["truth_tau_a_p4", "truth_tau_b_p4"])
             if "truth_visible_a_p4" in events.fields:
                 vector_fields.append("truth_visible_a_p4")
             if "truth_visible_b_p4" in events.fields:
                 vector_fields.append("truth_visible_b_p4")
+
         if "missing_p4" in events.fields:
             vector_fields.append("missing_p4")
+
         for field in vector_fields:
             events[field] = rebuild_vector(events[field])
 
         mask = event_preselection_mask(events)
         if not np.any(mask):
-            row_offset += len(events)
             continue
+
         selected = events[mask]
-        selected_indices = np.flatnonzero(mask).astype(np.int64) + row_offset
+        selected_indices = np.flatnonzero(mask).astype(np.int64) + overlap_start
+
         output_events = build_output_events(
             selected_events=selected,
             sample=sample,
@@ -665,22 +678,145 @@ def worker_process_file(
             invisible_features=invisible_features,
             max_particles=max_particles,
             remove_neutral_non_photon=remove_neutral_non_photon,
-            source_sample_index=source_sample_index,
-            source_file_index=source_file_index,
-            source_row_index=selected_indices
+            source_sample_index=task.source_sample_index,
+            source_file_index=task.source_file_index,
+            source_row_index=selected_indices,
         )
+
         shard_buffers.append(output_events)
-        selected_in_buffer += len(output_events)
-        if selected_in_buffer >= rows_per_shard:
-            flush_buffer()
-        row_offset += len(events)
-    flush_buffer()
+        selected_rows += len(output_events)
+
+    if not shard_buffers:
+        return {
+            "sample_key": sample.key,
+            "source_file": task.file_path,
+            "source_file_index": task.source_file_index,
+            "shards": [],
+        }
+
+    shard_events = shard_buffers[0] if len(shard_buffers) == 1 else ak.concatenate(shard_buffers, axis=0)
+
+    shard_path = (
+        output_root
+        / "shards"
+        / sample.key
+        / f"{sample.key}__file{task.source_file_index:03d}__shard{task.shard_index:05d}.parquet"
+    )
+
+    write_shard(shard_events, shard_path)
+
     return {
         "sample_key": sample.key,
-        "source_file": file_path,
-        "source_file_index": source_file_index,
-        "shards": written_shards,
+        "source_file": task.file_path,
+        "source_file_index": task.source_file_index,
+        "shards": [
+            {
+                "path": str(shard_path.relative_to(output_root)),
+                "rows": int(len(shard_events)),
+                "source_file": task.file_path,
+                "source_file_index": task.source_file_index,
+                "row_start": int(task.row_start),
+                "row_stop": int(task.row_stop),
+            }
+        ],
     }
+
+# def worker_process_file(
+#     sample_payload: dict[str, Any],
+#     luminosity: float | None,
+#     classification_lookup,
+#     feature_config,
+#     invisible_features: tuple[str, ...],
+#     max_particles: int,
+#     remove_neutral_non_photon: bool,
+#     source_sample_index: int,
+#     file_path: str,
+#     source_file_index: int,
+#     output_dir: str,
+#     batch_size: int,
+#     rows_per_shard: int,
+# ):
+#     sample = Sample(**sample_payload)
+#     output_root = Path(output_dir)
+#     parquet = pq.ParquetFile(file_path)
+#     schema_names = {field.name for field in parquet.schema_arrow}
+#     columns = required_columns(schema_names, feature_config, sample)
+#
+#     shard_buffers: list[ak.Array] = []
+#     selected_in_buffer = 0
+#     written_shards: list[dict[str, Any]] = []
+#     row_offset = 0
+#     shard_index = 0
+#
+#     def flush_buffer() -> None:
+#         nonlocal shard_buffers, selected_in_buffer, shard_index
+#         if not shard_buffers:
+#             return
+#         shard_events = shard_buffers[0] if len(shard_buffers) == 1 else  ak.concatenate(shard_buffers, axis=0)
+#         shard_path = (
+#             output_root
+#             / "shards"
+#             / sample.key
+#             / f"{sample.key}__file{source_file_index:03d}__shard{shard_index:05d}.parquet"
+#         )
+#         write_shard(shard_events, shard_path)
+#         written_shards.append(
+#             {
+#                 "path": str(shard_path.relative_to(output_root)),
+#                 "rows": int(len(shard_events)),
+#                 "source_file": file_path,
+#                 "source_file_index": source_file_index,
+#             }
+#         )
+#         shard_index += 1
+#         shard_buffers = []
+#         selected_in_buffer = 0
+#
+#     for record_batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
+#         events = ak.from_arrow(record_batch)
+#         vector_fields = ["lead_a_visible_p4", "lead_b_visible_p4"]
+#         if sample.is_signal:
+#             vector_fields.extend(["truth_tau_a_p4", "truth_tau_b_p4"])
+#             if "truth_visible_a_p4" in events.fields:
+#                 vector_fields.append("truth_visible_a_p4")
+#             if "truth_visible_b_p4" in events.fields:
+#                 vector_fields.append("truth_visible_b_p4")
+#         if "missing_p4" in events.fields:
+#             vector_fields.append("missing_p4")
+#         for field in vector_fields:
+#             events[field] = rebuild_vector(events[field])
+#
+#         mask = event_preselection_mask(events)
+#         if not np.any(mask):
+#             row_offset += len(events)
+#             continue
+#         selected = events[mask]
+#         selected_indices = np.flatnonzero(mask).astype(np.int64) + row_offset
+#         output_events = build_output_events(
+#             selected_events=selected,
+#             sample=sample,
+#             luminosity=luminosity,
+#             classification_lookup=classification_lookup,
+#             feature_config=feature_config,
+#             invisible_features=invisible_features,
+#             max_particles=max_particles,
+#             remove_neutral_non_photon=remove_neutral_non_photon,
+#             source_sample_index=source_sample_index,
+#             source_file_index=source_file_index,
+#             source_row_index=selected_indices
+#         )
+#         shard_buffers.append(output_events)
+#         selected_in_buffer += len(output_events)
+#         if selected_in_buffer >= rows_per_shard:
+#             flush_buffer()
+#         row_offset += len(events)
+#     flush_buffer()
+#     return {
+#         "sample_key": sample.key,
+#         "source_file": file_path,
+#         "source_file_index": source_file_index,
+#         "shards": written_shards,
+#     }
 
 
 
@@ -752,11 +888,42 @@ def main() -> None:
     sample_index_lookup = {sample.key: index for index, sample in enumerate(samples)}
 
     # configure multi-cpu jobs
-    jobs: list[tuple[Sample, str, int]] = []
+    tasks: list[ShardTask] = []
+
     for sample in samples:
-        files = sample.files
-        for file_index, file_path in enumerate(files):
-            jobs.append((sample, file_path, file_index))
+        sample_payload = {
+            "key": sample.key,
+            "name": sample.name,
+            "is_data": sample.is_data,
+            "is_signal": sample.is_signal,
+            "files": sample.files,
+            "file_source": sample.file_source,
+            "norm_factor": sample.norm_factor,
+            "lumi": sample.lumi,
+            "total_initial_num_events": sample.total_initial_num_events,
+            "plot_label": sample.plot_label,
+            "predict_neutrino": sample.predict_neutrino,
+        }
+
+        for file_index, file_path in enumerate(sample.files):
+            num_rows = parquet_num_rows(file_path)
+
+            for shard_index, (row_start, row_stop) in enumerate(
+                    split_row_ranges(num_rows, args.rows_per_shard)
+            ):
+                tasks.append(
+                    ShardTask(
+                        sample_payload=sample_payload,
+                        sample_key=sample.key,
+                        file_path=file_path,
+                        source_file_index=file_index,
+                        source_sample_index=sample_index_lookup[sample.key],
+                        row_start=row_start,
+                        row_stop=row_stop,
+                        shard_index=shard_index,
+                    )
+                )
+    print(f"[ml_pipeline_lite] tasks={len(tasks)} workers={args.num_workers}")
 
     max_particles = 0
     max_scan_columns = ["nprong", "Part_fourMomentum_fCoordinates_fT", "Part_pdgId", "Part_charge"]
@@ -782,56 +949,44 @@ def main() -> None:
     print(f"[ml_pipeline_lite] output_dir={output_dir}")
     print(f"[ml_pipeline_lite] samples={[sample.key for sample in samples]}")
     print(f"[ml_pipeline_lite] class_labels={list(classification_lookup.class_labels)}")
-    print(f"[ml_pipeline_lite] jobs={len(jobs)} workers={args.num_workers}")
     print(f"[ml_pipeline_lite] invisible_features={list(invisible_features)}")
     print(f"[ml_pipeline_lite] remove_neutral_non_photon={remove_neutral_non_photon}")
     print(f"[ml_pipeline_lite] max_particles={max_particles}")
 
     worker_results: list[dict[str, Any]] = []
-    max_workers = max(1, min(args.num_workers, len(jobs)))
+    max_workers = max(1, min(args.num_workers, len(tasks)))
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
             executor.submit(
-                worker_process_file,
-                sample_payload={
-                    "key": sample.key,
-                    "name": sample.name,
-                    "is_data": sample.is_data,
-                    "is_signal": sample.is_signal,
-                    "files": sample.files,
-                    "file_source": sample.file_source,
-                    "norm_factor": sample.norm_factor,
-                    "lumi": sample.lumi,
-                    "total_initial_num_events": sample.total_initial_num_events,
-                    "plot_label": sample.plot_label,
-                    "predict_neutrino": sample.predict_neutrino,
-                },
+                worker_process_shard,
+                task=task,
                 luminosity=luminosity,
                 classification_lookup=classification_lookup,
                 feature_config=feature_config,
                 invisible_features=invisible_features,
                 max_particles=max_particles,
                 remove_neutral_non_photon=remove_neutral_non_photon,
-                source_sample_index=sample_index_lookup[sample.key],
-                file_path=file_path,
-                source_file_index=file_index,
                 output_dir=str(output_dir),
                 batch_size=args.batch_size,
-                rows_per_shard=args.rows_per_shard,
-            ): (sample.key, file_path)
-            for sample, file_path, file_index in jobs
+            ): task
+            for task in tasks
         }
 
         for future in as_completed(future_map):
-            sample_key, file_path = future_map[future]
+            task = future_map[future]
             result = future.result()
             worker_results.append(result)
+
             row_written = sum(int(item["rows"]) for item in result["shards"])
             print(
-                f"[ml_pipeline_lite] finished sample={sample_key} file={file_path} "
-                f"shards={len(result['shards'])} rows={row_written}"
+                f"[ml_pipeline_lite] finished sample={task.sample_key} "
+                f"file={task.file_path} "
+                f"range={task.row_start}:{task.row_stop} "
+                f"shards={len(result['shards'])} rows={row_written}",
+                flush=True,
             )
+
     write_manifest(
         output_dir,
         args,

@@ -300,6 +300,66 @@ def to_torch_batch(batch: dict[str, np.ndarray], device: torch.device) -> dict[s
         output[key] = tensor.to(device=device)
     return output
 
+def tensor_to_numpy(value: Any) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def add_output_columns_to_events(
+    input_path: Path,
+    output_path: Path,
+    output_columns: dict[str, np.ndarray],
+    event_start: int | None = None,
+    event_stop: int | None = None,
+) -> None:
+    events = ak.from_parquet(input_path)
+
+    if event_start is not None or event_stop is not None:
+        start = 0 if event_start is None else int(event_start)
+        stop = len(events) if event_stop is None else int(event_stop)
+        events = events[start:stop]
+
+    for name, values in output_columns.items():
+        events = ak.with_field(events, values, name)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ak.to_parquet(events, output_path)
+
+
+def extract_invisible_prediction(
+    model_outputs: Any,
+    invisible_feature_names: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      pred: shape (B, N_invisible, N_features)
+      mask: shape (B, N_invisible)
+
+    This accepts either:
+      - direct tensor / array
+      - {"x_invisible": tensor}
+      - {"pred_invisible": tensor}
+      - {"neutrinos": {"predict": {"pt": ..., "eta": ..., "phi": ...}}}
+    """
+    if isinstance(model_outputs, torch.Tensor):
+        pred = tensor_to_numpy(model_outputs)
+        mask = np.ones(pred.shape[:2], dtype=bool)
+        return pred.astype(np.float32), mask
+
+    if not isinstance(model_outputs, dict):
+        raise TypeError(f"Cannot extract invisible prediction from {type(model_outputs)!r}")
+
+    for key in ("x_invisible", "pred_invisible", "predict_invisible", "sample"):
+        if key in model_outputs:
+            pred = tensor_to_numpy(model_outputs[key])
+            mask = tensor_to_numpy(
+                model_outputs.get("x_invisible_mask", np.ones(pred.shape[:2], dtype=bool))
+            ).astype(bool)
+            return pred.astype(np.float32), mask
+
+
+
 def predict_converted_events(
     batch_np: dict[str, np.ndarray],
     model_bundle: dict[str, Any],
@@ -314,29 +374,26 @@ def predict_converted_events(
     diffusion_model = model_bundle["diffusion_model"]
     classification_model = model_bundle["classification_model"]
     sampler = model_bundle["sampler"]
-    diffusion_steps = num_steps
 
     batch_np = ensure_converted_batch_fields(batch_np, invisible_dim=len(invisible_feature_names))
     num_events = int(batch_np["x"].shape[0])
     num_invisibles = int(batch_np["x_invisible"].shape[1])
 
-    pred_class_index = np.full(num_events, -1, dtype=np.int64)
-    pred_class_prob  = np.full(num_events, -1, dtype=np.float32)
+    output_columns: dict[str, np.ndarray] = {
+        "evenet_class_index": np.full(num_events, -1, dtype=np.int64),
+        "evenet_class_prob": np.full(num_events, -1.0, dtype=np.float32),
+    }
 
     valid_signal_prediction = np.zeros(num_events, dtype=bool)
-    pred_invisible = np.zeros((num_events, num_invisibles, len(invisible_feature_names)), dtype=np.float32)
-    target_invisible = np.zeros((num_events, len(invisible_feature_names)), dtype=np.float32)
-    total_batches = max(1, math.ceil(num_events / batch_size))
-    target_mask = batch_np["x_invisible_mask"].astype(bool)
-    fill_invisible_feature_outputs(
-        target_invisible,
-        prefix="target_invisible",
-        values=batch_np["x_invisible"].astype(np.float32),
-        valid_mask=target_mask,
-        feature_names=invisible_feature_names,
-        target_indices=np.arange(num_events, dtype=np.int64),
+    pred_invisible = np.zeros(
+        (num_events, num_invisibles, len(invisible_feature_names)),
+        dtype=np.float32
     )
-
+    pred_invisible_mask = np.zeros(
+        (num_events, num_invisibles),
+        dtype=bool
+    )
+    total_batches = max(1, math.ceil(num_events / batch_size))
     for start in range(0, num_events, batch_size):
         stop = min(start + batch_size, num_events)
         batch_id = start // batch_size + 1
@@ -354,8 +411,8 @@ def predict_converted_events(
         batch_torch = to_torch_batch(batch_slice, device=device)
         with torch.no_grad():
             if skip_classification:
-                pred_class_index[start:stop] = batch_np["classification"]
-                pred_class_prob[start:stop] = 1.0
+                batch_class_index = batch_np["classification"]
+                batch_class_prob = np.ones(stop - start, dtype=np.float32)
             else:
                 cls_outputs = classification_model.shared_step(
                     batch=batch_torch,
@@ -376,18 +433,45 @@ def predict_converted_events(
                     )
                 logits = next(iter(classification_outputs.values()))
                 probs = torch.softmax(logits, dim=-1)
-                batch_pred_index = torch.argmax(probs, dim=-1)
-                batch_pred_prob = torch.gather(probs, -1, batch_pred_index.unsqueeze(-1)).squeeze(-1)
+                pred_index = torch.argmax(probs, dim=-1)
+                pred_prob = torch.gather(probs, -1, pred_index.unsqueeze(-1)).squeeze(-1)
 
-                batch_pred_index_np = batch_pred_index.detach().cpu().numpy().astype(np.int64)
-                batch_pred_prob_np = batch_pred_prob.detach().cpu().numpy().astype(np.float32)
+                batch_class_index = pred_index.detach().cpu().numpy().astype(np.int64)
+                batch_class_prob = pred_prob.detach().cpu().numpy().astype(np.float32)
 
-                pred_class_index[start:stop] = batch_pred_index_np
-                pred_class_prob[start:stop] = batch_pred_prob_np
-    return {
-        "pred_class_index": pred_class_index,
-        "pred_class_prob": pred_class_prob,
-    }
+            output_columns["evenet_class_index"][start:stop] = batch_class_index
+            output_columns["evenet_class_prob"][start:stop] = batch_class_prob
+
+            # Make generation use the class you chose.
+            batch_slice["classification"] = batch_class_index
+            batch_torch = to_torch_batch(batch_slice, device=device)
+
+            # --------------------------------------------------
+            # 2. Invisible / neutrino generation
+            # --------------------------------------------------
+            gen_outputs = sampler.sample(
+                model=diffusion_model,
+                batch=batch_torch,
+                batch_size=batch_size,
+                num_steps=num_steps,
+            )
+            batch_pred_invisible, batch_pred_mask = extract_invisible_prediction(
+                gen_outputs,
+                invisible_feature_names=invisible_feature_names,
+            )
+            pred_invisible[start:stop] = batch_pred_invisible.astype(np.float32)
+            pred_invisible_mask[start:stop] = batch_pred_mask.astype(bool)
+
+    fill_invisible_feature_outputs(
+        output_columns,
+        prefix="evenet_invisible",
+        values=pred_invisible,
+        valid_mask=pred_invisible_mask,
+        feature_names=invisible_feature_names,
+        target_indices=np.arange(num_events, dtype=np.int64),
+    )
+
+    return output_columns
 
 def load_converted_batch(
     parquet_path: Path,
@@ -413,36 +497,108 @@ def augment_converted_parquet_task(
     device: torch.device,
 ) -> None:
     input_path = Path(task.input_path).resolve()
+    output_path = Path(task.output_path).resolve()
+
+    if shape_metadata_path is None:
+        metadata_path = input_path.parent / "shape_metadata.json"
+    else:
+        metadata_path = Path(shape_metadata_path).resolve()
+
     print(f"[converted-task] loading {input_path}", flush=True)
-    metadata_path = Path(shape_metadata_path).resolve()
+
     batch_np = load_converted_batch(
-        input_path=str(input_path),
-        metadata_path=metadata_path,
+        parquet_path=input_path,
+        shape_metadata_path=metadata_path,
         event_start=task.event_start,
         event_stop=task.event_stop,
     )
+
+    num_events = int(batch_np["x"].shape[0])
     print(
         f"[converted-task] loaded {input_path.name} "
-        f"events={int(batch_np['x'].shape[0])} "
-        f"range=[{task.event_start if task.event_start is not None else 0},"
-        f"{task.event_stop if task.event_stop is not None else int(batch_np['x'].shape[0])}) "
-        f"shape_metadata={metadata_path}",
+        f"events={num_events} "
+        f"range=[{task.event_start if task.event_start is not None else 0}, "
+        f"{task.event_stop if task.event_stop is not None else num_events})",
         flush=True,
     )
-    outputs = predict_converted_events(
+
+    output_columns = predict_converted_events(
         batch_np=batch_np,
         model_bundle=model_bundle,
         batch_size=batch_size,
         num_steps=num_steps,
         converted_split_fraction=converted_split_fraction,
-        device=device,
         skip_classification=skip_classification,
+        device=device,
     )
-    num_events = int(batch_np["x"].shape[0])
+
+    add_output_columns_to_events(
+        input_path=input_path,
+        output_path=output_path,
+        output_columns=output_columns,
+        event_start=task.event_start,
+        event_stop=task.event_stop,
+    )
+
+    print(f"[converted-task] wrote {output_path}", flush=True)
+
+def load_checkpoint_into_model(
+    model: EveNetModel,
+    checkpoint_path: Path,
+    *,
+    use_ema: bool,
+    device: torch.device,
+) -> EveNetModel:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    if use_ema and isinstance(checkpoint, dict) and "ema_state_dict" in checkpoint:
+        state_dict = checkpoint["ema_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    safe_load_state(model, state_dict)
+    model.to(device)
+    model.eval()
+    return model
 
 
+def load_model_bundle(
+    runtime_train_config: Path,
+    classification_checkpoint: Path,
+    diffusion_checkpoint: Path,
+    *,
+    diffusion_use_ema: bool,
+    device: torch.device,
+) -> dict[str, Any]:
+    # Keep this consistent with the way EveNetModel is normally initialized in your repo.
+    global_config.initialize(str(runtime_train_config)) if hasattr(global_config, "initialize") else None
 
+    classification_model = EveNetModel()
+    diffusion_model = EveNetModel()
 
+    classification_model = load_checkpoint_into_model(
+        classification_model,
+        classification_checkpoint,
+        use_ema=False,
+        device=device,
+    )
+
+    diffusion_model = load_checkpoint_into_model(
+        diffusion_model,
+        diffusion_checkpoint,
+        use_ema=diffusion_use_ema,
+        device=device,
+    )
+
+    sampler = DDIMSampler(diffusion_model)
+
+    return {
+        "classification_model": classification_model,
+        "diffusion_model": diffusion_model,
+        "sampler": sampler,
+    }
 
 
 
@@ -599,6 +755,7 @@ def main() -> None:
     args = parser.parse_args()
 
     analysis_config = read_yaml(args.analysis_config)
+    invisible_features = tuple(str(key) for key in analysis_config["Normalization"].get("Invisible"))
     output_dir = args.output_dir
     converted_parquets = resolve_converted_parquets(args.converted_parquet)
     converted_split_fraction = args.converted_split_fraction
@@ -650,7 +807,47 @@ def main() -> None:
         diffusion_check_point = args.checkpoint.resolve()
 
     tasks = select_task_shard(all_tasks, args.task_num_shards, args.task_shard_index)
+    if not tasks:
+        print("[converted-predict] no tasks assigned to this shard", flush=True)
+        return
 
+    device = torch.device("cuda:0" if use_cuda else "cpu")
+    print(f"[converted-predict] using device={device}", flush=True)
+
+    model_bundle = load_model_bundle(
+        runtime_train_config=runtime_train_config,
+        classification_checkpoint=classification_check_point,
+        diffusion_checkpoint=diffusion_check_point,
+        diffusion_use_ema=diffusion_use_ema,
+        device=device,
+    )
+    model_bundle["invisible_feature_names"] = invisible_features
+
+    for task in tasks:
+        augment_converted_parquet_task(
+            task=task,
+            model_bundle=model_bundle,
+            batch_size=args.batch_size,
+            num_steps=args.num_steps,
+            converted_split_fraction=converted_split_fraction,
+            shape_metadata_path=args.shape_metadata,
+            skip_classification=args.use_truth_classification,
+            device=device,
+        )
+
+    if not args.skip_merge:
+        if args.task_num_shards > 1 and args.task_shard_index != 0:
+            print(
+                f"[converted-merge] skipped on shard {args.task_shard_index}; "
+                "run merge once from shard 0 after all shards finish",
+                flush=True,
+            )
+            return
+
+        merge_converted_chunk_outputs(
+            all_tasks,
+            delete_parts=args.delete_merged_parts,
+        )
 if __name__ == "__main__":
     main()
 
