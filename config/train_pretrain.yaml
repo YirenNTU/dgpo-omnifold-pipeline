@@ -168,7 +168,7 @@ options:
         "66": "n"
 
 network:
-  default: ../EveNet-Full/share/network/network-20M.yaml
+  default: /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/EveNet-Full/share/network/network-20M.yaml
 
   Body:
     GroupedSequentialEmbedding:
