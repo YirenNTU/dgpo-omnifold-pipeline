@@ -331,6 +331,7 @@ def add_output_columns_to_events(
     output_columns: dict[str, np.ndarray],
     event_start: int | None = None,
     event_stop: int | None = None,
+    converted_split_fraction: float | None = None,
 ) -> None:
     events = ak.from_parquet(input_path)
 
@@ -341,6 +342,10 @@ def add_output_columns_to_events(
 
     for name, values in output_columns.items():
         events = ak.with_field(events, values, name)
+
+    if converted_split_fraction is not None:
+        events["event_weight"] *= 1/converted_split_fraction
+
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ak.to_parquet(events, output_path)
@@ -514,6 +519,7 @@ def predict_converted_events(
         target_indices=np.arange(num_events, dtype=np.int64),
     )
 
+
     return output_columns
 
 def load_converted_batch(
@@ -581,6 +587,7 @@ def augment_converted_parquet_task(
         output_columns=output_columns,
         event_start=task.event_start,
         event_stop=task.event_stop,
+        converted_split_fraction=converted_split_fraction,
     )
 
     print(f"[converted-task] wrote {output_path}", flush=True)
