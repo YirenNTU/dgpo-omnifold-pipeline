@@ -464,7 +464,7 @@ def process_control_feature(payload: dict[str, Any]) -> dict[str, Any]:
     feature_idx = payload["feature_idx"]
     feature_name = payload["feature_name"]
     feature_kind = payload["feature_kind"]
-    sample_files = {**payload["data_files"], **payload["mc_files"]}
+    sample_files = {**payload["mc_files"]}
     range_result = scan_feature_range(
         sample_files,
         feature_kind,
@@ -708,7 +708,7 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
     process_values: dict[str, dict[str, Any]] = {}
     columns = quantum_columns(observable, payload["weight_column"])
     columns.extend(["classification_target_name", "event_category"])
-    sample_files = {**payload["data_files"], **payload["mc_files"]}
+    sample_files = {**payload["mc_files"]}
     allowed_labels = set(payload["neutrino_prediction_labels"])
 
     for sample_name, files in sample_files.items():
