@@ -852,7 +852,7 @@ def main() -> None:
     # data_files = build_sample_map(args.data_dir, "data", combine=True)
     mc_files = build_sample_map(args.mc_dir, "mc", combine=False)
     common_payload = {
-        "data_files": data_files,
+        # "data_files": data_files,
         "mc_files": mc_files,
         "max_events": args.max_events,
         "bins": args.bins,
@@ -863,7 +863,7 @@ def main() -> None:
     }
 
     all_results: dict[str, Any] = {
-        "data_samples": {name: len(files) for name, files in data_files.items()},
+        # "data_samples": {name: len(files) for name, files in data_files.items()},
         "mc_samples": {name: len(files) for name, files in mc_files.items()},
         "max_events": args.max_events,
         "weight_column": args.weight_column,
