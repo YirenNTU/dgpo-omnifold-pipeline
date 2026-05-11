@@ -325,7 +325,7 @@ def sample_feature_values(
 
 def needed_columns(feature_kind: str, weight_column: str | None) -> list[str]:
     columns = ["conditions"] if feature_kind == "global" else ["x", "x_mask"]
-    columns.extend(["classification_target_name", "event_category"])
+    columns.extend(["classification_target_name", "event_category", "baseline_theta_cm"])
     if weight_column:
         columns.append(weight_column)
     return columns
@@ -808,9 +808,7 @@ def observable_values(
     return to_numpy(events[field], np.float64)
 
 def baseline_valid_mask(events: ak.Array) -> np.ndarray:
-    print(events.fields)
-    print(events["evenet_invisible_a_valid"])
-    return events["evenet_invisible_a_valid"]
+    return events["baseline_theta_cm"] > 0
 
 
 def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
