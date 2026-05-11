@@ -447,14 +447,32 @@ def predict_converted_events(
             batch_slice["classification"] = batch_class_index
             batch_torch = to_torch_batch(batch_slice, device=device)
 
+            prediction_invisible_mask = torch.ones(
+                batch_torch["x_invisible"].shape[:2],
+                dtype=torch.bool,
+                device=device,
+            )
+            prediction_noise_mask = prediction_invisible_mask.unsqueeze(-1)
+
             # --------------------------------------------------
             # 2. Invisible / neutrino generation
             # --------------------------------------------------
             gen_outputs = sampler.sample(
-                model=diffusion_model,
-                batch=batch_torch,
-                batch_size=batch_size,
+                data_shape=batch_torch["x_invisible"].shape,
+                pred_fn=lambda noise_x, time: diffusion_model.predict_diffusion_vector(
+                    noise_x=noise_x,
+                    cond_x=batch_torch,
+                    time=time,
+                    mode="neutrino",
+                    noise_mask=prediction_noise_mask
+                ),
+                normalize_fn=diffusion_model.invisible_normalizer,
+                eta=1.0,
                 num_steps=num_steps,
+                use_tqdm=False,
+                process_name="NeutrinoPredict",
+                remove_padding = (getattr(diffusion_model, "invisible_padding", 0) > 0),
+                noise_mask = prediction_noise_mask,
             )
             batch_pred_invisible, batch_pred_mask = extract_invisible_prediction(
                 gen_outputs,
