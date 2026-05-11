@@ -105,7 +105,7 @@ options:
 
 
     EarlyStopping:
-      patience: 100
+      patience: 1000
       min_delta: 0.0
       monitor: "val/loss"
       mode: "min"
@@ -150,7 +150,7 @@ options:
       label_feature: "Part_pdgId"
       max_points: 10000
       max_batches: 10
-      log_every_n_epochs: 1
+      log_every_n_epochs: 20
       alpha: 0.8
       marker_size: 8.0
       outlier_percentile_low: 0.5

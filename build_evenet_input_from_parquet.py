@@ -311,6 +311,8 @@ def features_from_p4_local(p4: ak.Array, feature_names: tuple[str, ...]) -> np.n
             values = ak.to_numpy(p4.phi, allow_missing=False)
         elif feature_name == "mass":
             values = ak.to_numpy(p4.mass, allow_missing=False)
+        elif feature_name == "theta":
+            values = ak.to_numpy(p4.theta, allow_missing=False)
         else:
             raise ValueError(f"Unsupported four-vector feature '{feature_name}'.")
         components.append(values.astype(np.float32))
