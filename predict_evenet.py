@@ -179,6 +179,7 @@ def prepare_runtime_train_config(
     evenet_config_path: Path,
     checkpoint_override: Path | None,
 ) -> Path:
+
     train_cfg = read_yaml(train_config_path)
     analysis_cfg = read_yaml(analysis_config_path)
     feature_config = parse_feature_config(analysis_cfg)
@@ -573,18 +574,20 @@ def load_model_bundle(
     device: torch.device,
 ) -> dict[str, Any]:
     # Keep this consistent with the way EveNetModel is normally initialized in your repo.
-    global_config.initialize(str(runtime_train_config)) if hasattr(global_config, "initialize") else None
-    print(global_config)
+    global_config.load_yaml(runtime_train_config, current_dir=REPO_ROOT)
+    normalization_dict = torch.load(global_config.options.Dataset.normalization_file, map_location=device)
     classification_model = EveNetModel(
         config=global_config,
         device=device,
         classification=True,
+        normalization_dict=normalization_dict,
     )
     diffusion_model = EveNetModel(
         config=global_config,
         device=device,
         classification=False,
-        neutrino_generation=True
+        neutrino_generation=True,
+        normalization_dict=normalization_dict,
     )
 
     classification_model = load_checkpoint_into_model(
@@ -825,7 +828,7 @@ def main() -> None:
     print(f"[converted-predict] using device={device}", flush=True)
 
     model_bundle = load_model_bundle(
-        runtime_train_config=runtime_train_cfg_data,
+        runtime_train_config=runtime_train_cfg,
         classification_checkpoint=classification_check_point,
         diffusion_checkpoint=diffusion_check_point,
         diffusion_use_ema=diffusion_use_ema,
