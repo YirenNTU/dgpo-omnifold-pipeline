@@ -574,7 +574,7 @@ def load_model_bundle(
 ) -> dict[str, Any]:
     # Keep this consistent with the way EveNetModel is normally initialized in your repo.
     global_config.initialize(str(runtime_train_config)) if hasattr(global_config, "initialize") else None
-
+    print(global_config)
     classification_model = EveNetModel(
         config=global_config,
         device=device,
