@@ -23,8 +23,7 @@ logger:
     version: "v1"
 
 options:
-  default: ../EveNet-Full/share/options/options.yaml
-
+  default: /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/EveNet-Full/share/options/options.yaml
   Training:
     total_epochs: 1000
     epochs: 1000
