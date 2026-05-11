@@ -421,8 +421,8 @@ def build_output_events(
         truth_tau_a = visible_a * 0 # meaningless stuff
         truth_tau_b = visible_b * 0 # meaningless stuff
 
-    invisible_a = truth_tau_a - visible_a
-    invisible_b = truth_tau_b - visible_b
+    invisible_a = truth_tau_a # - visible_a
+    invisible_b = truth_tau_b # - visible_b
 
     invisible_a_for_delta = features_from_p4_local(invisible_a, invisible_features)
     invisible_b_for_delta = features_from_p4_local(invisible_b, invisible_features)

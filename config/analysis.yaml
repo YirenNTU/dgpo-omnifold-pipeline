@@ -15,12 +15,12 @@ Samples:
     norm_factor: 1458.9 # pb
     input_files:
       - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_0/filtered___baseline.parquet"
-#      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_1/filtered___baseline.parquet"
-#      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_2/filtered___baseline.parquet"
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_1/filtered___baseline.parquet"
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_2/filtered___baseline.parquet"
     raw_files:
       - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_0/filtered___raw.parquet"
-#      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_1/filtered___raw.parquet"
-#      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_2/filtered___raw.parquet"
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_1/filtered___raw.parquet"
+      - "/pscratch/sd/t/tihsu/database/ZtautauAnalysis/baseline/Ztautau_extra/Ztautau_2/filtered___raw.parquet"
 
 
   Zll:
@@ -203,7 +203,7 @@ Normalization:
     Part_in_hemisphere_a: none
     Part_in_hemisphere_b: none
     Part_dR_to_lead_a: normalize
-    Part_dR_to_lead_a: normalize
+    Part_dR_to_lead_b: normalize
     Part_angle_to_lead_a: normalize
     Part_angle_to_lead_b: normalize
   Global:
@@ -226,6 +226,6 @@ Normalization:
     thrust_y: normalize
     thrust_z: normalize
   Invisible:
-    pt: normalize
-    eta: normalize
+#    pt: normalize
+    theta: normalize
     phi: normalize
