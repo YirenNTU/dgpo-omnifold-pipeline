@@ -30,7 +30,7 @@ options:
     epochs: 1000
     model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/checkpoint-pretrain-diffusion
     model_checkpoint_load_path: null
-    pretrain_model_load_path: /global/homes/t/tihsu/CMSOpenData-GridStudy/pretrain-weights/checkpoints.20M.a4.last.ckpt
+    pretrain_model_load_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/checkpoint-pretrain-diffusion/last-v4.ckpt
     freeze_modules: []
     diffusion_every_n_epochs: 20
     diffusion_every_n_steps: 1
