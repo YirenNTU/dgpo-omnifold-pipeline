@@ -1,6 +1,6 @@
 platform:
-  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/evenet_input/before_shuffle/train-diffusion
-  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/evenet_input/before_shuffle/val-diffusion
+  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_delta_tau_based/evenet-input/train-diffusion
+  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_delta_tau_based/evenet-input/val-diffusion
   number_of_workers: 16
   resources_per_worker: {
     "CPU": 20,
@@ -25,9 +25,9 @@ logger:
 options:
   default: /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/EveNet-Full/share/options/options.yaml
   Training:
-    total_epochs: 1000
-    epochs: 1000
-    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/checkpoint-pretrain-diffusion
+    total_epochs: 1500
+    epochs: 1500
+    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_delta_tau_based/checkpoint-pretrain-diffusion
     model_checkpoint_load_path: null
     pretrain_model_load_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/checkpoint-pretrain-diffusion/last-v4.ckpt
     freeze_modules: []
@@ -132,7 +132,7 @@ options:
 
   Dataset:
     dataset_limit: 1.0
-    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline/evenet_input/before_shuffle/normalization.pt
+    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_delta_tau_based/evenet-input/normalization.pt
     val_split: [0.8, 1.0]
 
   Metrics:
