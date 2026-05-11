@@ -824,7 +824,7 @@ def main() -> None:
     print(f"[converted-predict] using device={device}", flush=True)
 
     model_bundle = load_model_bundle(
-        runtime_train_config=runtime_train_config,
+        runtime_train_config=runtime_train_cfg_data,
         classification_checkpoint=classification_check_point,
         diffusion_checkpoint=diffusion_check_point,
         diffusion_use_ema=diffusion_use_ema,
