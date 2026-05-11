@@ -5,36 +5,26 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import gc
 import json
+import math
+import os
 from pathlib import Path
 from typing import Any
 
 import awkward as ak
 import numpy as np
-import vector
 
 try:
     import yaml
 except ModuleNotFoundError:
     yaml = None
 
-from common import (
-    build_classification_lookup,
-    channel_latex_label,
-    process_latex_label,
-)
+import math
 from generate_event_info_yaml import parse_feature_config
-from plot_style import plot_truth_prediction_bundle
+from common import build_classification_lookup, channel_latex_label, process_latex_label
+from plot_style import plot_data_mc_histogram_from_counts, plot_truth_prediction_bundle
 from quantum.observables_builder import build_observables, get_observable_names
 
-vector.register_awkward()
-
-METHOD_LABELS = {
-    "target": "Target",
-    "truth": "Stored truth",
-    "baseline": "Baseline",
-    "evenet": "EveNet",
-}
-
+DEFAULT_SAMPLE_LIMIT = 200_000
 QUANTUM_RANGES = {
     "theta_cm": (0.0, 1.0),
     "mtautau": (0.0, 150.0),
@@ -48,15 +38,6 @@ for _axis_a in ("n", "r", "k"):
 del _axis, _axis_a, _axis_b
 
 
-def debug_print(debug: bool, *items: Any) -> None:
-    if debug:
-        print("[debug]", *items, flush=True)
-
-
-def warn_print(*items: Any) -> None:
-    print("[warning]", *items, flush=True)
-
-
 def load_config(path: Path) -> dict[str, Any]:
     text = path.read_text()
     if path.suffix in {".yaml", ".yml"}:
@@ -64,19 +45,6 @@ def load_config(path: Path) -> dict[str, Any]:
             raise RuntimeError("Install pyyaml or use JSON config.")
         return yaml.safe_load(text)
     return json.loads(text)
-
-
-def to_numpy(array: Any, dtype: Any) -> np.ndarray:
-    try:
-        return np.asarray(ak.to_numpy(array, allow_missing=False), dtype=dtype)
-    except TypeError:
-        return np.asarray(ak.to_numpy(array), dtype=dtype)
-    except Exception:
-        return np.asarray(ak.to_list(array), dtype=dtype)
-
-
-def wrap_phi(phi: np.ndarray) -> np.ndarray:
-    return np.arctan2(np.sin(phi), np.cos(phi))
 
 
 def parquet_files(paths: list[Path]) -> list[str]:
@@ -125,7 +93,6 @@ def category_lookup_payload(config: dict[str, Any]) -> dict[str, Any]:
 def neutrino_prediction_labels(config: dict[str, Any]) -> set[str]:
     prediction_cfg = config.get("NeutrinoPrediction") or {}
     labels: set[str] = set()
-
     for raw_value in prediction_cfg.values():
         if isinstance(raw_value, dict):
             for nested_value in raw_value.values():
@@ -137,8 +104,29 @@ def neutrino_prediction_labels(config: dict[str, Any]) -> set[str]:
             labels.update(str(item) for item in raw_value)
         elif raw_value is not None:
             labels.add(str(raw_value))
-
     return labels
+
+
+def event_process_labels(
+    events: ak.Array,
+    sample_name: str,
+    is_data: bool,
+    label_lookup: dict[str, Any],
+) -> np.ndarray:
+    if is_data:
+        return np.asarray(["Data"] * len(events), dtype=object)
+    if "classification_target_name" in events.fields:
+        labels = np.asarray(ak.to_numpy(events["classification_target_name"], allow_missing=False), dtype=str)
+        return np.asarray([display_process_label(label) for label in labels], dtype=object)
+
+    category_map = label_lookup.get("sample_event_category_to_label", {}).get(sample_name)
+    if category_map and "event_category" in events.fields:
+        categories = to_numpy(events["event_category"], np.int64)
+        labels = [category_map.get(int(category), sample_name) for category in categories]
+        return np.asarray([display_process_label(label) for label in labels], dtype=object)
+
+    default_label = label_lookup.get("sample_default_label", {}).get(sample_name, sample_name)
+    return np.asarray([display_process_label(default_label)] * len(events), dtype=object)
 
 
 def raw_event_process_labels(
@@ -147,16 +135,12 @@ def raw_event_process_labels(
     label_lookup: dict[str, Any],
 ) -> np.ndarray:
     if "classification_target_name" in events.fields:
-        return np.asarray(
-            ak.to_numpy(events["classification_target_name"], allow_missing=False),
-            dtype=str,
-        )
+        return np.asarray(ak.to_numpy(events["classification_target_name"], allow_missing=False), dtype=str)
 
     category_map = label_lookup.get("sample_event_category_to_label", {}).get(sample_name)
     if category_map and "event_category" in events.fields:
         categories = to_numpy(events["event_category"], np.int64)
-        labels = [category_map.get(int(category), "") for category in categories]
-        return np.asarray(labels, dtype=str)
+        return np.asarray([category_map.get(int(category), "") for category in categories], dtype=str)
 
     default_label = label_lookup.get("sample_default_label", {}).get(sample_name, sample_name)
     return np.asarray([default_label] * len(events), dtype=str)
@@ -174,7 +158,6 @@ def available_columns(file_name: str) -> set[str] | None:
 def row_group_chunks(file_name: str, row_groups_per_chunk: int) -> list[list[int] | None]:
     if row_groups_per_chunk <= 0:
         return [None]
-
     try:
         import inspect
 
@@ -182,7 +165,6 @@ def row_group_chunks(file_name: str, row_groups_per_chunk: int) -> list[list[int
             return [None]
     except Exception:
         return [None]
-
     try:
         import pyarrow.parquet as pq
 
@@ -194,76 +176,344 @@ def row_group_chunks(file_name: str, row_groups_per_chunk: int) -> list[list[int
     chunks: list[list[int] | None] = []
     for start in range(0, num_row_groups, row_groups_per_chunk):
         chunks.append(list(range(start, min(start + row_groups_per_chunk, num_row_groups))))
-
     return chunks or [None]
 
 
-def read_parquet_chunk(
-    file_name: str,
-    columns: list[str],
-    row_groups: list[int] | None,
-    debug: bool = False,
-) -> ak.Array | None:
+def read_parquet_chunk(file_name: str, columns: list[str], row_groups: list[int] | None) -> ak.Array | None:
     present = available_columns(file_name)
     requested = list(dict.fromkeys(columns))
     selected = requested if present is None else [column for column in requested if column in present]
-    missing = [] if present is None else [column for column in requested if column not in present]
-
-    debug_print(debug, "read file =", file_name)
-    debug_print(debug, "row_groups =", row_groups)
-    debug_print(debug, "requested columns =", len(requested))
-    debug_print(debug, "selected columns =", len(selected))
-    if missing:
-        debug_print(debug, "missing first 40 columns =", missing[:40])
-
     if not selected:
-        debug_print(debug, "skip chunk: no selected columns")
         return None
-
     if row_groups is not None:
         try:
-            events = ak.from_parquet(file_name, columns=selected, row_groups=row_groups)
-            debug_print(debug, "loaded rows =", len(events), "fields =", len(events.fields))
-            return events
+            return ak.from_parquet(file_name, columns=selected, row_groups=row_groups)
         except TypeError:
             pass
+    return ak.from_parquet(file_name, columns=selected)
 
-    events = ak.from_parquet(file_name, columns=selected)
-    debug_print(debug, "loaded rows =", len(events), "fields =", len(events.fields))
-    return events
+
+def to_numpy(array: Any, dtype: Any) -> np.ndarray:
+    try:
+        return np.asarray(ak.to_numpy(array, allow_missing=False), dtype=dtype)
+    except TypeError:
+        return np.asarray(ak.to_numpy(array), dtype=dtype)
+    except Exception:
+        return np.asarray(ak.to_list(array), dtype=dtype)
 
 
 def event_weights(events: ak.Array, weight_column: str | None) -> np.ndarray | None:
     if not weight_column or weight_column not in events.fields:
         return None
-
     weights = to_numpy(events[weight_column], np.float64).reshape(-1)
     if len(weights) != len(events):
-        warn_print(f"weight column length mismatch: {weight_column} has {len(weights)}, events has {len(events)}")
         return None
-
     return weights
 
 
-def p4_field_candidates(prefixes: tuple[str, ...], component: str) -> list[str]:
-    candidates: list[str] = []
-
-    for prefix in prefixes:
-        candidates.append(f"{prefix}_{component}")
-
-        if component == "E":
-            candidates.append(f"{prefix}_energy")
-            candidates.append(f"{prefix}_Energy")
-            candidates.append(f"{prefix}_t")
-
-    return candidates
+def condition_values(events: ak.Array, global_idx: int) -> np.ndarray:
+    conditions = to_numpy(events["conditions"], np.float64)
+    if conditions.ndim != 2:
+        conditions = np.asarray(conditions, dtype=np.float64).reshape((len(events), -1))
+    if global_idx >= conditions.shape[1]:
+        raise IndexError(f"conditions only has {conditions.shape[1]} columns; requested index {global_idx}.")
+    return conditions[:, global_idx]
 
 
-def scalar_p4_columns(prefixes: tuple[str, ...]) -> list[str]:
-    columns: list[str] = []
-    for component in ("px", "py", "pz", "E"):
-        columns.extend(p4_field_candidates(prefixes, component))
+def sequential_values_and_weights(
+    events: ak.Array,
+    sequential_idx: int,
+    weight_column: str | None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    x = to_numpy(events["x"], np.float64)
+    x_mask = to_numpy(events["x_mask"], bool)
+    if x.ndim != 3:
+        raise ValueError(f"x must be rank-3, got shape {x.shape}")
+    if x_mask.shape != x.shape[:2]:
+        raise ValueError(f"x_mask shape {x_mask.shape} does not match x leading shape {x.shape[:2]}")
+    if sequential_idx >= x.shape[2]:
+        raise IndexError(f"x only has {x.shape[2]} features; requested index {sequential_idx}.")
+
+    values = x[:, :, sequential_idx][x_mask]
+    weights = event_weights(events, weight_column)
+    if weights is None:
+        return values, None
+    expanded_weights = np.broadcast_to(weights[:, None], x_mask.shape)[x_mask]
+    return values, expanded_weights
+
+
+def update_summary(summary: dict[str, Any], values: np.ndarray, sample_limit: int) -> None:
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return
+
+    summary["count"] += int(finite_values.size)
+    summary["min"] = min(summary["min"], float(np.min(finite_values)))
+    summary["max"] = max(summary["max"], float(np.max(finite_values)))
+    summary["integer"] = bool(summary["integer"] and np.allclose(finite_values, np.round(finite_values)))
+
+    sampled = summary["sampled"]
+    if sampled.size < sample_limit:
+        need = sample_limit - sampled.size
+        if finite_values.size > need:
+            indices = np.linspace(0, finite_values.size - 1, need, dtype=np.int64)
+            finite_values = finite_values[indices]
+        summary["sampled"] = np.concatenate([sampled, finite_values])
+
+
+def make_bins(summary: dict[str, Any], bins: int, max_integer_bins: int) -> np.ndarray:
+    if summary["count"] == 0:
+        return np.linspace(0.0, 1.0, bins + 1)
+
+    low = float(summary["min"])
+    high = float(summary["max"])
+    if summary["integer"]:
+        int_low = math.floor(low)
+        int_high = math.ceil(high)
+        if int_high - int_low + 1 <= max_integer_bins:
+            return np.arange(int_low - 0.5, int_high + 1.5, 1.0)
+
+    sampled = summary["sampled"]
+    if sampled.size:
+        low, high = np.quantile(sampled, [0.005, 0.995])
+
+    if not np.isfinite(low) or not np.isfinite(high) or low == high:
+        low = float(summary["min"])
+        high = float(summary["max"])
+    if low == high:
+        pad = abs(low) if low else 1.0
+        low -= 0.5 * pad
+        high += 0.5 * pad
+
+    pad = 0.05 * (high - low)
+    return np.linspace(low - pad, high + pad, bins + 1)
+
+
+def empty_summary() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "min": float("inf"),
+        "max": float("-inf"),
+        "integer": True,
+        "sampled": np.array([], dtype=np.float64),
+    }
+
+
+def sample_feature_values(
+    events: ak.Array,
+    feature_kind: str,
+    feature_idx: int,
+    weight_column: str | None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    if feature_kind == "global":
+        return condition_values(events, feature_idx), event_weights(events, weight_column)
+    if feature_kind == "sequential":
+        return sequential_values_and_weights(events, feature_idx, weight_column)
+    raise ValueError(f"Unsupported feature kind: {feature_kind}")
+
+
+def needed_columns(feature_kind: str, weight_column: str | None) -> list[str]:
+    columns = ["conditions"] if feature_kind == "global" else ["x", "x_mask"]
+    columns.extend(["classification_target_name", "event_category"])
+    if weight_column:
+        columns.append(weight_column)
     return columns
+
+
+def scan_feature_range(
+    sample_files: dict[str, list[str]],
+    feature_kind: str,
+    feature_idx: int,
+    weight_column: str | None,
+    max_events: int | None,
+    row_groups_per_chunk: int,
+) -> dict[str, Any]:
+    summary = empty_summary()
+    rows_by_sample: dict[str, int] = {}
+    columns = needed_columns(feature_kind, weight_column)
+    for sample_name, files in sample_files.items():
+        remaining = max_events
+        rows_by_sample[sample_name] = 0
+        for file_name in files:
+            for row_groups in row_group_chunks(file_name, row_groups_per_chunk):
+                if remaining is not None and remaining <= 0:
+                    break
+                events = read_parquet_chunk(file_name, columns, row_groups)
+                if events is None:
+                    continue
+                if remaining is not None and len(events) > remaining:
+                    events = events[:remaining]
+                values, _ = sample_feature_values(events, feature_kind, feature_idx, weight_column)
+                rows_by_sample[sample_name] += int(len(events))
+                update_summary(summary, values, DEFAULT_SAMPLE_LIMIT)
+                if remaining is not None:
+                    remaining -= int(len(events))
+                del events, values
+                gc.collect()
+            if remaining is not None and remaining <= 0:
+                break
+    return {"summary": summary, "rows_by_sample": rows_by_sample}
+
+
+def histogram_feature(
+    sample_files: dict[str, list[str]],
+    feature_kind: str,
+    feature_idx: int,
+    bins: np.ndarray,
+    weight_column: str | None,
+    max_events: int | None,
+    row_groups_per_chunk: int,
+    *,
+    is_data: bool,
+    label_lookup: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    histograms: dict[str, dict[str, Any]] = {}
+    columns = needed_columns(feature_kind, weight_column)
+    for sample_name, files in sample_files.items():
+        rows = 0
+        remaining = max_events
+        for file_name in files:
+            for row_groups in row_group_chunks(file_name, row_groups_per_chunk):
+                if remaining is not None and remaining <= 0:
+                    break
+                events = read_parquet_chunk(file_name, columns, row_groups)
+                if events is None:
+                    continue
+                if remaining is not None and len(events) > remaining:
+                    events = events[:remaining]
+                values, weights = sample_feature_values(events, feature_kind, feature_idx, weight_column)
+                event_labels = event_process_labels(events, sample_name, is_data, label_lookup)
+                if feature_kind == "sequential":
+                    x_mask = to_numpy(events["x_mask"], bool)
+                    labels = np.broadcast_to(event_labels[:, None], x_mask.shape)[x_mask]
+                else:
+                    labels = event_labels
+
+                finite = np.isfinite(values)
+                if weights is not None:
+                    finite &= np.isfinite(weights)
+                finite_values = values[finite]
+                finite_labels = labels[finite]
+                finite_weights = None if weights is None else weights[finite]
+                for label in np.unique(finite_labels):
+                    label_mask = finite_labels == label
+                    state = histograms.setdefault(
+                        str(label),
+                        {
+                            "counts": np.zeros(len(bins) - 1, dtype=np.float64),
+                            "sumw2": np.zeros(len(bins) - 1, dtype=np.float64),
+                            "rows": 0,
+                            "weighted": False,
+                        },
+                    )
+                    if finite_weights is None:
+                        counts_chunk = np.histogram(finite_values[label_mask], bins=bins)[0].astype(np.float64)
+                        state["counts"] += counts_chunk
+                        state["sumw2"] += counts_chunk
+                    else:
+                        label_weights = finite_weights[label_mask]
+                        state["weighted"] = True
+                        state["counts"] += np.histogram(finite_values[label_mask], bins=bins, weights=label_weights)[0]
+                        state["sumw2"] += np.histogram(
+                            finite_values[label_mask],
+                            bins=bins,
+                            weights=label_weights * label_weights,
+                        )[0]
+                    state["rows"] += int(np.sum(label_mask))
+
+                rows += int(len(events))
+                if remaining is not None:
+                    remaining -= int(len(events))
+                del events, values, weights, labels
+                gc.collect()
+            if remaining is not None and remaining <= 0:
+                break
+        if rows == 0:
+            continue
+    return histograms
+
+
+def plot_control_histograms(
+    feature_name: str,
+    bins: np.ndarray,
+    data_histograms: dict[str, dict[str, Any]],
+    mc_histograms: dict[str, dict[str, Any]],
+    output_dir: Path,
+    title_prefix: str,
+) -> str:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    data_counts = np.zeros(len(bins) - 1, dtype=np.float64)
+    data_sumw2 = np.zeros(len(bins) - 1, dtype=np.float64)
+    for payload in data_histograms.values():
+        data_counts += payload["counts"]
+        data_sumw2 += payload["sumw2"]
+    mc_counts = {sample_name: payload["counts"] for sample_name, payload in mc_histograms.items()}
+    plot_path = output_dir / f"{feature_name.replace('/', '_')}.png"
+    return plot_data_mc_histogram_from_counts(
+        bins,
+        data_counts,
+        data_sumw2,
+        mc_counts,
+        plot_path,
+        title=f"{title_prefix}: {feature_name}",
+        xlabel=feature_name,
+    )
+
+
+def process_control_feature(payload: dict[str, Any]) -> dict[str, Any]:
+    feature_idx = payload["feature_idx"]
+    feature_name = payload["feature_name"]
+    feature_kind = payload["feature_kind"]
+    sample_files = {**payload["data_files"], **payload["mc_files"]}
+    range_result = scan_feature_range(
+        sample_files,
+        feature_kind,
+        feature_idx,
+        payload["weight_column"],
+        payload["max_events"],
+        payload["row_groups_per_chunk"],
+    )
+    bins = make_bins(range_result["summary"], payload["bins"], payload["max_integer_bins"])
+    data_histograms = histogram_feature(
+        payload["data_files"],
+        feature_kind,
+        feature_idx,
+        bins,
+        payload["weight_column"],
+        payload["max_events"],
+        payload["row_groups_per_chunk"],
+        is_data=True,
+        label_lookup=payload["label_lookup"],
+    )
+    mc_histograms = histogram_feature(
+        payload["mc_files"],
+        feature_kind,
+        feature_idx,
+        bins,
+        payload["weight_column"],
+        payload["max_events"],
+        payload["row_groups_per_chunk"],
+        is_data=False,
+        label_lookup=payload["label_lookup"],
+    )
+    plot_path = plot_control_histograms(
+        feature_name,
+        bins,
+        data_histograms,
+        mc_histograms,
+        Path(payload["output_dir"]),
+        payload["title_prefix"],
+    )
+    return {
+        "feature_kind": feature_kind,
+        "feature_name": feature_name,
+        "plot": plot_path,
+        "rows_by_sample": range_result["rows_by_sample"],
+    }
+
+
+def p4_field_candidates(prefixes: tuple[str, ...], component: str) -> list[str]:
+    return [f"{prefix}_{component}" for prefix in prefixes]
 
 
 def first_existing_field(events: ak.Array, candidates: list[str]) -> str | None:
@@ -274,23 +524,13 @@ def first_existing_field(events: ak.Array, candidates: list[str]) -> str | None:
     return None
 
 
-def component_array(
-    events: ak.Array,
-    candidates: list[str],
-    slot: int | None = None,
-    debug: bool = False,
-) -> np.ndarray | None:
+def component_array(events: ak.Array, candidates: list[str], slot: int | None = None) -> np.ndarray | None:
     field = first_existing_field(events, candidates)
     if field is None:
-        debug_print(debug, "missing component candidates =", candidates)
         return None
-
     values = to_numpy(events[field], np.float64)
-
     if slot is not None and values.ndim == 2 and values.shape[1] > slot:
-        values = values[:, slot]
-
-    debug_print(debug, "component field =", field, "shape =", values.shape)
+        return values[:, slot]
     return values
 
 
@@ -298,19 +538,15 @@ def p4_from_component_prefixes(
     events: ak.Array,
     prefixes: tuple[str, ...],
     slot: int | None = None,
-    debug: bool = False,
 ) -> ak.Array | None:
     components = {
-        "px": component_array(events, p4_field_candidates(prefixes, "px"), slot, debug),
-        "py": component_array(events, p4_field_candidates(prefixes, "py"), slot, debug),
-        "pz": component_array(events, p4_field_candidates(prefixes, "pz"), slot, debug),
-        "E": component_array(events, p4_field_candidates(prefixes, "E"), slot, debug),
+        "px": component_array(events, p4_field_candidates(prefixes, "px"), slot),
+        "py": component_array(events, p4_field_candidates(prefixes, "py"), slot),
+        "pz": component_array(events, p4_field_candidates(prefixes, "pz"), slot),
+        "E": component_array(events, p4_field_candidates(prefixes, "E"), slot),
     }
-
     if any(value is None for value in components.values()):
-        debug_print(debug, "failed to build p4 for prefixes =", prefixes)
         return None
-
     return ak.zip(
         {
             "px": components["px"],
@@ -322,279 +558,95 @@ def p4_from_component_prefixes(
     )
 
 
-def massless_p4_from_pt_eta_phi(pt: np.ndarray, eta: np.ndarray, phi: np.ndarray) -> ak.Array:
-    pt = np.asarray(pt, dtype=np.float64)
-    eta = np.asarray(eta, dtype=np.float64)
-    phi = wrap_phi(np.asarray(phi, dtype=np.float64))
-
-    px = pt * np.cos(phi)
-    py = pt * np.sin(phi)
-    pz = pt * np.sinh(eta)
-    energy = np.sqrt(np.clip(px * px + py * py + pz * pz, 0.0, None))
-
-    return ak.zip(
-        {
-            "px": px,
-            "py": py,
-            "pz": pz,
-            "E": energy,
-        },
-        with_name="Momentum4D",
-    )
-
-
-def vector_pt_eta_phi(p4: ak.Array) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    pt = np.asarray(ak.to_numpy(p4.pt, allow_missing=False), dtype=np.float64)
-    eta = np.asarray(ak.to_numpy(p4.eta, allow_missing=False), dtype=np.float64)
-    phi = np.asarray(ak.to_numpy(p4.phi, allow_missing=False), dtype=np.float64)
-    return pt, eta, phi
-
-
-def method_columns(
-    observable_names: list[str],
-    weight_column: str | None,
-    methods: list[str],
-    reference_method: str,
-) -> list[str]:
-    requested_methods = set(methods) | {reference_method}
-    columns: list[str] = []
-
-    columns.extend(["classification_target_name", "event_category"])
-
-    if weight_column:
-        columns.append(weight_column)
-
-    # Visible legs.
-    columns.extend(scalar_p4_columns(("lead_a_visible", "visible_a", "visible")))
-    columns.extend(scalar_p4_columns(("lead_b_visible", "visible_b", "visible")))
-
-    if "target" in requested_methods:
-        columns.extend(
-            scalar_p4_columns(
-                (
-                    "target_a_invisible",
-                    "target_a_missing",
-                    "target_missing_a",
-                    "lead_a_missing",
-                    "target_missing",
-                    "target_invisible",
-                )
-            )
+def target_visible_columns() -> list[str]:
+    columns = []
+    for leg in ("a", "b"):
+        visible_prefixes = (
+            f"lead_{leg}_visible",
+            f"visible_{leg}",
+            "visible",
         )
-        columns.extend(
-            scalar_p4_columns(
-                (
-                    "target_b_invisible",
-                    "target_b_missing",
-                    "target_missing_b",
-                    "lead_b_missing",
-                    "target_missing",
-                    "target_invisible",
-                )
-            )
-        )
-
-    if "truth" in requested_methods:
-        columns.extend(scalar_p4_columns(("truth_tau_a",)))
-        columns.extend(scalar_p4_columns(("truth_tau_b",)))
-        columns.extend(scalar_p4_columns(("truth_a_visible", "truth_visible_a")))
-        columns.extend(scalar_p4_columns(("truth_b_visible", "truth_visible_b")))
-        for observable in observable_names:
-            columns.append(f"truth_{observable}")
-
-    if "baseline" in requested_methods:
-        for observable in observable_names:
-            columns.append(f"baseline_{observable}")
-        columns.extend(["baseline_flags_valid", "flags_valid", "baseline_mmc_likelihood", "mmc_likelihood"])
-
-    if "evenet" in requested_methods:
-        for leg in ("a", "b"):
-            columns.append(f"evenet_invisible_{leg}_valid")
-            for feature in ("pt", "log_pt", "eta", "phi"):
-                columns.append(f"evenet_invisible_{leg}_{feature}")
-
-    return list(dict.fromkeys(columns))
-
-
-def stored_observables(events: ak.Array, source: str, observable_names: list[str]) -> dict[str, np.ndarray]:
-    out: dict[str, np.ndarray] = {}
-
-    for name in observable_names:
-        if source == "truth":
-            field = f"truth_{name}"
-        elif source == "baseline":
-            field = f"baseline_{name}"
-        else:
-            field = f"{source}_{name}"
-
-        if field in events.fields:
-            out[name] = to_numpy(events[field], np.float64).reshape(-1)
-
-    return out
-
-
-def build_target_observables(events: ak.Array, debug: bool = False) -> dict[str, np.ndarray] | None:
-    visible_a = p4_from_component_prefixes(events, ("lead_a_visible", "visible_a", "visible"), slot=0, debug=debug)
-    visible_b = p4_from_component_prefixes(events, ("lead_b_visible", "visible_b", "visible"), slot=1, debug=debug)
-
-    target_a = p4_from_component_prefixes(
-        events,
-        (
-            "target_a_invisible",
-            "target_a_missing",
-            "target_missing_a",
-            "lead_a_missing",
+        target_prefixes = (
+            f"target_{leg}_invisible",
+            f"target_{leg}_missing",
+            f"target_missing_{leg}",
+            f"lead_{leg}_missing",
             "target_missing",
             "target_invisible",
-        ),
+        )
+        for component in ("px", "py", "pz", "E"):
+            columns.extend(p4_field_candidates(visible_prefixes, component))
+            columns.extend(p4_field_candidates(target_prefixes, component))
+    return columns
+
+
+def build_target_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
+    try:
+        import vector
+
+        vector.register_awkward()
+    except Exception:
+        pass
+
+    visible_a = p4_from_component_prefixes(events, ("lead_a_visible", "visible_a", "visible"), slot=0)
+    visible_b = p4_from_component_prefixes(events, ("lead_b_visible", "visible_b", "visible"), slot=1)
+    target_a = p4_from_component_prefixes(
+        events,
+        ("target_a_invisible", "target_a_missing", "target_missing_a", "lead_a_missing", "target_missing", "target_invisible"),
         slot=0,
-        debug=debug,
     )
     target_b = p4_from_component_prefixes(
         events,
-        (
-            "target_b_invisible",
-            "target_b_missing",
-            "target_missing_b",
-            "lead_b_missing",
-            "target_missing",
-            "target_invisible",
-        ),
+        ("target_b_invisible", "target_b_missing", "target_missing_b", "lead_b_missing", "target_missing", "target_invisible"),
         slot=1,
-        debug=debug,
     )
-
     if visible_a is None or visible_b is None or target_a is None or target_b is None:
-        debug_print(debug, "target observables unavailable")
         return None
-
     observables = build_observables(
         tau_a_p4=visible_a + target_a,
         tau_b_p4=visible_b + target_b,
         vis_a_p4=visible_a,
         vis_b_p4=visible_b,
     )
+    return {name: np.asarray(values, dtype=np.float64) for name, values in observables.items()}
 
-    out = {name: np.asarray(values, dtype=np.float64).reshape(-1) for name, values in observables.items()}
-    debug_print(debug, "target observables built =", len(out))
-    return out
+def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
 
+    visible_a = p4_from_component_prefixes(events, ("lead_a_visible", "visible_a", "visible"), slot=0)
+    visible_b = p4_from_component_prefixes(events, ("lead_b_visible", "visible_b", "visible"), slot=1)
 
-def build_truth_observables(
-    events: ak.Array,
-    observable_names: list[str],
-    debug: bool = False,
-) -> dict[str, np.ndarray] | None:
-    tau_a = p4_from_component_prefixes(events, ("truth_tau_a",), debug=debug)
-    tau_b = p4_from_component_prefixes(events, ("truth_tau_b",), debug=debug)
-    vis_a = p4_from_component_prefixes(events, ("truth_a_visible", "truth_visible_a"), debug=debug)
-    vis_b = p4_from_component_prefixes(events, ("truth_b_visible", "truth_visible_b"), debug=debug)
+    delta_visible_a_pt = events["evenet_invisible_a_pt"]
+    delta_visible_a_eta = events["evenet_invisible_a_eta"]
+    delta_visible_a_phi = events["evenet_invisible_a_phi"]
+    delta_visible_b_pt = events["evenet_invisible_b_pt"]
+    delta_visible_b_eta = events["evenet_invisible_b_eta"]
+    delta_visible_b_phi = events["evenet_invisible_b_phi"]
 
-    if tau_a is not None and tau_b is not None and vis_a is not None and vis_b is not None:
-        observables = build_observables(
-            tau_a_p4=tau_a,
-            tau_b_p4=tau_b,
-            vis_a_p4=vis_a,
-            vis_b_p4=vis_b,
-        )
-        out = {name: np.asarray(values, dtype=np.float64).reshape(-1) for name, values in observables.items()}
-        debug_print(debug, "truth observables rebuilt from p4 =", len(out))
-        return out
+    invisible_a_pt = visible_a.pt + delta_visible_a_pt
+    invisible_b_pt = visible_b.pt + delta_visible_b_pt
+    invisible_a_eta = visible_a.eta + delta_visible_a_eta
+    invisible_b_eta = visible_b.eta + delta_visible_b_eta
+    invisible_a_phi = (visible_a.phi + delta_visible_a_phi) % (2 * math.pi)
+    invisible_b_phi = (visible_b.phi + delta_visible_b_phi) % (2 * math.pi)
 
-    stored = stored_observables(events, "truth", observable_names)
-    debug_print(debug, "truth stored observables =", len(stored))
-    return stored if stored else None
-
-
-def evenet_invisible_p4(events: ak.Array, visible: ak.Array, leg: str, debug: bool = False) -> ak.Array | None:
-    valid_field = f"evenet_invisible_{leg}_valid"
-    eta_field = f"evenet_invisible_{leg}_eta"
-    phi_field = f"evenet_invisible_{leg}_phi"
-    pt_field = f"evenet_invisible_{leg}_pt"
-    log_pt_field = f"evenet_invisible_{leg}_log_pt"
-
-    if eta_field not in events.fields or phi_field not in events.fields:
-        debug_print(debug, f"evenet leg {leg}: missing eta/phi fields")
-        return None
-
-    visible_pt, visible_eta, visible_phi = vector_pt_eta_phi(visible)
-
-    delta_eta = to_numpy(events[eta_field], np.float64).reshape(-1)
-    delta_phi = to_numpy(events[phi_field], np.float64).reshape(-1)
-
-    pred_eta = visible_eta + delta_eta
-    pred_phi = wrap_phi(visible_phi + delta_phi)
-
-    if pt_field in events.fields:
-        delta_pt = to_numpy(events[pt_field], np.float64).reshape(-1)
-        pred_pt = visible_pt + delta_pt
-        debug_print(
-            debug,
-            f"evenet leg {leg}: using delta pt",
-            "visible_pt min/max =", float(np.nanmin(visible_pt)), float(np.nanmax(visible_pt)),
-            "delta_pt min/max =", float(np.nanmin(delta_pt)), float(np.nanmax(delta_pt)),
-            "raw pred_pt min/max =", float(np.nanmin(pred_pt)), float(np.nanmax(pred_pt)),
-        )
-    elif log_pt_field in events.fields:
-        delta_log_pt = to_numpy(events[log_pt_field], np.float64).reshape(-1)
-        pred_pt = np.expm1(np.log1p(np.clip(visible_pt, 0.0, None)) + delta_log_pt)
-        debug_print(
-            debug,
-            f"evenet leg {leg}: using delta log_pt",
-            "raw pred_pt min/max =", float(np.nanmin(pred_pt)), float(np.nanmax(pred_pt)),
-        )
-    else:
-        debug_print(debug, f"evenet leg {leg}: missing pt/log_pt")
-        return None
-
-    if valid_field in events.fields:
-        valid = to_numpy(events[valid_field], bool).reshape(-1)
-    else:
-        valid = np.ones(len(events), dtype=bool)
-
-    if len(valid) != len(pred_pt):
-        raise ValueError(f"{valid_field} length {len(valid)} != pred_pt length {len(pred_pt)}")
-
-    if np.sum(pred_pt > 0) == 0:
-        warn_print(
-            f"all EveNet reconstructed pt <= 0 before clipping for leg {leg};",
-            "this usually means evenet_invisible_* is not a delta in normal pt space",
-        )
-
-    pred_pt = np.clip(pred_pt, 0.0, None)
-
-    pred_pt = np.where(valid, pred_pt, 0.0)
-    pred_eta = np.where(valid, pred_eta, 0.0)
-    pred_phi = np.where(valid, pred_phi, 0.0)
-
-    debug_print(
-        debug,
-        f"evenet leg {leg}: valid =",
-        int(np.sum(valid)),
-        "/",
-        len(valid),
-        "final pred_pt min/max =",
-        float(np.nanmin(pred_pt)),
-        float(np.nanmax(pred_pt)),
+    invisible_a = ak.zip(
+        {
+            "pt": invisible_a_pt,
+            "eta": invisible_a_eta,
+            "phi": invisible_a_phi,
+            "m": ak.zeros_like(invisible_a_pt),
+        },
+        with_name="Momentum4D",
     )
-
-    return massless_p4_from_pt_eta_phi(pred_pt, pred_eta, pred_phi)
-
-
-def build_evenet_observables(events: ak.Array, debug: bool = False) -> dict[str, np.ndarray] | None:
-    visible_a = p4_from_component_prefixes(events, ("lead_a_visible", "visible_a", "visible"), slot=0, debug=debug)
-    visible_b = p4_from_component_prefixes(events, ("lead_b_visible", "visible_b", "visible"), slot=1, debug=debug)
-
-    if visible_a is None or visible_b is None:
-        debug_print(debug, "evenet observables unavailable: missing visible p4")
-        return None
-
-    invisible_a = evenet_invisible_p4(events, visible_a, "a", debug=debug)
-    invisible_b = evenet_invisible_p4(events, visible_b, "b", debug=debug)
-
-    if invisible_a is None or invisible_b is None:
-        debug_print(debug, "evenet observables unavailable: missing invisible p4")
-        return None
+    invisible_b = ak.zip(
+        {
+            "pt": invisible_b_pt,
+            "eta": invisible_b_eta,
+            "phi": invisible_b_phi,
+            "m": ak.zeros_like(invisible_b_pt),
+        },
+        with_name="Momentum4D",
+    )
 
     observables = build_observables(
         tau_a_p4=visible_a + invisible_a,
@@ -602,371 +654,129 @@ def build_evenet_observables(events: ak.Array, debug: bool = False) -> dict[str,
         vis_a_p4=visible_a,
         vis_b_p4=visible_b,
     )
-
-    out = {name: np.asarray(values, dtype=np.float64).reshape(-1) for name, values in observables.items()}
-    debug_print(debug, "evenet observables built =", len(out))
-    return out
+    return {name: np.asarray(values, dtype=np.float64) for name, values in observables.items()}
 
 
-def baseline_valid_mask(events: ak.Array, debug: bool = False) -> np.ndarray:
-    if "baseline_flags_valid" in events.fields:
-        valid = to_numpy(events["baseline_flags_valid"], bool).reshape(-1)
-        debug_print(debug, "baseline valid from baseline_flags_valid =", int(np.sum(valid)), "/", len(valid))
-        return valid
-
-    if "flags_valid" in events.fields:
-        valid = to_numpy(events["flags_valid"], bool).reshape(-1)
-        debug_print(debug, "baseline valid from flags_valid =", int(np.sum(valid)), "/", len(valid))
-        return valid
-
-    if "baseline_mmc_likelihood" in events.fields:
-        likelihood = to_numpy(events["baseline_mmc_likelihood"], np.float64).reshape(-1)
-        valid = np.isfinite(likelihood) & (likelihood > 0.0)
-        debug_print(debug, "baseline valid from baseline_mmc_likelihood =", int(np.sum(valid)), "/", len(valid))
-        return valid
-
-    if "mmc_likelihood" in events.fields:
-        likelihood = to_numpy(events["mmc_likelihood"], np.float64).reshape(-1)
-        valid = np.isfinite(likelihood) & (likelihood > 0.0)
-        debug_print(debug, "baseline valid from mmc_likelihood =", int(np.sum(valid)), "/", len(valid))
-        return valid
-
-    valid = np.zeros(len(events), dtype=bool)
-    debug_print(debug, "baseline valid unavailable; all false")
-    return valid
+def quantum_columns(observable: str, weight_column: str | None) -> list[str]:
+    columns = target_visible_columns()
+    columns.extend([f"truth_{observable}", f"baseline_{observable}", "baseline_mmc_likelihood", "mmc_likelihood"])
+    if weight_column:
+        columns.append(weight_column)
+    return list(dict.fromkeys(columns))
 
 
-def evenet_valid_mask(events: ak.Array, debug: bool = False) -> np.ndarray:
-    valid = np.ones(len(events), dtype=bool)
-
-    for leg in ("a", "b"):
-        field = f"evenet_invisible_{leg}_valid"
-        if field in events.fields:
-            leg_valid = to_numpy(events[field], bool).reshape(-1)
-            valid &= leg_valid
-            debug_print(debug, field, "valid =", int(np.sum(leg_valid)), "/", len(leg_valid))
-
-    debug_print(debug, "evenet combined valid =", int(np.sum(valid)), "/", len(valid))
-    return valid
-
-
-def method_valid_masks(events: ak.Array, debug: bool = False) -> dict[str, np.ndarray]:
-    return {
-        "target": np.ones(len(events), dtype=bool),
-        "truth": np.ones(len(events), dtype=bool),
-        "baseline": baseline_valid_mask(events, debug),
-        "evenet": evenet_valid_mask(events, debug),
-    }
-
-
-def build_method_observables(
+def observable_values(
     events: ak.Array,
-    observable_names: list[str],
-    debug: bool = False,
-) -> dict[str, dict[str, np.ndarray]]:
-    methods: dict[str, dict[str, np.ndarray]] = {}
+    source: str,
+    observable: str,
+    target_observables: dict[str, np.ndarray] | None,
+) -> np.ndarray | None:
+    if source == "target":
+        if target_observables is None:
+            return None
+        return target_observables.get(observable)
+    field = f"{source}_{observable}"
+    if source == "truth":
+        field = f"truth_{observable}"
+    if source == "baseline":
+        field = f"baseline_{observable}"
+    if field not in events.fields:
+        return None
+    return to_numpy(events[field], np.float64)
 
-    target = build_target_observables(events, debug)
-    if target is not None:
-        methods["target"] = target
 
-    truth = build_truth_observables(events, observable_names, debug)
-    if truth is not None:
-        methods["truth"] = truth
-
-    baseline = stored_observables(events, "baseline", observable_names)
-    if baseline:
-        methods["baseline"] = baseline
-        debug_print(debug, "baseline stored observables =", len(baseline))
+def baseline_valid_mask(events: ak.Array) -> np.ndarray:
+    if "baseline_flags_valid" in events.fields:
+        baseline_valid = to_numpy(events["baseline_flags_valid"], bool)
+        print(baseline_valid)
+        return baseline_valid
     else:
-        debug_print(debug, "baseline stored observables unavailable")
-
-    evenet = build_evenet_observables(events, debug)
-    if evenet is not None:
-        methods["evenet"] = evenet
-
-    debug_print(debug, "built methods =", sorted(methods))
-    return methods
-
-
-def finite_common_mask(
-    x: np.ndarray,
-    y: np.ndarray,
-    weight: np.ndarray | None,
-    base_mask: np.ndarray,
-) -> np.ndarray:
-    mask = base_mask & np.isfinite(x) & np.isfinite(y)
-
-    if weight is not None:
-        mask &= np.isfinite(weight)
-
-    return mask
-
-
-def make_comparison_tasks(methods: list[str], reference: str = "target") -> list[tuple[str, str, str]]:
-    tasks = []
-    for method in methods:
-        if method == reference:
-            continue
-        tasks.append((f"{reference}_vs_{method}", reference, method))
-    return tasks
+        return np.zeros_like(events["baseline_mmc_likelihood"], dtype=bool)
 
 
 def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
     observable = payload["observable"]
-    observable_names = payload["observable_names"]
-    debug = bool(payload.get("debug", False))
-
     low, high = QUANTUM_RANGES.get(observable, (-1.0, 1.0))
     bins = np.linspace(low, high, payload["bins_2d"] + 1)
-
-    comparisons = make_comparison_tasks(
-        payload["comparison_methods"],
-        reference=payload["reference_method"],
-    )
-
-    states: dict[str, dict[str, dict[str, Any]]] = {}
-
-    columns = method_columns(
-        observable_names=observable_names,
-        weight_column=payload["weight_column"],
-        methods=payload["comparison_methods"],
-        reference_method=payload["reference_method"],
-    )
-
-    sample_files = payload["sample_files"]
-
+    comparisons = {
+        "truth_vs_target": ("truth", "target", "Stored truth", "Target", {"Baseline": "baseline"}),
+        "target_vs_baseline": ("target", "baseline", "Target", "Baseline", {"Stored truth": "truth"}),
+        "truth_vs_baseline": ("truth", "baseline", "Stored truth", "Baseline", {"Target": "target"}),
+        "truth_vs_evenet": ("truth", "evenet", "Stored truth", "Event", {"Evenet": "evenet"}),
+        "target_vs_evenet": ("target", "evenet", "Target", "Event", {"Event": "evenet"}),
+    }
+    process_values: dict[str, dict[str, Any]] = {}
+    columns = quantum_columns(observable, payload["weight_column"])
+    columns.extend(["classification_target_name", "event_category"])
+    sample_files = {**payload["data_files"], **payload["mc_files"]}
     allowed_labels = set(payload["neutrino_prediction_labels"])
-    if payload.get("no_label_filter", False):
-        allowed_labels = set()
-
-    print(f"[method-monitor] observable={observable}", flush=True)
-    debug_print(debug, "comparison tasks =", comparisons)
-    debug_print(debug, "allowed labels =", sorted(allowed_labels) if allowed_labels else "<disabled>")
-    debug_print(debug, "sample files =", {name: len(files) for name, files in sample_files.items()})
-    debug_print(debug, "requested columns =", len(columns))
 
     for sample_name, files in sample_files.items():
         remaining = payload["max_events"]
-
         for file_name in files:
-            debug_print(debug, "start file", sample_name, file_name)
-
             for row_groups in row_group_chunks(file_name, payload["row_groups_per_chunk"]):
                 if remaining is not None and remaining <= 0:
                     break
-
-                events = read_parquet_chunk(file_name, columns, row_groups, debug=debug)
+                events = read_parquet_chunk(file_name, columns, row_groups)
                 if events is None:
-                    debug_print(debug, "skip: events is None")
                     continue
-
                 if remaining is not None and len(events) > remaining:
                     events = events[:remaining]
-                    debug_print(debug, "trimmed to remaining =", remaining)
-
                 labels = raw_event_process_labels(events, sample_name, payload["label_lookup"])
-                unique_labels, unique_counts = np.unique(labels, return_counts=True)
-                debug_print(debug, "labels =", dict(zip(unique_labels.tolist(), unique_counts.tolist())))
-
-                if allowed_labels:
-                    keep = np.asarray([label in allowed_labels for label in labels], dtype=bool)
-                else:
-                    keep = np.ones(len(events), dtype=bool)
-
-                debug_print(debug, "keep =", int(np.sum(keep)), "/", len(keep))
-
+                keep = np.asarray([label in allowed_labels for label in labels], dtype=bool)
                 if not np.any(keep):
                     if remaining is not None:
                         remaining -= int(len(events))
-                    del events, labels, keep
+                    del events, labels
                     gc.collect()
                     continue
-
+                target_observables = build_target_observables(events)
+                evenet_observables = build_evenet_observables(events)
                 weights = event_weights(events, payload["weight_column"])
-                if weights is None:
-                    debug_print(debug, "weights = None")
-                else:
-                    debug_print(
-                        debug,
-                        "weights len/min/max/sum =",
-                        len(weights),
-                        float(np.nanmin(weights)),
-                        float(np.nanmax(weights)),
-                        float(np.nansum(weights)),
+                source_values = {
+                    "truth": observable_values(events, "truth", observable, target_observables),
+                    "target": observable_values(events, "target", observable, target_observables),
+                    "baseline": observable_values(events, "baseline", observable, target_observables),
+                    "evenet": observable_values(events, "evenet", observable, target_observables),
+                }
+                if source_values["baseline"] is not None:
+                    baseline_values = source_values["baseline"].copy()
+                    # baseline_values[~baseline_valid_mask(events)] = np.nan
+                    source_values["baseline"] = baseline_values
+
+                for process_name in np.unique(labels[keep]):
+                    process_mask = keep & (labels == process_name)
+                    state = process_values.setdefault(
+                        str(process_name),
+                        {"truth": [], "target": [], "baseline": [], "evenet": [], "weight": [], "total": 0},
                     )
-
-                method_values = build_method_observables(events, observable_names, debug=debug)
-                valid_masks = method_valid_masks(events, debug=debug)
-
-                for method_name, obs_dict in method_values.items():
-                    debug_print(
-                        debug,
-                        method_name,
-                        "n_observables =",
-                        len(obs_dict),
-                        "has current =",
-                        observable in obs_dict,
-                    )
-
-                for comparison_name, x_method, y_method in comparisons:
-                    debug_print(debug, "comparison =", comparison_name, x_method, "vs", y_method)
-
-                    if x_method not in method_values:
-                        debug_print(debug, "skip: missing x method", x_method)
-                        continue
-
-                    if y_method not in method_values:
-                        debug_print(debug, "skip: missing y method", y_method)
-                        continue
-
-                    if observable not in method_values[x_method]:
-                        debug_print(debug, "skip: missing observable for x", x_method, observable)
-                        continue
-
-                    if observable not in method_values[y_method]:
-                        debug_print(debug, "skip: missing observable for y", y_method, observable)
-                        continue
-
-                    x_all = method_values[x_method][observable]
-                    y_all = method_values[y_method][observable]
-
-                    if len(x_all) != len(events) or len(y_all) != len(events):
-                        raise ValueError(
-                            f"{observable} length mismatch: "
-                            f"{x_method} len={len(x_all)}, {y_method} len={len(y_all)}, events len={len(events)}"
-                        )
-
-                    base_valid = keep.copy()
-                    base_valid &= valid_masks.get(x_method, np.ones(len(events), dtype=bool))
-                    base_valid &= valid_masks.get(y_method, np.ones(len(events), dtype=bool))
-
-                    common = finite_common_mask(x_all, y_all, weights, base_valid)
-
-                    debug_print(
-                        debug,
-                        "common count =",
-                        comparison_name,
-                        int(np.sum(common)),
-                        "/",
-                        len(common),
-                    )
-
-                    if not np.any(common):
-                        continue
-
-                    for process_name in np.unique(labels[common]):
-                        process_mask = common & (labels == process_name)
-
-                        if not np.any(process_mask):
-                            continue
-
-                        debug_print(
-                            debug,
-                            "process entries =",
-                            comparison_name,
-                            process_name,
-                            int(np.sum(process_mask)),
-                        )
-
-                        state = states.setdefault(comparison_name, {}).setdefault(
-                            str(process_name),
-                            {
-                                "x": [],
-                                "y": [],
-                                "weight": [],
-                                "extra": {},
-                                "total": 0,
-                            },
-                        )
-
-                        state["x"].append(x_all[process_mask])
-                        state["y"].append(y_all[process_mask])
-                        state["total"] += int(np.sum(process_mask))
-
-                        if weights is not None:
-                            state["weight"].append(weights[process_mask])
-
-                        if payload["include_extra"]:
-                            for extra_method, extra_observables in method_values.items():
-                                if extra_method in {x_method, y_method}:
-                                    continue
-                                if observable not in extra_observables:
-                                    continue
-
-                                extra_values = extra_observables[observable][process_mask].copy()
-                                extra_valid = valid_masks.get(extra_method, np.ones(len(events), dtype=bool))[process_mask]
-                                extra_values = np.where(extra_valid & np.isfinite(extra_values), extra_values, np.nan)
-
-                                label = METHOD_LABELS.get(extra_method, extra_method)
-                                state["extra"].setdefault(label, []).append(extra_values)
-
+                    state["total"] += int(np.sum(process_mask))
+                    for source_name, values_array in source_values.items():
+                        if values_array is not None:
+                            state[source_name].append(values_array[process_mask])
+                    if weights is not None:
+                        state["weight"].append(weights[process_mask])
                 if remaining is not None:
                     remaining -= int(len(events))
-
-                del events, weights, labels, keep, method_values, valid_masks
+                del events, target_observables, weights, labels, keep, source_values
                 gc.collect()
-
             if remaining is not None and remaining <= 0:
                 break
 
-    debug_print(debug, "states comparisons =", list(states))
-    for comparison_name, process_states in states.items():
-        debug_print(debug, comparison_name, "processes =", list(process_states))
-        for process_name, state in process_states.items():
-            nx = sum(len(chunk) for chunk in state["x"])
-            ny = sum(len(chunk) for chunk in state["y"])
-            nw = sum(len(chunk) for chunk in state["weight"])
-            debug_print(
-                debug,
-                comparison_name,
-                process_name,
-                "x/y/w/total =",
-                nx,
-                ny,
-                nw,
-                state["total"],
-            )
-
-    results: dict[str, dict[str, Any]] = {}
+    results = {}
     output_dir = Path(payload["output_dir"])
-
-    for comparison_name, x_method, y_method in comparisons:
-        process_states = states.get(comparison_name, {})
-        x_label = METHOD_LABELS.get(x_method, x_method)
-        y_label = METHOD_LABELS.get(y_method, y_method)
-
-        if not process_states:
-            debug_print(debug, "no process states for", comparison_name)
-
-        for process_name, state in process_states.items():
-            if not state["x"] or not state["y"]:
-                debug_print(debug, "skip plotting empty state", comparison_name, process_name)
+    for comparison_name, (x_source, y_source, x_label, y_label, extra_sources) in comparisons.items():
+        for process_name, state in process_values.items():
+            if not state[x_source] or not state[y_source]:
                 continue
-
-            x_values = np.concatenate(state["x"])
-            y_values = np.concatenate(state["y"])
+            x_values = np.concatenate(state[x_source])
+            y_values = np.concatenate(state[y_source])
             weights = np.concatenate(state["weight"]) if state["weight"] else None
-
             extra_predictions = {
-                extra_label: np.concatenate(extra_chunks)
-                for extra_label, extra_chunks in state["extra"].items()
-                if extra_chunks
+                extra_label: np.concatenate(state[source_name])
+                for extra_label, source_name in extra_sources.items()
+                if state[source_name]
             }
-
-            debug_print(
-                debug,
-                "plotting",
-                comparison_name,
-                process_name,
-                "entries =",
-                len(x_values),
-                "weights =",
-                None if weights is None else len(weights),
-                "extras =",
-                list(extra_predictions),
-            )
-
             process_result = plot_truth_prediction_bundle(
                 x_values,
                 y_values,
@@ -982,11 +792,7 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
                 total_entries=state["total"],
                 extra_predictions=extra_predictions,
             )
-
-            debug_print(debug, "plot result =", process_result)
-
             results.setdefault(comparison_name, {})[process_name] = process_result
-
     return {
         "observable": observable,
         "plots": {
@@ -1006,153 +812,79 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_tasks(tasks: list[dict[str, Any]], workers: int) -> list[dict[str, Any]]:
+def run_tasks(tasks: list[dict[str, Any]], workers: int, worker_func, log_key: str) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-
     if workers <= 1 or len(tasks) <= 1:
         for task in tasks:
-            print(f"[method-monitor] plotting {task['observable']}", flush=True)
-            results.append(process_quantum_observable(task))
+            print(f"[monitor-input] plotting {task[log_key]}", flush=True)
+            results.append(worker_func(task))
         return results
 
     with ProcessPoolExecutor(max_workers=min(workers, len(tasks))) as executor:
-        future_map = {executor.submit(process_quantum_observable, task): task["observable"] for task in tasks}
-
+        future_map = {executor.submit(worker_func, task): task[log_key] for task in tasks}
         for future in as_completed(future_map):
-            observable = future_map[future]
-            result = future.result()
-            print(f"[method-monitor] finished {observable}", flush=True)
-            results.append(result)
-
+            name = future_map[future]
+            print(f"[monitor-input] finished {name}", flush=True)
+            results.append(future.result())
     return results
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser("Monitor EveNet method-comparison parquet files")
-    parser.add_argument("--input-dir", nargs="+", type=Path, required=True)
+    parser = argparse.ArgumentParser("Monitor EveNet input parquet files")
+    parser.add_argument("--data-dir", nargs="+", type=Path, required=True)
+    parser.add_argument("--mc-dir", nargs="+", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("method_comparison_plots"))
+    parser.add_argument("--output-dir", type=Path, default=Path("monitor_plots"))
     parser.add_argument("--max-events", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--bins", type=int, default=60)
     parser.add_argument("--bins-2d", type=int, default=70)
+    parser.add_argument("--max-integer-bins", type=int, default=120)
     parser.add_argument("--weight-column", default="event_weight")
     parser.add_argument("--row-groups-per-chunk", type=int, default=1)
-    parser.add_argument(
-        "--comparison-methods",
-        nargs="+",
-        default=["truth", "baseline", "evenet"],
-        help="Methods to compare against --reference-method.",
-    )
-    parser.add_argument(
-        "--reference-method",
-        default="target",
-        help="Reference method for comparison plots.",
-    )
-    parser.add_argument(
-        "--include-extra",
-        action="store_true",
-        help="Overlay other methods in summary panels when available.",
-    )
-    parser.add_argument(
-        "--combine-inputs",
-        action="store_true",
-        help="Combine all input dirs/files into one sample group. Default keeps one group per path.",
-    )
-    parser.add_argument(
-        "--no-label-filter",
-        action="store_true",
-        help="Do not filter to NeutrinoPrediction labels. Useful for debugging no-output problems.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Print detailed diagnostics for files, columns, labels, masks, methods, and entries.",
-    )
-    parser.add_argument(
-        "--observables",
-        nargs="+",
-        default=None,
-        help="Optional subset of quantum observables to run.",
-    )
+    parser.add_argument("--skip-quantum", action="store_true")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-
     config = load_config(args.config)
-    _feature_config = parse_feature_config(config)
+    feature_config = parse_feature_config(config)
 
-    sample_files = build_sample_map(args.input_dir, "samples", combine=args.combine_inputs)
-
-    observable_names = list(get_observable_names())
-    if args.observables is not None:
-        requested = set(args.observables)
-        observable_names = [name for name in observable_names if name in requested]
-        missing = sorted(requested - set(observable_names))
-        if missing:
-            raise ValueError(f"Requested observables are not known: {missing}")
-
-    print("[method-monitor] input samples:", flush=True)
-    for sample_name, files in sample_files.items():
-        print(f"  {sample_name}: {len(files)} file(s)", flush=True)
-        if args.debug:
-            for file_name in files[:20]:
-                print(f"    {file_name}", flush=True)
-
-    print(
-        f"[method-monitor] observables={len(observable_names)} workers={args.num_workers} "
-        f"reference={args.reference_method} comparisons={args.comparison_methods}",
-        flush=True,
-    )
-    print(
-        f"[method-monitor] output_dir={args.output_dir} "
-        f"weight_column={args.weight_column} "
-        f"max_events={args.max_events} "
-        f"row_groups_per_chunk={args.row_groups_per_chunk}",
-        flush=True,
-    )
-
-    pred_labels = sorted(neutrino_prediction_labels(config))
-    print(f"[method-monitor] neutrino_prediction_labels={pred_labels}", flush=True)
-    if args.no_label_filter:
-        print("[method-monitor] label filter disabled", flush=True)
-
+    data_files = build_sample_map(args.data_dir, "data", combine=True)
+    mc_files = build_sample_map(args.mc_dir, "mc", combine=False)
     common_payload = {
-        "sample_files": sample_files,
+        "data_files": data_files,
+        "mc_files": mc_files,
         "max_events": args.max_events,
-        "bins_2d": args.bins_2d,
+        "bins": args.bins,
+        "max_integer_bins": args.max_integer_bins,
         "weight_column": args.weight_column or None,
         "row_groups_per_chunk": args.row_groups_per_chunk,
         "label_lookup": category_lookup_payload(config),
-        "neutrino_prediction_labels": pred_labels,
-        "comparison_methods": list(args.comparison_methods),
-        "reference_method": str(args.reference_method),
-        "include_extra": bool(args.include_extra),
-        "no_label_filter": bool(args.no_label_filter),
-        "debug": bool(args.debug),
-        "observable_names": observable_names,
-        "output_dir": str(args.output_dir / "quantum_method_comparison"),
     }
 
-    tasks = [
-        {
-            **common_payload,
-            "observable": observable,
-        }
-        for observable in observable_names
-    ]
-
-    results = run_tasks(tasks, args.num_workers)
-
-    summary = {
-        "input_samples": {name: len(files) for name, files in sample_files.items()},
+    all_results: dict[str, Any] = {
+        "data_samples": {name: len(files) for name, files in data_files.items()},
+        "mc_samples": {name: len(files) for name, files in mc_files.items()},
         "max_events": args.max_events,
         "weight_column": args.weight_column,
-        "reference_method": args.reference_method,
-        "comparison_methods": args.comparison_methods,
-        "include_extra": args.include_extra,
-        "no_label_filter": args.no_label_filter,
-        "neutrino_prediction_labels": pred_labels,
-        "quantum_method_comparison": {
+        "neutrino_prediction_labels": sorted(neutrino_prediction_labels(config)),
+    }
+
+    if not args.skip_quantum:
+        quantum_dir = args.output_dir / "quantum_2d"
+        quantum_tasks = [
+            {
+                **common_payload,
+                "observable": observable,
+                "bins_2d": args.bins_2d,
+                "output_dir": str(quantum_dir),
+                "neutrino_prediction_labels": sorted(neutrino_prediction_labels(config)),
+            }
+            for observable in get_observable_names()
+        ]
+        print(f"[monitor-input] quantum comparisons={len(quantum_tasks)} workers={args.num_workers}", flush=True)
+        quantum_results = run_tasks(quantum_tasks, args.num_workers, process_quantum_observable, "observable")
+        all_results["quantum_2d"] = {
             result["observable"]: {
                 comparison: {
                     process_name: {
@@ -1163,17 +895,16 @@ def main() -> None:
                 }
                 for comparison, comparison_plots in result["plots"].items()
             }
-            for result in results
-        },
-        "quantum_metrics": {
+            for result in quantum_results
+        }
+        all_results["quantum_metrics"] = {
             result["observable"]: result["metrics"]
-            for result in results
-        },
-    }
+            for result in quantum_results
+        }
 
     summary_path = args.output_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"[method-monitor] wrote {summary_path}", flush=True)
+    summary_path.write_text(json.dumps(all_results, indent=2) + "\n")
+    print(f"[monitor-input] wrote {summary_path}", flush=True)
 
 
 if __name__ == "__main__":
