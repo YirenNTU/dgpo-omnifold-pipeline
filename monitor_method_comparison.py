@@ -219,6 +219,17 @@ def condition_values(events: ak.Array, global_idx: int) -> np.ndarray:
         raise IndexError(f"conditions only has {conditions.shape[1]} columns; requested index {global_idx}.")
     return conditions[:, global_idx]
 
+def evenet_columns() -> list[str]:
+    return [
+        "evenet_invisible_a_valid",
+        "evenet_invisible_a_pt",
+        "evenet_invisible_a_eta",
+        "evenet_invisible_a_phi",
+        "evenet_invisible_b_valid",
+        "evenet_invisible_b_pt",
+        "evenet_invisible_b_eta",
+        "evenet_invisible_b_phi",
+    ]
 
 def sequential_values_and_weights(
     events: ak.Array,
@@ -611,9 +622,32 @@ def build_target_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
     return {name: np.asarray(values, dtype=np.float64) for name, values in observables.items()}
 
 def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
+    try:
+        import vector
+        vector.register_awkward()
+    except Exception:
+        pass
+
+    required = {
+        "evenet_invisible_a_pt",
+        "evenet_invisible_a_eta",
+        "evenet_invisible_a_phi",
+        "evenet_invisible_b_pt",
+        "evenet_invisible_b_eta",
+        "evenet_invisible_b_phi",
+    }
+
+    missing = required - set(events.fields)
+    if missing:
+        print(f"[monitor-input] missing EveNet columns: {sorted(missing)}", flush=True)
+        return None
 
     visible_a = p4_from_component_prefixes(events, ("lead_a_visible", "visible_a", "visible"), slot=0)
     visible_b = p4_from_component_prefixes(events, ("lead_b_visible", "visible_b", "visible"), slot=1)
+
+    if visible_a is None or visible_b is None:
+        print("[monitor-input] missing visible four-vector columns", flush=True)
+        return None
 
     delta_visible_a_pt = events["evenet_invisible_a_pt"]
     delta_visible_a_eta = events["evenet_invisible_a_eta"]
@@ -626,8 +660,9 @@ def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
     invisible_b_pt = visible_b.pt + delta_visible_b_pt
     invisible_a_eta = visible_a.eta + delta_visible_a_eta
     invisible_b_eta = visible_b.eta + delta_visible_b_eta
-    invisible_a_phi = (visible_a.phi + delta_visible_a_phi) % (2 * math.pi)
-    invisible_b_phi = (visible_b.phi + delta_visible_b_phi) % (2 * math.pi)
+
+    invisible_a_phi = (visible_a.phi + delta_visible_a_phi + math.pi) % (2 * math.pi) - math.pi
+    invisible_b_phi = (visible_b.phi + delta_visible_b_phi + math.pi) % (2 * math.pi) - math.pi
 
     invisible_a = ak.zip(
         {
@@ -638,6 +673,7 @@ def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
         },
         with_name="Momentum4D",
     )
+
     invisible_b = ak.zip(
         {
             "pt": invisible_b_pt,
@@ -654,12 +690,19 @@ def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
         vis_a_p4=visible_a,
         vis_b_p4=visible_b,
     )
-    return {name: np.asarray(values, dtype=np.float64) for name, values in observables.items()}
 
+    return {name: np.asarray(values, dtype=np.float64) for name, values in observables.items()}
 
 def quantum_columns(observable: str, weight_column: str | None) -> list[str]:
     columns = target_visible_columns()
-    columns.extend([f"truth_{observable}", f"baseline_{observable}", "baseline_mmc_likelihood", "mmc_likelihood"])
+    columns.extend(evenet_columns())
+    columns.extend([
+        f"truth_{observable}",
+        f"baseline_{observable}",
+        "baseline_flags_valid",
+        "baseline_mmc_likelihood",
+        "mmc_likelihood",
+    ])
     if weight_column:
         columns.append(weight_column)
     return list(dict.fromkeys(columns))
@@ -669,21 +712,24 @@ def observable_values(
     events: ak.Array,
     source: str,
     observable: str,
-    target_observables: dict[str, np.ndarray] | None,
+    derived_observables: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray | None:
-    if source == "target":
-        if target_observables is None:
+    if source in {"target", "evenet"}:
+        if derived_observables is None:
             return None
-        return target_observables.get(observable)
-    field = f"{source}_{observable}"
+        return derived_observables.get(observable)
+
     if source == "truth":
         field = f"truth_{observable}"
-    if source == "baseline":
+    elif source == "baseline":
         field = f"baseline_{observable}"
+    else:
+        field = f"{source}_{observable}"
+
     if field not in events.fields:
         return None
-    return to_numpy(events[field], np.float64)
 
+    return to_numpy(events[field], np.float64)
 
 def baseline_valid_mask(events: ak.Array) -> np.ndarray:
     if "baseline_flags_valid" in events.fields:
@@ -734,10 +780,10 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
                 evenet_observables = build_evenet_observables(events)
                 weights = event_weights(events, payload["weight_column"])
                 source_values = {
-                    "truth": observable_values(events, "truth", observable, target_observables),
+                    "truth": observable_values(events, "truth", observable),
                     "target": observable_values(events, "target", observable, target_observables),
-                    "baseline": observable_values(events, "baseline", observable, target_observables),
-                    "evenet": observable_values(events, "evenet", observable, target_observables),
+                    "baseline": observable_values(events, "baseline", observable),
+                    "evenet": observable_values(events, "evenet", observable, evenet_observables),
                 }
                 if source_values["baseline"] is not None:
                     baseline_values = source_values["baseline"].copy()
