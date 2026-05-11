@@ -769,7 +769,7 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
                 if remaining is not None and len(events) > remaining:
                     events = events[:remaining]
                 labels = raw_event_process_labels(events, sample_name, payload["label_lookup"])
-                keep = np.asarray([label in allowed_labels for label in labels], dtype=bool)
+                keep = np.asarray([True for label in labels], dtype=bool) # TODO, to fix later
                 if not np.any(keep):
                     if remaining is not None:
                         remaining -= int(len(events))
