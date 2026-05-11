@@ -824,7 +824,7 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
     }
     process_values: dict[str, dict[str, Any]] = {}
     columns = quantum_columns(observable, payload["weight_column"])
-    columns.extend(["classification_target_name", "event_category"])
+    columns.extend(["classification_target_name", "event_category", "baseline_theta_cm"])
     sample_files = {**payload["mc_files"]}
     allowed_labels = set(payload["neutrino_prediction_labels"])
 
