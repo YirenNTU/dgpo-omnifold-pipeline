@@ -577,7 +577,7 @@ def load_checkpoint_into_model(
 
     safe_load_state(model, state_dict)
     model.eval()
-    return model
+    return model.to(device)
 
 
 def load_model_bundle(
