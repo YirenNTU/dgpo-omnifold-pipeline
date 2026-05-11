@@ -570,15 +570,12 @@ def load_checkpoint_into_model(
 ) -> EveNetModel:
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    if use_ema and isinstance(checkpoint, dict) and "ema_state_dict" in checkpoint:
+    if use_ema and "ema_state_dict" in checkpoint:
         state_dict = checkpoint["ema_state_dict"]
-    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
     else:
-        state_dict = checkpoint
+        state_dict = checkpoint["state_dict"]
 
     safe_load_state(model, state_dict)
-    model.to(device)
     model.eval()
     return model
 
@@ -598,12 +595,23 @@ def load_model_bundle(
         config=global_config,
         device=device,
         classification=True,
+        regression=False,
+        global_generation=False,
+        point_cloud_generation=False,
+        assignment=False,
+        segmentation=False,
+        neutrino_generation=False,
         normalization_dict=normalization_dict,
     )
     diffusion_model = EveNetModel(
         config=global_config,
         device=device,
         classification=False,
+        regression=False,
+        global_generation=False,
+        point_cloud_generation=False,
+        assignment=False,
+        segmentation=False,
         neutrino_generation=True,
         normalization_dict=normalization_dict,
     )
