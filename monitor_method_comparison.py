@@ -809,7 +809,7 @@ def observable_values(
 
 def baseline_valid_mask(events: ak.Array) -> np.ndarray:
     print(events.fields)
-    return events["baseline_theta_cm"] > 0
+    return events["evenet_invisible_a_valid"]
 
 
 def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
