@@ -270,6 +270,22 @@ def ensure_converted_batch_fields(
 
     return output
 
+def invisible_feature_defaults(
+    num_events: int,
+    num_slots: int,
+    feature_names: list[str],
+    prefix: str,
+) -> dict[str, np.ndarray]:
+    output: dict[str, np.ndarray] = {}
+    name_order = ["a", "b"]
+    for slot in range(num_slots):
+        name = name_order[slot]
+        output[f"{prefix}_{name}_valid"] = np.zeros(num_events, dtype=bool)
+        for feature_name in feature_names:
+            output[f"{prefix}_{name}_{feature_name}"] = np.full(num_events, 0, dtype=np.float32)
+            if feature_name.startswith("log_"):
+                output[f"{prefix}_{name}_{feature_name[4:]}"] = np.full(num_events, 0, dtype=np.float32)
+    return output
 
 def fill_invisible_feature_outputs(
     output_columns: dict[str, np.ndarray],
@@ -291,6 +307,8 @@ def fill_invisible_feature_outputs(
                 linear_name = feature_name[4:]
                 linear_values = np.where(valid_mask[:, slot], np.expm1(slot_values), 0).astype(np.float32)
                 output_columns[f"{prefix}_{name}_{linear_name}"][target_indices] = linear_values
+
+
 
 def to_torch_batch(batch: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
     output: dict[str, torch.Tensor] = {}
@@ -384,6 +402,12 @@ def predict_converted_events(
         "evenet_class_index": np.full(num_events, -1, dtype=np.int64),
         "evenet_class_prob": np.full(num_events, -1.0, dtype=np.float32),
     }
+    output_columns.update(invisible_feature_defaults(
+        num_events,
+        num_invisibles,
+        invisible_feature_names,
+        prefix="evenet_invisible"
+    ))
 
     valid_signal_prediction = np.zeros(num_events, dtype=bool)
     pred_invisible = np.zeros(
