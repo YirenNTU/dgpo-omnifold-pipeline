@@ -141,8 +141,8 @@ options:
       # so 121 here gives 120 visible bins in wandb.
       "neutrino-energy": [ 121, 0, 60 ]
       "neutrino-pt": [ 121, 0, 60 ]
-      "neutrino-eta": [ 121, -0.25, 0.25]
-      "neutrino-phi": [ 121, -0.25, 0.25 ]
+      "neutrino-eta": [ 121, -0.15, 0.15]
+      "neutrino-phi": [ 121, -0.15, 0.15 ]
     ObjectTag-Embedding:
       enable: true
       group_name: "ObjectTag"
