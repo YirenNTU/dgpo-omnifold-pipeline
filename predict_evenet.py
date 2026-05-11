@@ -436,7 +436,7 @@ def predict_converted_events(
         batch_torch = to_torch_batch(batch_slice, device=device)
         with torch.no_grad():
             if skip_classification:
-                batch_class_index = batch_np["classification"]
+                batch_class_index = batch_np["classification"][start:stop].astype(np.int64)
                 batch_class_prob = np.ones(stop - start, dtype=np.float32)
             else:
                 cls_outputs = classification_model.shared_step(
@@ -662,7 +662,71 @@ def load_model_bundle(
         "sampler": sampler,
     }
 
+def predict_worker(
+    worker_rank: int,
+    num_workers: int,
+    tasks: list[InferenceTask],
+    runtime_train_config: Path,
+    classification_checkpoint: Path,
+    diffusion_checkpoint: Path,
+    diffusion_use_ema: bool,
+    invisible_features: tuple[str, ...],
+    batch_size: int,
+    num_steps: int | None,
+    converted_split_fraction: float | None,
+    shape_metadata_path: Path | None,
+    skip_classification: bool,
+    use_cuda: bool,
+) -> None:
+    worker_tasks = tasks[worker_rank::num_workers]
 
+    if not worker_tasks:
+        print(f"[gpu-worker {worker_rank}] no tasks", flush=True)
+        return
+
+    if use_cuda:
+        torch.cuda.set_device(worker_rank)
+        device = torch.device(f"cuda:{worker_rank}")
+    else:
+        device = torch.device("cpu")
+
+    print(
+        f"[gpu-worker {worker_rank}] device={device} tasks={len(worker_tasks)}",
+        flush=True,
+    )
+
+    model_bundle = load_model_bundle(
+        runtime_train_config=runtime_train_config,
+        classification_checkpoint=classification_checkpoint,
+        diffusion_checkpoint=diffusion_checkpoint,
+        diffusion_use_ema=diffusion_use_ema,
+        device=device,
+    )
+    model_bundle["invisible_feature_names"] = invisible_features
+
+    for task_index, task in enumerate(worker_tasks):
+        print(
+            f"[gpu-worker {worker_rank}] task {task_index + 1}/{len(worker_tasks)} "
+            f"{Path(task.input_path).name} "
+            f"range={task.event_start}:{task.event_stop}",
+            flush=True,
+        )
+
+        augment_converted_parquet_task(
+            task=task,
+            model_bundle=model_bundle,
+            batch_size=batch_size,
+            num_steps=num_steps,
+            converted_split_fraction=converted_split_fraction,
+            shape_metadata_path=shape_metadata_path,
+            skip_classification=skip_classification,
+            device=device,
+        )
+
+        if use_cuda:
+            torch.cuda.empty_cache()
+
+    print(f"[gpu-worker {worker_rank}] done", flush=True)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -873,28 +937,57 @@ def main() -> None:
         print("[converted-predict] no tasks assigned to this shard", flush=True)
         return
 
-    device = torch.device("cuda:0" if use_cuda else "cpu")
-    print(f"[converted-predict] using device={device}", flush=True)
+    if use_cuda:
+        num_workers = min(args.num_gpus, torch.cuda.device_count())
+    else:
+        num_workers = 1
 
-    model_bundle = load_model_bundle(
-        runtime_train_config=runtime_train_config,
-        classification_checkpoint=classification_check_point,
-        diffusion_checkpoint=diffusion_check_point,
-        diffusion_use_ema=diffusion_use_ema,
-        device=device,
+    num_workers = max(1, min(num_workers, len(tasks)))
+
+    print(
+        f"[converted-predict] use_cuda={use_cuda} "
+        f"num_workers={num_workers} tasks={len(tasks)}",
+        flush=True,
     )
-    model_bundle["invisible_feature_names"] = invisible_features
 
-    for task in tasks:
-        augment_converted_parquet_task(
-            task=task,
-            model_bundle=model_bundle,
-            batch_size=args.batch_size,
-            num_steps=args.num_steps,
-            converted_split_fraction=converted_split_fraction,
-            shape_metadata_path=args.shape_metadata,
-            skip_classification=args.use_truth_classification,
-            device=device,
+    if num_workers == 1:
+        predict_worker(
+            0,
+            num_workers,
+            tasks,
+            runtime_train_config,
+            classification_check_point,
+            diffusion_check_point,
+            diffusion_use_ema,
+            invisible_features,
+            args.batch_size,
+            args.num_steps,
+            converted_split_fraction,
+            args.shape_metadata,
+            args.use_truth_classification,
+            use_cuda,
+        )
+    else:
+        mp.set_start_method("spawn", force=True)
+        mp.spawn(
+            predict_worker,
+            args=(
+                num_workers,
+                tasks,
+                runtime_train_config,
+                classification_check_point,
+                diffusion_check_point,
+                diffusion_use_ema,
+                invisible_features,
+                args.batch_size,
+                args.num_steps,
+                converted_split_fraction,
+                args.shape_metadata,
+                args.use_truth_classification,
+                use_cuda,
+            ),
+            nprocs=num_workers,
+            join=True,
         )
 
     if not args.skip_merge:
