@@ -143,7 +143,7 @@ options:
       "neutrino-pt": [ 121, 0, 60 ]
       "neutrino-eta": [ 121, -0.15, 0.15]
       "neutrino-phi": [ 121, -0.05, 0.05 ]
-      "neutrino-theta": [ 121, -1, 1]
+      "neutrino-theta": [ 121, -0.05, 0.05]
     ObjectTag-Embedding:
       enable: true
       group_name: "ObjectTag"
