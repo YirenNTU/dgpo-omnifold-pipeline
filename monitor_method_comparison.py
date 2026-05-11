@@ -849,7 +849,7 @@ def main() -> None:
     config = load_config(args.config)
     feature_config = parse_feature_config(config)
 
-    data_files = build_sample_map(args.data_dir, "data", combine=True)
+    # data_files = build_sample_map(args.data_dir, "data", combine=True)
     mc_files = build_sample_map(args.mc_dir, "mc", combine=False)
     common_payload = {
         "data_files": data_files,
