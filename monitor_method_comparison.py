@@ -809,6 +809,7 @@ def observable_values(
 
 def baseline_valid_mask(events: ak.Array) -> np.ndarray:
     print(events.fields)
+    print(events["evenet_invisible_a_valid"])
     return events["evenet_invisible_a_valid"]
 
 
