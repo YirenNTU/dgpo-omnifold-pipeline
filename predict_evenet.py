@@ -630,7 +630,7 @@ def load_model_bundle(
         device=device,
     )
 
-    sampler = DDIMSampler(diffusion_model)
+    sampler = DDIMSampler(device=device)
 
     return {
         "classification_model": classification_model,
