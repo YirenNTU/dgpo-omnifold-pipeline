@@ -182,7 +182,7 @@ network:
     feature_drop: 0.0
 
 event_info:
-  default: generated_event_info.yaml
+  default:  /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/config/generated_event_info.yaml
 
 resonance:
-  default: resonance.yaml
+  default:  /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/config/resonance.yaml
