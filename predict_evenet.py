@@ -803,6 +803,7 @@ def main() -> None:
     runtime_train_cfg_data.setdefault("options", {}).setdefault("prediction", {})["disable_ema"] = bool(args.disable_ema)
     with runtime_train_config.open("w") as handle:
         yaml.safe_dump(runtime_train_cfg_data, handle, sort_keys=False)
+    print(runtime_train_cfg_data)
 
     diffusion_use_ema = not args.disable_ema
     if args.classification_checkpoint is not None:
