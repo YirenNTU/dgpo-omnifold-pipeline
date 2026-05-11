@@ -808,6 +808,7 @@ def observable_values(
     return to_numpy(events[field], np.float64)
 
 def baseline_valid_mask(events: ak.Array) -> np.ndarray:
+    print(events.fields)
     return events["baseline_theta_cm"] > 0
 
 
