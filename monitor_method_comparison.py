@@ -821,6 +821,8 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
         "truth_vs_baseline": ("truth", "baseline", "Stored truth", "Baseline", {"Target": "target"}),
         "truth_vs_evenet": ("truth", "evenet", "Stored truth", "Evenet", {"Baseline": "baseline"}),
         "target_vs_evenet": ("target", "evenet", "Target", "Evenet", {"Baseline": "baseline"}),
+        "baseline_vs_evenet": ("baseline", "evenet", "Baseline", "Evenet", {"Stored truth": "truth"}),
+
     }
     process_values: dict[str, dict[str, Any]] = {}
     columns = quantum_columns(observable, payload["weight_column"])
