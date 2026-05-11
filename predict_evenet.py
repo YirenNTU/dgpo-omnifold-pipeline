@@ -575,8 +575,17 @@ def load_model_bundle(
     # Keep this consistent with the way EveNetModel is normally initialized in your repo.
     global_config.initialize(str(runtime_train_config)) if hasattr(global_config, "initialize") else None
 
-    classification_model = EveNetModel()
-    diffusion_model = EveNetModel()
+    classification_model = EveNetModel(
+        config=global_config,
+        device=device,
+        classification=True,
+    )
+    diffusion_model = EveNetModel(
+        config=global_config,
+        device=device,
+        classification=False,
+        neutrino_generation=True
+    )
 
     classification_model = load_checkpoint_into_model(
         classification_model,
