@@ -808,12 +808,7 @@ def observable_values(
     return to_numpy(events[field], np.float64)
 
 def baseline_valid_mask(events: ak.Array) -> np.ndarray:
-    if "baseline_flags_valid" in events.fields:
-        baseline_valid = to_numpy(events["baseline_flags_valid"], bool)
-        print(baseline_valid)
-        return baseline_valid
-    else:
-        return np.zeros_like(events["baseline_mmc_likelihood"], dtype=bool)
+    return events["baseline_theta_cm"] > 0
 
 
 def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
@@ -863,7 +858,7 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
                 }
                 if source_values["baseline"] is not None:
                     baseline_values = source_values["baseline"].copy()
-                    # baseline_values[~baseline_valid_mask(events)] = np.nan
+                    baseline_values[~baseline_valid_mask(events)] = np.nan
                     source_values["baseline"] = baseline_values
 
                 for process_name in np.unique(labels[keep]):
@@ -891,6 +886,7 @@ def process_quantum_observable(payload: dict[str, Any]) -> dict[str, Any]:
         for process_name, state in process_values.items():
             if not state[x_source] or not state[y_source]:
                 continue
+
             x_values = np.concatenate(state[x_source])
             y_values = np.concatenate(state[y_source])
             weights = np.concatenate(state["weight"]) if state["weight"] else None
