@@ -736,7 +736,7 @@ def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
             "pt": p * np.sin(tau_a_theta),
             "theta": tau_a_theta,
             "phi": tau_a_phi,
-            "m": ak.one_like(tau_a_theta) * mass,
+            "m": ak.ones_like(tau_a_theta) * mass,
         },
         with_name="Momentum4D",
     )
@@ -746,7 +746,7 @@ def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
             "pt": p * np.sin(tau_b_theta),
             "theta": tau_b_theta,
             "phi": tau_b_phi,
-            "m": ak.one_like(tau_b_theta) * mass,
+            "m": ak.ones_like(tau_b_theta) * mass,
         },
         with_name="Momentum4D",
     )
