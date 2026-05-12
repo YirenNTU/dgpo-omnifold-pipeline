@@ -223,11 +223,11 @@ def evenet_columns() -> list[str]:
     return [
         "evenet_invisible_a_valid",
         "evenet_invisible_a_pt",
-        "evenet_invisible_a_eta",
+        "evenet_invisible_a_theta",
         "evenet_invisible_a_phi",
         "evenet_invisible_b_valid",
         "evenet_invisible_b_pt",
-        "evenet_invisible_b_eta",
+        "evenet_invisible_a_theta",
         "evenet_invisible_b_phi",
     ]
 

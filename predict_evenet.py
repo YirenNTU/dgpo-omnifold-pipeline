@@ -131,8 +131,9 @@ def merge_converted_chunk_outputs(tasks: list[InferenceTask], delete_parts: bool
             )
         arrays = [ak.from_parquet(chunk_path) for chunk_path in chunk_paths]
         merged = ak.concatenate(arrays, axis=0) if len(arrays) > 1 else arrays[0]
-        order = np.argsort(ak.to_numpy(merged["event_index"], allow_missing=False))
-        merged = merged[order]
+        if "event_index" in merged.fields:
+            order = np.argsort(ak.to_numpy(merged["event_index"], allow_missing=False))
+            merged = merged[order]
 
         final_path.parent.mkdir(parents=True, exist_ok=True)
         ak.to_parquet(merged, final_path)
