@@ -227,7 +227,7 @@ def evenet_columns() -> list[str]:
         "evenet_invisible_a_phi",
         "evenet_invisible_b_valid",
         "evenet_invisible_b_pt",
-        "evenet_invisible_a_theta",
+        "evenet_invisible_b_theta",
         "evenet_invisible_b_phi",
     ]
 
