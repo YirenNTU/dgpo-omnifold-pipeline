@@ -344,7 +344,13 @@ def add_output_columns_to_events(
         events = ak.with_field(events, values, name)
 
     if converted_split_fraction is not None:
-        events["event_weight"] *= 1/converted_split_fraction
+        if "event_weight" not in events.fields:
+            raise ValueError("Converted parquet must contain event_weight to rescale event weights.")
+        events = ak.with_field(
+            events,
+            events["event_weight"] * (1 / converted_split_fraction),
+            "event_weight",
+        )
 
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1012,4 +1018,3 @@ def main() -> None:
         )
 if __name__ == "__main__":
     main()
-
