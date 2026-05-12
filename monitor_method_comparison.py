@@ -698,11 +698,9 @@ def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
         pass
 
     required = {
-        "evenet_invisible_a_pt",
-        "evenet_invisible_a_eta",
+        "evenet_invisible_a_theta",
         "evenet_invisible_a_phi",
-        "evenet_invisible_b_pt",
-        "evenet_invisible_b_eta",
+        "evenet_invisible_b_theta",
         "evenet_invisible_b_phi",
     }
 
@@ -718,43 +716,41 @@ def build_evenet_observables(events: ak.Array) -> dict[str, np.ndarray] | None:
         print("[monitor-input] missing visible four-vector columns", flush=True)
         return None
 
-    delta_visible_a_pt = events["evenet_invisible_a_pt"]
-    delta_visible_a_eta = events["evenet_invisible_a_eta"]
+    delta_visible_a_theta = events["evenet_invisible_a_theta"]
     delta_visible_a_phi = events["evenet_invisible_a_phi"]
-    delta_visible_b_pt = events["evenet_invisible_b_pt"]
-    delta_visible_b_eta = events["evenet_invisible_b_eta"]
+    delta_visible_b_theta = events["evenet_invisible_b_theta"]
     delta_visible_b_phi = events["evenet_invisible_b_phi"]
 
-    invisible_a_pt = visible_a.pt + delta_visible_a_pt
-    invisible_b_pt = visible_b.pt + delta_visible_b_pt
-    invisible_a_eta = visible_a.eta + delta_visible_a_eta
-    invisible_b_eta = visible_b.eta + delta_visible_b_eta
+    tau_a_theta = visible_a.theta + delta_visible_a_theta
+    tau_b_theta = visible_b.theta + delta_visible_b_theta
+    tau_a_phi = (visible_a.phi + delta_visible_a_phi + math.pi) % (2 * math.pi) - math.pi
+    tau_b_phi = (visible_b.phi + delta_visible_b_phi + math.pi) % (2 * math.pi) - math.pi
 
-    invisible_a_phi = (visible_a.phi + delta_visible_a_phi + math.pi) % (2 * math.pi) - math.pi
-    invisible_b_phi = (visible_b.phi + delta_visible_b_phi + math.pi) % (2 * math.pi) - math.pi
+    energy = CM_ENERGY / 2
+    mass = TAU_MASS
 
-    invisible_a = ak.zip(
+    p = np.sqrt( energy ** 2 - mass ** 2)
+
+    tau_a = ak.zip(
         {
-            "pt": invisible_a_pt,
-            "eta": invisible_a_eta,
-            "phi": invisible_a_phi,
-            "m": ak.zeros_like(invisible_a_pt),
+            "pt": p * np.sin(tau_a_theta),
+            "theta": tau_a_theta,
+            "phi": tau_a_phi,
+            "m": ak.one_like(tau_a_theta) * mass,
         },
         with_name="Momentum4D",
     )
 
-    invisible_b = ak.zip(
+    tau_b = ak.zip(
         {
-            "pt": invisible_b_pt,
-            "eta": invisible_b_eta,
-            "phi": invisible_b_phi,
-            "m": ak.zeros_like(invisible_b_pt),
+            "pt": p * np.sin(tau_b_theta),
+            "theta": tau_b_theta,
+            "phi": tau_b_phi,
+            "m": ak.one_like(tau_b_theta) * mass,
         },
         with_name="Momentum4D",
     )
 
-    tau_a = visible_a + invisible_a
-    tau_b = visible_b + invisible_b
 
     tau_a, tau_b = post_calibrate_tau_tau(tau_a, tau_b)
 
