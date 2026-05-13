@@ -629,8 +629,50 @@ def write_cutflow(sample_dir: Path, sample_name: str, events: ak.Array) -> None:
     (sample_dir / f"cutflow_{sample_name}.json").write_text(json.dumps([record], indent=2))
 
 
+def numeric_field(events: ak.Array, name: str, dtype: Any, fill_value: float | int | bool) -> np.ndarray:
+    if name not in events.fields:
+        return np.full(len(events), fill_value, dtype=dtype)
+    values = ak.fill_none(events[name], fill_value)
+    return to_numpy(values, dtype)
+
+
+def string_field(events: ak.Array, name: str, fill_value: str) -> ak.Array:
+    if name not in events.fields:
+        return ak.Array([fill_value] * len(events))
+    values = ak.fill_none(events[name], fill_value)
+    return ak.Array([str(value) for value in ak.to_list(values)])
+
+
+def final_qi_events(events: ak.Array, sample_name: str, regions: list[str]) -> ak.Array:
+    fields: dict[str, Any] = {
+        "event_category": numeric_field(events, "event_category", np.int32, 0),
+        "truth_QI_region": numeric_field(events, "truth_QI_region", bool, False),
+        "analyzing_power_a": numeric_field(events, "analyzing_power_a", np.float32, np.nan),
+        "analyzing_power_b": numeric_field(events, "analyzing_power_b", np.float32, np.nan),
+        "analyzing_power": numeric_field(events, "analyzing_power", np.float32, np.nan),
+        "initial_total_num_events": numeric_field(events, "initial_total_num_events", np.float64, 0.0),
+        "nprong": numeric_field(events, "nprong", np.int32, 0),
+        "baseline_cut": numeric_field(events, "baseline_cut", bool, False),
+        "weight": numeric_field(events, "weight", np.float32, 0.0),
+        "weight_nominal": numeric_field(events, "weight_nominal", np.float32, 0.0),
+        "classification_target_name": string_field(events, "classification_target_name", sample_name),
+    }
+
+    for name in export_observable_names():
+        fill_value = CM_ENERGY_GEV if name == "mtautau" else np.nan
+        fields[name] = numeric_field(events, name, np.float32, fill_value)
+        fields[f"truth_{name}"] = numeric_field(events, f"truth_{name}", np.float32, fill_value)
+
+    fields["flags_valid"] = numeric_field(events, "flags_valid", bool, False)
+    fields["mmc_likelihood"] = numeric_field(events, "mmc_likelihood", np.float32, 0.0)
+    for region in regions:
+        fields[f"{region}_cut"] = numeric_field(events, f"{region}_cut", bool, False)
+    return ak.Array(fields)
+
+
 def write_tree(events: ak.Array, sample_dir: Path, sample_name: str, regions: list[str], compression: str) -> None:
     sample_dir.mkdir(parents=True, exist_ok=True)
+    events = final_qi_events(events, sample_name, regions)
     ak.to_parquet(events, sample_dir / "filtered___raw.parquet", compression=compression)
     for region in regions:
         cut = f"{region}_cut"
