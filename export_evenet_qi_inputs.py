@@ -8,6 +8,7 @@ import glob
 import json
 import math
 from pathlib import Path
+import shutil
 import sys
 from typing import Any
 
@@ -43,7 +44,6 @@ MAX_VISIBLE_ENERGY_GEV = 91.25
 METHOD_CHOICES = ("target", "baseline", "evenet")
 DEFAULT_METHODS = ("target", "evenet")
 SAMPLE_ORDER = ("data94", "Zqq", "Zll", "Ztautau")
-SKIPPED_OBSERVABLES = frozenset({"mtautau"})
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,7 @@ class RawWeightInfo:
 
 
 def export_observable_names() -> tuple[str, ...]:
-    return tuple(name for name in get_observable_names() if name not in SKIPPED_OBSERVABLES)
+    return tuple(get_observable_names())
 
 
 def parse_args() -> argparse.Namespace:
@@ -363,8 +363,11 @@ def evenet_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray]:
 def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], np.ndarray]:
     names = export_observable_names()
     if method == "target":
-        if all(f"truth_{name}" in events.fields for name in names):
-            output = {name: events[f"truth_{name}"] for name in names}
+        if all(f"truth_{name}" in events.fields or name == "mtautau" for name in names):
+            output = {
+                name: observable_field_values(events, name, (f"truth_{name}",))
+                for name in names
+            }
             valid = np.ones(len(events), dtype=bool)
             for values in output.values():
                 valid &= finite(values)
@@ -420,10 +423,16 @@ def observable_field_values(events: ak.Array, observable_name: str, candidates: 
     for candidate in candidates:
         if candidate in events.fields:
             return events[candidate]
+    if observable_name == "mtautau":
+        return fixed_mtautau_values(len(events))
     raise KeyError(
         f"Missing observable '{observable_name}'. Expected one of {list(candidates)}. "
         f"Available matching fields: {matching_observable_fields(events, observable_name)}"
     )
+
+
+def fixed_mtautau_values(num_events: int) -> np.ndarray:
+    return np.full(num_events, CM_ENERGY_GEV, dtype=np.float32)
 
 
 def matching_observable_fields(events: ak.Array, observable_name: str) -> list[str]:
@@ -549,6 +558,8 @@ def raw_observable_values(raw_events: ak.Array, sample_key: str, name: str, requ
     baseline_name = f"baseline_{name}"
     if baseline_name in raw_events.fields:
         return raw_events[baseline_name]
+    if name == "mtautau":
+        return fixed_mtautau_values(len(raw_events))
     if require_field:
         raise KeyError(f"RAW sample '{sample_key}' is missing observable '{name}' or '{baseline_name}'.")
     return invalid_float_values(len(raw_events))
@@ -628,6 +639,100 @@ def write_tree(events: ak.Array, sample_dir: Path, sample_name: str, regions: li
         mask = to_numpy(events[cut], bool)
         ak.to_parquet(events[mask], sample_dir / f"filtered___{region}.parquet", compression=compression)
     write_cutflow(sample_dir, sample_name, events)
+
+
+def write_fragment_tree(events: ak.Array, fragment_dir: Path, sample_name: str, regions: list[str], compression: str) -> None:
+    write_tree(events, fragment_dir, sample_name, regions, compression)
+
+
+def clean_method_outputs(output_root: Path, methods: list[str]) -> None:
+    for method in methods:
+        method_dir = output_root / method
+        for child_name in ("processed", "_fragments"):
+            child = method_dir / child_name
+            if child.exists():
+                shutil.rmtree(child)
+        method_dir.mkdir(parents=True, exist_ok=True)
+
+
+def sample_fragment_dirs(fragment_root: Path, sample_name: str) -> list[Path]:
+    if not fragment_root.exists():
+        return []
+    output: list[tuple[int, Path]] = []
+    for path in fragment_root.iterdir():
+        if not path.is_dir():
+            continue
+        if path.name == sample_name:
+            output.append((-1, path))
+            continue
+        prefix = f"{sample_name}_"
+        if not path.name.startswith(prefix):
+            continue
+        suffix = path.name.removeprefix(prefix)
+        if suffix.isdigit():
+            output.append((int(suffix), path))
+    return [path for _, path in sorted(output)]
+
+
+def read_parquet_list(paths: list[Path]) -> ak.Array:
+    if not paths:
+        raise ValueError("Cannot merge an empty parquet list.")
+    arrays = [ak.from_parquet(path) for path in paths]
+    return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
+
+
+def merge_sample_fragments(
+    method_dir: Path,
+    sample_name: str,
+    regions: list[str],
+    compression: str,
+) -> dict[str, int]:
+    fragment_dirs = sample_fragment_dirs(method_dir / "_fragments", sample_name)
+    if not fragment_dirs:
+        return {}
+
+    sample_dir = method_dir / "processed" / sample_name
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    counts: dict[str, int] = {}
+    for region in ["raw", *regions]:
+        files = [
+            fragment_dir / f"filtered___{region}.parquet"
+            for fragment_dir in fragment_dirs
+            if (fragment_dir / f"filtered___{region}.parquet").exists()
+        ]
+        if not files:
+            continue
+        events = read_parquet_list(files)
+        ak.to_parquet(events, sample_dir / f"filtered___{region}.parquet", compression=compression)
+        counts[region] = int(len(events))
+        if region == "raw":
+            write_cutflow(sample_dir, sample_name, events)
+    return counts
+
+
+def merge_fragment_outputs(
+    output_root: Path,
+    methods: list[str],
+    samples: dict[str, dict[str, Any]],
+    regions: list[str],
+    compression: str,
+) -> dict[str, dict[str, dict[str, int]]]:
+    sample_names = list(samples)
+    if "data94" not in sample_names:
+        sample_names.append("data94")
+    merged: dict[str, dict[str, dict[str, int]]] = {}
+    for method in methods:
+        method_dir = output_root / method
+        method_counts: dict[str, dict[str, int]] = {}
+        for sample_name_value in sample_names:
+            counts = merge_sample_fragments(method_dir, sample_name_value, regions, compression)
+            if counts:
+                method_counts[sample_name_value] = counts
+        fragment_root = method_dir / "_fragments"
+        if fragment_root.exists():
+            shutil.rmtree(fragment_root)
+        merged[method] = method_counts
+    return merged
 
 
 def parquet_schema_names(path: Path) -> set[str]:
@@ -766,12 +871,12 @@ def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
             sample_events = events[sample_keys == sample_key]
             for method in methods:
                 method_events = export_method_events(sample_events, method, sample_key, sample_cfg, config, regions)
-                sample_dir = output_root / method / "processed" / fragment_name(sample_key, fragment_index)
-                write_tree(method_events, sample_dir, sample_key, regions, compression)
+                sample_dir = output_root / method / "_fragments" / fragment_name(sample_key, fragment_index)
+                write_fragment_tree(method_events, sample_dir, sample_key, regions, compression)
                 counts[f"{method}:{sample_key}"] = counts.get(f"{method}:{sample_key}", 0) + len(method_events)
                 if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
-                    pseudo_dir = output_root / method / "processed" / fragment_name("data94", fragment_index)
-                    write_tree(method_events, pseudo_dir, "data94", regions, compression)
+                    pseudo_dir = output_root / method / "_fragments" / fragment_name("data94", fragment_index)
+                    write_fragment_tree(method_events, pseudo_dir, "data94", regions, compression)
                     counts[f"{method}:data94"] = counts.get(f"{method}:data94", 0) + len(method_events)
             fragment_index += 1
     return counts
@@ -786,8 +891,8 @@ def export_raw_file(args: tuple[Any, ...]) -> dict[str, int]:
         if len(complement) == 0:
             continue
         for method in methods:
-            sample_dir = output_root / method / "processed" / fragment_name(sample_key, fragment_index)
-            write_tree(complement, sample_dir, sample_key, regions, compression)
+            sample_dir = output_root / method / "_fragments" / fragment_name(sample_key, fragment_index)
+            write_fragment_tree(complement, sample_dir, sample_key, regions, compression)
             counts[f"{method}:{sample_key}"] = counts.get(f"{method}:{sample_key}", 0) + len(complement)
         fragment_index += 1
     return counts
@@ -848,6 +953,7 @@ def write_qi_config(
         "DataLoaders": data_loaders,
         "Processors": {
             "QIProcessor": {
+                "processor_name": "QIProcessor",
                 "output_dir_name": "QI_analysis",
                 "asimov_data": not pseudo_data,
                 "dict_region_to_signals": {region: [region] for region in regions if region in signal_cfg},
@@ -864,11 +970,12 @@ def main() -> None:
     config = read_yaml(args.analysis_config)
     samples = sample_configs(config)
     raw_weight_infos = build_raw_weight_info(config, samples)
-    regions = neutrino_prediction_regions(config)
+    regions = args.regions or neutrino_prediction_regions(config)
     if not regions:
         regions = class_regions(config)
     output_root = args.base_dir
     output_root.mkdir(parents=True, exist_ok=True)
+    clean_method_outputs(output_root, args.methods)
 
     prediction_paths = resolve_parquets(args.prediction_parquet)
     if not prediction_paths:
@@ -903,6 +1010,7 @@ def main() -> None:
     raw_counts = run_jobs(raw_jobs, export_raw_file, args.num_workers)
     pred_counts = run_jobs(pred_jobs, export_prediction_file, args.num_workers)
     counts = merge_counts([raw_counts, pred_counts])
+    merged_outputs = merge_fragment_outputs(output_root, args.methods, samples, regions, args.compression)
 
     config_paths = {}
     for method in args.methods:
@@ -915,6 +1023,7 @@ def main() -> None:
         "methods": args.methods,
         "regions": regions,
         "counts": counts,
+        "merged_outputs": merged_outputs,
         "configs": config_paths,
         "raw_weight_info": {sample_key: asdict(info) for sample_key, info in raw_weight_infos.items()},
         "pseudo_data": bool(args.pseudo_data),
