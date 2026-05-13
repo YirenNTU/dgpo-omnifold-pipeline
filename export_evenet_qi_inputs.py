@@ -40,8 +40,10 @@ vector.register_awkward()
 TAU_MASS_GEV = 1.777
 CM_ENERGY_GEV = 91.2
 MAX_VISIBLE_ENERGY_GEV = 91.25
-METHODS = ("target", "baseline", "evenet")
+METHOD_CHOICES = ("target", "baseline", "evenet")
+DEFAULT_METHODS = ("target", "evenet")
 SAMPLE_ORDER = ("data94", "Zqq", "Zll", "Ztautau")
+SKIPPED_OBSERVABLES = frozenset({"mtautau"})
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,10 @@ class RawWeightInfo:
     weight_source: str
 
 
+def export_observable_names() -> tuple[str, ...]:
+    return tuple(name for name in get_observable_names() if name not in SKIPPED_OBSERVABLES)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export EveNet prediction parquets as nominal QI unfolding inputs."
@@ -59,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--analysis-config", type=Path, default=Path("ml_pipeline/config/analysis.yaml"))
     parser.add_argument("--prediction-parquet", nargs="+", type=Path, required=True)
     parser.add_argument("--base-dir", type=Path, required=True)
-    parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=METHODS)
+    parser.add_argument("--methods", nargs="+", default=list(DEFAULT_METHODS), choices=METHOD_CHOICES)
     parser.add_argument("--regions", nargs="+", default=None, help="Defaults to Ztautau labels listed in NeutrinoPrediction.")
     parser.add_argument("--batch-size", type=int, default=50_000)
     parser.add_argument("--num-workers", type=int, default=1)
@@ -130,23 +136,9 @@ def analysis_luminosity(config: dict[str, Any]) -> float | None:
 
 
 def qi_luminosity(config: dict[str, Any]) -> float:
-    global_configs = config.get("GlobalConfigs") or {}
-    if global_configs.get("luminosity") is not None:
-        return float(global_configs["luminosity"])
     luminosity = analysis_luminosity(config)
     if luminosity is None:
         raise ValueError("QI config needs GlobalConfigs.luminosity or at least one data sample lumi.")
-    return luminosity
-
-
-def mc_luminosity(config: dict[str, Any], sample_key: str, sample_cfg: dict[str, Any]) -> float:
-    if sample_cfg.get("lumi") is not None:
-        return float(sample_cfg["lumi"])
-    luminosity = analysis_luminosity(config)
-    if luminosity is None:
-        raise ValueError(
-            f"MC sample '{sample_key}' is missing luminosity. Set sample.lumi or at least one data sample lumi."
-        )
     return luminosity
 
 
@@ -165,7 +157,7 @@ def raw_weight_info(
         )
 
     norm_factor = float(required_sample_value(sample_key, sample_cfg, "norm_factor"))
-    luminosity = mc_luminosity(config, sample_key, sample_cfg)
+    luminosity = qi_luminosity(config)
     total_initial_num_events = 0.0
     for raw_path in raw_files:
         file_total = read_file_initial_total_num_events(str(raw_path))
@@ -369,21 +361,37 @@ def evenet_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray]:
 
 
 def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], np.ndarray]:
-    names = get_observable_names()
-    if method == "target" and all(f"truth_{name}" in events.fields for name in names):
-        output = {name: events[f"truth_{name}"] for name in names}
-        valid = np.ones(len(events), dtype=bool)
-        for values in output.values():
-            valid &= finite(values)
-        return output, valid
-    if method == "target" and not {"target_a_invisible_p4", "target_a_invisible_px"}.intersection(events.fields):
-        method = "baseline"
-
+    names = export_observable_names()
+    if method == "target":
+        if all(f"truth_{name}" in events.fields for name in names):
+            output = {name: events[f"truth_{name}"] for name in names}
+            valid = np.ones(len(events), dtype=bool)
+            for values in output.values():
+                valid &= finite(values)
+            return output, valid
+        required_prefixes = (
+            "lead_a_visible",
+            "lead_b_visible",
+            "target_a_invisible",
+            "target_b_invisible",
+        )
+        missing = [
+            prefix
+            for prefix in required_prefixes
+            if f"{prefix}_p4" not in events.fields
+            and not all(f"{prefix}_{component}" in events.fields for component in ("px", "py", "pz", "E"))
+        ]
+        if missing:
+            missing_truth = [f"truth_{name}" for name in names if f"truth_{name}" not in events.fields]
+            raise KeyError(
+                "Target method needs either all truth observable fields or target four-vector fields. "
+                f"Missing truth observables: {missing_truth}. Missing four-vector prefixes: {missing}."
+            )
     if method == "baseline":
-        output = {}
-        for name in names:
-            field = f"baseline_{name}"
-            output[name] = events[field] if field in events.fields else events[name]
+        output = {
+            name: observable_field_values(events, name, (f"baseline_{name}", name))
+            for name in names
+        }
         _, _, valid = baseline_tau_pair(events)
         if valid is None:
             valid = np.ones(len(events), dtype=bool)
@@ -400,11 +408,26 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
     else:
         raise ValueError(f"Unknown method {method}")
 
-    output = build_observables(tau_a, tau_b, vis_a, vis_b)
+    built_observables = build_observables(tau_a, tau_b, vis_a, vis_b)
+    output = {name: built_observables[name] for name in names}
     valid &= np.ones(len(events), dtype=bool)
     for values in output.values():
         valid &= finite(values)
     return {name: ak.where(valid, values, np.nan) for name, values in output.items()}, valid
+
+
+def observable_field_values(events: ak.Array, observable_name: str, candidates: tuple[str, ...]) -> Any:
+    for candidate in candidates:
+        if candidate in events.fields:
+            return events[candidate]
+    raise KeyError(
+        f"Missing observable '{observable_name}'. Expected one of {list(candidates)}. "
+        f"Available matching fields: {matching_observable_fields(events, observable_name)}"
+    )
+
+
+def matching_observable_fields(events: ak.Array, observable_name: str) -> list[str]:
+    return sorted(field for field in events.fields if field == observable_name or field.endswith(f"_{observable_name}"))
 
 
 def base_fields(
@@ -497,8 +520,10 @@ def export_method_events(
 
 
 def auxiliary_field(events: ak.Array, method: str, name: str) -> ak.Array:
+    if name == "mmc_likelihood" and method in {"target", "evenet"}:
+        return np.zeros(len(events), dtype=np.float32)
     candidates = [name]
-    if method in {"target", "baseline", "evenet"}:
+    if method == "baseline":
         candidates.append(f"baseline_{name}")
     for candidate in candidates:
         if candidate in events.fields:
@@ -569,7 +594,7 @@ def export_raw_complement(
         weights,
         total_initial_num_events=weight_info.total_initial_num_events,
     )
-    for name in get_observable_names():
+    for name in export_observable_names():
         output[name] = raw_observable_values(raw_events, sample_key, name, require_qi_fields)
     output["flags_valid"] = raw_auxiliary_values(raw_events, sample_key, "flags_valid", require_qi_fields)
     output["mmc_likelihood"] = raw_auxiliary_values(raw_events, sample_key, "mmc_likelihood", require_qi_fields)
@@ -605,9 +630,92 @@ def write_tree(events: ak.Array, sample_dir: Path, sample_name: str, regions: li
     write_cutflow(sample_dir, sample_name, events)
 
 
-def iter_batches(path: Path, batch_size: int):
+def parquet_schema_names(path: Path) -> set[str]:
+    return {field.name for field in pq.ParquetFile(path).schema_arrow}
+
+
+def existing_columns(path: Path, requested: set[str]) -> list[str]:
+    schema_names = parquet_schema_names(path)
+    return sorted(column for column in requested if column in schema_names)
+
+
+def common_export_columns(regions: list[str]) -> set[str]:
+    columns = {
+        "sample_key",
+        "source_sample_index",
+        "event_weight",
+        "central_weight",
+        "classification_target_name",
+        "event_category",
+        "truth_QI_region",
+        "analyzing_power_a",
+        "analyzing_power_b",
+        "analyzing_power",
+        "initial_total_num_events",
+        "initial_num_events",
+        "nprong",
+        "baseline_cut",
+        "flags_valid",
+        "baseline_flags_valid",
+        "mmc_likelihood",
+        "baseline_mmc_likelihood",
+    }
+    columns.update(f"{region}_cut" for region in regions)
+    return columns
+
+
+def p4_columns(prefix: str) -> set[str]:
+    return {
+        f"{prefix}_p4",
+        f"{prefix}_px",
+        f"{prefix}_py",
+        f"{prefix}_pz",
+        f"{prefix}_E",
+    }
+
+
+def prediction_columns(methods: list[str], regions: list[str]) -> set[str]:
+    columns = common_export_columns(regions)
+    names = export_observable_names()
+    if "target" in methods:
+        columns.update(f"truth_{name}" for name in names)
+        columns.update(p4_columns("lead_a_visible"))
+        columns.update(p4_columns("lead_b_visible"))
+        columns.update(p4_columns("target_a_invisible"))
+        columns.update(p4_columns("target_b_invisible"))
+    if "baseline" in methods:
+        columns.update(names)
+        columns.update(f"baseline_{name}" for name in names)
+    if "evenet" in methods:
+        columns.update(p4_columns("lead_a_visible"))
+        columns.update(p4_columns("lead_b_visible"))
+        columns.update(
+            {
+                "evenet_pred_class_name",
+                "evenet_class_index",
+                "evenet_invisible_a_theta",
+                "evenet_invisible_b_theta",
+                "evenet_invisible_a_phi",
+                "evenet_invisible_b_phi",
+                "evenet_invisible_a_valid",
+                "evenet_invisible_b_valid",
+            }
+        )
+    return columns
+
+
+def raw_columns(regions: list[str]) -> set[str]:
+    columns = common_export_columns(regions)
+    names = export_observable_names()
+    columns.update(names)
+    columns.update(f"baseline_{name}" for name in names)
+    return columns
+
+
+def iter_batches(path: Path, batch_size: int, columns: set[str] | None = None):
     parquet = pq.ParquetFile(path)
-    for batch in parquet.iter_batches(batch_size=batch_size):
+    selected_columns = None if columns is None else existing_columns(path, columns)
+    for batch in parquet.iter_batches(batch_size=batch_size, columns=selected_columns):
         yield rebuild_vectors(ak.from_arrow(batch))
 
 
@@ -647,7 +755,7 @@ def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
     pred_path, config, samples, methods, regions, output_root, batch_size, compression, pseudo_data, start_index = args
     counts: dict[str, int] = {}
     fragment_index = start_index
-    for events in iter_batches(pred_path, batch_size):
+    for events in iter_batches(pred_path, batch_size, prediction_columns(methods, regions)):
         sample_keys = prediction_sample_keys(events, samples)
         for sample_key in sorted(set(sample_keys)):
             if sample_key not in samples:
@@ -673,7 +781,7 @@ def export_raw_file(args: tuple[Any, ...]) -> dict[str, int]:
     raw_path, sample_key, sample_cfg, config, weight_info, methods, regions, output_root, batch_size, compression, start_index = args
     counts: dict[str, int] = {}
     fragment_index = start_index
-    for events in iter_batches(raw_path, batch_size):
+    for events in iter_batches(raw_path, batch_size, raw_columns(regions)):
         complement = export_raw_complement(events, sample_key, sample_cfg, config, weight_info, regions)
         if len(complement) == 0:
             continue
@@ -756,10 +864,10 @@ def main() -> None:
     config = read_yaml(args.analysis_config)
     samples = sample_configs(config)
     raw_weight_infos = build_raw_weight_info(config, samples)
-    regions = args.regions or neutrino_prediction_regions(config)
+    regions = neutrino_prediction_regions(config)
     if not regions:
         regions = class_regions(config)
-    output_root = args.base_dir / "QI_analysis"
+    output_root = args.base_dir
     output_root.mkdir(parents=True, exist_ok=True)
 
     prediction_paths = resolve_parquets(args.prediction_parquet)
