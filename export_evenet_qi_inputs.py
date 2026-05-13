@@ -506,15 +506,52 @@ def auxiliary_field(events: ak.Array, method: str, name: str) -> ak.Array:
     raise KeyError(f"Missing required auxiliary field '{name}' for method '{method}'.")
 
 
+def invalid_float_values(num_events: int) -> np.ndarray:
+    return np.full(num_events, np.nan, dtype=np.float32)
+
+
+def invalid_bool_values(num_events: int) -> np.ndarray:
+    return np.zeros(num_events, dtype=bool)
+
+
+def invalid_likelihood_values(num_events: int) -> np.ndarray:
+    return np.zeros(num_events, dtype=np.float32)
+
+
+def raw_observable_values(raw_events: ak.Array, sample_key: str, name: str, require_field: bool) -> Any:
+    if name in raw_events.fields:
+        return raw_events[name]
+    baseline_name = f"baseline_{name}"
+    if baseline_name in raw_events.fields:
+        return raw_events[baseline_name]
+    if require_field:
+        raise KeyError(f"RAW sample '{sample_key}' is missing observable '{name}' or '{baseline_name}'.")
+    return invalid_float_values(len(raw_events))
+
+
+def raw_auxiliary_values(raw_events: ak.Array, sample_key: str, name: str, require_field: bool) -> Any:
+    if name in raw_events.fields:
+        return raw_events[name]
+    if require_field:
+        raise KeyError(f"RAW sample '{sample_key}' is missing {name}.")
+    if name == "flags_valid":
+        return invalid_bool_values(len(raw_events))
+    if name == "mmc_likelihood":
+        return invalid_likelihood_values(len(raw_events))
+    raise ValueError(f"Unsupported RAW auxiliary field '{name}'.")
+
+
 def export_raw_complement(
     raw_events: ak.Array,
     sample_key: str,
+    sample_cfg: dict[str, Any],
     config: dict[str, Any],
     weight_info: RawWeightInfo,
     regions: list[str],
 ) -> ak.Array:
     keep = ~preselection_mask(raw_events)
     raw_events = raw_events[keep]
+    require_qi_fields = sample_is_signal(sample_key, sample_cfg)
     weights = raw_weight(weight_info, len(raw_events))
     output = base_fields(
         raw_events,
@@ -524,22 +561,15 @@ def export_raw_complement(
         total_initial_num_events=weight_info.total_initial_num_events,
     )
     for name in get_observable_names():
-        if name in raw_events.fields:
-            output[name] = raw_events[name]
-        elif f"baseline_{name}" in raw_events.fields:
-            output[name] = raw_events[f"baseline_{name}"]
-        else:
-            raise KeyError(f"RAW sample '{sample_key}' is missing observable '{name}' or 'baseline_{name}'.")
-    if "flags_valid" not in raw_events.fields:
-        raise KeyError(f"RAW sample '{sample_key}' is missing flags_valid.")
-    if "mmc_likelihood" not in raw_events.fields:
-        raise KeyError(f"RAW sample '{sample_key}' is missing mmc_likelihood.")
-    output["flags_valid"] = raw_events["flags_valid"]
-    output["mmc_likelihood"] = raw_events["mmc_likelihood"]
+        output[name] = raw_observable_values(raw_events, sample_key, name, require_qi_fields)
+    output["flags_valid"] = raw_auxiliary_values(raw_events, sample_key, "flags_valid", require_qi_fields)
+    output["mmc_likelihood"] = raw_auxiliary_values(raw_events, sample_key, "mmc_likelihood", require_qi_fields)
     for region in regions:
         cut = f"{region}_cut"
         if cut in raw_events.fields:
             output[cut] = to_numpy(raw_events[cut], bool)
+        elif not require_qi_fields:
+            output[cut] = invalid_bool_values(len(raw_events))
         else:
             raise KeyError(f"RAW sample '{sample_key}' is missing region cut '{cut}'.")
     return ak.Array(output)
@@ -609,11 +639,11 @@ def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
 
 
 def export_raw_file(args: tuple[Any, ...]) -> dict[str, int]:
-    raw_path, sample_key, config, weight_info, methods, regions, output_root, batch_size, compression, start_index = args
+    raw_path, sample_key, sample_cfg, config, weight_info, methods, regions, output_root, batch_size, compression, start_index = args
     counts: dict[str, int] = {}
     fragment_index = start_index
     for events in iter_batches(raw_path, batch_size):
-        complement = export_raw_complement(events, sample_key, config, weight_info, regions)
+        complement = export_raw_complement(events, sample_key, sample_cfg, config, weight_info, regions)
         if len(complement) == 0:
             continue
         for method in methods:
@@ -714,6 +744,7 @@ def main() -> None:
             raw_jobs.append((
                 raw_path,
                 sample_key,
+                sample_cfg,
                 config,
                 raw_weight_infos[sample_key],
                 args.methods,
