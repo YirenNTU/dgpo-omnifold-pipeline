@@ -42,7 +42,7 @@ TAU_MASS_GEV = 1.777
 CM_ENERGY_GEV = 91.2
 MAX_VISIBLE_ENERGY_GEV = 91.25
 METHOD_CHOICES = ("target", "baseline", "evenet")
-DEFAULT_METHODS = ("target", "evenet")
+DEFAULT_METHODS = ("target", "evenet", "baseline")
 SAMPLE_ORDER = ("data94", "Zqq", "Zll", "Ztautau")
 
 
