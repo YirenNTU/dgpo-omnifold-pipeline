@@ -615,12 +615,40 @@ def fragment_name(sample: str, index: int) -> str:
     return sample if index == 0 else f"{sample}_{index:06d}"
 
 
+def prediction_sample_keys(events: ak.Array, samples: dict[str, dict[str, Any]]) -> np.ndarray:
+    if "sample_key" in events.fields:
+        sample_keys = np.asarray(ak.to_list(events["sample_key"]), dtype=object)
+    elif "source_sample_index" in events.fields:
+        sample_order = tuple(samples.keys())
+        source_indices = to_numpy(events["source_sample_index"], np.int64)
+        valid = (source_indices >= 0) & (source_indices < len(sample_order))
+        if not np.all(valid):
+            bad_indices = sorted({int(index) for index in source_indices[~valid]})
+            raise ValueError(
+                "Prediction parquet source_sample_index contains values outside Samples order: "
+                f"{bad_indices}."
+            )
+        sample_keys = np.asarray([sample_order[int(index)] for index in source_indices], dtype=object)
+    else:
+        available = ", ".join(events.fields[:40])
+        suffix = " ..." if len(events.fields) > 40 else ""
+        raise KeyError(
+            "Prediction parquet needs sample_key or source_sample_index to identify sample membership. "
+            f"Available fields include: {available}{suffix}"
+        )
+
+    unknown = sorted({str(key) for key in sample_keys if str(key) not in samples})
+    if unknown:
+        raise ValueError(f"Prediction parquet contains sample keys not present in analysis config: {unknown}")
+    return sample_keys
+
+
 def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
     pred_path, config, samples, methods, regions, output_root, batch_size, compression, pseudo_data, start_index = args
     counts: dict[str, int] = {}
     fragment_index = start_index
     for events in iter_batches(pred_path, batch_size):
-        sample_keys = np.asarray(ak.to_list(events["sample_key"]), dtype=object)
+        sample_keys = prediction_sample_keys(events, samples)
         for sample_key in sorted(set(sample_keys)):
             if sample_key not in samples:
                 continue
