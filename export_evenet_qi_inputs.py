@@ -925,7 +925,7 @@ def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
 
 
 def export_raw_file(args: tuple[Any, ...]) -> dict[str, int]:
-    raw_path, sample_key, sample_cfg, config, weight_info, methods, regions, output_root, batch_size, compression, start_index = args
+    raw_path, sample_key, sample_cfg, config, weight_info, methods, regions, output_root, batch_size, compression, pseudo_data, start_index = args
     counts: dict[str, int] = {}
     fragment_index = start_index
     for events in iter_batches(raw_path, batch_size, raw_columns(regions)):
@@ -936,6 +936,10 @@ def export_raw_file(args: tuple[Any, ...]) -> dict[str, int]:
             sample_dir = output_root / method / "_fragments" / fragment_name(sample_key, fragment_index)
             write_fragment_tree(complement, sample_dir, sample_key, regions, compression)
             counts[f"{method}:{sample_key}"] = counts.get(f"{method}:{sample_key}", 0) + len(complement)
+            if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
+                pseudo_dir = output_root / method / "_fragments" / fragment_name("data94", fragment_index)
+                write_fragment_tree(complement, pseudo_dir, "data94", regions, compression)
+                counts[f"{method}:data94"] = counts.get(f"{method}:data94", 0) + len(complement)
         fragment_index += 1
     return counts
 
@@ -1040,6 +1044,7 @@ def main() -> None:
                 output_root,
                 args.batch_size,
                 args.compression,
+                args.pseudo_data,
                 job_index,
             ))
             job_index += 100_000
