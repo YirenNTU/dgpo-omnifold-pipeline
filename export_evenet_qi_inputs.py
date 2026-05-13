@@ -76,7 +76,7 @@ def resolve_parquets(paths: list[Path]) -> list[Path]:
         candidates = [Path(match) for match in matches] if matches else [Path(text)]
         for candidate in candidates:
             if candidate.is_dir():
-                output.extend(sorted(candidate.glob("*__evenet_pred.parquet")))
+                output.extend(sorted(candidate.glob("*__evenet_pred.*.parquet")))
             else:
                 output.append(candidate)
     return [path.resolve() for path in output]
