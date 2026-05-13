@@ -541,6 +541,15 @@ def raw_auxiliary_values(raw_events: ak.Array, sample_key: str, name: str, requi
     raise ValueError(f"Unsupported RAW auxiliary field '{name}'.")
 
 
+def raw_region_cut_values(
+    raw_events: ak.Array,
+    region: str,
+) -> np.ndarray:
+    if not region.startswith("Ztautau_"):
+        raise ValueError(f"Unsupported QI region '{region}'.")
+    return invalid_bool_values(len(raw_events))
+
+
 def export_raw_complement(
     raw_events: ak.Array,
     sample_key: str,
@@ -565,13 +574,7 @@ def export_raw_complement(
     output["flags_valid"] = raw_auxiliary_values(raw_events, sample_key, "flags_valid", require_qi_fields)
     output["mmc_likelihood"] = raw_auxiliary_values(raw_events, sample_key, "mmc_likelihood", require_qi_fields)
     for region in regions:
-        cut = f"{region}_cut"
-        if cut in raw_events.fields:
-            output[cut] = to_numpy(raw_events[cut], bool)
-        elif not require_qi_fields:
-            output[cut] = invalid_bool_values(len(raw_events))
-        else:
-            raise KeyError(f"RAW sample '{sample_key}' is missing region cut '{cut}'.")
+        output[f"{region}_cut"] = raw_region_cut_values(raw_events, region)
     return ak.Array(output)
 
 
