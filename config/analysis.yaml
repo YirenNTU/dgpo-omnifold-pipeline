@@ -155,28 +155,42 @@ Inputs:
 
 Subcategories:
   Ztautau:
-#    Ztautau_pipi: [11]
-#    Ztautau_pirho: [12]
-#    Ztautau_rhopi: [21]
-#    Ztautau_pie: [13]
-#    Ztautau_epi: [31]
-#    Ztautau_pimu: [14]
-#    Ztautau_mupi: [41]
-#    Ztautau_rhoe: [23]
-#    Ztautau_erho: [32]
-#    Ztautau_rhomu: [42]
-#    Ztautau_murho: [24]
+    Ztautau_pipi: [11]
+    Ztautau_pirho: [12]
+    Ztautau_rhopi: [21]
+    Ztautau_pie: [13]
+    Ztautau_epi: [31]
+    Ztautau_pimu: [14]
+    Ztautau_mupi: [41]
+    Ztautau_rhoe: [23]
+    Ztautau_erho: [32]
+    Ztautau_rhomu: [42]
+    Ztautau_murho: [24]
     Ztautau_rhorho: [22]
-#    Ztautau_ee: [33]
-#    Ztautau_mumu: [44]
-#    Ztautau_emu: [34]
-#    Ztautau_mue: [43]
-    Ztautau_others: [11, 12, 21, 13, 31, 14, 41, 23, 32, 42, 24, 33, 34, 43, 44,
-                    15, 51, 25, 52, 35, 53, 45, 54, 55]
+    Ztautau_ee: [33]
+    Ztautau_mumu: [44]
+    Ztautau_emu: [34]
+    Ztautau_mue: [43]
+    Ztautau_others: [15, 51, 25, 52, 35, 53, 45, 54, 55]
 
 NeutrinoPrediction:
   Ztautau:
+    - Ztautau_pipi
+    - Ztautau_pirho
+    - Ztautau_rhopi
+    - Ztautau_pie
+    - Ztautau_epi
+    - Ztautau_pimu
+    - Ztautau_mupi
+    - Ztautau_rhoe
+    - Ztautau_erho
+    - Ztautau_rhomu
+    - Ztautau_murho
     - Ztautau_rhorho
+    - Ztautau_ee
+    - Ztautau_mumu
+    - Ztautau_emu
+    - Ztautau_mue
 
 Normalization:
   Sequential:
