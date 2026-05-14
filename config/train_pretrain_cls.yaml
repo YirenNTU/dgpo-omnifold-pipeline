@@ -1,6 +1,6 @@
 platform:
-  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed
-  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/val
+  data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/evenet-input/train
+  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/evenet-input/val
   number_of_workers: 16
   resources_per_worker: {
     "CPU": 20,
@@ -26,9 +26,9 @@ options:
   default: ../EveNet-Full/share/options/options.yaml
 
   Training:
-    total_epochs: 100
-    epochs: 100
-    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/checkpoint-pretrain-cls
+    total_epochs: 200
+    epochs: 200
+    model_checkpoint_save_path: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/checkpoint-pretrain-cls
     model_checkpoint_load_path: null
     pretrain_model_load_path: /global/homes/t/tihsu/CMSOpenData-GridStudy/pretrain-weights/checkpoints.20M.a4.last.ckpt
     freeze_modules: []
@@ -133,7 +133,7 @@ options:
 
   Dataset:
     dataset_limit: 1.0
-    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_based/evenet_train_mixed/normalization.pt
+    normalization_file: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/evenet-input/normalization.pt
     val_split: [0.8, 1.0]
 
   Metrics:
