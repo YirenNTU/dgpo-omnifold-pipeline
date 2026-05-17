@@ -1089,13 +1089,13 @@ def write_analysis_config(
             "QIProcessor": {
                 "processor_name": "QIProcessor",
                 "output_dir_name": "QI_analysis",
-                "asimov_data": not pseudo_data,
+                "asimov_data": True,
                 "dict_region_to_signals": region_to_signals,
             },
             "ForwardFoldingProcessor": {
                 "processor_name": "ForwardFoldingProcessor",
                 "output_dir_name": "ForwardFoldingProcessor",
-                "asimov_data": not pseudo_data,
+                "asimov_data": True,
                 "dict_region_to_signals": region_to_signals,
             },
         },
