@@ -40,10 +40,30 @@ vector.register_awkward()
 
 TAU_MASS_GEV = 1.777
 CM_ENERGY_GEV = 91.2
-MAX_VISIBLE_ENERGY_GEV = 91.25
 METHOD_CHOICES = ("target", "baseline", "evenet")
 DEFAULT_METHODS = ("target", "evenet", "baseline")
 SAMPLE_ORDER = ("data94", "Zqq", "Zll", "Ztautau")
+BASE_EVENT_FIELDS = (
+    "event_category",
+    "truth_QI_region",
+    "analyzing_power_a",
+    "analyzing_power_b",
+    "analyzing_power",
+    "initial_total_num_events",
+    "nprong",
+)
+FINAL_SCHEMA_FIELDS = (
+    ("event_category", np.int32, 0),
+    ("truth_QI_region", bool, False),
+    ("analyzing_power_a", np.float32, np.nan),
+    ("analyzing_power_b", np.float32, np.nan),
+    ("analyzing_power", np.float32, np.nan),
+    ("initial_total_num_events", np.float64, 0.0),
+    ("nprong", np.int32, 0),
+    ("baseline_cut", bool, False),
+    ("weight", np.float32, 0.0),
+    ("weight_nominal", np.float32, 0.0),
+)
 
 
 @dataclass(frozen=True)
@@ -277,10 +297,6 @@ def raw_weight(info: RawWeightInfo, num_events: int) -> np.ndarray:
     return np.full(num_events, info.weight_scale, dtype=np.float32)
 
 
-def class_labels(config: dict[str, Any]) -> tuple[str, ...]:
-    return build_classification_lookup(config).class_labels
-
-
 def label_from_index(indices: np.ndarray, labels: tuple[str, ...]) -> np.ndarray:
     output = np.full(len(indices), "", dtype=object)
     valid = (indices >= 0) & (indices < len(labels))
@@ -308,10 +324,11 @@ def target_labels(events: ak.Array, sample_key: str, config: dict[str, Any]) -> 
     return np.asarray([mapping[int(category)] for category in categories], dtype=object)
 
 
-def evenet_labels(events: ak.Array, labels: tuple[str, ...]) -> np.ndarray:
+def evenet_labels(events: ak.Array, config: dict[str, Any]) -> np.ndarray:
     if "evenet_pred_class_name" in events.fields:
         return np.asarray(ak.to_list(events["evenet_pred_class_name"]), dtype=object)
     if "evenet_class_index" in events.fields:
+        labels = build_classification_lookup(config).class_labels
         return label_from_index(to_numpy(events["evenet_class_index"], np.int64), labels)
     raise ValueError("EveNet region export requires evenet_pred_class_name or evenet_class_index.")
 
@@ -325,14 +342,19 @@ def target_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray]:
     return tau_a, tau_b, valid
 
 
-def baseline_tau_pair(events: ak.Array) -> tuple[ak.Array | None, ak.Array | None, np.ndarray | None]:
+def baseline_valid_mask(events: ak.Array) -> np.ndarray | None:
     if "baseline_flags_valid" in events.fields:
-        valid = to_numpy(events["baseline_flags_valid"], bool)
-    elif "flags_valid" in events.fields:
-        valid = to_numpy(events["flags_valid"], bool)
-    else:
-        valid = None
-    return None, None, valid
+        return to_numpy(events["baseline_flags_valid"], bool)
+    if "flags_valid" in events.fields:
+        return to_numpy(events["flags_valid"], bool)
+    return None
+
+
+def finite_valid_mask(values_by_name: dict[str, Any]) -> np.ndarray:
+    valid = np.ones(len(next(iter(values_by_name.values()))), dtype=bool)
+    for values in values_by_name.values():
+        valid &= finite(values)
+    return valid
 
 
 def evenet_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray]:
@@ -395,11 +417,10 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
             name: observable_field_values(events, name, (f"baseline_{name}", name))
             for name in names
         }
-        _, _, valid = baseline_tau_pair(events)
+        valid = baseline_valid_mask(events)
         if valid is None:
             valid = np.ones(len(events), dtype=bool)
-        for values in output.values():
-            valid &= finite(values)
+        valid &= finite_valid_mask(output)
         return output, valid
 
     vis_a = p4_from_fields(events, "lead_a_visible")
@@ -413,9 +434,7 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
 
     built_observables = build_observables(tau_a, tau_b, vis_a, vis_b)
     output = {name: built_observables[name] for name in names}
-    valid &= np.ones(len(events), dtype=bool)
-    for values in output.values():
-        valid &= finite(values)
+    valid &= finite_valid_mask(output)
     return {name: ak.where(valid, values, np.nan) for name, values in output.items()}, valid
 
 
@@ -447,15 +466,7 @@ def base_fields(
     total_initial_num_events: float | None = None,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {}
-    for name in [
-        "event_category",
-        "truth_QI_region",
-        "analyzing_power_a",
-        "analyzing_power_b",
-        "analyzing_power",
-        "initial_total_num_events",
-        "nprong",
-    ]:
+    for name in BASE_EVENT_FIELDS:
         if name in events.fields:
             fields[name] = events[name]
     for name in events.fields:
@@ -485,7 +496,7 @@ def base_fields(
 
 def region_masks(events: ak.Array, method: str, sample_key: str, regions: list[str], config: dict[str, Any]) -> dict[str, np.ndarray]:
     truth_label = target_labels(events, sample_key, config)
-    pred_label = evenet_labels(events, class_labels(config)) if method == "evenet" else None
+    pred_label = evenet_labels(events, config) if method == "evenet" else None
     output: dict[str, np.ndarray] = {}
     categories_cfg = signal_categories(config, regions)
     categories = to_numpy(events["event_category"], np.int64) if "event_category" in events.fields else None
@@ -577,13 +588,10 @@ def raw_auxiliary_values(raw_events: ak.Array, sample_key: str, name: str, requi
     raise ValueError(f"Unsupported RAW auxiliary field '{name}'.")
 
 
-def raw_region_cut_values(
-    raw_events: ak.Array,
-    region: str,
-) -> np.ndarray:
+def raw_region_cut_values(num_events: int, region: str) -> np.ndarray:
     if not region.startswith("Ztautau_"):
         raise ValueError(f"Unsupported QI region '{region}'.")
-    return invalid_bool_values(len(raw_events))
+    return invalid_bool_values(num_events)
 
 
 def export_raw_complement(
@@ -610,7 +618,7 @@ def export_raw_complement(
     output["flags_valid"] = raw_auxiliary_values(raw_events, sample_key, "flags_valid", require_qi_fields)
     output["mmc_likelihood"] = raw_auxiliary_values(raw_events, sample_key, "mmc_likelihood", require_qi_fields)
     for region in regions:
-        output[f"{region}_cut"] = raw_region_cut_values(raw_events, region)
+        output[f"{region}_cut"] = raw_region_cut_values(len(raw_events), region)
     return ak.Array(output)
 
 
@@ -645,18 +653,10 @@ def string_field(events: ak.Array, name: str, fill_value: str) -> ak.Array:
 
 def final_qi_events(events: ak.Array, sample_name: str, regions: list[str]) -> ak.Array:
     fields: dict[str, Any] = {
-        "event_category": numeric_field(events, "event_category", np.int32, 0),
-        "truth_QI_region": numeric_field(events, "truth_QI_region", bool, False),
-        "analyzing_power_a": numeric_field(events, "analyzing_power_a", np.float32, np.nan),
-        "analyzing_power_b": numeric_field(events, "analyzing_power_b", np.float32, np.nan),
-        "analyzing_power": numeric_field(events, "analyzing_power", np.float32, np.nan),
-        "initial_total_num_events": numeric_field(events, "initial_total_num_events", np.float64, 0.0),
-        "nprong": numeric_field(events, "nprong", np.int32, 0),
-        "baseline_cut": numeric_field(events, "baseline_cut", bool, False),
-        "weight": numeric_field(events, "weight", np.float32, 0.0),
-        "weight_nominal": numeric_field(events, "weight_nominal", np.float32, 0.0),
-        "classification_target_name": string_field(events, "classification_target_name", sample_name),
+        name: numeric_field(events, name, dtype, fill_value)
+        for name, dtype, fill_value in FINAL_SCHEMA_FIELDS
     }
+    fields["classification_target_name"] = string_field(events, "classification_target_name", sample_name)
 
     for name in export_observable_names():
         fill_value = CM_ENERGY_GEV if name == "mtautau" else np.nan
@@ -681,10 +681,6 @@ def write_tree(events: ak.Array, sample_dir: Path, sample_name: str, regions: li
         mask = to_numpy(events[cut], bool)
         ak.to_parquet(events[mask], sample_dir / f"filtered___{region}.parquet", compression=compression)
     write_cutflow(sample_dir, sample_name, events)
-
-
-def write_fragment_tree(events: ak.Array, fragment_dir: Path, sample_name: str, regions: list[str], compression: str) -> None:
-    write_tree(events, fragment_dir, sample_name, regions, compression)
 
 
 def clean_method_outputs(output_root: Path, methods: list[str]) -> None:
@@ -870,6 +866,43 @@ def fragment_name(sample: str, index: int) -> str:
     return sample if index == 0 else f"{sample}_{index:06d}"
 
 
+def count_key(method: str, sample_name: str) -> str:
+    return f"{method}:{sample_name}"
+
+
+def record_fragment(
+    events: ak.Array,
+    output_root: Path,
+    method: str,
+    sample_name: str,
+    fragment_index: int,
+    regions: list[str],
+    compression: str,
+    counts: dict[str, int],
+) -> None:
+    sample_dir = output_root / method / "_fragments" / fragment_name(sample_name, fragment_index)
+    write_tree(events, sample_dir, sample_name, regions, compression)
+    counts[count_key(method, sample_name)] = counts.get(count_key(method, sample_name), 0) + len(events)
+
+
+def export_fragment_outputs(
+    events: ak.Array,
+    sample_key: str,
+    sample_cfg: dict[str, Any],
+    methods: list[str],
+    regions: list[str],
+    output_root: Path,
+    compression: str,
+    pseudo_data: bool,
+    fragment_index: int,
+    counts: dict[str, int],
+) -> None:
+    for method in methods:
+        record_fragment(events, output_root, method, sample_key, fragment_index, regions, compression, counts)
+        if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
+            record_fragment(events, output_root, method, "data94", fragment_index, regions, compression, counts)
+
+
 def prediction_sample_keys(events: ak.Array, samples: dict[str, dict[str, Any]]) -> np.ndarray:
     if "sample_key" in events.fields:
         sample_keys = np.asarray(ak.to_list(events["sample_key"]), dtype=object)
@@ -913,13 +946,9 @@ def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
             sample_events = events[sample_keys == sample_key]
             for method in methods:
                 method_events = export_method_events(sample_events, method, sample_key, sample_cfg, config, regions)
-                sample_dir = output_root / method / "_fragments" / fragment_name(sample_key, fragment_index)
-                write_fragment_tree(method_events, sample_dir, sample_key, regions, compression)
-                counts[f"{method}:{sample_key}"] = counts.get(f"{method}:{sample_key}", 0) + len(method_events)
+                record_fragment(method_events, output_root, method, sample_key, fragment_index, regions, compression, counts)
                 if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
-                    pseudo_dir = output_root / method / "_fragments" / fragment_name("data94", fragment_index)
-                    write_fragment_tree(method_events, pseudo_dir, "data94", regions, compression)
-                    counts[f"{method}:data94"] = counts.get(f"{method}:data94", 0) + len(method_events)
+                    record_fragment(method_events, output_root, method, "data94", fragment_index, regions, compression, counts)
             fragment_index += 1
     return counts
 
@@ -932,14 +961,18 @@ def export_raw_file(args: tuple[Any, ...]) -> dict[str, int]:
         complement = export_raw_complement(events, sample_key, sample_cfg, config, weight_info, regions)
         if len(complement) == 0:
             continue
-        for method in methods:
-            sample_dir = output_root / method / "_fragments" / fragment_name(sample_key, fragment_index)
-            write_fragment_tree(complement, sample_dir, sample_key, regions, compression)
-            counts[f"{method}:{sample_key}"] = counts.get(f"{method}:{sample_key}", 0) + len(complement)
-            if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
-                pseudo_dir = output_root / method / "_fragments" / fragment_name("data94", fragment_index)
-                write_fragment_tree(complement, pseudo_dir, "data94", regions, compression)
-                counts[f"{method}:data94"] = counts.get(f"{method}:data94", 0) + len(complement)
+        export_fragment_outputs(
+            complement,
+            sample_key,
+            sample_cfg,
+            methods,
+            regions,
+            output_root,
+            compression,
+            pseudo_data,
+            fragment_index,
+            counts,
+        )
         fragment_index += 1
     return counts
 
@@ -963,7 +996,11 @@ def run_jobs(jobs: list[tuple[Any, ...]], fn, workers: int) -> dict[str, int]:
     return merge_counts(results)
 
 
-def write_qi_config(
+def processor_region_to_signals(regions: list[str], signal_cfg: dict[str, list[int]]) -> dict[str, list[str]]:
+    return {region: [region] for region in regions if region in signal_cfg}
+
+
+def write_analysis_config(
     method_dir: Path,
     method: str,
     config: dict[str, Any],
@@ -972,6 +1009,7 @@ def write_qi_config(
     pseudo_data: bool,
 ) -> Path:
     signal_cfg = signal_categories(config, regions)
+    region_to_signals = processor_region_to_signals(regions, signal_cfg)
     data_loaders = {}
     for sample_key in SAMPLE_ORDER:
         if sample_key not in samples and sample_key != "data94":
@@ -1002,8 +1040,14 @@ def write_qi_config(
                 "processor_name": "QIProcessor",
                 "output_dir_name": "QI_analysis",
                 "asimov_data": not pseudo_data,
-                "dict_region_to_signals": {region: [region] for region in regions if region in signal_cfg},
-            }
+                "dict_region_to_signals": region_to_signals,
+            },
+            "ForwardFoldingProcessor": {
+                "processor_name": "ForwardFoldingProcessor",
+                "output_dir_name": "ForwardFoldingProcessor",
+                "asimov_data": not pseudo_data,
+                "dict_region_to_signals": region_to_signals,
+            },
         },
     }
     path = method_dir / f"config_{method}.yaml"
@@ -1063,7 +1107,7 @@ def main() -> None:
     for method in args.methods:
         method_dir = output_root / method
         method_dir.mkdir(parents=True, exist_ok=True)
-        config_paths[method] = str(write_qi_config(method_dir, method, config, samples, regions, args.pseudo_data))
+        config_paths[method] = str(write_analysis_config(method_dir, method, config, samples, regions, args.pseudo_data))
 
     summary = {
         "prediction_files": [str(path) for path in prediction_paths],

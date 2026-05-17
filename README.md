@@ -193,6 +193,94 @@ Outputs:
 - `<output-dir>/<qi-method-label>__qi_export_summary.json`
 
 
+## `export_evenet_qi_inputs.py`
+
+Export the EveNet prediction parquet files into the central processed-parquet
+layout expected by `tree_ana`.
+
+This path is designed to keep the central framework unchanged:
+
+- write `filtered___raw.parquet` and `filtered___<region>.parquet` for each sample
+- preserve the fields needed by `QIProcessor`, `ForwardFoldingProcessor`, and `ResponseMatricesManager`
+- recompute RAW-complement MC weights from
+  `luminosity * norm_factor / sum(initial_total_num_events over raw files)`
+- build a central-style config that can run both unfolding and forward folding
+
+`--prediction-parquet` does not identify data / MC from the file name. Each row
+must carry `sample_key` or `source_sample_index`, and the final data-vs-MC
+decision comes from `Samples.<sample>.is_data` in `ml_pipeline/config/analysis.yaml`.
+
+Example:
+
+```bash
+python3 export_evenet_qi_inputs.py \
+  --analysis-config ml_pipeline/config/analysis.yaml \
+  --prediction-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_delta_tau_based/predict-evenet/ \
+  --pseudo-data \
+  --num-workers 4 \
+  --base-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study
+```
+
+Outputs:
+
+- `<base-dir>/<method>/processed/<sample>/filtered___raw.parquet`
+- `<base-dir>/<method>/processed/<sample>/filtered___<region>.parquet`
+- `<base-dir>/<method>/config_<method>.yaml`
+- `<base-dir>/export_summary.json`
+
+### Next step: run the central code
+
+The generated `config_<method>.yaml` contains both `QIProcessor` and
+`ForwardFoldingProcessor`, so the central `tree_ana` can run directly on the
+exported ntuples.
+
+Example for EveNet:
+
+```bash
+python3 bin/tree_ana \
+  -c /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/config_evenet.yaml
+```
+
+This writes, under:
+
+- `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/run/QI_analysis/`
+- `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/run/ForwardFoldingProcessor/`
+
+If you want to run only one central processor, keep the same generated config
+but remove the other block from `Processors` before running:
+
+- keep only `Processors.QIProcessor` to run unfolding only
+- keep only `Processors.ForwardFoldingProcessor` to run forward folding only
+
+### Next step: extract QI results
+
+After `tree_ana` finishes, extract the final QI summary from `results.txt`.
+Pass the exact `results.txt` path when possible.
+
+```bash
+python3 ml_pipeline/util/extract_qi_final_measurements.py \
+  --method EveNet:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/run/QI_analysis/results.txt \
+  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/summary/evenet
+```
+
+To compare multiple methods:
+
+```bash
+python3 ml_pipeline/util/extract_qi_final_measurements.py \
+  --method Baseline:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/baseline/run/QI_analysis/results.txt \
+  --method EveNet:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/run/QI_analysis/results.txt \
+  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/summary/baseline_vs_evenet
+```
+
+The extractor writes:
+
+- `<prefix>_per_channel.csv`
+- `<prefix>_per_channel.json`
+- `<prefix>_combined.csv`
+- `<prefix>_combined.json`
+- comparison plots unless `--no-plots` is given
+
+
 ## `plot_preunfolding_validation.py`
 
 Produce the lite pre-unfolding validation plots from the exported central-schema
