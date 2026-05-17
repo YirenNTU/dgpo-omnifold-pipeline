@@ -61,6 +61,7 @@ FINAL_SCHEMA_FIELDS = (
     ("initial_total_num_events", np.float64, 0.0),
     ("nprong", np.int32, 0),
     ("baseline_cut", bool, False),
+    ("predict_weight", np.float32, 0.0),
     ("weight", np.float32, 0.0),
     ("weight_nominal", np.float32, 0.0),
 )
@@ -477,6 +478,7 @@ def base_fields(
 
     if weights.shape != (len(events),):
         raise ValueError(f"Weight shape {weights.shape} does not match {len(events)} events for sample '{sample_key}'.")
+    fields["predict_weight"] = weights
     fields["weight"] = weights
     fields["weight_nominal"] = weights
     if "initial_total_num_events" not in fields and "initial_num_events" in events.fields:
@@ -670,6 +672,16 @@ def final_qi_events(events: ak.Array, sample_name: str, regions: list[str]) -> a
     return ak.Array(fields)
 
 
+def scale_event_weights(events: ak.Array, factor: float) -> ak.Array:
+    if factor == 1.0:
+        return events
+    output = {field: events[field] for field in events.fields}
+    for field in ("predict_weight", "weight", "weight_nominal"):
+        if field in output:
+            output[field] = to_numpy(output[field], np.float32) * np.float32(factor)
+    return ak.Array(output)
+
+
 def write_tree(events: ak.Array, sample_dir: Path, sample_name: str, regions: list[str], compression: str) -> None:
     sample_dir.mkdir(parents=True, exist_ok=True)
     events = final_qi_events(events, sample_name, regions)
@@ -719,6 +731,31 @@ def read_parquet_list(paths: list[Path]) -> ak.Array:
     return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
 
 
+def split_sample_for_train_test(
+    method_dir: Path,
+    sample_name: str,
+    raw_events: ak.Array,
+    regions: list[str],
+    compression: str,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    indices = np.arange(len(raw_events), dtype=np.int64)
+    split_masks = (
+        indices % 2 == 0,
+        indices % 2 == 1,
+    )
+    target_names = (sample_name, f"{sample_name}_000001")
+    for target_name, mask in zip(target_names, split_masks):
+        split_events = raw_events[mask]
+        sample_dir = method_dir / "processed" / target_name
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        write_tree(split_events, sample_dir, sample_name, regions, compression)
+        counts["raw"] = counts.get("raw", 0) + len(split_events)
+        for region in regions:
+            counts[region] = counts.get(region, 0) + int(np.sum(to_numpy(split_events[f"{region}_cut"], bool)))
+    return counts
+
+
 def merge_sample_fragments(
     method_dir: Path,
     sample_name: str,
@@ -728,6 +765,16 @@ def merge_sample_fragments(
     fragment_dirs = sample_fragment_dirs(method_dir / "_fragments", sample_name)
     if not fragment_dirs:
         return {}
+    if sample_name == "Ztautau":
+        raw_files = [
+            fragment_dir / "filtered___raw.parquet"
+            for fragment_dir in fragment_dirs
+            if (fragment_dir / "filtered___raw.parquet").exists()
+        ]
+        if not raw_files:
+            return {}
+        raw_events = read_parquet_list(raw_files)
+        return split_sample_for_train_test(method_dir, sample_name, raw_events, regions, compression)
 
     sample_dir = method_dir / "processed" / sample_name
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -900,7 +947,8 @@ def export_fragment_outputs(
     for method in methods:
         record_fragment(events, output_root, method, sample_key, fragment_index, regions, compression, counts)
         if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
-            record_fragment(events, output_root, method, "data94", fragment_index, regions, compression, counts)
+            pseudo_events = scale_event_weights(events, 0.5 if sample_key == "Ztautau" else 1.0)
+            record_fragment(pseudo_events, output_root, method, "data94", fragment_index, regions, compression, counts)
 
 
 def prediction_sample_keys(events: ak.Array, samples: dict[str, dict[str, Any]]) -> np.ndarray:
@@ -948,7 +996,8 @@ def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
                 method_events = export_method_events(sample_events, method, sample_key, sample_cfg, config, regions)
                 record_fragment(method_events, output_root, method, sample_key, fragment_index, regions, compression, counts)
                 if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
-                    record_fragment(method_events, output_root, method, "data94", fragment_index, regions, compression, counts)
+                    pseudo_events = scale_event_weights(method_events, 0.5 if sample_key == "Ztautau" else 1.0)
+                    record_fragment(pseudo_events, output_root, method, "data94", fragment_index, regions, compression, counts)
             fragment_index += 1
     return counts
 
