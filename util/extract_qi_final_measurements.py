@@ -47,6 +47,12 @@ RESULT_LINE_ASYMMETRIC_RE = re.compile(
     r"\+(?P<err_up>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
     r"/-(?P<err_down>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
 )
+RESULT_LINE_ASYMMETRIC_PLAIN_RE = re.compile(
+    r"^\s*(?P<name>\S(?:.*\S)?)\s+"
+    r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s+"
+    r"\+(?P<err_up>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s+"
+    r"-(?P<err_down>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
+)
 RESULT_LINE_SYMMETRIC_RE = re.compile(
     r"^\s*(?P<name>[^:=]+)\s*(?::|=)\s*"
     r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*"
@@ -274,7 +280,7 @@ def parse_results_text(
         if line.startswith("Region: "):
             region = line.removeprefix("Region: ").strip()
             signal = region
-            section_source = None
+            section_source = "Unfolded"
             section_group = None
             continue
 
@@ -295,13 +301,22 @@ def parse_results_text(
         parsed_value = parse_measurement_line(raw_line)
         if parsed_value is None:
             continue
-        if region is None or signal is None or section_source is None or section_group is None:
+        if region is None or signal is None or section_source is None:
             continue
+        if section_group is None:
+            parameter_name = canonical_parameter_name(str(parsed_value["name"]))
+            if parameter_name in BC_PARAMETER_ORDER:
+                section_group = "BC"
+            elif parameter_name in QUANTUM_PARAMETER_ORDER:
+                section_group = "quantum"
+            else:
+                continue
         if section_source == "Truth" and not keep_truth:
             continue
         if region in ignored_regions:
             continue
 
+        parameter_name = canonical_parameter_name(str(parsed_value["name"]))
         rows.append(
             {
                 "method": method,
@@ -310,7 +325,7 @@ def parse_results_text(
                 "channel": canonical_channel_key(region, signal),
                 "source": section_source,
                 "group": section_group,
-                "parameter": canonical_parameter_name(str(parsed_value["name"])),
+                "parameter": parameter_name,
                 "value": float(parsed_value["value"]),
                 "err_up": float(parsed_value["err_up"]),
                 "err_down": float(parsed_value["err_down"]),
@@ -351,6 +366,15 @@ def canonical_parameter_name(parameter: str) -> str:
 
 def parse_measurement_line(raw_line: str) -> dict[str, float | str] | None:
     match = RESULT_LINE_ASYMMETRIC_RE.match(raw_line)
+    if match:
+        return {
+            "name": match.group("name").strip(),
+            "value": float(match.group("value")),
+            "err_up": abs(float(match.group("err_up"))),
+            "err_down": abs(float(match.group("err_down"))),
+        }
+
+    match = RESULT_LINE_ASYMMETRIC_PLAIN_RE.match(raw_line)
     if match:
         return {
             "name": match.group("name").strip(),
