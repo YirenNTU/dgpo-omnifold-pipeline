@@ -80,6 +80,25 @@ CHANNEL_ORDER = [
     COMBINED_CHANNEL_KEY,
 ]
 
+CANONICAL_SIGNAL_CHANNELS = {
+    "pipi",
+    "pirho",
+    "rhopi",
+    "rhorho",
+    "ee",
+    "emu",
+    "mue",
+    "mumu",
+    "pie",
+    "epi",
+    "pimu",
+    "mupi",
+    "rhoe",
+    "erho",
+    "rhomu",
+    "murho",
+}
+
 QUANTUM_PARAMETER_ORDER = [
     "Concurrence",
     "Ckk + Cnn",
@@ -360,12 +379,36 @@ def canonical_channel_key(region: str, signal: str) -> str:
       region=pipi, signal=pipi              -> Ztautau_pipi
       region=pipi, signal=Ztautau_pipi      -> Ztautau_pipi
       region=emu,  signal=Ztautau_mue       -> Ztautau_mue
+      region=Ztautau_pie, signal=pie        -> Ztautau_pie
     """
-    raw = signal if signal.startswith("Ztautau_") else region
-    channel = raw.removeprefix("Ztautau_") if raw.startswith("Ztautau_") else raw
-    if channel in {"pipi", "pirho", "rhopi", "rhorho", "ee", "emu", "mue", "mumu"}:
-        return f"Ztautau_{channel}"
-    return channel
+    for raw in (signal, region):
+        channel = normalize_channel_name(raw)
+        if channel is not None:
+            return channel
+    return normalize_freeform_channel_name(signal or region)
+
+
+def normalize_channel_name(name: str) -> str | None:
+    raw = name.strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered.startswith("ztautau_"):
+        lowered = lowered.removeprefix("ztautau_")
+    if lowered in CANONICAL_SIGNAL_CHANNELS:
+        return f"Ztautau_{lowered}"
+    return None
+
+
+def normalize_freeform_channel_name(name: str) -> str:
+    raw = name.strip()
+    if not raw:
+        return raw
+    if raw.lower().startswith("ztautau_"):
+        suffix = raw[len("Ztautau_"):]
+        if suffix:
+            return f"Ztautau_{suffix}"
+    return raw
 
 
 def filter_rows(rows: list[dict[str, Any]], include_groups: list[str], only_key_quantum: bool) -> list[dict[str, Any]]:
