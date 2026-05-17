@@ -898,6 +898,7 @@ def raw_columns(regions: list[str]) -> set[str]:
     columns = common_export_columns(regions)
     names = export_observable_names()
     columns.update(names)
+    columns.update(f"truth_{name}" for name in names)
     columns.update(f"baseline_{name}" for name in names)
     return columns
 
