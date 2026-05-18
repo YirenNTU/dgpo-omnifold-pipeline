@@ -18,6 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import ROOT
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 try:
     from plot_style import channel_latex_label
@@ -455,6 +456,14 @@ def observable_output_dir(output_prefix: Path, observable: str) -> Path:
     return path
 
 
+def is_canonical_channel_matrix(row: dict[str, Any]) -> bool:
+    return row["region_key"] == row["channel"]
+
+
+def blue_white_cmap() -> Any:
+    return plt.get_cmap("Blues")
+
+
 def plot_diagonal_summary(rows: list[dict[str, Any]], output_path: Path, title: str, value_key: str) -> None:
     methods = list(dict.fromkeys(row["method"] for row in rows))
     matrix_keys = sorted(
@@ -543,37 +552,25 @@ def plot_observable_metric_summaries(
 
     for observable in observables:
         plot_dir = observable_output_dir(output_prefix, observable)
-        observable_rows = [row for row in rows if row["observable"] == observable]
-        discovered_matrix_keys = list(
+        observable_rows = [row for row in rows if row["observable"] == observable and is_canonical_channel_matrix(row)]
+        discovered_channels = list(
             dict.fromkeys(
-                row["matrix_key"]
+                row["channel"]
                 for row in sorted(
                     observable_rows,
-                    key=lambda row: matrix_sort_key(row["region_key"], row["channel"], row["matrix_label"]) + (row["method"],),
+                    key=lambda row: (channel_sort_key(row["channel"]), row["method"]),
                 )
             )
         )
         if channels_override is None:
-            matrix_keys = discovered_matrix_keys
+            channels = discovered_channels
         else:
             requested = set(channels_override)
-            matrix_keys = [
-                key
-                for key in discovered_matrix_keys
-                if any(
-                    token in requested
-                    for token in (
-                        next(row["matrix_label"] for row in observable_rows if row["matrix_key"] == key),
-                        next(row["channel"] for row in observable_rows if row["matrix_key"] == key),
-                        next(row["region_key"] for row in observable_rows if row["matrix_key"] == key),
-                    )
-                )
-            ]
-        if not matrix_keys:
+            channels = [channel for channel in discovered_channels if channel in requested]
+        if not channels:
             continue
-        matrix_labels = [next(row["matrix_label"] for row in observable_rows if row["matrix_key"] == key) for key in matrix_keys]
-        y_base = np.arange(len(matrix_keys), dtype=np.float64)
-        matrix_index = {key: index for index, key in enumerate(matrix_keys)}
+        y_base = np.arange(len(channels), dtype=np.float64)
+        channel_index = {channel: index for index, channel in enumerate(channels)}
 
         for metric_key, metric_label, xlim in METRIC_SPECS:
             values = np.array([row[metric_key] for row in observable_rows], dtype=np.float64)
@@ -581,7 +578,7 @@ def plot_observable_metric_summaries(
             if not np.any(finite):
                 continue
 
-            fig_height = max(4.4, 0.62 * len(matrix_keys) + 2.2)
+            fig_height = max(4.4, 0.62 * len(channels) + 2.2)
             fig, ax = plt.subplots(figsize=(11.6, fig_height), dpi=200)
 
             if xlim is None:
@@ -595,16 +592,16 @@ def plot_observable_metric_summaries(
                 ax.set_xlim(*xlim)
                 x_text_value = 1.025
 
-            for matrix_key in matrix_keys:
-                matrix_rows = [row for row in observable_rows if row["matrix_key"] == matrix_key]
-                matrix_rows.sort(key=lambda row: method_index[row["method"]])
-                offsets = np.linspace(-0.24, 0.24, len(matrix_rows)) if len(matrix_rows) > 1 else np.array([0.0])
-                for offset, row in zip(offsets, matrix_rows):
+            for channel in channels:
+                channel_rows = [row for row in observable_rows if row["channel"] == channel]
+                channel_rows.sort(key=lambda row: method_index[row["method"]])
+                offsets = np.linspace(-0.24, 0.24, len(channel_rows)) if len(channel_rows) > 1 else np.array([0.0])
+                for offset, row in zip(offsets, channel_rows):
                     value = float(row[metric_key])
                     if not np.isfinite(value):
                         continue
                     method_i = method_index[row["method"]]
-                    y = y_base[matrix_index[matrix_key]] + offset
+                    y = y_base[channel_index[channel]] + offset
                     color = method_color(row["method"], method_i)
                     marker = METHOD_MARKERS[method_i % len(METHOD_MARKERS)]
                     ax.plot(
@@ -636,14 +633,14 @@ def plot_observable_metric_summaries(
                 ax.axvline(0.0, color="#B0B0B0", linewidth=0.8, linestyle="--", zorder=0)
             ax.text(x_text_value, 1.02, "value", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
             ax.set_yticks(y_base)
-            ax.set_yticklabels([matrix_label_display(label) for label in matrix_labels])
+            ax.set_yticklabels([channel_latex_label(channel) for channel in channels])
             ax.invert_yaxis()
             ax.grid(axis="y", alpha=0.18, linestyle=":")
-            for separator in np.arange(len(matrix_keys) - 1, dtype=np.float64) + 0.5:
+            for separator in np.arange(len(channels) - 1, dtype=np.float64) + 0.5:
                 ax.axhline(separator, color="#D9D9D9", linewidth=0.8, zorder=0)
             ax.set_xlabel(metric_label)
-            ax.set_ylabel("Region / signal")
-            ax.set_title(f"{observable}: {metric_label} by response matrix and method")
+            ax.set_ylabel("Channel")
+            ax.set_title(f"{observable}: {metric_label} by channel and method")
 
             handles = [
                 plt.Line2D(
@@ -679,7 +676,7 @@ def plot_observable_metric_summaries(
                 "metric": metric_key,
                 "num_points": len(observable_rows),
                 "methods": methods,
-                "matrix_labels": matrix_labels,
+                "channels": channels,
             }
 
     return plot_summary
@@ -692,36 +689,19 @@ def plot_observable_grids(
     channels_override: list[str] | None = None,
 ) -> list[str]:
     methods = list(dict.fromkeys(row["method"] for row in rows))
-    all_matrix_keys = sorted(
-        {row["matrix_key"] for row in rows},
-        key=lambda key: matrix_sort_key(
-            next(row["region_key"] for row in rows if row["matrix_key"] == key),
-            next(row["channel"] for row in rows if row["matrix_key"] == key),
-            next(row["matrix_label"] for row in rows if row["matrix_key"] == key),
-        ),
-    )
+    canonical_rows = [row for row in rows if is_canonical_channel_matrix(row)]
+    all_channels = sorted({row["channel"] for row in canonical_rows}, key=channel_sort_key)
     if channels_override is None:
-        matrix_keys = all_matrix_keys
+        channels = all_channels
     else:
         requested = set(channels_override)
-        matrix_keys = [
-            key
-            for key in all_matrix_keys
-            if any(
-                token in requested
-                for token in (
-                    next(row["matrix_label"] for row in rows if row["matrix_key"] == key),
-                    next(row["channel"] for row in rows if row["matrix_key"] == key),
-                    next(row["region_key"] for row in rows if row["matrix_key"] == key),
-                )
-            )
-        ]
+        channels = [channel for channel in all_channels if channel in requested]
     observables = sorted({row["observable"] for row in rows}, key=observable_sort_key)
     output_paths: list[str] = []
 
     for observable in observables:
         plot_dir = observable_output_dir(output_prefix, observable)
-        observable_rows = [row for row in rows if row["observable"] == observable and row["matrix_key"] in matrix_keys]
+        observable_rows = [row for row in canonical_rows if row["observable"] == observable and row["channel"] in channels]
         if not observable_rows:
             continue
 
@@ -730,31 +710,34 @@ def plot_observable_grids(
         diag_lookup: dict[tuple[str, str], float] = {}
         for row in observable_rows:
             normalized = normalize_matrix(np.asarray(row["matrix_values"], dtype=np.float64), normalize)
-            panel_lookup[(row["matrix_key"], row["method"])] = normalized
-            diag_lookup[(row["matrix_key"], row["method"])] = float(row["diagonal_fraction"])
+            panel_lookup[(row["channel"], row["method"])] = normalized
+            diag_lookup[(row["channel"], row["method"])] = float(row["diagonal_fraction"])
             finite_values = normalized[np.isfinite(normalized)]
             if finite_values.size:
                 value_max = max(value_max, float(np.max(finite_values)))
         if value_max <= 0:
             value_max = 1.0
 
-        matrix_labels = [next(row["matrix_label"] for row in observable_rows if row["matrix_key"] == key) for key in matrix_keys]
-        for method in methods:
-            fig_width = 6.6
-            fig_height = max(1.7 * len(matrix_keys) + 1.6, 6.0)
-            fig, axes = plt.subplots(len(matrix_keys), 1, figsize=(fig_width, fig_height), dpi=220, squeeze=False)
-            image = None
-            for y_idx, matrix_key in enumerate(matrix_keys):
-                ax = axes[y_idx][0]
-                matrix = panel_lookup.get((matrix_key, method))
+        fig_width = max(2.8 * len(methods) + 1.6, 6.0)
+        fig_height = max(2.8 * len(channels) + 1.6, 6.0)
+        fig, axes = plt.subplots(len(channels), len(methods), figsize=(fig_width, fig_height), dpi=220, squeeze=False)
+        cmap = blue_white_cmap()
+        for y_idx, channel in enumerate(channels):
+            for x_idx, method in enumerate(methods):
+                ax = axes[y_idx][x_idx]
+                matrix = panel_lookup.get((channel, method))
                 if matrix is None:
                     ax.axis("off")
                     continue
-                image = ax.imshow(matrix, origin="lower", aspect="auto", cmap="magma", vmin=0.0, vmax=value_max)
-                ax.set_ylabel(matrix_label_display(matrix_labels[y_idx]))
+                image = ax.imshow(matrix, origin="lower", aspect="equal", cmap=cmap, vmin=0.0, vmax=value_max)
+                ax.set_box_aspect(1)
+                if y_idx == 0:
+                    ax.set_title(method)
+                if x_idx == 0:
+                    ax.set_ylabel(channel_latex_label(channel))
                 ax.set_xticks([])
                 ax.set_yticks([])
-                diag_value = diag_lookup[(matrix_key, method)]
+                diag_value = diag_lookup[(channel, method)]
                 ax.text(
                     0.04,
                     0.96,
@@ -762,23 +745,23 @@ def plot_observable_grids(
                     transform=ax.transAxes,
                     ha="left",
                     va="top",
-                    color="white",
+                    color="black",
                     fontsize=8,
-                    bbox={"facecolor": "black", "alpha": 0.38, "pad": 2.4, "edgecolor": "none"},
+                    bbox={"facecolor": "white", "alpha": 0.70, "pad": 2.4, "edgecolor": "none"},
                 )
-                if y_idx == 0:
-                    ax.set_title(method)
-            fig.suptitle(f"{observable} response matrices ({normalize} normalized)", y=0.995)
-            if image is not None:
-                cbar = fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.97, pad=0.01)
-                cbar.set_label("Normalized response")
-            fig.tight_layout()
-            png_path = plot_dir / f"{sanitize_filename(method)}_response_grid.png"
-            pdf_path = plot_dir / f"{sanitize_filename(method)}_response_grid.pdf"
-            fig.savefig(png_path)
-            fig.savefig(pdf_path)
-            plt.close(fig)
-            output_paths.extend([str(png_path), str(pdf_path)])
+                divider = make_axes_locatable(ax)
+                cax = divider.append_axes("right", size="5%", pad=0.04)
+                cbar = fig.colorbar(image, cax=cax)
+                cbar.set_label("Normalized response", fontsize=8)
+                cbar.ax.tick_params(labelsize=7)
+        fig.suptitle(f"{observable} response matrices ({normalize} normalized)", y=0.995)
+        fig.tight_layout()
+        png_path = plot_dir / "response_grid.png"
+        pdf_path = plot_dir / "response_grid.pdf"
+        fig.savefig(png_path)
+        fig.savefig(pdf_path)
+        plt.close(fig)
+        output_paths.extend([str(png_path), str(pdf_path)])
     return output_paths
 
 
