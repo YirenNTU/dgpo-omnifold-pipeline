@@ -406,8 +406,8 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
         required_prefixes = (
             "lead_a_visible",
             "lead_b_visible",
-            "target_a_invisible",
-            "target_b_invisible",
+            "truth_tau_a",
+            "truth_tau_b",
         )
         missing = [
             prefix
@@ -418,7 +418,7 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
         if missing:
             missing_truth = [f"truth_{name}" for name in names if f"truth_{name}" not in events.fields]
             raise KeyError(
-                "Target method needs either all truth observable fields or target four-vector fields. "
+                "Target method needs truth tau four-vector fields. "
                 f"Missing truth observables: {missing_truth}. Missing four-vector prefixes: {missing}."
             )
 
@@ -882,8 +882,8 @@ def prediction_columns(methods: list[str], regions: list[str]) -> set[str]:
     if "target" in methods:
         columns.update(p4_columns("lead_a_visible"))
         columns.update(p4_columns("lead_b_visible"))
-        columns.update(p4_columns("target_a_invisible"))
-        columns.update(p4_columns("target_b_invisible"))
+        columns.update(p4_columns("truth_tau_a"))
+        columns.update(p4_columns("truth_tau_b"))
     if "baseline" in methods:
         columns.update(names)
         columns.update(f"baseline_{name}" for name in names)
