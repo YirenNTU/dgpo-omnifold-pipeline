@@ -40,8 +40,8 @@ vector.register_awkward()
 
 TAU_MASS_GEV = 1.777
 CM_ENERGY_GEV = 91.2
-METHOD_CHOICES = ("target", "baseline", "evenet")
-DEFAULT_METHODS = ("target", "evenet", "baseline")
+METHOD_CHOICES = ("target", "baseline", "evenet", "truth")
+DEFAULT_METHODS = ("target", "evenet", "baseline", "truth")
 SAMPLE_ORDER = ("data94", "Zqq", "Zll", "Ztautau")
 BASE_EVENT_FIELDS = (
     "event_category",
@@ -90,7 +90,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--regions", nargs="+", default=None, help="Defaults to Ztautau labels listed in NeutrinoPrediction.")
     parser.add_argument("--batch-size", type=int, default=50_000)
     parser.add_argument("--num-workers", type=int, default=1)
-    parser.add_argument("--pseudo-data", action="store_true")
+    parser.add_argument(
+        "--pseudo-data",
+        action="store_true",
+        help="Deprecated and no longer supported. Use real data inputs instead.",
+    )
     parser.add_argument("--compression", default="snappy")
     return parser.parse_args()
 
@@ -337,8 +341,8 @@ def evenet_labels(events: ak.Array, config: dict[str, Any]) -> np.ndarray:
 def target_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray]:
     vis_a = p4_from_fields(events, "lead_a_visible")
     vis_b = p4_from_fields(events, "lead_b_visible")
-    tau_a = p4_from_fields(events, "target_a_invisible")
-    tau_b = p4_from_fields(events, "target_b_invisible")
+    tau_a = p4_from_fields(events, "truth_tau_a")
+    tau_b = p4_from_fields(events, "truth_tau_b")
     valid = finite_p4(vis_a) & finite_p4(vis_b) & finite_p4(tau_a) & finite_p4(tau_b)
     return tau_a, tau_b, valid
 
@@ -385,7 +389,7 @@ def evenet_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray]:
 
 def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], np.ndarray]:
     names = export_observable_names()
-    if method == "target":
+    if method == "truth":
         if all(f"truth_{name}" in events.fields or name == "mtautau" for name in names):
             output = {
                 name: observable_field_values(events, name, (f"truth_{name}",))
@@ -395,6 +399,10 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
             for values in output.values():
                 valid &= finite(values)
             return output, valid
+        else:
+            raise ValueError(f"Method {method} not implemented.")
+
+    elif method == "target":
         required_prefixes = (
             "lead_a_visible",
             "lead_b_visible",
@@ -413,7 +421,8 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
                 "Target method needs either all truth observable fields or target four-vector fields. "
                 f"Missing truth observables: {missing_truth}. Missing four-vector prefixes: {missing}."
             )
-    if method == "baseline":
+
+    elif method == "baseline":
         output = {
             name: observable_field_values(events, name, (f"baseline_{name}", name))
             for name in names
@@ -423,6 +432,7 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
             valid = np.ones(len(events), dtype=bool)
         valid &= finite_valid_mask(output)
         return output, valid
+
 
     vis_a = p4_from_fields(events, "lead_a_visible")
     vis_b = p4_from_fields(events, "lead_b_visible")
@@ -542,7 +552,7 @@ def export_method_events(
 
 
 def auxiliary_field(events: ak.Array, method: str, name: str) -> ak.Array:
-    if name == "mmc_likelihood" and method in {"target", "evenet"}:
+    if name == "mmc_likelihood" and method in {"target", "evenet", "truth"}:
         return np.zeros(len(events), dtype=np.float32)
     candidates = [name]
     if method == "baseline":
@@ -746,7 +756,7 @@ def split_sample_for_train_test(
     )
     target_names = (sample_name, f"{sample_name}_000001")
     for target_name, mask in zip(target_names, split_masks):
-        split_events = raw_events[mask]
+        split_events = scale_event_weights(raw_events[mask], 2.0)
         sample_dir = method_dir / "processed" / target_name
         sample_dir.mkdir(parents=True, exist_ok=True)
         write_tree(split_events, sample_dir, sample_name, regions, compression)
@@ -867,8 +877,9 @@ def p4_columns(prefix: str) -> set[str]:
 def prediction_columns(methods: list[str], regions: list[str]) -> set[str]:
     columns = common_export_columns(regions)
     names = export_observable_names()
-    if "target" in methods:
+    if "truth" in methods:
         columns.update(f"truth_{name}" for name in names)
+    if "target" in methods:
         columns.update(p4_columns("lead_a_visible"))
         columns.update(p4_columns("lead_b_visible"))
         columns.update(p4_columns("target_a_invisible"))
@@ -936,20 +947,15 @@ def record_fragment(
 def export_fragment_outputs(
     events: ak.Array,
     sample_key: str,
-    sample_cfg: dict[str, Any],
     methods: list[str],
     regions: list[str],
     output_root: Path,
     compression: str,
-    pseudo_data: bool,
     fragment_index: int,
     counts: dict[str, int],
 ) -> None:
     for method in methods:
         record_fragment(events, output_root, method, sample_key, fragment_index, regions, compression, counts)
-        if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
-            pseudo_events = scale_event_weights(events, 0.5 if sample_key == "Ztautau" else 1.0)
-            record_fragment(pseudo_events, output_root, method, "data94", fragment_index, regions, compression, counts)
 
 
 def prediction_sample_keys(events: ak.Array, samples: dict[str, dict[str, Any]]) -> np.ndarray:
@@ -981,7 +987,7 @@ def prediction_sample_keys(events: ak.Array, samples: dict[str, dict[str, Any]])
 
 
 def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
-    pred_path, config, samples, methods, regions, output_root, batch_size, compression, pseudo_data, start_index = args
+    pred_path, config, samples, methods, regions, output_root, batch_size, compression, start_index = args
     counts: dict[str, int] = {}
     fragment_index = start_index
     for events in iter_batches(pred_path, batch_size, prediction_columns(methods, regions)):
@@ -990,21 +996,16 @@ def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
             if sample_key not in samples:
                 continue
             sample_cfg = samples[sample_key]
-            if pseudo_data and sample_is_data(sample_key, sample_cfg):
-                continue
             sample_events = events[sample_keys == sample_key]
             for method in methods:
                 method_events = export_method_events(sample_events, method, sample_key, sample_cfg, config, regions)
                 record_fragment(method_events, output_root, method, sample_key, fragment_index, regions, compression, counts)
-                if pseudo_data and sample_key != "data94" and not sample_is_data(sample_key, sample_cfg):
-                    pseudo_events = scale_event_weights(method_events, 0.5 if sample_key == "Ztautau" else 1.0)
-                    record_fragment(pseudo_events, output_root, method, "data94", fragment_index, regions, compression, counts)
             fragment_index += 1
     return counts
 
 
 def export_raw_file(args: tuple[Any, ...]) -> dict[str, int]:
-    raw_path, sample_key, sample_cfg, config, weight_info, methods, regions, output_root, batch_size, compression, pseudo_data, start_index = args
+    raw_path, sample_key, sample_cfg, config, weight_info, methods, regions, output_root, batch_size, compression, start_index = args
     counts: dict[str, int] = {}
     fragment_index = start_index
     for events in iter_batches(raw_path, batch_size, raw_columns(regions)):
@@ -1014,12 +1015,10 @@ def export_raw_file(args: tuple[Any, ...]) -> dict[str, int]:
         export_fragment_outputs(
             complement,
             sample_key,
-            sample_cfg,
             methods,
             regions,
             output_root,
             compression,
-            pseudo_data,
             fragment_index,
             counts,
         )
@@ -1056,7 +1055,6 @@ def write_analysis_config(
     config: dict[str, Any],
     samples: dict[str, dict[str, Any]],
     regions: list[str],
-    pseudo_data: bool,
 ) -> Path:
     signal_cfg = signal_categories(config, regions)
     region_to_signals = processor_region_to_signals(regions, signal_cfg)
@@ -1107,6 +1105,8 @@ def write_analysis_config(
 
 def main() -> None:
     args = parse_args()
+    if args.pseudo_data:
+        raise ValueError("--pseudo-data has been removed from export_evenet_qi_inputs.py. Export real data and MC directly.")
     config = read_yaml(args.analysis_config)
     samples = sample_configs(config)
     raw_weight_infos = build_raw_weight_info(config, samples)
@@ -1124,8 +1124,6 @@ def main() -> None:
     raw_jobs = []
     job_index = 1
     for sample_key, sample_cfg in samples.items():
-        if args.pseudo_data and sample_is_data(sample_key, sample_cfg):
-            continue
         for raw_path in sample_raw_files(sample_key, sample_cfg):
             raw_jobs.append((
                 raw_path,
@@ -1138,14 +1136,13 @@ def main() -> None:
                 output_root,
                 args.batch_size,
                 args.compression,
-                args.pseudo_data,
                 job_index,
             ))
             job_index += 100_000
 
     pred_jobs = []
     for pred_path in prediction_paths:
-        pred_jobs.append((pred_path, config, samples, args.methods, regions, output_root, args.batch_size, args.compression, args.pseudo_data, job_index))
+        pred_jobs.append((pred_path, config, samples, args.methods, regions, output_root, args.batch_size, args.compression, job_index))
         job_index += 100_000
 
     raw_counts = run_jobs(raw_jobs, export_raw_file, args.num_workers)
@@ -1157,7 +1154,7 @@ def main() -> None:
     for method in args.methods:
         method_dir = output_root / method
         method_dir.mkdir(parents=True, exist_ok=True)
-        config_paths[method] = str(write_analysis_config(method_dir, method, config, samples, regions, args.pseudo_data))
+        config_paths[method] = str(write_analysis_config(method_dir, method, config, samples, regions))
 
     summary = {
         "prediction_files": [str(path) for path in prediction_paths],
@@ -1167,7 +1164,6 @@ def main() -> None:
         "merged_outputs": merged_outputs,
         "configs": config_paths,
         "raw_weight_info": {sample_key: asdict(info) for sample_key, info in raw_weight_infos.items()},
-        "pseudo_data": bool(args.pseudo_data),
     }
     (output_root / "export_summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2), flush=True)
