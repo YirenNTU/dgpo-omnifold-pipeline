@@ -449,6 +449,12 @@ def sanitize_filename(name: str) -> str:
     return safe.strip("_") or "response"
 
 
+def observable_output_dir(output_prefix: Path, observable: str) -> Path:
+    path = output_prefix.parent / f"{output_prefix.name}_observables" / sanitize_filename(observable)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def plot_diagonal_summary(rows: list[dict[str, Any]], output_path: Path, title: str, value_key: str) -> None:
     methods = list(dict.fromkeys(row["method"] for row in rows))
     matrix_keys = sorted(
@@ -530,14 +536,13 @@ def plot_observable_metric_summaries(
     output_prefix: Path,
     channels_override: list[str] | None = None,
 ) -> dict[str, Any]:
-    plot_dir = output_prefix.parent / f"{output_prefix.name}_plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
     methods = list(dict.fromkeys(row["method"] for row in rows))
     method_index = {method: index for index, method in enumerate(methods)}
     observables = sorted({row["observable"] for row in rows}, key=observable_sort_key)
     plot_summary: dict[str, Any] = {}
 
     for observable in observables:
+        plot_dir = observable_output_dir(output_prefix, observable)
         observable_rows = [row for row in rows if row["observable"] == observable]
         discovered_matrix_keys = list(
             dict.fromkeys(
@@ -664,11 +669,12 @@ def plot_observable_metric_summaries(
             )
             fig.subplots_adjust(right=0.74, top=0.82, left=0.16, bottom=0.16)
 
-            plot_path = plot_dir / f"{sanitize_filename(observable)}_{sanitize_filename(metric_key)}.png"
+            plot_path = plot_dir / f"{sanitize_filename(metric_key)}.png"
             fig.savefig(plot_path)
             plt.close(fig)
             plot_summary[f"{observable}:{metric_key}"] = {
                 "plot": str(plot_path),
+                "directory": str(plot_dir),
                 "observable": observable,
                 "metric": metric_key,
                 "num_points": len(observable_rows),
@@ -714,6 +720,7 @@ def plot_observable_grids(
     output_paths: list[str] = []
 
     for observable in observables:
+        plot_dir = observable_output_dir(output_prefix, observable)
         observable_rows = [row for row in rows if row["observable"] == observable and row["matrix_key"] in matrix_keys]
         if not observable_rows:
             continue
@@ -731,23 +738,20 @@ def plot_observable_grids(
         if value_max <= 0:
             value_max = 1.0
 
-        fig_width = max(1.9 * len(methods) + 1.6, 6.0)
-        fig_height = max(1.7 * len(matrix_keys) + 1.6, 6.0)
-        fig, axes = plt.subplots(len(matrix_keys), len(methods), figsize=(fig_width, fig_height), dpi=220, squeeze=False)
-        image = None
         matrix_labels = [next(row["matrix_label"] for row in observable_rows if row["matrix_key"] == key) for key in matrix_keys]
-        for y_idx, matrix_key in enumerate(matrix_keys):
-            for x_idx, method in enumerate(methods):
-                ax = axes[y_idx][x_idx]
+        for method in methods:
+            fig_width = 6.6
+            fig_height = max(1.7 * len(matrix_keys) + 1.6, 6.0)
+            fig, axes = plt.subplots(len(matrix_keys), 1, figsize=(fig_width, fig_height), dpi=220, squeeze=False)
+            image = None
+            for y_idx, matrix_key in enumerate(matrix_keys):
+                ax = axes[y_idx][0]
                 matrix = panel_lookup.get((matrix_key, method))
                 if matrix is None:
                     ax.axis("off")
                     continue
                 image = ax.imshow(matrix, origin="lower", aspect="auto", cmap="magma", vmin=0.0, vmax=value_max)
-                if y_idx == 0:
-                    ax.set_title(method)
-                if x_idx == 0:
-                    ax.set_ylabel(matrix_label_display(matrix_labels[y_idx]))
+                ax.set_ylabel(matrix_label_display(matrix_labels[y_idx]))
                 ax.set_xticks([])
                 ax.set_yticks([])
                 diag_value = diag_lookup[(matrix_key, method)]
@@ -762,17 +766,19 @@ def plot_observable_grids(
                     fontsize=8,
                     bbox={"facecolor": "black", "alpha": 0.38, "pad": 2.4, "edgecolor": "none"},
                 )
-        fig.suptitle(f"{observable} response matrices ({normalize} normalized)", y=0.995)
-        if image is not None:
-            cbar = fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.97, pad=0.01)
-            cbar.set_label("Normalized response")
-        fig.tight_layout()
-        png_path = output_prefix.parent / f"{output_prefix.name}_{observable}_response_grid.png"
-        pdf_path = output_prefix.parent / f"{output_prefix.name}_{observable}_response_grid.pdf"
-        fig.savefig(png_path)
-        fig.savefig(pdf_path)
-        plt.close(fig)
-        output_paths.extend([str(png_path), str(pdf_path)])
+                if y_idx == 0:
+                    ax.set_title(method)
+            fig.suptitle(f"{observable} response matrices ({normalize} normalized)", y=0.995)
+            if image is not None:
+                cbar = fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.97, pad=0.01)
+                cbar.set_label("Normalized response")
+            fig.tight_layout()
+            png_path = plot_dir / f"{sanitize_filename(method)}_response_grid.png"
+            pdf_path = plot_dir / f"{sanitize_filename(method)}_response_grid.pdf"
+            fig.savefig(png_path)
+            fig.savefig(pdf_path)
+            plt.close(fig)
+            output_paths.extend([str(png_path), str(pdf_path)])
     return output_paths
 
 
