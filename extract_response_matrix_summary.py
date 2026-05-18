@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import re
+from pathlib import Path
+from typing import Any, Iterable
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp")
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import ROOT
+
+try:
+    from plot_style import channel_latex_label
+except Exception:
+    def channel_latex_label(channel: str) -> str:
+        if channel.startswith("Ztautau_"):
+            return channel.removeprefix("Ztautau_").replace("_", r"\_")
+        return channel.replace("_", r"\_")
+
+from quantum.observables_builder import get_observable_names
+
+ROOT.gROOT.SetBatch(True)
+
+METHOD_MARKERS = ("o", "D", "^", "s", "P", "X", "v", "*")
+METRIC_SPECS = [
+    ("diagonal_fraction", "Diagonal fraction", (0.0, 1.0)),
+    ("near_diagonal_fraction", "Near-diagonal fraction", (0.0, 1.0)),
+    ("mean_abs_bin_offset", "Mean |reco bin - truth bin|", None),
+    ("rms_bin_offset", "RMS(reco bin - truth bin)", None),
+]
+DEFAULT_CHANNEL_ORDER = [
+    "Ztautau_pipi",
+    "Ztautau_pirho",
+    "Ztautau_rhopi",
+    "Ztautau_rhorho",
+    "Ztautau_ee",
+    "Ztautau_emu",
+    "Ztautau_mue",
+    "Ztautau_mumu",
+    "Ztautau_pie",
+    "Ztautau_epi",
+    "Ztautau_pimu",
+    "Ztautau_mupi",
+    "Ztautau_rhoe",
+    "Ztautau_erho",
+    "Ztautau_rhomu",
+    "Ztautau_murho",
+]
+FALLBACK_COLORS = [
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+]
+RESPONSE_FILE_RE = re.compile(r"^response_(?P<region>.+)\.root$")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Summarize central RooUnfold response matrices across methods and channels. "
+            "Writes per-matrix JSON/CSV tables, diagonality summary plots, and one large 2D grid "
+            "for each observable."
+        )
+    )
+    parser.add_argument(
+        "--method",
+        action="append",
+        required=True,
+        help=(
+            "Method spec Label:/path/to/response_matrices or Label:/path/to/response_<region>.root. "
+            "Repeat for Baseline, EveNet, Truth, etc."
+        ),
+    )
+    parser.add_argument(
+        "--output-prefix",
+        type=Path,
+        required=True,
+        help="Output prefix. Writes <prefix>_matrix_metrics.*, <prefix>_summary.*, and per-observable grids.",
+    )
+    parser.add_argument(
+        "--observables",
+        nargs="+",
+        default=None,
+        help="Optional subset of observables. Default: all cos_theta observables in the response files.",
+    )
+    parser.add_argument(
+        "--channels",
+        nargs="+",
+        default=None,
+        help="Optional subset and display order of channels. Default: standard Ztautau fine-channel order.",
+    )
+    parser.add_argument(
+        "--normalize",
+        choices=["total", "truth", "reco"],
+        default="total",
+        help=(
+            "Normalization used in the big 2D matrix panels. "
+            "'total' divides by the total matrix yield, "
+            "'truth' normalizes each truth column, "
+            "'reco' normalizes each reco row."
+        ),
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Only write JSON/CSV summaries; skip PNG/PDF plots.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print extra diagnostics while reading response matrices.",
+    )
+    return parser.parse_args()
+
+
+def parse_method_specs(specs: Iterable[str]) -> list[tuple[str, Path]]:
+    methods: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for spec in specs:
+        if ":" not in spec:
+            raise ValueError(f"Invalid --method '{spec}'. Expected Label:/path/to/response_matrices")
+        label, raw_path = spec.split(":", 1)
+        label = label.strip()
+        if not label:
+            raise ValueError(f"Invalid --method '{spec}'. Empty method label.")
+        if label in seen:
+            raise ValueError(f"Duplicate method label '{label}'.")
+        seen.add(label)
+        methods.append((label, resolve_response_path(Path(raw_path))))
+    return methods
+
+
+def resolve_response_path(path: Path) -> Path:
+    if path.is_file():
+        return path
+    if not path.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+    if not path.is_dir():
+        raise ValueError(f"Path is neither a file nor a directory: {path}")
+
+    if any(child.is_file() and RESPONSE_FILE_RE.match(child.name) for child in path.iterdir()):
+        return path
+    nested = path / "response_matrices"
+    if nested.is_dir() and any(child.is_file() and RESPONSE_FILE_RE.match(child.name) for child in nested.iterdir()):
+        return nested
+
+    matches = sorted(path.rglob("response_*.root"))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(f"No response_*.root files found under: {path}")
+    pretty = "\n".join(f"  - {match}" for match in matches[:20])
+    extra = "" if len(matches) <= 20 else f"\n  ... and {len(matches) - 20} more"
+    raise ValueError(
+        f"Multiple response root files found under {path}. Please pass a response_matrices directory or exact file:\n"
+        f"{pretty}{extra}"
+    )
+
+
+def canonical_channel_key(region: str, signal: str) -> str:
+    for raw in (signal, region):
+        channel = normalize_signal_channel(raw)
+        if channel is not None:
+            return channel
+    return signal if signal else region
+
+
+def normalize_signal_channel(name: str) -> str | None:
+    raw = name.strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered.startswith("ztautau_"):
+        lowered = lowered.removeprefix("ztautau_")
+    valid = {
+        "pipi", "pirho", "rhopi", "rhorho", "ee", "emu", "mue", "mumu",
+        "pie", "epi", "pimu", "mupi", "rhoe", "erho", "rhomu", "murho",
+    }
+    if lowered in valid:
+        return f"Ztautau_{lowered}"
+    return None
+
+
+def extract_region_from_filename(path: Path) -> str | None:
+    match = RESPONSE_FILE_RE.match(path.name)
+    if match is None:
+        return None
+    return match.group("region")
+
+
+def response_observable_names() -> list[str]:
+    return [name for name in get_observable_names() if "cos_theta" in name]
+
+
+def parse_response_key(key_name: str, default_region: str | None) -> tuple[str, str, str] | None:
+    for observable in sorted(response_observable_names(), key=len, reverse=True):
+        suffix = f"_{observable}"
+        if not key_name.endswith(suffix):
+            continue
+        prefix = key_name[: -len(suffix)]
+        if prefix.endswith("_"):
+            prefix = prefix[:-1]
+        if default_region and prefix.startswith(f"{default_region}_"):
+            signal = prefix[len(default_region) + 1 :]
+            return default_region, signal, observable
+        if "_" in prefix:
+            region, signal = prefix.split("_", 1)
+            return region, signal, observable
+        return default_region or prefix, prefix, observable
+    return None
+
+
+def get_response_histogram(response_object: Any) -> Any:
+    if hasattr(response_object, "HresponseNoOverflow"):
+        histogram = response_object.HresponseNoOverflow()
+        histogram.SetDirectory(0)
+        return histogram
+    if hasattr(response_object, "GetNbinsX") and hasattr(response_object, "GetNbinsY"):
+        response_object.SetDirectory(0)
+        return response_object
+    raise TypeError(f"Object '{response_object.GetName()}' is not a supported response matrix.")
+
+
+def th2_to_numpy(histogram: Any) -> np.ndarray:
+    values = np.zeros((histogram.GetNbinsY(), histogram.GetNbinsX()), dtype=np.float64)
+    for x_bin in range(1, histogram.GetNbinsX() + 1):
+        for y_bin in range(1, histogram.GetNbinsY() + 1):
+            values[y_bin - 1, x_bin - 1] = float(histogram.GetBinContent(x_bin, y_bin))
+    return values
+
+
+def normalize_matrix(values: np.ndarray, mode: str) -> np.ndarray:
+    matrix = np.array(values, copy=True, dtype=np.float64)
+    if mode == "total":
+        total = float(np.sum(matrix))
+        return matrix / total if total > 0 else matrix
+    if mode == "truth":
+        denom = np.sum(matrix, axis=0, keepdims=True)
+        return np.divide(matrix, denom, out=np.zeros_like(matrix), where=denom > 0)
+    if mode == "reco":
+        denom = np.sum(matrix, axis=1, keepdims=True)
+        return np.divide(matrix, denom, out=np.zeros_like(matrix), where=denom > 0)
+    raise ValueError(f"Unknown normalization mode: {mode}")
+
+
+def compute_matrix_metrics(values: np.ndarray) -> dict[str, float]:
+    total = float(np.sum(values))
+    if total <= 0.0:
+        return {
+            "total": 0.0,
+            "diagonal_fraction": float("nan"),
+            "near_diagonal_fraction": float("nan"),
+            "mean_abs_bin_offset": float("nan"),
+            "rms_bin_offset": float("nan"),
+        }
+    x_idx = np.arange(values.shape[1], dtype=np.float64)
+    y_idx = np.arange(values.shape[0], dtype=np.float64)
+    x_grid, y_grid = np.meshgrid(x_idx, y_idx)
+    abs_offset = np.abs(x_grid - y_grid)
+    diagonal_sum = float(np.trace(values))
+    near_diagonal_sum = float(np.sum(values[abs_offset <= 1]))
+    mean_abs_bin_offset = float(np.sum(values * abs_offset) / total)
+    rms_bin_offset = float(np.sqrt(np.sum(values * np.square(abs_offset)) / total))
+    return {
+        "total": total,
+        "diagonal_fraction": diagonal_sum / total,
+        "near_diagonal_fraction": near_diagonal_sum / total,
+        "mean_abs_bin_offset": mean_abs_bin_offset,
+        "rms_bin_offset": rms_bin_offset,
+    }
+
+
+def collect_response_rows(methods: list[tuple[str, Path]], selected_observables: set[str] | None, debug: bool) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for method_label, method_path in methods:
+        root_files = [method_path] if method_path.is_file() else sorted(method_path.glob("response_*.root"))
+        if not root_files:
+            raise FileNotFoundError(f"No response_*.root files found for method '{method_label}' under {method_path}")
+        for root_file in root_files:
+            default_region = extract_region_from_filename(root_file)
+            root_handle = ROOT.TFile.Open(str(root_file), "READ")
+            if root_handle is None or root_handle.IsZombie():
+                raise OSError(f"Failed to open ROOT file: {root_file}")
+            try:
+                for key in root_handle.GetListOfKeys():
+                    key_name = key.GetName()
+                    parsed = parse_response_key(key_name, default_region)
+                    if parsed is None:
+                        continue
+                    region, signal, observable = parsed
+                    if selected_observables is not None and observable not in selected_observables:
+                        continue
+                    response_object = root_handle.Get(key_name)
+                    histogram = get_response_histogram(response_object)
+                    values = th2_to_numpy(histogram)
+                    metrics = compute_matrix_metrics(values)
+                    row = {
+                        "method": method_label,
+                        "root_file": str(root_file),
+                        "region": region,
+                        "signal": signal,
+                        "channel": canonical_channel_key(region, signal),
+                        "observable": observable,
+                        "matrix_shape": [int(values.shape[0]), int(values.shape[1])],
+                        "matrix_values": values.tolist(),
+                        **metrics,
+                    }
+                    rows.append(row)
+                    if debug:
+                        print(
+                            "[response-summary] "
+                            f"method={method_label} region={region} signal={signal} observable={observable} "
+                            f"diag={metrics['diagonal_fraction']:.4f} total={metrics['total']:.4f}",
+                            flush=True,
+                        )
+            finally:
+                root_handle.Close()
+    return rows
+
+
+def rows_to_csv(rows: list[dict[str, Any]], path: Path) -> None:
+    fieldnames = [
+        "method",
+        "root_file",
+        "region",
+        "signal",
+        "channel",
+        "observable",
+        "total",
+        "diagonal_fraction",
+        "near_diagonal_fraction",
+        "mean_abs_bin_offset",
+        "rms_bin_offset",
+    ]
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key) for key in fieldnames})
+
+
+def channel_sort_key(channel: str) -> tuple[int, str]:
+    if channel in DEFAULT_CHANNEL_ORDER:
+        return (DEFAULT_CHANNEL_ORDER.index(channel), channel)
+    return (len(DEFAULT_CHANNEL_ORDER), channel)
+
+
+def observable_sort_key(observable: str) -> tuple[int, str]:
+    ordered = response_observable_names()
+    if observable in ordered:
+        return (ordered.index(observable), observable)
+    return (len(ordered), observable)
+
+
+def aggregate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault((row["method"], row["channel"]), []).append(row)
+    output: list[dict[str, Any]] = []
+    for (method, channel), channel_rows in grouped.items():
+        diag_values = np.array([row["diagonal_fraction"] for row in channel_rows], dtype=np.float64)
+        near_values = np.array([row["near_diagonal_fraction"] for row in channel_rows], dtype=np.float64)
+        mean_offsets = np.array([row["mean_abs_bin_offset"] for row in channel_rows], dtype=np.float64)
+        rms_offsets = np.array([row["rms_bin_offset"] for row in channel_rows], dtype=np.float64)
+        output.append(
+            {
+                "method": method,
+                "channel": channel,
+                "num_observables": int(len(channel_rows)),
+                "mean_diagonal_fraction": float(np.nanmean(diag_values)),
+                "mean_near_diagonal_fraction": float(np.nanmean(near_values)),
+                "mean_abs_bin_offset": float(np.nanmean(mean_offsets)),
+                "mean_rms_bin_offset": float(np.nanmean(rms_offsets)),
+            }
+        )
+    output.sort(key=lambda row: (row["method"], channel_sort_key(row["channel"])))
+    return output
+
+
+def aggregate_to_csv(rows: list[dict[str, Any]], path: Path) -> None:
+    fieldnames = [
+        "method",
+        "channel",
+        "num_observables",
+        "mean_diagonal_fraction",
+        "mean_near_diagonal_fraction",
+        "mean_abs_bin_offset",
+        "mean_rms_bin_offset",
+    ]
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def method_color(method: str, index: int) -> str:
+    return FALLBACK_COLORS[index % len(FALLBACK_COLORS)]
+
+
+def sanitize_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    return safe.strip("_") or "response"
+
+
+def plot_diagonal_summary(rows: list[dict[str, Any]], output_path: Path, title: str, value_key: str) -> None:
+    methods = list(dict.fromkeys(row["method"] for row in rows))
+    channels = sorted({row["channel"] for row in rows}, key=channel_sort_key)
+    matrix = np.full((len(channels), len(methods)), np.nan, dtype=np.float64)
+    for row in rows:
+        y_idx = channels.index(row["channel"])
+        x_idx = methods.index(row["method"])
+        matrix[y_idx, x_idx] = float(row[value_key])
+
+    fig_width = max(5.4, 1.3 * len(methods) + 2.4)
+    fig_height = max(5.0, 0.45 * len(channels) + 2.2)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=220)
+    image = ax.imshow(matrix, aspect="auto", vmin=0.0 if "fraction" in value_key else None, vmax=1.0 if "fraction" in value_key else None, cmap="viridis")
+    ax.set_xticks(np.arange(len(methods), dtype=np.float64))
+    ax.set_xticklabels(methods, rotation=20, ha="right")
+    ax.set_yticks(np.arange(len(channels), dtype=np.float64))
+    ax.set_yticklabels([channel_latex_label(channel) for channel in channels])
+    ax.set_title(title)
+    for y_idx, channel in enumerate(channels):
+        for x_idx, method in enumerate(methods):
+            value = matrix[y_idx, x_idx]
+            if np.isfinite(value):
+                ax.text(x_idx, y_idx, f"{value:.3f}", ha="center", va="center", color="white", fontsize=8)
+    cbar = fig.colorbar(image, ax=ax, shrink=0.95)
+    cbar.set_label(value_key.replace("_", " "))
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_diagonal_scatter(rows: list[dict[str, Any]], output_path: Path, title: str) -> None:
+    methods = list(dict.fromkeys(row["method"] for row in rows))
+    channels = sorted({row["channel"] for row in rows}, key=channel_sort_key)
+    fig_width = max(7.0, 0.55 * len(channels) + 2.8)
+    fig, ax = plt.subplots(figsize=(fig_width, 5.2), dpi=220)
+    x = np.arange(len(channels), dtype=np.float64)
+    for index, method in enumerate(methods):
+        method_rows = {row["channel"]: row for row in rows if row["method"] == method}
+        y = np.array([method_rows[channel]["mean_diagonal_fraction"] if channel in method_rows else np.nan for channel in channels], dtype=np.float64)
+        ax.plot(
+            x,
+            y,
+            marker=METHOD_MARKERS[index % len(METHOD_MARKERS)],
+            linewidth=1.6,
+            markersize=5.5,
+            color=method_color(method, index),
+            label=method,
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels([channel_latex_label(channel) for channel in channels], rotation=35, ha="right")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("Mean diagonal fraction")
+    ax.set_title(title)
+    ax.grid(axis="y", linestyle=":", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_observable_metric_summaries(
+    rows: list[dict[str, Any]],
+    output_prefix: Path,
+    channels_override: list[str] | None = None,
+) -> dict[str, Any]:
+    plot_dir = output_prefix.parent / f"{output_prefix.name}_plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    methods = list(dict.fromkeys(row["method"] for row in rows))
+    method_index = {method: index for index, method in enumerate(methods)}
+    observables = sorted({row["observable"] for row in rows}, key=observable_sort_key)
+    plot_summary: dict[str, Any] = {}
+
+    for observable in observables:
+        observable_rows = [row for row in rows if row["observable"] == observable]
+        discovered_channels = list(
+            dict.fromkeys(
+                row["channel"] for row in sorted(observable_rows, key=lambda row: (channel_sort_key(row["channel"]), row["method"]))
+            )
+        )
+        channels = [channel for channel in (channels_override or discovered_channels) if channel in discovered_channels]
+        if not channels:
+            continue
+        y_base = np.arange(len(channels), dtype=np.float64)
+        channel_index = {channel: index for index, channel in enumerate(channels)}
+
+        for metric_key, metric_label, xlim in METRIC_SPECS:
+            values = np.array([row[metric_key] for row in observable_rows], dtype=np.float64)
+            finite = np.isfinite(values)
+            if not np.any(finite):
+                continue
+
+            fig_height = max(4.4, 0.62 * len(channels) + 2.2)
+            fig, ax = plt.subplots(figsize=(11.6, fig_height), dpi=200)
+
+            if xlim is None:
+                xmin = float(np.nanmin(values[finite]))
+                xmax = float(np.nanmax(values[finite]))
+                span = xmax - xmin
+                pad = max(0.12 * span, 0.04)
+                ax.set_xlim(xmin - pad, xmax + pad)
+                x_text_value = 1.025
+            else:
+                ax.set_xlim(*xlim)
+                x_text_value = 1.025
+
+            for channel in channels:
+                channel_rows = [row for row in observable_rows if row["channel"] == channel]
+                channel_rows.sort(key=lambda row: method_index[row["method"]])
+                offsets = np.linspace(-0.24, 0.24, len(channel_rows)) if len(channel_rows) > 1 else np.array([0.0])
+                for offset, row in zip(offsets, channel_rows):
+                    value = float(row[metric_key])
+                    if not np.isfinite(value):
+                        continue
+                    method_i = method_index[row["method"]]
+                    y = y_base[channel_index[channel]] + offset
+                    color = method_color(row["method"], method_i)
+                    marker = METHOD_MARKERS[method_i % len(METHOD_MARKERS)]
+                    ax.plot(
+                        value,
+                        y,
+                        marker=marker,
+                        color=color,
+                        markerfacecolor=color,
+                        markeredgecolor=color,
+                        markersize=6.5,
+                        linestyle="None",
+                    )
+                    ax.text(
+                        x_text_value,
+                        y,
+                        f"{value:.4f}",
+                        color=color,
+                        fontsize=8,
+                        va="center",
+                        ha="left",
+                        transform=ax.get_yaxis_transform(),
+                        clip_on=False,
+                    )
+
+            if metric_key.endswith("fraction"):
+                ax.axvline(1.0, color="#D9D9D9", linewidth=0.8, linestyle=":", zorder=0)
+                ax.axvline(0.0, color="#B0B0B0", linewidth=0.8, linestyle="--", zorder=0)
+            else:
+                ax.axvline(0.0, color="#B0B0B0", linewidth=0.8, linestyle="--", zorder=0)
+            ax.text(x_text_value, 1.02, "value", transform=ax.transAxes, fontsize=8, ha="left", va="bottom")
+            ax.set_yticks(y_base)
+            ax.set_yticklabels([channel_latex_label(channel) for channel in channels])
+            ax.invert_yaxis()
+            ax.grid(axis="y", alpha=0.18, linestyle=":")
+            for separator in np.arange(len(channels) - 1, dtype=np.float64) + 0.5:
+                ax.axhline(separator, color="#D9D9D9", linewidth=0.8, zorder=0)
+            ax.set_xlabel(metric_label)
+            ax.set_ylabel("Channel")
+            ax.set_title(f"{observable}: {metric_label} by channel and method")
+
+            handles = [
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker=METHOD_MARKERS[index % len(METHOD_MARKERS)],
+                    color=method_color(method, index),
+                    markerfacecolor=method_color(method, index),
+                    markeredgecolor=method_color(method, index),
+                    markersize=7,
+                    linestyle="None",
+                    label=method,
+                )
+                for index, method in enumerate(methods)
+            ]
+            ax.legend(
+                handles=handles,
+                title="Method",
+                frameon=False,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.15),
+                ncol=min(len(handles), 4),
+            )
+            fig.subplots_adjust(right=0.74, top=0.82, left=0.16, bottom=0.16)
+
+            plot_path = plot_dir / f"{sanitize_filename(observable)}_{sanitize_filename(metric_key)}.png"
+            fig.savefig(plot_path)
+            plt.close(fig)
+            plot_summary[f"{observable}:{metric_key}"] = {
+                "plot": str(plot_path),
+                "observable": observable,
+                "metric": metric_key,
+                "num_points": len(observable_rows),
+                "methods": methods,
+                "channels": channels,
+            }
+
+    return plot_summary
+
+
+def plot_observable_grids(
+    rows: list[dict[str, Any]],
+    output_prefix: Path,
+    normalize: str,
+    channels_override: list[str] | None = None,
+) -> list[str]:
+    methods = list(dict.fromkeys(row["method"] for row in rows))
+    all_channels = sorted({row["channel"] for row in rows}, key=channel_sort_key)
+    channels = channels_override or all_channels
+    observables = sorted({row["observable"] for row in rows}, key=observable_sort_key)
+    output_paths: list[str] = []
+
+    for observable in observables:
+        observable_rows = [row for row in rows if row["observable"] == observable and row["channel"] in channels]
+        if not observable_rows:
+            continue
+
+        value_max = 0.0
+        panel_lookup: dict[tuple[str, str], np.ndarray] = {}
+        diag_lookup: dict[tuple[str, str], float] = {}
+        for row in observable_rows:
+            normalized = normalize_matrix(np.asarray(row["matrix_values"], dtype=np.float64), normalize)
+            panel_lookup[(row["channel"], row["method"])] = normalized
+            diag_lookup[(row["channel"], row["method"])] = float(row["diagonal_fraction"])
+            finite_values = normalized[np.isfinite(normalized)]
+            if finite_values.size:
+                value_max = max(value_max, float(np.max(finite_values)))
+        if value_max <= 0:
+            value_max = 1.0
+
+        fig_width = max(1.9 * len(methods) + 1.6, 6.0)
+        fig_height = max(1.7 * len(channels) + 1.6, 6.0)
+        fig, axes = plt.subplots(len(channels), len(methods), figsize=(fig_width, fig_height), dpi=220, squeeze=False)
+        image = None
+        for y_idx, channel in enumerate(channels):
+            for x_idx, method in enumerate(methods):
+                ax = axes[y_idx][x_idx]
+                matrix = panel_lookup.get((channel, method))
+                if matrix is None:
+                    ax.axis("off")
+                    continue
+                image = ax.imshow(matrix, origin="lower", aspect="auto", cmap="magma", vmin=0.0, vmax=value_max)
+                if y_idx == 0:
+                    ax.set_title(method)
+                if x_idx == 0:
+                    ax.set_ylabel(channel_latex_label(channel))
+                ax.set_xticks([])
+                ax.set_yticks([])
+                diag_value = diag_lookup[(channel, method)]
+                ax.text(
+                    0.04,
+                    0.96,
+                    f"D={diag_value:.3f}",
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    color="white",
+                    fontsize=8,
+                    bbox={"facecolor": "black", "alpha": 0.38, "pad": 2.4, "edgecolor": "none"},
+                )
+        fig.suptitle(f"{observable} response matrices ({normalize} normalized)", y=0.995)
+        if image is not None:
+            cbar = fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.97, pad=0.01)
+            cbar.set_label("Normalized response")
+        fig.tight_layout()
+        png_path = output_prefix.parent / f"{output_prefix.name}_{observable}_response_grid.png"
+        pdf_path = output_prefix.parent / f"{output_prefix.name}_{observable}_response_grid.pdf"
+        fig.savefig(png_path)
+        fig.savefig(pdf_path)
+        plt.close(fig)
+        output_paths.extend([str(png_path), str(pdf_path)])
+    return output_paths
+
+
+def json_safe(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        clean: dict[str, Any] = {}
+        for key, value in row.items():
+            if isinstance(value, np.generic):
+                clean[key] = value.item()
+            else:
+                clean[key] = value
+        output.append(clean)
+    return output
+
+
+def main() -> None:
+    args = parse_args()
+    methods = parse_method_specs(args.method)
+    selected_observables = None if args.observables is None else set(args.observables)
+    rows = collect_response_rows(methods, selected_observables, args.debug)
+    if not rows:
+        raise ValueError("No response matrices matched the requested inputs.")
+
+    if args.channels is not None:
+        allowed = set(args.channels)
+        rows = [row for row in rows if row["channel"] in allowed]
+        if not rows:
+            raise ValueError("No response matrices remain after applying --channels.")
+
+    rows.sort(key=lambda row: (observable_sort_key(row["observable"]), channel_sort_key(row["channel"]), row["method"]))
+    aggregate_rows_by_channel = aggregate_rows(rows)
+
+    matrix_json = args.output_prefix.parent / f"{args.output_prefix.name}_matrix_metrics.json"
+    matrix_csv = args.output_prefix.parent / f"{args.output_prefix.name}_matrix_metrics.csv"
+    summary_json = args.output_prefix.parent / f"{args.output_prefix.name}_summary.json"
+    summary_csv = args.output_prefix.parent / f"{args.output_prefix.name}_summary.csv"
+
+    matrix_json.write_text(json.dumps(json_safe(rows), indent=2, sort_keys=True) + "\n")
+    summary_json.write_text(json.dumps(json_safe(aggregate_rows_by_channel), indent=2, sort_keys=True) + "\n")
+    rows_to_csv(rows, matrix_csv)
+    aggregate_to_csv(aggregate_rows_by_channel, summary_csv)
+
+    plot_paths: list[str] = []
+    plot_summary_json: Path | None = None
+    if not args.no_plots:
+        plot_summary = plot_observable_metric_summaries(rows, args.output_prefix, args.channels)
+        plot_summary_json = args.output_prefix.parent / f"{args.output_prefix.name}_plot_summary.json"
+        plot_summary_json.write_text(json.dumps(plot_summary, indent=2, sort_keys=True) + "\n")
+        plot_paths.extend(item["plot"] for item in plot_summary.values())
+        mean_diag_png = args.output_prefix.parent / f"{args.output_prefix.name}_mean_diagonal_fraction_heatmap.png"
+        near_diag_png = args.output_prefix.parent / f"{args.output_prefix.name}_mean_near_diagonal_fraction_heatmap.png"
+        scatter_png = args.output_prefix.parent / f"{args.output_prefix.name}_mean_diagonal_fraction_by_channel.png"
+        plot_diagonal_summary(
+            aggregate_rows_by_channel,
+            mean_diag_png,
+            "Mean diagonal fraction across response observables",
+            "mean_diagonal_fraction",
+        )
+        plot_diagonal_summary(
+            aggregate_rows_by_channel,
+            near_diag_png,
+            "Mean near-diagonal fraction across response observables",
+            "mean_near_diagonal_fraction",
+        )
+        plot_diagonal_scatter(
+            aggregate_rows_by_channel,
+            scatter_png,
+            "Response matrix diagonal fraction by channel",
+        )
+        plot_paths.extend([str(mean_diag_png), str(near_diag_png), str(scatter_png)])
+        plot_paths.extend(plot_observable_grids(rows, args.output_prefix, args.normalize, args.channels))
+
+    payload = {
+        "methods": [{"label": label, "path": str(path)} for label, path in methods],
+        "num_matrices": len(rows),
+        "matrix_metrics_json": str(matrix_json),
+        "matrix_metrics_csv": str(matrix_csv),
+        "summary_json": str(summary_json),
+        "summary_csv": str(summary_csv),
+        "plot_summary_json": str(plot_summary_json) if plot_summary_json is not None else None,
+        "plots": plot_paths,
+    }
+    print(json.dumps(payload, indent=2), flush=True)
+
+
+if __name__ == "__main__":
+    main()
