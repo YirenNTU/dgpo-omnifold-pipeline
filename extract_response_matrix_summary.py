@@ -153,20 +153,9 @@ def resolve_response_path(path: Path) -> Path:
 
     if any(child.is_file() and RESPONSE_FILE_RE.match(child.name) for child in path.iterdir()):
         return path
-    nested = path / "response_matrices"
-    if nested.is_dir() and any(child.is_file() and RESPONSE_FILE_RE.match(child.name) for child in nested.iterdir()):
-        return nested
-
-    matches = sorted(path.rglob("response_*.root"))
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise FileNotFoundError(f"No response_*.root files found under: {path}")
-    pretty = "\n".join(f"  - {match}" for match in matches[:20])
-    extra = "" if len(matches) <= 20 else f"\n  ... and {len(matches) - 20} more"
-    raise ValueError(
-        f"Multiple response root files found under {path}. Please pass a response_matrices directory or exact file:\n"
-        f"{pretty}{extra}"
+    raise FileNotFoundError(
+        f"No response_*.root files found directly under: {path}\n"
+        "Please pass either an exact response_<region>.root file or the response_matrices directory itself."
     )
 
 
