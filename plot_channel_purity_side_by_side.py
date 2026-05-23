@@ -666,6 +666,19 @@ def style_for_method(method_name: str, method_index: int, is_baseline: bool) -> 
     }
 
 
+def method_short_label(method_name: str) -> str:
+    normalized = method_name.strip().lower()
+    if normalized == "baseline":
+        return "B"
+    if normalized == "evenet":
+        return "E"
+    if normalized == "scratch":
+        return "S"
+    if normalized:
+        return normalized[0].upper()
+    return "?"
+
+
 def finite_nanmax(values: np.ndarray) -> float:
     finite_values = values[np.isfinite(values)]
     return float(np.max(finite_values)) if finite_values.size else 0.0
@@ -682,7 +695,6 @@ def plot_comparison(
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
 
     process_names = all_process_names(methods)
     num_methods = len(methods)
@@ -693,16 +705,17 @@ def plot_comparison(
     panel_height_ratios = [5.6, 1.55, 1.55, 1.55] if unblind else [5.6, 1.55, 1.55]
     figure_height = 12.2 if unblind else 10.4
     fig = plt.figure(figsize=(max(13.5, 1.05 * len(channels) + 4.0), figure_height), dpi=220)
-    gs = fig.add_gridspec(len(panel_height_ratios), 1, height_ratios=panel_height_ratios, hspace=0.08)
+    gs = fig.add_gridspec(len(panel_height_ratios), 1, height_ratios=panel_height_ratios, hspace=0.11)
     ax_main = fig.add_subplot(gs[0, 0])
     ax_purity = fig.add_subplot(gs[1, 0], sharex=ax_main)
     ax_ratio = fig.add_subplot(gs[2, 0], sharex=ax_main) if unblind else None
     ax_signal = fig.add_subplot(gs[3, 0], sharex=ax_main) if unblind else fig.add_subplot(gs[2, 0], sharex=ax_main)
 
+    for boundary in x[:-1] + 0.5:
+        ax_main.axvline(boundary, color="#D9D9D9", linewidth=0.8, alpha=0.9, zorder=0)
+
     component_legend_handles: list[Any] = []
     component_legend_labels: list[str] = []
-    method_legend_handles: list[Any] = []
-    method_legend_labels: list[str] = []
     method_lower_legend_handles: list[Any] = []
     method_lower_legend_labels: list[str] = []
 
@@ -711,6 +724,7 @@ def plot_comparison(
 
     for method_index, method in enumerate(methods):
         method_style = style_for_method(method.name, method_index, method.is_baseline)
+        short_label = method_short_label(method.name)
         x_offset = x - group_width / 2.0 + (method_index + 0.5) * bar_width
         bottoms = np.zeros(len(channels), dtype=np.float64)
 
@@ -732,7 +746,6 @@ def plot_comparison(
                 edgecolor="#202020",
                 linewidth=1.0,
                 alpha=method_style["alpha"],
-                hatch=method_style["hatch"],
                 zorder=2,
             )
             if process_name not in component_legend_labels:
@@ -742,6 +755,18 @@ def plot_comparison(
             for channel_index, channel in enumerate(channels):
                 if process_name == signal_process_for_channel(channel):
                     exact_signal_yields[channel_index] = values[channel_index]
+
+        for xpos in x_offset:
+            ax_main.text(
+                xpos,
+                -0.075,
+                short_label,
+                transform=ax_main.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=8.5,
+                clip_on=False,
+            )
 
         total_values = np.array([method.total_mc.get(channel, 0.0) for channel in channels], dtype=np.float64)
         data_values = np.array([method.data_yield.get(channel, np.nan) for channel in channels], dtype=np.float64)
@@ -820,16 +845,6 @@ def plot_comparison(
             hatch=method_style["hatch"],
             zorder=2,
         )
-        method_legend_handles.append(
-            Patch(
-                facecolor="white",
-                edgecolor="#202020",
-                linewidth=1.0,
-                hatch=method_style["hatch"],
-            )
-        )
-        method_legend_labels.append(method.name)
-
         summary["methods"][method.name] = {
             "is_baseline": bool(method.is_baseline),
             "per_channel": {
@@ -852,6 +867,17 @@ def plot_comparison(
     ax_main.set_ylabel("Yield")
     ax_main.grid(axis="y", linestyle=":", alpha=0.28)
     ax_main.set_ylim(0.0, max(1.0, max_yield) * 1.30)
+    ax_main.text(
+        0.01,
+        0.98,
+        "B = Baseline, E = EveNet, S = Scratch",
+        transform=ax_main.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        color="#303030",
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 1.5},
+    )
 
     ax_purity.set_ylabel("Purity")
     ax_purity.set_ylim(0.0, 1.05)
@@ -895,24 +921,12 @@ def plot_comparison(
             title_fontsize=10.5,
         )
         ax_main.add_artist(first_legend)
-    second_legend = ax_main.legend(
-        method_legend_handles,
-        method_legend_labels,
-        loc="upper right",
-        bbox_to_anchor=(0.995, 0.995),
-        frameon=False,
-        title="Methods",
-        ncols=1,
-        fontsize=9.5,
-        title_fontsize=10.5,
-    )
-    ax_main.add_artist(second_legend)
     ax_purity.legend(
         method_lower_legend_handles,
         method_lower_legend_labels,
         loc="upper right",
         frameon=False,
-        ncols=max(1, min(4, len(method_legend_handles))),
+        ncols=max(1, min(4, len(method_lower_legend_handles))),
         fontsize=8.0,
         title_fontsize=8.3,
     )
@@ -921,7 +935,7 @@ def plot_comparison(
         method_lower_legend_labels,
         loc="upper right",
         frameon=False,
-        ncols=max(1, min(4, len(method_legend_handles))),
+        ncols=max(1, min(4, len(method_lower_legend_handles))),
         fontsize=8.0,
         title_fontsize=8.3,
     )
