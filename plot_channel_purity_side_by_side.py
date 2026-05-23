@@ -705,7 +705,7 @@ def plot_comparison(
     panel_height_ratios = [5.6, 1.55, 1.55, 1.55] if unblind else [5.6, 1.55, 1.55]
     figure_height = 12.2 if unblind else 10.4
     fig = plt.figure(figsize=(max(13.5, 1.05 * len(channels) + 4.0), figure_height), dpi=220)
-    gs = fig.add_gridspec(len(panel_height_ratios), 1, height_ratios=panel_height_ratios, hspace=0.11)
+    gs = fig.add_gridspec(len(panel_height_ratios), 1, height_ratios=panel_height_ratios, hspace=0.14)
     ax_main = fig.add_subplot(gs[0, 0])
     ax_purity = fig.add_subplot(gs[1, 0], sharex=ax_main)
     ax_ratio = fig.add_subplot(gs[2, 0], sharex=ax_main) if unblind else None
@@ -720,6 +720,7 @@ def plot_comparison(
     method_lower_legend_labels: list[str] = []
 
     max_yield = 0.0
+    max_signal_yield = 0.0
     summary: dict[str, Any] = {"channels": channels, "methods": {}}
 
     for method_index, method in enumerate(methods):
@@ -759,12 +760,13 @@ def plot_comparison(
         for xpos in x_offset:
             ax_main.text(
                 xpos,
-                -0.075,
+                -0.12,
                 short_label,
                 transform=ax_main.get_xaxis_transform(),
                 ha="center",
                 va="top",
-                fontsize=8.5,
+                fontsize=9.0,
+                zorder=5,
                 clip_on=False,
             )
 
@@ -862,6 +864,7 @@ def plot_comparison(
                 for channel in channels
             },
         }
+        max_signal_yield = max(max_signal_yield, finite_nanmax(exact_signal_yields))
 
     ax_main.set_title(title)
     ax_main.set_ylabel("Yield")
@@ -892,7 +895,7 @@ def plot_comparison(
 
     ax_signal.set_ylabel("Signal")
     ax_signal.grid(axis="y", linestyle=":", alpha=0.28)
-    ax_signal.set_ylim(bottom=0.0)
+    ax_signal.set_ylim(0.0, max(1.0, max_signal_yield) * 1.45)
 
     ax_signal.set_xticks(x)
     ax_signal.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
