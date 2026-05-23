@@ -233,6 +233,13 @@ Outputs:
 - `<base-dir>/<method>/config_<method>.yaml`
 - `<base-dir>/export_summary.json`
 
+For exported predicted events, the post-calibration direction change is also
+stored per event as:
+
+- `calibration_deltaR_a`
+- `calibration_deltaR_b`
+- `calibration_deltaR_sum = calibration_deltaR_a + calibration_deltaR_b`
+
 
 ### Next step: compare channel purity
 
@@ -258,6 +265,25 @@ python3 ml_pipeline/plot_channel_purity_side_by_side.py \
   --method Scratch:/path/to/scratch/evenet \
   --unblind
 ```
+
+### Next step: summarize calibration magnitude
+
+To compare the average post-calibration direction change across methods and
+selected channels:
+
+```bash
+python3 ml_pipeline/extract_qi_calibration_magnitude.py \
+  --method Pretrain:/path/to/pretrain/evenet \
+  --method Scratch:/path/to/scratch/evenet \
+  --output-prefix /path/to/calibration_magnitude
+```
+
+This writes:
+
+- `<prefix>.json`
+- `<prefix>.csv`
+- `<prefix>.png`
+- `<prefix>.pdf`
 
 ### Next step: run the central code
 

@@ -64,6 +64,9 @@ FINAL_SCHEMA_FIELDS = (
     ("predict_weight", np.float32, 0.0),
     ("weight", np.float32, 0.0),
     ("weight_nominal", np.float32, 0.0),
+    ("calibration_deltaR_a", np.float32, np.nan),
+    ("calibration_deltaR_b", np.float32, np.nan),
+    ("calibration_deltaR_sum", np.float32, np.nan),
 )
 
 
@@ -385,7 +388,23 @@ def finite_valid_mask(values_by_name: dict[str, Any]) -> np.ndarray:
     return valid
 
 
-def evenet_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray]:
+def wrapped_delta_phi(phi_a: np.ndarray, phi_b: np.ndarray) -> np.ndarray:
+    return (phi_a - phi_b + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def delta_r(before: ak.Array, after: ak.Array) -> np.ndarray:
+    return before.deltaR(after)
+
+
+def invalid_calibration_fields(num_events: int) -> dict[str, np.ndarray]:
+    return {
+        "calibration_deltaR_a": np.full(num_events, np.nan, dtype=np.float32),
+        "calibration_deltaR_b": np.full(num_events, np.nan, dtype=np.float32),
+        "calibration_deltaR_sum": np.full(num_events, np.nan, dtype=np.float32),
+    }
+
+
+def evenet_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray, dict[str, np.ndarray]]:
     vis_a = p4_from_fields(events, "lead_a_visible")
     vis_b = p4_from_fields(events, "lead_b_visible")
     theta_a = vis_a.theta + events["evenet_invisible_a_theta"]
@@ -395,22 +414,29 @@ def evenet_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray]:
 
     energy = CM_ENERGY_GEV / 2
     momentum = math.sqrt(energy * energy - TAU_MASS_GEV * TAU_MASS_GEV)
-    tau_a = ak.zip(
+    tau_a_before = ak.zip(
         {"pt": momentum * np.sin(theta_a), "theta": theta_a, "phi": phi_a, "m": ak.ones_like(theta_a) * TAU_MASS_GEV},
         with_name="Momentum4D",
     )
-    tau_b = ak.zip(
+    tau_b_before = ak.zip(
         {"pt": momentum * np.sin(theta_b), "theta": theta_b, "phi": phi_b, "m": ak.ones_like(theta_b) * TAU_MASS_GEV},
         with_name="Momentum4D",
     )
-    tau_a, tau_b = post_calibrate_tau_tau(tau_a, tau_b)
+    tau_a, tau_b = post_calibrate_tau_tau(tau_a_before, tau_b_before)
 
     valid = to_numpy(events["evenet_invisible_a_valid"], bool) & to_numpy(events["evenet_invisible_b_valid"], bool)
     valid &= finite_p4(vis_a) & finite_p4(vis_b) & finite_p4(tau_a) & finite_p4(tau_b)
-    return tau_a, tau_b, valid
+    calibration_delta_r_a = delta_r(tau_a_before, tau_a).astype(np.float32)
+    calibration_delta_r_b = delta_r(tau_b_before, tau_b).astype(np.float32)
+    calibration_fields = {
+        "calibration_deltaR_a": np.where(valid, calibration_delta_r_a, np.nan).astype(np.float32),
+        "calibration_deltaR_b": np.where(valid, calibration_delta_r_b, np.nan).astype(np.float32),
+        "calibration_deltaR_sum": np.where(valid, calibration_delta_r_a + calibration_delta_r_b, np.nan).astype(np.float32),
+    }
+    return tau_a, tau_b, valid, calibration_fields
 
 
-def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], np.ndarray]:
+def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], np.ndarray, dict[str, np.ndarray]]:
     names = export_observable_names()
     if method == "truth":
         if all(f"truth_{name}" in events.fields or name == "mtautau" for name in names):
@@ -421,7 +447,7 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
             valid = np.ones(len(events), dtype=bool)
             for values in output.values():
                 valid &= finite(values)
-            return output, valid
+            return output, valid, invalid_calibration_fields(len(events))
         else:
             raise ValueError(f"Method {method} not implemented.")
 
@@ -454,22 +480,23 @@ def method_observables(events: ak.Array, method: str) -> tuple[dict[str, Any], n
         if valid is None:
             valid = np.ones(len(events), dtype=bool)
         valid &= finite_valid_mask(output)
-        return output, valid
+        return output, valid, invalid_calibration_fields(len(events))
 
 
     vis_a = p4_from_fields(events, "lead_a_visible")
     vis_b = p4_from_fields(events, "lead_b_visible")
     if method == "target":
         tau_a, tau_b, valid = target_tau_pair(events)
+        calibration_fields = invalid_calibration_fields(len(events))
     elif method == "evenet":
-        tau_a, tau_b, valid = evenet_tau_pair(events)
+        tau_a, tau_b, valid, calibration_fields = evenet_tau_pair(events)
     else:
         raise ValueError(f"Unknown method {method}")
 
     built_observables = build_observables(tau_a, tau_b, vis_a, vis_b)
     output = {name: built_observables[name] for name in names}
     valid &= finite_valid_mask(output)
-    return {name: ak.where(valid, values, np.nan) for name, values in output.items()}, valid
+    return {name: ak.where(valid, values, np.nan) for name, values in output.items()}, valid, calibration_fields
 
 
 def observable_field_values(events: ak.Array, observable_name: str, candidates: tuple[str, ...]) -> Any:
@@ -564,8 +591,9 @@ def export_method_events(
 ) -> ak.Array:
     weights = prediction_weight(sample_key, sample_cfg, events, mc_weight_scale)
     output = base_fields(events, sample_key, config, weights)
-    observables, valid = method_observables(events, method)
+    observables, valid, calibration_fields = method_observables(events, method)
     output.update(observables)
+    output.update(calibration_fields)
     output["flags_valid"] = valid
     output["mmc_likelihood"] = auxiliary_field(events, method, "mmc_likelihood")
 
