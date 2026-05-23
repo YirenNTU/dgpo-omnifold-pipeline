@@ -711,13 +711,11 @@ def plot_comparison(
     ax_ratio = fig.add_subplot(gs[2, 0], sharex=ax_main) if unblind else None
     ax_signal = fig.add_subplot(gs[3, 0], sharex=ax_main) if unblind else fig.add_subplot(gs[2, 0], sharex=ax_main)
 
-    for boundary in x[:-1] + 0.5:
-        ax_main.axvline(boundary, color="#D9D9D9", linewidth=0.8, alpha=0.9, zorder=0)
-
     component_legend_handles: list[Any] = []
     component_legend_labels: list[str] = []
     method_lower_legend_handles: list[Any] = []
     method_lower_legend_labels: list[str] = []
+    upper_method_labels: list[tuple[np.ndarray, str]] = []
 
     max_yield = 0.0
     max_signal_yield = 0.0
@@ -727,6 +725,7 @@ def plot_comparison(
         method_style = style_for_method(method.name, method_index, method.is_baseline)
         short_label = method_short_label(method.name)
         x_offset = x - group_width / 2.0 + (method_index + 0.5) * bar_width
+        upper_method_labels.append((x_offset.copy(), short_label))
         bottoms = np.zeros(len(channels), dtype=np.float64)
 
         exact_signal_yields = np.zeros(len(channels), dtype=np.float64)
@@ -756,19 +755,6 @@ def plot_comparison(
             for channel_index, channel in enumerate(channels):
                 if process_name == signal_process_for_channel(channel):
                     exact_signal_yields[channel_index] = values[channel_index]
-
-        for xpos in x_offset:
-            ax_main.text(
-                xpos,
-                -0.12,
-                short_label,
-                transform=ax_main.get_xaxis_transform(),
-                ha="center",
-                va="top",
-                fontsize=9.0,
-                zorder=5,
-                clip_on=False,
-            )
 
         total_values = np.array([method.total_mc.get(channel, 0.0) for channel in channels], dtype=np.float64)
         data_values = np.array([method.data_yield.get(channel, np.nan) for channel in channels], dtype=np.float64)
@@ -944,6 +930,24 @@ def plot_comparison(
     )
 
     fig.tight_layout()
+
+    main_pos = ax_main.get_position()
+    purity_pos = ax_purity.get_position()
+    method_label_y = purity_pos.y1 + 0.42 * (main_pos.y0 - purity_pos.y1)
+    for x_positions, short_label in upper_method_labels:
+        for xpos in x_positions:
+            display_x, _ = ax_main.transData.transform((float(xpos), 0.0))
+            figure_x, _ = fig.transFigure.inverted().transform((display_x, 0.0))
+            fig.text(
+                figure_x,
+                method_label_y,
+                short_label,
+                ha="center",
+                va="center",
+                fontsize=9.0,
+                color="#202020",
+            )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, bbox_inches="tight")
     if output_path.suffix.lower() != ".pdf":
