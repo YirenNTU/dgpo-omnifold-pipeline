@@ -216,10 +216,15 @@ Example:
 python3 export_evenet_qi_inputs.py \
   --analysis-config ml_pipeline/config/analysis.yaml \
   --prediction-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_delta_tau_based/predict-evenet/ \
-  --pseudo-data \
+  --mc-split-fraction 0.5 \
   --num-workers 4 \
   --base-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study
 ```
+
+Use `--mc-split-fraction` only when MC prediction parquets were produced from a
+split and did not already receive the corresponding `1 / split_fraction` weight
+correction during prediction. Data and RAW-complement events are not scaled by
+this option.
 
 Outputs:
 
@@ -245,11 +250,13 @@ python3 ml_pipeline/plot_channel_purity_side_by_side.py \
 By default, the baseline workbook is used as the baseline reference. Add one
 `--method NAME:PATH` argument for each exported method directory to compare.
 `PATH` may be either the method directory or its `processed` subdirectory.
+Data points and the `Data/MC` panel stay hidden unless `--unblind` is passed.
 
 ```bash
 python3 ml_pipeline/plot_channel_purity_side_by_side.py \
   --method Pretrain:/path/to/pretrain/evenet \
-  --method Scratch:/path/to/scratch/evenet
+  --method Scratch:/path/to/scratch/evenet \
+  --unblind
 ```
 
 ### Next step: run the central code

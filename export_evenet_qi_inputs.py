@@ -91,6 +91,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=50_000)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument(
+        "--mc-split-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Optional MC prediction split fraction. If prediction parquets were made from a split "
+            "without applying the 1/fraction weight correction, MC prediction rows are scaled by "
+            "1 / mc_split_fraction during export. Data and RAW-complement rows are not scaled."
+        ),
+    )
+    parser.add_argument(
         "--pseudo-data",
         action="store_true",
         help="Deprecated and no longer supported. Use real data inputs instead.",
@@ -287,7 +297,20 @@ def preselection_mask(events: ak.Array) -> np.ndarray:
     mask &= event_preselection_mask(events)
     return mask
 
-def prediction_weight(sample_key: str, sample_cfg: dict[str, Any], events: ak.Array) -> np.ndarray:
+def mc_prediction_weight_scale(split_fraction: float | None) -> float:
+    if split_fraction is None:
+        return 1.0
+    if not math.isfinite(split_fraction) or split_fraction <= 0.0 or split_fraction > 1.0:
+        raise ValueError(f"--mc-split-fraction must be in (0, 1], got {split_fraction}.")
+    return 1.0 / split_fraction
+
+
+def prediction_weight(
+    sample_key: str,
+    sample_cfg: dict[str, Any],
+    events: ak.Array,
+    mc_weight_scale: float,
+) -> np.ndarray:
     if sample_is_data(sample_key, sample_cfg):
         return np.ones(len(events), dtype=np.float32)
     if "event_weight" not in events.fields:
@@ -295,7 +318,7 @@ def prediction_weight(sample_key: str, sample_cfg: dict[str, Any], events: ak.Ar
             f"Prediction parquet for MC sample '{sample_key}' is missing event_weight. "
             "Do not fall back to an inferred normalization."
         )
-    return to_numpy(events["event_weight"], np.float32)
+    return to_numpy(events["event_weight"], np.float32) * np.float32(mc_weight_scale)
 
 
 def raw_weight(info: RawWeightInfo, num_events: int) -> np.ndarray:
@@ -537,8 +560,9 @@ def export_method_events(
     sample_cfg: dict[str, Any],
     config: dict[str, Any],
     regions: list[str],
+    mc_weight_scale: float,
 ) -> ak.Array:
-    weights = prediction_weight(sample_key, sample_cfg, events)
+    weights = prediction_weight(sample_key, sample_cfg, events, mc_weight_scale)
     output = base_fields(events, sample_key, config, weights)
     observables, valid = method_observables(events, method)
     output.update(observables)
@@ -987,7 +1011,7 @@ def prediction_sample_keys(events: ak.Array, samples: dict[str, dict[str, Any]])
 
 
 def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
-    pred_path, config, samples, methods, regions, output_root, batch_size, compression, start_index = args
+    pred_path, config, samples, methods, regions, output_root, batch_size, compression, start_index, mc_weight_scale = args
     counts: dict[str, int] = {}
     fragment_index = start_index
     for events in iter_batches(pred_path, batch_size, prediction_columns(methods, regions)):
@@ -998,7 +1022,15 @@ def export_prediction_file(args: tuple[Any, ...]) -> dict[str, int]:
             sample_cfg = samples[sample_key]
             sample_events = events[sample_keys == sample_key]
             for method in methods:
-                method_events = export_method_events(sample_events, method, sample_key, sample_cfg, config, regions)
+                method_events = export_method_events(
+                    sample_events,
+                    method,
+                    sample_key,
+                    sample_cfg,
+                    config,
+                    regions,
+                    mc_weight_scale,
+                )
                 record_fragment(method_events, output_root, method, sample_key, fragment_index, regions, compression, counts)
             fragment_index += 1
     return counts
@@ -1113,6 +1145,7 @@ def main() -> None:
     regions = args.regions or neutrino_prediction_regions(config)
     if not regions:
         regions = class_regions(config)
+    mc_weight_scale = mc_prediction_weight_scale(args.mc_split_fraction)
     output_root = args.base_dir
     output_root.mkdir(parents=True, exist_ok=True)
     clean_method_outputs(output_root, args.methods)
@@ -1142,7 +1175,18 @@ def main() -> None:
 
     pred_jobs = []
     for pred_path in prediction_paths:
-        pred_jobs.append((pred_path, config, samples, args.methods, regions, output_root, args.batch_size, args.compression, job_index))
+        pred_jobs.append((
+            pred_path,
+            config,
+            samples,
+            args.methods,
+            regions,
+            output_root,
+            args.batch_size,
+            args.compression,
+            job_index,
+            mc_weight_scale,
+        ))
         job_index += 100_000
 
     raw_counts = run_jobs(raw_jobs, export_raw_file, args.num_workers)
@@ -1163,6 +1207,8 @@ def main() -> None:
         "counts": counts,
         "merged_outputs": merged_outputs,
         "configs": config_paths,
+        "mc_split_fraction": args.mc_split_fraction,
+        "mc_prediction_weight_scale": mc_weight_scale,
         "raw_weight_info": {sample_key: asdict(info) for sample_key, info in raw_weight_infos.items()},
     }
     (output_root / "export_summary.json").write_text(json.dumps(summary, indent=2))

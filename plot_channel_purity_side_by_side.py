@@ -111,6 +111,7 @@ DEFAULT_ANALYSIS_CONFIG = ML_PIPELINE_DIR / "config" / "analysis.yaml"
 OPENXML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 METHOD_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "*", "h")
+METHOD_HATCHES = ("", "///", "\\\\\\", "xx", "++", "..", "oo", "**", "--", "||")
 
 BASELINE_PROCESS_COLUMN_MAP = {
     "C": "Zqq",
@@ -247,6 +248,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--summary-json", type=Path, default=None)
     parser.add_argument("--title", default="Channel Purity Comparison")
+    parser.add_argument(
+        "--unblind",
+        action="store_true",
+        help="Show data yields and the Data/MC panel. By default, data is hidden.",
+    )
     return parser.parse_args()
 
 
@@ -512,12 +518,8 @@ def processed_dir(method_path: Path) -> Path:
 def sample_dirs(processed_path: Path, sample_name: str) -> list[Path]:
     if not processed_path.is_dir():
         return []
-    prefix = f"{sample_name}_"
-    return sorted(
-        path
-        for path in processed_path.iterdir()
-        if path.is_dir() and (path.name == sample_name or path.name.startswith(prefix))
-    )
+    sample_dir = processed_path / sample_name
+    return [sample_dir] if sample_dir.is_dir() else []
 
 
 def region_files(processed_path: Path, sample_name: str, region: str) -> list[Path]:
@@ -652,12 +654,15 @@ def all_process_names(methods: list[MethodPlotData]) -> list[str]:
 
 
 def style_for_method(method_name: str, method_index: int, is_baseline: bool) -> dict[str, Any]:
+    hatch = METHOD_HATCHES[method_index % len(METHOD_HATCHES)]
+    if is_baseline and not hatch:
+        hatch = "///"
     return {
         "color": method_color(method_name, method_index),
         "linestyle": "--" if is_baseline else "-",
         "marker": METHOD_MARKERS[method_index % len(METHOD_MARKERS)],
-        "hatch": "///" if is_baseline else None,
-        "alpha": 0.85 if is_baseline else 0.92,
+        "hatch": hatch,
+        "alpha": 0.88,
     }
 
 
@@ -671,12 +676,13 @@ def plot_comparison(
     channels: list[str],
     output_path: Path,
     title: str,
+    unblind: bool,
 ) -> dict[str, Any]:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
 
     process_names = all_process_names(methods)
     num_methods = len(methods)
@@ -684,12 +690,14 @@ def plot_comparison(
     group_width = min(0.84, 0.20 * num_methods + 0.18)
     bar_width = group_width / max(num_methods, 1)
 
-    fig = plt.figure(figsize=(max(13.5, 1.05 * len(channels) + 4.0), 12.2), dpi=220)
-    gs = fig.add_gridspec(4, 1, height_ratios=[5.6, 1.55, 1.55, 1.55], hspace=0.08)
+    panel_height_ratios = [5.6, 1.55, 1.55, 1.55] if unblind else [5.6, 1.55, 1.55]
+    figure_height = 12.2 if unblind else 10.4
+    fig = plt.figure(figsize=(max(13.5, 1.05 * len(channels) + 4.0), figure_height), dpi=220)
+    gs = fig.add_gridspec(len(panel_height_ratios), 1, height_ratios=panel_height_ratios, hspace=0.08)
     ax_main = fig.add_subplot(gs[0, 0])
     ax_purity = fig.add_subplot(gs[1, 0], sharex=ax_main)
-    ax_ratio = fig.add_subplot(gs[2, 0], sharex=ax_main)
-    ax_signal = fig.add_subplot(gs[3, 0], sharex=ax_main)
+    ax_ratio = fig.add_subplot(gs[2, 0], sharex=ax_main) if unblind else None
+    ax_signal = fig.add_subplot(gs[3, 0], sharex=ax_main) if unblind else fig.add_subplot(gs[2, 0], sharex=ax_main)
 
     component_legend_handles: list[Any] = []
     component_legend_labels: list[str] = []
@@ -721,7 +729,7 @@ def plot_comparison(
                 width=bar_width * 0.95,
                 bottom=bottoms,
                 color=bar_color,
-                edgecolor=bar_color if method.is_baseline else "white",
+                edgecolor="#202020",
                 linewidth=1.0,
                 alpha=method_style["alpha"],
                 hatch=method_style["hatch"],
@@ -740,7 +748,9 @@ def plot_comparison(
         purity_values = np.array([method.purity.get(channel, np.nan) for channel in channels], dtype=np.float64)
         ratio_values = np.array([method.data_over_mc.get(channel, np.nan) for channel in channels], dtype=np.float64)
 
-        max_yield = max(max_yield, finite_nanmax(total_values), finite_nanmax(data_values))
+        max_yield = max(max_yield, finite_nanmax(total_values))
+        if unblind:
+            max_yield = max(max_yield, finite_nanmax(data_values))
 
         data_unc = np.sqrt(np.clip(data_values, a_min=0.0, a_max=None))
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -752,7 +762,7 @@ def plot_comparison(
             )
 
         data_mask = np.isfinite(data_values)
-        if np.any(data_mask):
+        if unblind and np.any(data_mask):
             ax_main.errorbar(
                 x_offset[data_mask],
                 data_values[data_mask],
@@ -783,7 +793,7 @@ def plot_comparison(
         method_lower_legend_handles.append(bars[0])
         method_lower_legend_labels.append(method.name)
         ratio_mask = np.isfinite(ratio_values)
-        if np.any(ratio_mask):
+        if unblind and ax_ratio is not None and np.any(ratio_mask):
             ax_ratio.errorbar(
                 x_offset[ratio_mask],
                 ratio_values[ratio_mask],
@@ -811,15 +821,11 @@ def plot_comparison(
             zorder=2,
         )
         method_legend_handles.append(
-            Line2D(
-                [0],
-                [0],
-                color=DATA_COLOR,
-                linestyle="None",
-                marker=method_style["marker"],
-                markerfacecolor=DATA_COLOR,
-                markeredgecolor=DATA_COLOR,
-                markersize=6.0,
+            Patch(
+                facecolor="white",
+                edgecolor="#202020",
+                linewidth=1.0,
+                hatch=method_style["hatch"],
             )
         )
         method_legend_labels.append(method.name)
@@ -833,10 +839,10 @@ def plot_comparison(
                         for process_name in process_names
                     },
                     "total_mc_yield": float(method.total_mc.get(channel, 0.0)),
-                    "data_yield": float(method.data_yield.get(channel, np.nan)),
+                    "data_yield": float(method.data_yield.get(channel, np.nan)) if unblind else float("nan"),
                     "signal_purity": float(method.purity.get(channel, np.nan)),
                     "exact_signal_yield": float(exact_signal_yields[channels.index(channel)]),
-                    "data_over_mc": float(method.data_over_mc.get(channel, np.nan)),
+                    "data_over_mc": float(method.data_over_mc.get(channel, np.nan)) if unblind else float("nan"),
                 }
                 for channel in channels
             },
@@ -852,23 +858,25 @@ def plot_comparison(
     ax_purity.grid(axis="y", linestyle=":", alpha=0.28)
     ax_purity.axhline(0.5, color="gray", linestyle=":", linewidth=0.9, alpha=0.5)
 
-    ax_ratio.set_ylabel("Data/MC")
-    ax_ratio.set_ylim(0.8, 1.2)
-    ax_ratio.axhline(1.0, color="gray", linestyle=":", linewidth=1.0, alpha=0.6)
-    ax_ratio.grid(axis="y", linestyle=":", alpha=0.28)
+    if unblind and ax_ratio is not None:
+        ax_ratio.set_ylabel("Data/MC")
+        ax_ratio.set_ylim(0.8, 1.2)
+        ax_ratio.axhline(1.0, color="gray", linestyle=":", linewidth=1.0, alpha=0.6)
+        ax_ratio.grid(axis="y", linestyle=":", alpha=0.28)
 
     ax_signal.set_ylabel("Signal")
     ax_signal.grid(axis="y", linestyle=":", alpha=0.28)
     ax_signal.set_ylim(bottom=0.0)
 
-    ax_ratio.set_xticks(x)
-    ax_ratio.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
     ax_signal.set_xticks(x)
     ax_signal.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
     ax_signal.set_xlabel("Selected channel")
     plt.setp(ax_main.get_xticklabels(), visible=False)
     plt.setp(ax_purity.get_xticklabels(), visible=False)
-    plt.setp(ax_ratio.get_xticklabels(), visible=False)
+    if unblind and ax_ratio is not None:
+        ax_ratio.set_xticks(x)
+        ax_ratio.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
+        plt.setp(ax_ratio.get_xticklabels(), visible=False)
 
     component_labels_display = [
         process_latex_label(label) if label != "Other" else "Other bkg"
@@ -924,6 +932,7 @@ def plot_comparison(
     if output_path.suffix.lower() != ".pdf":
         fig.savefig(output_path.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
+    summary["unblind"] = bool(unblind)
     return summary
 
 
@@ -965,6 +974,7 @@ def main() -> None:
         channels=channels,
         output_path=output_path,
         title=args.title,
+        unblind=args.unblind,
     )
 
     summary_json = (
