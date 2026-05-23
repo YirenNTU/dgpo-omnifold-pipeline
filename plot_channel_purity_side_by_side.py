@@ -743,8 +743,8 @@ def plot_comparison(
                 width=bar_width * 0.95,
                 bottom=bottoms,
                 color=bar_color,
-                edgecolor="#202020",
-                linewidth=1.0,
+                edgecolor="none",
+                linewidth=0.0,
                 alpha=method_style["alpha"],
                 zorder=2,
             )
