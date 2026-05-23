@@ -228,6 +228,31 @@ Outputs:
 - `<base-dir>/<method>/config_<method>.yaml`
 - `<base-dir>/export_summary.json`
 
+
+### Next step: compare channel purity
+
+After `export_evenet_qi_inputs.py` finishes, draw side-by-side channel yield,
+purity, signal-yield, and data/MC comparisons from the exported central-style
+parquet trees.
+
+```bash
+python3 ml_pipeline/plot_channel_purity_side_by_side.py \
+  --base-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study \
+  --baseline-xlsx data/baseline_yield.xlsx \
+  --output /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/summary/channel_purity_side_by_side.png
+```
+
+By default, the baseline workbook is used as the baseline reference, and
+methods are read from `<base-dir>/export_summary.json`. If the workbook is
+present, the exported `baseline` method is skipped by default to avoid drawing
+the same baseline twice. To choose methods explicitly:
+
+```bash
+python3 ml_pipeline/plot_channel_purity_side_by_side.py \
+  --base-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study \
+  --methods evenet target truth
+```
+
 ### Next step: run the central code
 
 The generated `config_<method>.yaml` contains both `QIProcessor` and

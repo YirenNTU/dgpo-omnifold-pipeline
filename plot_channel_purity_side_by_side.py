@@ -2,27 +2,112 @@
 from __future__ import annotations
 
 import argparse
-import glob
-import json
 from dataclasses import dataclass
+import json
+import math
 from pathlib import Path
+import sys
 from typing import Any
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
-import matplotlib.pyplot as plt
 import numpy as np
-import awkward as ak
-from matplotlib.lines import Line2D
-import math
 
-from plot_style import OKABE_ITO, channel_latex_label, method_color, process_color, process_latex_label
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ML_PIPELINE_DIR = REPO_ROOT / "ml_pipeline"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(ML_PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(ML_PIPELINE_DIR))
 
+try:
+    from ml_pipeline.plot_style import (
+        OKABE_ITO,
+        channel_latex_label,
+        method_color,
+        process_color,
+        process_latex_label,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "awkward":
+        raise
+
+    OKABE_ITO = {
+        "black": "#000000",
+        "orange": "#E69F00",
+        "sky_blue": "#56B4E9",
+        "bluish_green": "#009E73",
+        "yellow": "#F0E442",
+        "blue": "#0072B2",
+        "vermillion": "#D55E00",
+        "reddish_purple": "#CC79A7",
+    }
+    METHOD_COLORS = {
+        "Baseline": OKABE_ITO["vermillion"],
+        "EveNet": OKABE_ITO["blue"],
+        "Target": OKABE_ITO["reddish_purple"],
+        "Truth": OKABE_ITO["orange"],
+    }
+    METHOD_COLOR_CYCLE = (
+        OKABE_ITO["vermillion"],
+        OKABE_ITO["blue"],
+        OKABE_ITO["bluish_green"],
+        OKABE_ITO["orange"],
+        OKABE_ITO["reddish_purple"],
+        OKABE_ITO["sky_blue"],
+    )
+    PROCESS_COLOR_CYCLE = (
+        "#4477AA",
+        "#EE6677",
+        "#228833",
+        "#CCBB44",
+        "#66CCEE",
+        "#AA3377",
+        "#EE7733",
+        "#009988",
+        "#BBBBBB",
+    )
+    PROCESS_LATEX_LABELS = {
+        "Ztautau_pipi": r"$\tau\tau\to\pi\pi$",
+        "Ztautau_pirho": r"$\tau\tau\to\pi\rho$",
+        "Ztautau_rhopi": r"$\tau\tau\to\rho\pi$",
+        "Ztautau_rhorho": r"$\tau\tau\to\rho\rho$",
+        "Ztautau_pie": r"$\tau\tau\to\pi e$",
+        "Ztautau_epi": r"$\tau\tau\to e\pi$",
+        "Ztautau_pimu": r"$\tau\tau\to\pi\mu$",
+        "Ztautau_mupi": r"$\tau\tau\to\mu\pi$",
+        "Ztautau_rhoe": r"$\tau\tau\to\rho e$",
+        "Ztautau_erho": r"$\tau\tau\to e\rho$",
+        "Ztautau_rhomu": r"$\tau\tau\to\rho\mu$",
+        "Ztautau_murho": r"$\tau\tau\to\mu\rho$",
+        "Ztautau_ee": r"$\tau\tau\to ee$",
+        "Ztautau_mumu": r"$\tau\tau\to\mu\mu$",
+        "Ztautau_emu": r"$\tau\tau\to e\mu$",
+        "Ztautau_mue": r"$\tau\tau\to\mu e$",
+        "Ztautau_others": r"$Z\to\tau\tau$ other",
+        "Zll": r"$Z\to\ell\ell$",
+        "Zqq": r"$Z\to q\bar{q}$",
+    }
+
+    def method_color(method: str, method_index: int) -> str:
+        return METHOD_COLORS.get(method, METHOD_COLOR_CYCLE[method_index % len(METHOD_COLOR_CYCLE)])
+
+    def process_color(process_name: str, process_index: int = 0) -> str:
+        return PROCESS_COLOR_CYCLE[process_index % len(PROCESS_COLOR_CYCLE)]
+
+    def process_latex_label(sample_name: str) -> str:
+        return PROCESS_LATEX_LABELS.get(sample_name, sample_name.replace("_", r"\_"))
+
+    def channel_latex_label(name: str) -> str:
+        channel = name.removeprefix("Ztautau_")
+        return PROCESS_LATEX_LABELS.get(f"Ztautau_{channel}", name.replace("_", r"\_"))
 
 DATA_COLOR = OKABE_ITO["black"]
 BACKGROUND_COLOR = "#D8D8D8"
 DEFAULT_CLASS_NAME = "unselected"
-DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "plots" / "channel_purity_side_by_side.png"
+DEFAULT_OUTPUT = ML_PIPELINE_DIR / "plots" / "channel_purity_side_by_side.png"
+DEFAULT_BASELINE_XLSX = REPO_ROOT / "data" / "baseline_yield.xlsx"
+DEFAULT_ANALYSIS_CONFIG = ML_PIPELINE_DIR / "config" / "analysis.yaml"
 OPENXML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 METHOD_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "*", "h")
@@ -79,9 +164,7 @@ SIGNAL_CHANNEL_KEYS = {
     "mue",
 }
 
-BASELINE_CHANNEL_ORDER = [
-    "zee",
-    "zmumu",
+CHANNEL_ORDER = [
     "ee",
     "mumu",
     "emu",
@@ -97,7 +180,30 @@ BASELINE_CHANNEL_ORDER = [
     "erho",
     "rhomu",
     "murho",
-    "baseline",
+    "rhorho",
+]
+
+PROCESS_ORDER = [
+    "Ztautau_pipi",
+    "Ztautau_pirho",
+    "Ztautau_rhopi",
+    "Ztautau_rhorho",
+    "Ztautau_pie",
+    "Ztautau_epi",
+    "Ztautau_pimu",
+    "Ztautau_mupi",
+    "Ztautau_rhoe",
+    "Ztautau_erho",
+    "Ztautau_rhomu",
+    "Ztautau_murho",
+    "Ztautau_ee",
+    "Ztautau_mumu",
+    "Ztautau_emu",
+    "Ztautau_mue",
+    "Ztautau_others",
+    "Zll",
+    "Zqq",
+    "Other",
 ]
 
 
@@ -115,90 +221,130 @@ class MethodPlotData:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare baseline and prediction channel-purity yields side by side."
+        description="Compare baseline and exported QI channel-purity yields side by side."
     )
     parser.add_argument(
         "--baseline-xlsx",
         type=Path,
-        required=True,
-        help="Baseline yield workbook, e.g. baseline_yield.xlsx.",
+        default=DEFAULT_BASELINE_XLSX,
+        help="Baseline yield workbook. Pass 'none' to skip it.",
     )
     parser.add_argument(
-        "--prediction-method",
+        "--base-dir",
+        type=Path,
+        default=None,
+        help="Base directory produced by export_evenet_qi_inputs.py.",
+    )
+    parser.add_argument(
+        "--method",
         action="append",
         default=[],
-        metavar="NAME:MC_PATH[:DATA_PATH]",
-        help=(
-            "Prediction method definition. MC_PATH and optional DATA_PATH can be parquet files, "
-            "directories, or glob patterns."
-        ),
+        metavar="NAME:PATH",
+        help="Exported method definition. PATH may be a method directory or its processed directory.",
     )
     parser.add_argument(
-        "--channels",
+        "--methods",
         nargs="*",
         default=None,
-        help="Optional explicit channel order using canonical names such as pipi, emu, pie.",
+        help="Method directory names under --base-dir. Defaults to export_summary.json methods.",
     )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT,
-        help="Output figure path.",
-    )
-    parser.add_argument(
-        "--summary-json",
-        type=Path,
-        default=None,
-        help="Optional sidecar JSON summary. Defaults to <output>.json.",
-    )
-    parser.add_argument(
-        "--title",
-        default="Predicted Channel Purity Comparison",
-        help="Figure title.",
-    )
+    parser.add_argument("--analysis-config", type=Path, default=DEFAULT_ANALYSIS_CONFIG)
+    parser.add_argument("--data-sample-name", default="data94")
+    parser.add_argument("--mc-sample-names", nargs="+", default=["Ztautau", "Zll", "Zqq"])
+    parser.add_argument("--channels", nargs="*", default=None)
+    parser.add_argument("--load-batch-size", type=int, default=100_000)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--summary-json", type=Path, default=None)
+    parser.add_argument("--title", default="Channel Purity Comparison")
     return parser.parse_args()
 
 
-def expand_paths(patterns: list[str]) -> list[str]:
-    resolved: list[str] = []
-    for pattern in patterns:
-        expanded = Path(pattern).expanduser()
-        if expanded.is_dir():
-            final_prediction_paths = sorted(expanded.glob("*__evenet_pred.parquet"))
-            paths = final_prediction_paths if final_prediction_paths else sorted(expanded.glob("*.parquet"))
-            resolved.extend(str(path.resolve()) for path in paths)
-            continue
-        matches = sorted(glob.glob(str(expanded)))
-        if matches:
-            resolved.extend(str(Path(match).resolve()) for match in matches)
-        else:
-            resolved.append(str(expanded.resolve()))
-    return resolved
+def baseline_xlsx_arg(path: Path | str | None) -> Path | None:
+    if path is None:
+        return None
+    text = str(path)
+    if text.lower() in {"", "none", "null", "skip"}:
+        return None
+    return Path(path)
 
 
-def load_events(paths: list[str]) -> ak.Array:
-    import awkward as ak
+def method_display_name(method: str) -> str:
+    mapping = {
+        "baseline": "Baseline",
+        "evenet": "EveNet",
+        "target": "Target",
+        "truth": "Truth",
+    }
+    return mapping.get(method, method)
 
-    arrays = [ak.from_parquet(path) for path in paths]
-    if not arrays:
-        raise ValueError("No parquet inputs found.")
-    return arrays[0] if len(arrays) == 1 else ak.concatenate(arrays, axis=0)
+
+def read_export_summary_methods(base_dir: Path) -> list[str]:
+    summary_path = base_dir / "export_summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+        methods = summary.get("methods")
+        if isinstance(methods, list):
+            return [str(method) for method in methods]
+    return sorted(path.name for path in base_dir.iterdir() if (path / "processed").is_dir())
 
 
-def event_weights(events: ak.Array) -> np.ndarray:
-    if "evenet_weight" not in events.fields:
-        raise ValueError("Prediction comparison requires evenet_weight in prediction parquet.")
-    weights = np.asarray(ak.to_numpy(events["evenet_weight"]), dtype=np.float64)
-    valid = np.isfinite(weights) & (weights > 0)
-    return np.where(valid, weights, 0.0)
+def resolve_method_specs(args: argparse.Namespace, include_baseline_xlsx: bool) -> list[tuple[str, Path]]:
+    if args.method:
+        output: list[tuple[str, Path]] = []
+        for spec in args.method:
+            name, separator, path_text = spec.partition(":")
+            if not separator or not name.strip() or not path_text.strip():
+                raise ValueError(f"Invalid --method '{spec}'. Use NAME:PATH.")
+            output.append((name.strip(), Path(path_text).expanduser().resolve()))
+        return output
+
+    if args.base_dir is None:
+        return []
+
+    base_dir = args.base_dir.expanduser().resolve()
+    method_names = args.methods if args.methods is not None else read_export_summary_methods(base_dir)
+    if args.methods is None and include_baseline_xlsx:
+        method_names = [method for method in method_names if method != "baseline"]
+    return [(method_display_name(method), base_dir / method) for method in method_names]
+
+
+def read_analysis_channels(path: Path) -> list[str]:
+    try:
+        import yaml
+    except ModuleNotFoundError:
+        return CHANNEL_ORDER.copy()
+
+    if not path.exists():
+        return CHANNEL_ORDER.copy()
+    config = yaml.safe_load(path.read_text()) or {}
+    regions: list[str] = []
+    prediction_cfg = config.get("NeutrinoPrediction") or {}
+    for value in prediction_cfg.values():
+        if isinstance(value, list):
+            regions.extend(str(item) for item in value)
+        elif isinstance(value, dict):
+            regions.extend(str(item) for item in value.values())
+    output: list[str] = []
+    seen: set[str] = set()
+    for region in regions:
+        channel = canonical_channel_name(region)
+        if channel is not None and channel in SIGNAL_CHANNEL_KEYS and channel not in seen:
+            output.append(channel)
+            seen.add(channel)
+    return output or CHANNEL_ORDER.copy()
+
+
+def channel_to_region(channel: str) -> str:
+    if channel.startswith("Ztautau_"):
+        return channel
+    return f"Ztautau_{channel}"
 
 
 def canonical_channel_name(name: str) -> str | None:
     text = str(name).strip()
     if not text or text == DEFAULT_CLASS_NAME:
         return None
-    lowered = text.lower()
-    lowered = CHANNEL_ALIASES.get(lowered, lowered)
+    lowered = CHANNEL_ALIASES.get(text.lower(), text.lower())
     if lowered.startswith("ztautau_"):
         lowered = lowered.removeprefix("ztautau_")
     if lowered in {"zqq", "zll"}:
@@ -210,19 +356,18 @@ def canonical_process_name(name: str) -> str | None:
     text = str(name).strip()
     if not text or text == DEFAULT_CLASS_NAME:
         return None
-    lowered = text.lower()
-    lowered = CHANNEL_ALIASES.get(lowered, lowered)
-    if lowered in {"zqq", "z→qq"}:
+    lowered = CHANNEL_ALIASES.get(text.lower(), text.lower())
+    if lowered in {"zqq", "z->qq", "zqqbar"}:
         return "Zqq"
-    if lowered in {"zll", "z→ℓℓ", "z→ll"}:
+    if lowered in {"zll", "z->ll", "z->ell ell"}:
         return "Zll"
     if lowered in {"other", "other bkg", "other_bkg"}:
         return "Other"
     if lowered.startswith("ztautau_"):
         channel = lowered.removeprefix("ztautau_")
-        if channel in SIGNAL_CHANNEL_KEYS:
+        if channel in SIGNAL_CHANNEL_KEYS or channel == "others":
             return f"Ztautau_{channel}"
-    if lowered in SIGNAL_CHANNEL_KEYS:
+    if lowered in SIGNAL_CHANNEL_KEYS or lowered == "others":
         return f"Ztautau_{lowered}"
     return text
 
@@ -254,26 +399,27 @@ def method_channel_order(methods: list[MethodPlotData], explicit_channels: list[
         return [canonical_channel_name(channel) or channel for channel in explicit_channels]
     ordered: list[str] = []
     seen: set[str] = set()
-    for channel in BASELINE_CHANNEL_ORDER:
-        if channel not in SIGNAL_CHANNEL_KEYS:
-            continue
+    for channel in CHANNEL_ORDER:
         if channel not in seen and any(channel in method.channel_order for method in methods):
             ordered.append(channel)
             seen.add(channel)
     for method in methods:
         for channel in method.channel_order:
-            if channel not in SIGNAL_CHANNEL_KEYS:
-                continue
-            if channel not in seen:
+            if channel in SIGNAL_CHANNEL_KEYS and channel not in seen:
                 ordered.append(channel)
                 seen.add(channel)
     return ordered
 
 
 def stack_draw_order(process_names: list[str]) -> list[str]:
-    signal_names = [name for name in process_names if not is_background_like_process(name)]
-    background_names = [name for name in process_names if is_background_like_process(name)]
-    return signal_names + background_names
+    known = [name for name in PROCESS_ORDER if name in process_names]
+    extra_signal = sorted(
+        name for name in process_names if name not in PROCESS_ORDER and not is_background_like_process(name)
+    )
+    extra_background = sorted(
+        name for name in process_names if name not in PROCESS_ORDER and is_background_like_process(name)
+    )
+    return [*known, *extra_signal, *extra_background]
 
 
 def process_stack_color(process_name: str, index: int) -> str:
@@ -283,33 +429,11 @@ def process_stack_color(process_name: str, index: int) -> str:
 
 
 def display_channel_label(channel: str) -> str:
-    if channel == "zee":
-        return r"$Z\to ee$"
-    if channel == "zmumu":
-        return r"$Z\to\mu\mu$"
     if channel == "zll":
         return process_latex_label("Zll")
     if channel == "zqq":
         return process_latex_label("Zqq")
     return channel_latex_label(channel)
-
-
-def parse_prediction_method(spec: str) -> tuple[str, list[str], list[str]]:
-    parts = spec.split(":")
-    if len(parts) < 2:
-        raise ValueError(
-            f"Invalid --prediction-method '{spec}'. Use NAME:MC_PATH[:DATA_PATH]."
-        )
-    name = parts[0].strip()
-    mc_path = parts[1].strip()
-    data_path = parts[2].strip() if len(parts) > 2 and parts[2].strip() else ""
-    if not name or not mc_path:
-        raise ValueError(
-            f"Invalid --prediction-method '{spec}'. NAME and MC_PATH are required."
-        )
-    mc_paths = expand_paths([mc_path])
-    data_paths = expand_paths([data_path]) if data_path else []
-    return name, mc_paths, data_paths
 
 
 def cell_reference_to_column(cell_ref: str) -> str:
@@ -383,7 +507,7 @@ def parse_baseline_workbook(path: Path) -> MethodPlotData:
         if not channel_raw or channel_raw in {"Region", "Column groups", "Highlighting", "Notes"}:
             continue
         channel = canonical_channel_name(channel_raw)
-        if channel is None:
+        if channel is None or channel not in SIGNAL_CHANNEL_KEYS:
             continue
         channel_order.append(channel)
 
@@ -416,54 +540,135 @@ def parse_baseline_workbook(path: Path) -> MethodPlotData:
     )
 
 
-def summarize_prediction_method(name: str, mc_paths: list[str], data_paths: list[str]) -> MethodPlotData:
-    mc_events = load_events(mc_paths)
-    mc_pred = np.asarray(ak.to_list(mc_events["evenet_pred_class_name"]), dtype=object)
-    mc_truth = np.asarray(ak.to_list(mc_events["evenet_truth_class_name"]), dtype=object)
-    mc_weight = event_weights(mc_events)
+def processed_dir(method_path: Path) -> Path:
+    if method_path.name == "processed":
+        return method_path
+    if (method_path / "processed").is_dir():
+        return method_path / "processed"
+    return method_path
 
-    valid_mc = np.isfinite(mc_weight) & (mc_weight > 0)
-    mc_pred = mc_pred[valid_mc]
-    mc_truth = mc_truth[valid_mc]
-    mc_weight = mc_weight[valid_mc]
+
+def sample_dirs(processed_path: Path, sample_name: str) -> list[Path]:
+    if not processed_path.is_dir():
+        return []
+    prefix = f"{sample_name}_"
+    return sorted(
+        path
+        for path in processed_path.iterdir()
+        if path.is_dir() and (path.name == sample_name or path.name.startswith(prefix))
+    )
+
+
+def region_files(processed_path: Path, sample_name: str, region: str) -> list[Path]:
+    output: list[Path] = []
+    for sample_dir in sample_dirs(processed_path, sample_name):
+        path = sample_dir / f"filtered___{region}.parquet"
+        if path.exists():
+            output.append(path)
+    return output
+
+
+def parquet_columns(path: Path) -> set[str]:
+    import pyarrow.parquet as pq
+
+    return {field.name for field in pq.ParquetFile(path).schema_arrow}
+
+
+def iter_parquet_batches(paths: list[Path], requested_columns: set[str], batch_size: int):
+    import awkward as ak
+    import pyarrow.parquet as pq
+
+    for path in paths:
+        available = parquet_columns(path)
+        columns = sorted(requested_columns & available)
+        if not columns:
+            continue
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_size, columns=columns):
+            yield ak.from_arrow(batch)
+
+
+def numeric_values(events: ak.Array, name: str, default: float) -> np.ndarray:
+    import awkward as ak
+
+    if name not in events.fields:
+        return np.full(len(events), default, dtype=np.float64)
+    return np.asarray(ak.to_numpy(ak.fill_none(events[name], default)), dtype=np.float64)
+
+
+def string_values(events: ak.Array, name: str, default: str) -> np.ndarray:
+    import awkward as ak
+
+    if name not in events.fields:
+        return np.full(len(events), default, dtype=object)
+    return np.asarray([str(value) for value in ak.to_list(ak.fill_none(events[name], default))], dtype=object)
+
+
+def add_weighted_events(
+    stack: dict[str, float],
+    events: ak.Array,
+    sample_name: str,
+) -> None:
+    weights = numeric_values(events, "weight", 1.0)
+    labels = string_values(events, "classification_target_name", sample_name)
+    for label, weight in zip(labels, weights):
+        if not np.isfinite(weight) or weight <= 0.0:
+            continue
+        process_name = canonical_process_name(label)
+        if process_name is None:
+            process_name = canonical_process_name(sample_name)
+        if process_name is None:
+            continue
+        stack[process_name] = stack.get(process_name, 0.0) + float(weight)
+
+
+def data_count(events: ak.Array) -> float:
+    return float(len(events))
+
+
+def summarize_exported_method(
+    name: str,
+    method_path: Path,
+    channels: list[str],
+    data_sample_name: str,
+    mc_sample_names: list[str],
+    batch_size: int,
+) -> MethodPlotData:
+    processed_path = processed_dir(method_path)
+    if not processed_path.is_dir():
+        raise FileNotFoundError(f"Cannot find processed directory for method '{name}': {method_path}")
 
     stack_matrix: dict[str, dict[str, float]] = {}
     total_mc: dict[str, float] = {}
     data_yield: dict[str, float] = {}
     purity: dict[str, float] = {}
     data_over_mc: dict[str, float] = {}
-
     observed_channels: list[str] = []
-    for pred_name, truth_name, weight in zip(mc_pred, mc_truth, mc_weight):
-        channel = canonical_channel_name(pred_name)
-        process_name = canonical_process_name(truth_name)
-        if channel is None or process_name is None:
+
+    for channel in channels:
+        region = channel_to_region(channel)
+        stack: dict[str, float] = {}
+        for sample_name in mc_sample_names:
+            files = region_files(processed_path, sample_name, region)
+            for events in iter_parquet_batches(files, {"weight", "classification_target_name"}, batch_size):
+                add_weighted_events(stack, events, sample_name)
+
+        data_total = 0.0
+        data_files = region_files(processed_path, data_sample_name, region)
+        for events in iter_parquet_batches(data_files, {"weight"}, batch_size):
+            data_total += data_count(events)
+
+        if not stack and data_total == 0.0:
             continue
-        if channel not in stack_matrix:
-            observed_channels.append(channel)
-            stack_matrix[channel] = {}
-        stack_matrix[channel][process_name] = stack_matrix[channel].get(process_name, 0.0) + float(weight)
 
-    for channel in observed_channels:
-        total = float(sum(stack_matrix[channel].values()))
+        observed_channels.append(channel)
+        stack_matrix[channel] = stack
+        total = float(sum(stack.values()))
         total_mc[channel] = total
+        data_yield[channel] = data_total if data_files else float("nan")
         signal_process = signal_process_for_channel(channel)
-        signal_yield = stack_matrix[channel].get(signal_process, 0.0) if signal_process is not None else float("nan")
+        signal_yield = stack.get(signal_process, 0.0) if signal_process is not None else float("nan")
         purity[channel] = signal_yield / total if signal_process is not None and total > 0 else float("nan")
-
-    if data_paths:
-        data_events = load_events(data_paths)
-        data_pred = np.asarray(ak.to_list(data_events["evenet_pred_class_name"]), dtype=object)
-        for pred_name in data_pred:
-            channel = canonical_channel_name(pred_name)
-            if channel is None:
-                continue
-            data_yield[channel] = data_yield.get(channel, 0.0) + 1.0
-
-    for channel in observed_channels:
-        mc_total = total_mc.get(channel, 0.0)
-        count = data_yield.get(channel, float("nan"))
-        data_over_mc[channel] = count / mc_total if mc_total > 0 and np.isfinite(count) else float("nan")
+        data_over_mc[channel] = data_total / total if total > 0 and data_files else float("nan")
 
     return MethodPlotData(
         name=name,
@@ -473,6 +678,7 @@ def summarize_prediction_method(name: str, mc_paths: list[str], data_paths: list
         data_yield=data_yield,
         purity=purity,
         data_over_mc=data_over_mc,
+        is_baseline=name.lower() == "baseline",
     )
 
 
@@ -494,12 +700,23 @@ def style_for_method(method_name: str, method_index: int, is_baseline: bool) -> 
     }
 
 
+def finite_nanmax(values: np.ndarray) -> float:
+    finite_values = values[np.isfinite(values)]
+    return float(np.max(finite_values)) if finite_values.size else 0.0
+
+
 def plot_comparison(
     methods: list[MethodPlotData],
     channels: list[str],
     output_path: Path,
     title: str,
 ) -> dict[str, Any]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
     process_names = all_process_names(methods)
     num_methods = len(methods)
     x = np.arange(len(channels), dtype=np.float64)
@@ -562,9 +779,7 @@ def plot_comparison(
         purity_values = np.array([method.purity.get(channel, np.nan) for channel in channels], dtype=np.float64)
         ratio_values = np.array([method.data_over_mc.get(channel, np.nan) for channel in channels], dtype=np.float64)
 
-        max_yield = max(max_yield, float(np.nanmax(total_values)) if np.any(np.isfinite(total_values)) else 0.0)
-        if np.any(np.isfinite(data_values)):
-            max_yield = max(max_yield, float(np.nanmax(data_values)))
+        max_yield = max(max_yield, finite_nanmax(total_values), finite_nanmax(data_values))
 
         data_unc = np.sqrt(np.clip(data_values, a_min=0.0, a_max=None))
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -652,7 +867,10 @@ def plot_comparison(
             "is_baseline": bool(method.is_baseline),
             "per_channel": {
                 channel: {
-                    "stack": {process_name: float(method.stack_matrix.get(channel, {}).get(process_name, 0.0)) for process_name in process_names},
+                    "stack": {
+                        process_name: float(method.stack_matrix.get(channel, {}).get(process_name, 0.0))
+                        for process_name in process_names
+                    },
                     "total_mc_yield": float(method.total_mc.get(channel, 0.0)),
                     "data_yield": float(method.data_yield.get(channel, np.nan)),
                     "signal_purity": float(method.purity.get(channel, np.nan)),
@@ -673,13 +891,6 @@ def plot_comparison(
     ax_purity.grid(axis="y", linestyle=":", alpha=0.28)
     ax_purity.axhline(0.5, color="gray", linestyle=":", linewidth=0.9, alpha=0.5)
 
-    ratio_values_all = [
-        method.data_over_mc.get(channel, np.nan)
-        for method in methods
-        for channel in channels
-    ]
-    finite_ratio_values = np.asarray([value for value in ratio_values_all if np.isfinite(value)], dtype=np.float64)
-    ratio_upper = 2.0 if finite_ratio_values.size == 0 else max(1.6, min(3.0, float(np.nanmax(finite_ratio_values) * 1.15)))
     ax_ratio.set_ylabel("Data/MC")
     ax_ratio.set_ylim(0.8, 1.2)
     ax_ratio.axhline(1.0, color="gray", linestyle=":", linewidth=1.0, alpha=0.6)
@@ -693,24 +904,28 @@ def plot_comparison(
     ax_ratio.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
     ax_signal.set_xticks(x)
     ax_signal.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
-    ax_signal.set_xlabel("Predicted channel")
+    ax_signal.set_xlabel("Selected channel")
     plt.setp(ax_main.get_xticklabels(), visible=False)
     plt.setp(ax_purity.get_xticklabels(), visible=False)
     plt.setp(ax_ratio.get_xticklabels(), visible=False)
 
-    component_labels_display = [process_latex_label(label) if label != "Other" else "Other bkg" for label in component_legend_labels]
-    first_legend = ax_main.legend(
-        component_legend_handles,
-        component_labels_display,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.995),
-        frameon=False,
-        title="MC truth components",
-        ncols=min(max(4, math.ceil(len(component_legend_labels) / 2)), len(component_legend_labels)),
-        fontsize=9.5,
-        title_fontsize=10.5,
-    )
-    ax_main.add_artist(first_legend)
+    component_labels_display = [
+        process_latex_label(label) if label != "Other" else "Other bkg"
+        for label in component_legend_labels
+    ]
+    if component_legend_handles:
+        first_legend = ax_main.legend(
+            component_legend_handles,
+            component_labels_display,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.995),
+            frameon=False,
+            title="MC truth components",
+            ncols=min(max(4, math.ceil(len(component_legend_labels) / 2)), len(component_legend_labels)),
+            fontsize=9.5,
+            title_fontsize=10.5,
+        )
+        ax_main.add_artist(first_legend)
     second_legend = ax_main.legend(
         method_legend_handles,
         method_legend_labels,
@@ -728,7 +943,6 @@ def plot_comparison(
         method_lower_legend_labels,
         loc="upper right",
         frameon=False,
-        title=None,
         ncols=max(1, min(4, len(method_legend_handles))),
         fontsize=8.0,
         title_fontsize=8.3,
@@ -738,39 +952,68 @@ def plot_comparison(
         method_lower_legend_labels,
         loc="upper right",
         frameon=False,
-        title=None,
         ncols=max(1, min(4, len(method_legend_handles))),
         fontsize=8.0,
         title_fontsize=8.3,
     )
 
-
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, bbox_inches="tight")
+    if output_path.suffix.lower() != ".pdf":
+        fig.savefig(output_path.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
     return summary
 
 
 def main() -> None:
     args = parse_args()
-    methods: list[MethodPlotData] = [parse_baseline_workbook(args.baseline_xlsx.resolve())]
-    for method_spec in args.prediction_method:
-        method_name, mc_paths, data_paths = parse_prediction_method(method_spec)
-        methods.append(summarize_prediction_method(method_name, mc_paths, data_paths))
+    baseline_path = baseline_xlsx_arg(args.baseline_xlsx)
+    methods: list[MethodPlotData] = []
+    if baseline_path is not None:
+        methods.append(parse_baseline_workbook(baseline_path.expanduser().resolve()))
+
+    scan_channels = (
+        [canonical_channel_name(channel) or channel for channel in args.channels]
+        if args.channels
+        else read_analysis_channels(args.analysis_config.expanduser().resolve())
+    )
+    method_specs = resolve_method_specs(args, include_baseline_xlsx=baseline_path is not None)
+    for method_name, method_path in method_specs:
+        methods.append(
+            summarize_exported_method(
+                method_name,
+                method_path,
+                scan_channels,
+                args.data_sample_name,
+                args.mc_sample_names,
+                args.load_batch_size,
+            )
+        )
+
+    if not methods:
+        raise ValueError("No baseline workbook or exported methods were provided.")
 
     channels = method_channel_order(methods, args.channels)
+    if not channels:
+        raise ValueError("No channels with yields were found.")
+
+    output_path = args.output.expanduser().resolve()
     summary = plot_comparison(
         methods=methods,
         channels=channels,
-        output_path=args.output.resolve(),
+        output_path=output_path,
         title=args.title,
     )
 
-    summary_json = args.summary_json.resolve() if args.summary_json is not None else args.output.resolve().with_suffix(".json")
-    with summary_json.open("w") as handle:
-        json.dump(summary, handle, indent=2)
-    print(f"[channel-purity-compare] wrote figure to {args.output.resolve()}")
+    summary_json = (
+        args.summary_json.expanduser().resolve()
+        if args.summary_json is not None
+        else output_path.with_suffix(".json")
+    )
+    summary_json.parent.mkdir(parents=True, exist_ok=True)
+    summary_json.write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"[channel-purity-compare] wrote figure to {output_path}")
     print(f"[channel-purity-compare] wrote summary to {summary_json}")
 
 
