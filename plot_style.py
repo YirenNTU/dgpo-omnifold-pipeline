@@ -568,8 +568,8 @@ def plot_data_mc_histogram_from_counts(
             align="edge",
             alpha=0.82,
             color=color,
-            edgecolor="black",
-            linewidth=0.25,
+            edgecolor=None,
+            # linewidth=0.25,
             label=label,
         )
         stack_base += counts
