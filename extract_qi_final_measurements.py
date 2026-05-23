@@ -783,6 +783,36 @@ def format_value_unc(row: dict[str, Any]) -> str:
     return f"{value:.3f} +{err_up:.3f}/-{err_down:.3f}"
 
 
+def focused_x_window(
+    values: np.ndarray,
+    err_down: np.ndarray,
+    err_up: np.ndarray,
+    coverage: float = 0.90,
+) -> tuple[float, float]:
+    finite = np.isfinite(values) & np.isfinite(err_down) & np.isfinite(err_up)
+    if not np.any(finite):
+        return (-1.0, 1.0)
+
+    lower_bounds = values[finite] - err_down[finite]
+    upper_bounds = values[finite] + err_up[finite]
+    tail = 0.5 * (1.0 - coverage)
+    q_low = 100.0 * tail
+    q_high = 100.0 * (1.0 - tail)
+    xmin = float(np.nanpercentile(lower_bounds, q_low))
+    xmax = float(np.nanpercentile(upper_bounds, q_high))
+
+    if not np.isfinite(xmin) or not np.isfinite(xmax) or xmin >= xmax:
+        xmin = float(np.nanmin(lower_bounds))
+        xmax = float(np.nanmax(upper_bounds))
+    if not np.isfinite(xmin) or not np.isfinite(xmax) or xmin >= xmax:
+        center = float(np.nanmean(values[finite]))
+        width = float(np.nanmean(np.maximum(err_down[finite], err_up[finite])))
+        width = width if np.isfinite(width) and width > 0.0 else 1.0
+        xmin = center - width
+        xmax = center + width
+    return xmin, xmax
+
+
 def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) -> dict[str, Any]:
     plot_dir = output_prefix.parent / f"{output_prefix.name}_plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -811,8 +841,7 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
             finite = np.isfinite(values) & np.isfinite(err_up) & np.isfinite(err_down)
             if not np.any(finite):
                 continue
-            xmin = float(np.nanmin(values[finite] - err_down[finite]))
-            xmax = float(np.nanmax(values[finite] + err_up[finite]))
+            xmin, xmax = focused_x_window(values, err_down, err_up, coverage=0.90)
             span = xmax - xmin
             pad = max(0.12 * span, 0.02)
 
@@ -836,7 +865,7 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                     ax.errorbar(
                         row["value"],
                         y,
-                        xerr=np.array([[min(row["err_down"],3)], [min(row["err_up"],3)]], dtype=np.float64),
+                        xerr=np.array([[row["err_down"]], [row["err_up"]]], dtype=np.float64),
                         fmt=marker,
                         color=color,
                         markerfacecolor="white" if is_truth else color,
@@ -853,6 +882,10 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                             label += f"  [n={nchan}, scale={scale:.2f}]"
                         else:
                             label += f"  [n={nchan}]"
+                    lower = float(row["value"] - row["err_down"])
+                    upper = float(row["value"] + row["err_up"])
+                    if lower < xmin or upper > xmax:
+                        label += "  w. overflow"
                     ax.text(
                         x_text_value,
                         y,
