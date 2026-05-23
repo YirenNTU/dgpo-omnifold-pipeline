@@ -426,12 +426,15 @@ def evenet_tau_pair(events: ak.Array) -> tuple[ak.Array, ak.Array, np.ndarray, d
 
     valid = to_numpy(events["evenet_invisible_a_valid"], bool) & to_numpy(events["evenet_invisible_b_valid"], bool)
     valid &= finite_p4(vis_a) & finite_p4(vis_b) & finite_p4(tau_a) & finite_p4(tau_b)
-    calibration_delta_r_a = delta_r(tau_a_before, tau_a).astype(np.float32)
-    calibration_delta_r_b = delta_r(tau_b_before, tau_b).astype(np.float32)
+    calibration_delta_r_a = np.asarray(delta_r(tau_a_before, tau_a), dtype=np.float32)
+    calibration_delta_r_b = np.asarray(delta_r(tau_b_before, tau_b), dtype=np.float32)
     calibration_fields = {
-        "calibration_deltaR_a": np.where(valid, calibration_delta_r_a, np.nan).astype(np.float32),
-        "calibration_deltaR_b": np.where(valid, calibration_delta_r_b, np.nan).astype(np.float32),
-        "calibration_deltaR_sum": np.where(valid, calibration_delta_r_a + calibration_delta_r_b, np.nan).astype(np.float32),
+        "calibration_deltaR_a": np.asarray(np.where(valid, calibration_delta_r_a, np.nan), dtype=np.float32),
+        "calibration_deltaR_b": np.asarray(np.where(valid, calibration_delta_r_b, np.nan), dtype=np.float32),
+        "calibration_deltaR_sum": np.asarray(
+            np.where(valid, calibration_delta_r_a + calibration_delta_r_b, np.nan),
+            dtype=np.float32,
+        ),
     }
     return tau_a, tau_b, valid, calibration_fields
 
