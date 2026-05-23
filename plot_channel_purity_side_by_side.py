@@ -230,23 +230,14 @@ def parse_args() -> argparse.Namespace:
         help="Baseline yield workbook. Pass 'none' to skip it.",
     )
     parser.add_argument(
-        "--base-dir",
-        type=Path,
-        default=None,
-        help="Base directory produced by export_evenet_qi_inputs.py.",
-    )
-    parser.add_argument(
         "--method",
         action="append",
         default=[],
         metavar="NAME:PATH",
-        help="Exported method definition. PATH may be a method directory or its processed directory.",
-    )
-    parser.add_argument(
-        "--methods",
-        nargs="*",
-        default=None,
-        help="Method directory names under --base-dir. Defaults to export_summary.json methods.",
+        help=(
+            "Exported method definition. PATH may be the method directory, its processed directory, "
+            "or a directory containing processed sample folders."
+        ),
     )
     parser.add_argument("--analysis-config", type=Path, default=DEFAULT_ANALYSIS_CONFIG)
     parser.add_argument("--data-sample-name", default="data94")
@@ -268,44 +259,14 @@ def baseline_xlsx_arg(path: Path | str | None) -> Path | None:
     return Path(path)
 
 
-def method_display_name(method: str) -> str:
-    mapping = {
-        "baseline": "Baseline",
-        "evenet": "EveNet",
-        "target": "Target",
-        "truth": "Truth",
-    }
-    return mapping.get(method, method)
-
-
-def read_export_summary_methods(base_dir: Path) -> list[str]:
-    summary_path = base_dir / "export_summary.json"
-    if summary_path.exists():
-        summary = json.loads(summary_path.read_text())
-        methods = summary.get("methods")
-        if isinstance(methods, list):
-            return [str(method) for method in methods]
-    return sorted(path.name for path in base_dir.iterdir() if (path / "processed").is_dir())
-
-
-def resolve_method_specs(args: argparse.Namespace, include_baseline_xlsx: bool) -> list[tuple[str, Path]]:
-    if args.method:
-        output: list[tuple[str, Path]] = []
-        for spec in args.method:
-            name, separator, path_text = spec.partition(":")
-            if not separator or not name.strip() or not path_text.strip():
-                raise ValueError(f"Invalid --method '{spec}'. Use NAME:PATH.")
-            output.append((name.strip(), Path(path_text).expanduser().resolve()))
-        return output
-
-    if args.base_dir is None:
-        return []
-
-    base_dir = args.base_dir.expanduser().resolve()
-    method_names = args.methods if args.methods is not None else read_export_summary_methods(base_dir)
-    if args.methods is None and include_baseline_xlsx:
-        method_names = [method for method in method_names if method != "baseline"]
-    return [(method_display_name(method), base_dir / method) for method in method_names]
+def resolve_method_specs(args: argparse.Namespace) -> list[tuple[str, Path]]:
+    output: list[tuple[str, Path]] = []
+    for spec in args.method:
+        name, separator, path_text = spec.partition(":")
+        if not separator or not name.strip() or not path_text.strip():
+            raise ValueError(f"Invalid --method '{spec}'. Use NAME:PATH.")
+        output.append((name.strip(), Path(path_text).expanduser().resolve()))
+    return output
 
 
 def read_analysis_channels(path: Path) -> list[str]:
@@ -978,7 +939,7 @@ def main() -> None:
         if args.channels
         else read_analysis_channels(args.analysis_config.expanduser().resolve())
     )
-    method_specs = resolve_method_specs(args, include_baseline_xlsx=baseline_path is not None)
+    method_specs = resolve_method_specs(args)
     for method_name, method_path in method_specs:
         methods.append(
             summarize_exported_method(

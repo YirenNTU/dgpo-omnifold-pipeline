@@ -237,20 +237,19 @@ parquet trees.
 
 ```bash
 python3 ml_pipeline/plot_channel_purity_side_by_side.py \
-  --base-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study \
+  --method Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/slide/pretrain/evenet \
   --baseline-xlsx data/baseline_yield.xlsx \
-  --output /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/summary/channel_purity_side_by_side.png
+  --output /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/slide/pretrain/channel_purity_side_by_side.png
 ```
 
-By default, the baseline workbook is used as the baseline reference, and
-methods are read from `<base-dir>/export_summary.json`. If the workbook is
-present, the exported `baseline` method is skipped by default to avoid drawing
-the same baseline twice. To choose methods explicitly:
+By default, the baseline workbook is used as the baseline reference. Add one
+`--method NAME:PATH` argument for each exported method directory to compare.
+`PATH` may be either the method directory or its `processed` subdirectory.
 
 ```bash
 python3 ml_pipeline/plot_channel_purity_side_by_side.py \
-  --base-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study \
-  --methods evenet target truth
+  --method Pretrain:/path/to/pretrain/evenet \
+  --method Scratch:/path/to/scratch/evenet
 ```
 
 ### Next step: run the central code
