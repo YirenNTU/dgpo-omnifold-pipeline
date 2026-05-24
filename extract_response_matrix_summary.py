@@ -856,6 +856,7 @@ def main() -> None:
     args = parse_args()
     maybe_load_roounfold()
     methods = parse_method_specs(args.method)
+    args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
     selected_observables = None if args.observables is None else set(args.observables)
     rows = collect_response_rows(methods, selected_observables, args.debug)
     if not rows:
