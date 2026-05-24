@@ -806,7 +806,7 @@ def format_value_sigma(row: dict[str, Any]) -> str:
     sensitivity = sensitivity_value(row)
     if not np.isfinite(sensitivity):
         return f"{value:.3f}"
-    return f"{value:.3f} ({sensitivity:.2f}\\sigma)"
+    return rf"{value:.3f} (${sensitivity:.2f}\sigma$)"
 
 
 def focused_x_window(
@@ -985,14 +985,14 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
             sensitivity_rows = [row for row in parameter_rows if np.isfinite(sensitivity_value(row))]
             if sensitivity_rows:
                 sensitivity_values = np.array([sensitivity_value(row) for row in sensitivity_rows], dtype=np.float64)
-                sens_min = float(np.nanmin(sensitivity_values))
+                sens_min = 0.0
                 sens_max = float(np.nanmax(sensitivity_values))
                 sens_span = sens_max - sens_min
-                sens_pad = max(0.22 * max(sens_span, 1.0), 0.8)
+                sens_pad = max(0.18 * max(sens_span, 1.0), 0.6)
 
                 sens_fig_height = max(5.2, 0.92 * len(channel_keys) + 2.8)
                 sens_fig, sens_ax = plt.subplots(figsize=(11.6, sens_fig_height), dpi=200)
-                sens_ax.set_xlim(sens_min - sens_pad, sens_max + sens_pad)
+                sens_ax.set_xlim(0.0, sens_max + sens_pad)
 
                 max_rows_per_channel = max(
                     len([row for row in parameter_rows if row["channel"] == key])
@@ -1025,7 +1025,11 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                             linewidth=1.3,
                             zorder=2,
                         )
-                        x_text = sensitivity + 0.03 * (sens_max - sens_min + 2.0) if sensitivity >= 0.0 else sensitivity - 0.03 * (sens_max - sens_min + 2.0)
+                        x_text = (
+                            sensitivity + 0.03 * (sens_max - sens_min + 2.0)
+                            if sensitivity >= 0.0
+                            else sensitivity - 0.03 * (sens_max - sens_min + 2.0)
+                        )
                         sens_ax.text(
                             x_text,
                             y,
