@@ -244,8 +244,8 @@ stored per event as:
 ### Next step: compare channel purity
 
 After `export_evenet_qi_inputs.py` finishes, draw side-by-side channel yield,
-purity, signal-yield, and data/MC comparisons from the exported central-style
-parquet trees.
+purity, signal-yield, significance, and data/MC comparisons from the exported
+central-style parquet trees.
 
 ```bash
 python3 ml_pipeline/plot_channel_purity_side_by_side.py \
@@ -258,6 +258,8 @@ By default, the baseline workbook is used as the baseline reference. Add one
 `--method NAME:PATH` argument for each exported method directory to compare.
 `PATH` may be either the method directory or its `processed` subdirectory.
 Data points and the `Data/MC` panel stay hidden unless `--unblind` is passed.
+The baseline input and `--method` paths may also point to XML yield files such
+as `data/ztautau_yields_full.xml`.
 
 ```bash
 python3 ml_pipeline/plot_channel_purity_side_by_side.py \

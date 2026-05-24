@@ -207,6 +207,13 @@ PROCESS_ORDER = [
     "Other",
 ]
 
+SIGNIFICANCE_GROUPS = {
+    "ll": ["ee", "mumu", "emu", "mue"],
+    "l had": ["pie", "epi", "pimu", "mupi", "rhoe", "erho", "rhomu", "murho"],
+    "pipi": ["pipi"],
+    "other hadhad": ["pirho", "rhopi", "rhorho"],
+}
+
 
 @dataclass
 class MethodPlotData:
@@ -216,6 +223,7 @@ class MethodPlotData:
     total_mc: dict[str, float]
     data_yield: dict[str, float]
     purity: dict[str, float]
+    significance: dict[str, float]
     data_over_mc: dict[str, float]
     is_baseline: bool = False
 
@@ -228,7 +236,7 @@ def parse_args() -> argparse.Namespace:
         "--baseline-xlsx",
         type=Path,
         default=DEFAULT_BASELINE_XLSX,
-        help="Baseline yield workbook. Pass 'none' to skip it.",
+        help="Baseline yield workbook or XML yield file. Pass 'none' to skip it.",
     )
     parser.add_argument(
         "--method",
@@ -237,7 +245,7 @@ def parse_args() -> argparse.Namespace:
         metavar="NAME:PATH",
         help=(
             "Exported method definition. PATH may be the method directory, its processed directory, "
-            "or a directory containing processed sample folders."
+            "a directory containing processed sample folders, or an XML yield file."
         ),
     )
     parser.add_argument("--analysis-config", type=Path, default=DEFAULT_ANALYSIS_CONFIG)
@@ -347,6 +355,24 @@ def signal_process_for_channel(channel: str) -> str | None:
     if channel == "zqq":
         return "Zqq"
     return None
+
+
+def significance(signal_yield: float, total_mc: float) -> float:
+    if not np.isfinite(signal_yield) or not np.isfinite(total_mc) or total_mc <= 0.0:
+        return float("nan")
+    return float(signal_yield / math.sqrt(total_mc))
+
+
+def safe_float(text: str | None, default: float = 0.0) -> float:
+    if text is None:
+        return default
+    value = str(text).strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def is_background_like_process(name: str) -> bool:
@@ -466,6 +492,7 @@ def parse_baseline_workbook(path: Path) -> MethodPlotData:
     total_mc: dict[str, float] = {}
     data_yield: dict[str, float] = {}
     purity: dict[str, float] = {}
+    z_values: dict[str, float] = {}
     data_over_mc: dict[str, float] = {}
     channel_order: list[str] = []
 
@@ -493,6 +520,7 @@ def parse_baseline_workbook(path: Path) -> MethodPlotData:
         total_mc[channel] = mc_total
         data_yield[channel] = data_count
         purity[channel] = signal_yield / mc_total if signal_process is not None and mc_total > 0 else float("nan")
+        z_values[channel] = significance(signal_yield, mc_total)
         data_over_mc[channel] = ratio if np.isfinite(ratio) else (data_count / mc_total if mc_total > 0 else float("nan"))
 
     return MethodPlotData(
@@ -502,9 +530,86 @@ def parse_baseline_workbook(path: Path) -> MethodPlotData:
         total_mc=total_mc,
         data_yield=data_yield,
         purity=purity,
+        significance=z_values,
         data_over_mc=data_over_mc,
         is_baseline=True,
     )
+
+
+def is_xml_yield_file(path: Path) -> bool:
+    return path.suffix.lower() == ".xml"
+
+
+def is_data_process(process_name: str, data_sample_name: str) -> bool:
+    normalized = process_name.strip().lower()
+    return normalized == data_sample_name.strip().lower() or normalized.startswith("data")
+
+
+def parse_yield_xml(path: Path, name: str, data_sample_name: str, is_baseline: bool = False) -> MethodPlotData:
+    root = ET.parse(path).getroot()
+    stack_matrix: dict[str, dict[str, float]] = {}
+    total_mc: dict[str, float] = {}
+    data_yield: dict[str, float] = {}
+    purity: dict[str, float] = {}
+    z_values: dict[str, float] = {}
+    data_over_mc: dict[str, float] = {}
+    channel_order: list[str] = []
+
+    for region in root.findall("region"):
+        channel = canonical_channel_name(region.attrib.get("name", ""))
+        if channel is None or channel not in SIGNAL_CHANNEL_KEYS:
+            continue
+
+        process_values: dict[str, float] = {}
+        data_count = float("nan")
+        for process in region.findall("process"):
+            raw_process_name = process.attrib.get("name", "")
+            value = safe_float(process.text, 0.0)
+            if is_data_process(raw_process_name, data_sample_name):
+                data_count = 0.0 if not np.isfinite(data_count) else data_count
+                data_count += value
+                continue
+
+            process_name = canonical_process_name(raw_process_name)
+            if process_name is None:
+                continue
+            process_values[process_name] = process_values.get(process_name, 0.0) + value
+
+        total_node = region.find("total_mc")
+        mc_total = safe_float(total_node.text if total_node is not None else None, float("nan"))
+        if not np.isfinite(mc_total):
+            mc_total = float(sum(process_values.values()))
+
+        data_mc_node = region.find("data_mc")
+        ratio = safe_float(data_mc_node.text if data_mc_node is not None else None, float("nan"))
+        signal_process = signal_process_for_channel(channel)
+        signal_yield = process_values.get(signal_process, 0.0) if signal_process is not None else float("nan")
+
+        channel_order.append(channel)
+        stack_matrix[channel] = process_values
+        total_mc[channel] = mc_total
+        data_yield[channel] = data_count
+        purity[channel] = signal_yield / mc_total if signal_process is not None and mc_total > 0 else float("nan")
+        z_values[channel] = significance(signal_yield, mc_total)
+        data_over_mc[channel] = ratio if np.isfinite(ratio) else (data_count / mc_total if mc_total > 0 else float("nan"))
+
+    return MethodPlotData(
+        name=name,
+        channel_order=channel_order,
+        stack_matrix=stack_matrix,
+        total_mc=total_mc,
+        data_yield=data_yield,
+        purity=purity,
+        significance=z_values,
+        data_over_mc=data_over_mc,
+        is_baseline=is_baseline,
+    )
+
+
+def parse_baseline_yields(path: Path, data_sample_name: str) -> MethodPlotData:
+    if is_xml_yield_file(path):
+        return parse_yield_xml(path, name="Baseline", data_sample_name=data_sample_name, is_baseline=True)
+    return parse_baseline_workbook(path)
 
 
 def processed_dir(method_path: Path) -> Path:
@@ -604,6 +709,7 @@ def summarize_exported_method(
     total_mc: dict[str, float] = {}
     data_yield: dict[str, float] = {}
     purity: dict[str, float] = {}
+    z_values: dict[str, float] = {}
     data_over_mc: dict[str, float] = {}
     observed_channels: list[str] = []
 
@@ -631,6 +737,7 @@ def summarize_exported_method(
         signal_process = signal_process_for_channel(channel)
         signal_yield = stack.get(signal_process, 0.0) if signal_process is not None else float("nan")
         purity[channel] = signal_yield / total if signal_process is not None and total > 0 else float("nan")
+        z_values[channel] = significance(signal_yield, total)
         data_over_mc[channel] = data_total / total if total > 0 and data_files else float("nan")
 
     return MethodPlotData(
@@ -640,6 +747,7 @@ def summarize_exported_method(
         total_mc=total_mc,
         data_yield=data_yield,
         purity=purity,
+        significance=z_values,
         data_over_mc=data_over_mc,
         is_baseline=name.lower() == "baseline",
     )
@@ -684,6 +792,36 @@ def finite_nanmax(values: np.ndarray) -> float:
     return float(np.max(finite_values)) if finite_values.size else 0.0
 
 
+def finite_sum(values: np.ndarray) -> float:
+    finite_values = values[np.isfinite(values)]
+    return float(np.sum(finite_values)) if finite_values.size else float("nan")
+
+
+def grouped_total_z_summary(
+    channels: list[str],
+    total_values: np.ndarray,
+    signal_values: np.ndarray,
+) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for group_name, group_channels in SIGNIFICANCE_GROUPS.items():
+        indices = [index for index, channel in enumerate(channels) if channel in group_channels]
+        group_total = finite_sum(total_values[indices]) if indices else float("nan")
+        group_signal = finite_sum(signal_values[indices]) if indices else float("nan")
+        group_background = (
+            group_total - group_signal
+            if np.isfinite(group_total) and np.isfinite(group_signal)
+            else float("nan")
+        )
+        output[group_name] = {
+            "channels": [channel for channel in channels if channel in group_channels],
+            "signal_yield": group_signal,
+            "background_yield": group_background,
+            "total_mc_yield": group_total,
+            "z": significance(group_signal, group_total),
+        }
+    return output
+
+
 def plot_comparison(
     methods: list[MethodPlotData],
     channels: list[str],
@@ -702,14 +840,15 @@ def plot_comparison(
     group_width = min(0.84, 0.20 * num_methods + 0.18)
     bar_width = group_width / max(num_methods, 1)
 
-    panel_height_ratios = [5.6, 1.55, 1.55, 1.55] if unblind else [5.6, 1.55, 1.55]
-    figure_height = 12.2 if unblind else 10.4
+    panel_height_ratios = [5.6, 1.45, 1.45, 1.45, 1.45] if unblind else [5.6, 1.45, 1.45, 1.45]
+    figure_height = 13.6 if unblind else 11.6
     fig = plt.figure(figsize=(max(13.5, 1.05 * len(channels) + 4.0), figure_height), dpi=220)
     gs = fig.add_gridspec(len(panel_height_ratios), 1, height_ratios=panel_height_ratios, hspace=0.14)
     ax_main = fig.add_subplot(gs[0, 0])
     ax_purity = fig.add_subplot(gs[1, 0], sharex=ax_main)
     ax_ratio = fig.add_subplot(gs[2, 0], sharex=ax_main) if unblind else None
     ax_signal = fig.add_subplot(gs[3, 0], sharex=ax_main) if unblind else fig.add_subplot(gs[2, 0], sharex=ax_main)
+    ax_z = fig.add_subplot(gs[4, 0], sharex=ax_main) if unblind else fig.add_subplot(gs[3, 0], sharex=ax_main)
 
     component_legend_handles: list[Any] = []
     component_legend_labels: list[str] = []
@@ -719,7 +858,8 @@ def plot_comparison(
 
     max_yield = 0.0
     max_signal_yield = 0.0
-    summary: dict[str, Any] = {"channels": channels, "methods": {}}
+    max_z = 0.0
+    summary: dict[str, Any] = {"channels": channels, "methods": {}, "total_z_summary": {}}
 
     for method_index, method in enumerate(methods):
         method_style = style_for_method(method.name, method_index, method.is_baseline)
@@ -760,6 +900,7 @@ def plot_comparison(
         data_values = np.array([method.data_yield.get(channel, np.nan) for channel in channels], dtype=np.float64)
         purity_values = np.array([method.purity.get(channel, np.nan) for channel in channels], dtype=np.float64)
         ratio_values = np.array([method.data_over_mc.get(channel, np.nan) for channel in channels], dtype=np.float64)
+        z_values = np.array([significance(signal, total) for signal, total in zip(exact_signal_yields, total_values)])
 
         max_yield = max(max_yield, finite_nanmax(total_values))
         if unblind:
@@ -833,6 +974,18 @@ def plot_comparison(
             hatch=method_style["hatch"],
             zorder=2,
         )
+        ax_z.bar(
+            x_offset,
+            z_values,
+            width=bar_width * 0.82,
+            color=method_style["color"],
+            edgecolor=method_style["color"],
+            linewidth=0.8,
+            alpha=0.78,
+            hatch=method_style["hatch"],
+            zorder=2,
+        )
+        grouped_z = grouped_total_z_summary(channels, total_values, exact_signal_yields)
         summary["methods"][method.name] = {
             "is_baseline": bool(method.is_baseline),
             "per_channel": {
@@ -845,12 +998,16 @@ def plot_comparison(
                     "data_yield": float(method.data_yield.get(channel, np.nan)) if unblind else float("nan"),
                     "signal_purity": float(method.purity.get(channel, np.nan)),
                     "exact_signal_yield": float(exact_signal_yields[channels.index(channel)]),
+                    "z": float(z_values[channels.index(channel)]),
                     "data_over_mc": float(method.data_over_mc.get(channel, np.nan)) if unblind else float("nan"),
                 }
                 for channel in channels
             },
+            "total_z_summary": grouped_z,
         }
+        summary["total_z_summary"][method.name] = grouped_z
         max_signal_yield = max(max_signal_yield, finite_nanmax(exact_signal_yields))
+        max_z = max(max_z, finite_nanmax(z_values))
 
     ax_main.set_title(title)
     ax_main.set_ylabel("Yield")
@@ -883,11 +1040,16 @@ def plot_comparison(
     ax_signal.grid(axis="y", linestyle=":", alpha=0.28)
     ax_signal.set_ylim(0.0, max(1.0, max_signal_yield) * 1.45)
 
-    ax_signal.set_xticks(x)
-    ax_signal.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
-    ax_signal.set_xlabel("Selected channel")
+    ax_z.set_ylabel(r"$S/\sqrt{S+B}$")
+    ax_z.grid(axis="y", linestyle=":", alpha=0.28)
+    ax_z.set_ylim(0.0, max(1.0, max_z) * 1.35)
+
+    ax_z.set_xticks(x)
+    ax_z.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
+    ax_z.set_xlabel("Selected channel")
     plt.setp(ax_main.get_xticklabels(), visible=False)
     plt.setp(ax_purity.get_xticklabels(), visible=False)
+    plt.setp(ax_signal.get_xticklabels(), visible=False)
     if unblind and ax_ratio is not None:
         ax_ratio.set_xticks(x)
         ax_ratio.set_xticklabels([display_channel_label(channel) for channel in channels], rotation=30, ha="right")
@@ -920,6 +1082,15 @@ def plot_comparison(
         title_fontsize=8.3,
     )
     ax_signal.legend(
+        method_lower_legend_handles,
+        method_lower_legend_labels,
+        loc="upper right",
+        frameon=False,
+        ncols=max(1, min(4, len(method_lower_legend_handles))),
+        fontsize=8.0,
+        title_fontsize=8.3,
+    )
+    ax_z.legend(
         method_lower_legend_handles,
         method_lower_legend_labels,
         loc="upper right",
@@ -962,7 +1133,7 @@ def main() -> None:
     baseline_path = baseline_xlsx_arg(args.baseline_xlsx)
     methods: list[MethodPlotData] = []
     if baseline_path is not None:
-        methods.append(parse_baseline_workbook(baseline_path.expanduser().resolve()))
+        methods.append(parse_baseline_yields(baseline_path.expanduser().resolve(), args.data_sample_name))
 
     scan_channels = (
         [canonical_channel_name(channel) or channel for channel in args.channels]
@@ -971,16 +1142,26 @@ def main() -> None:
     )
     method_specs = resolve_method_specs(args)
     for method_name, method_path in method_specs:
-        methods.append(
-            summarize_exported_method(
-                method_name,
-                method_path,
-                scan_channels,
-                args.data_sample_name,
-                args.mc_sample_names,
-                args.load_batch_size,
+        if is_xml_yield_file(method_path):
+            methods.append(
+                parse_yield_xml(
+                    method_path,
+                    name=method_name,
+                    data_sample_name=args.data_sample_name,
+                    is_baseline=method_name.lower() == "baseline",
+                )
             )
-        )
+        else:
+            methods.append(
+                summarize_exported_method(
+                    method_name,
+                    method_path,
+                    scan_channels,
+                    args.data_sample_name,
+                    args.mc_sample_names,
+                    args.load_batch_size,
+                )
+            )
 
     if not methods:
         raise ValueError("No baseline workbook or exported methods were provided.")
