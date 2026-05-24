@@ -787,6 +787,18 @@ def method_short_label(method_name: str) -> str:
     return "?"
 
 
+def method_label_note(methods: list[MethodPlotData]) -> str:
+    entries: list[str] = []
+    used_labels: set[str] = set()
+    for method_index, method in enumerate(methods):
+        label = method_short_label(method.name)
+        if label in used_labels:
+            label = str(method_index + 1)
+        used_labels.add(label)
+        entries.append(f"{label} = {method.name}")
+    return ", ".join(entries)
+
+
 def finite_nanmax(values: np.ndarray) -> float:
     finite_values = values[np.isfinite(values)]
     return float(np.max(finite_values)) if finite_values.size else 0.0
@@ -1016,7 +1028,7 @@ def plot_comparison(
     ax_main.text(
         0.01,
         0.98,
-        "B = Baseline, E = EveNet, S = Scratch",
+        method_label_note(methods),
         transform=ax_main.transAxes,
         ha="left",
         va="top",
