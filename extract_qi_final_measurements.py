@@ -745,14 +745,17 @@ def method_marker(method: str, method_index: int) -> str:
 
 def source_display_name(source: str) -> str:
     if source == "Unfolded":
-        return "Reco"
+        return ""
     if source == "Truth":
         return "Truth"
     return source
 
 
 def series_label(method: str, source: str) -> str:
-    return f"{method} ({source_display_name(source)})"
+    source_label = source_display_name(source)
+    if not source_label:
+        return method
+    return f"{method} ({source_label})"
 
 
 def channel_label(channel: str) -> str:
@@ -781,6 +784,29 @@ def format_value_unc(row: dict[str, Any]) -> str:
     if math.isclose(err_up, err_down, rel_tol=0.05, abs_tol=5.0e-4):
         return f"{value:.3f} ± {0.5 * (err_up + err_down):.3f}"
     return f"{value:.3f} +{err_up:.3f}/-{err_down:.3f}"
+
+
+def sensitivity_value(row: dict[str, Any]) -> float:
+    value = float(row["value"])
+    err_up = float(row["err_up"])
+    err_down = float(row["err_down"])
+    if value > 0.0:
+        uncertainty = err_down
+    elif value < 0.0:
+        uncertainty = err_up
+    else:
+        uncertainty = 0.5 * (err_up + err_down)
+    if not np.isfinite(value) or not np.isfinite(uncertainty) or uncertainty <= 0.0:
+        return float("nan")
+    return float(value / uncertainty)
+
+
+def format_value_sigma(row: dict[str, Any]) -> str:
+    value = float(row["value"])
+    sensitivity = sensitivity_value(row)
+    if not np.isfinite(sensitivity):
+        return f"{value:.3f}"
+    return f"{value:.3f} ({sensitivity:.2f}\\sigma)"
 
 
 def focused_x_window(
@@ -832,7 +858,8 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
             if COMBINED_CHANNEL_KEY in channel_keys:
                 channel_keys = [key for key in channel_keys if key != COMBINED_CHANNEL_KEY] + [COMBINED_CHANNEL_KEY]
 
-            y_base = np.arange(len(channel_keys), dtype=np.float64)
+            row_spacing = 1.35
+            y_base = np.arange(len(channel_keys), dtype=np.float64) * row_spacing
             channel_index = {key: index for index, key in enumerate(channel_keys)}
 
             values = np.array([row["value"] for row in parameter_rows], dtype=np.float64)
@@ -845,7 +872,7 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
             span = xmax - xmin
             pad = max(0.12 * span, 0.02)
 
-            fig_height = max(4.4, 0.62 * len(channel_keys) + 2.2)
+            fig_height = max(5.2, 0.92 * len(channel_keys) + 2.8)
             fig, ax = plt.subplots(figsize=(11.6, fig_height), dpi=200)
             ax.set_xlim(xmin - pad, xmax + pad)
 
@@ -853,7 +880,11 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
             for key in channel_keys:
                 channel_rows = [row for row in parameter_rows if row["channel"] == key]
                 channel_rows.sort(key=lambda row: series_index[(row["method"], row["source"])])
-                offsets = np.linspace(-0.24, 0.24, len(channel_rows)) if len(channel_rows) > 1 else np.array([0.0])
+                offsets = (
+                    np.linspace(-0.42, 0.42, len(channel_rows))
+                    if len(channel_rows) > 1
+                    else np.array([0.0])
+                )
                 for offset, row in zip(offsets, channel_rows):
                     method_i = method_index[row["method"]]
                     y = y_base[channel_index[key]] + offset
@@ -891,7 +922,7 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                         y,
                         label,
                         color=color,
-                        fontsize=8,
+                        fontsize=7.6,
                         va="center",
                         ha="left",
                         transform=ax.get_yaxis_transform(),
@@ -904,8 +935,9 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
             ax.set_yticklabels([channel_label(channel) for channel in channel_keys])
             ax.invert_yaxis()
             ax.grid(axis="y", alpha=0.18, linestyle=":")
-            for separator in np.arange(len(channel_keys) - 1, dtype=np.float64) + 0.5:
-                if channel_keys[int(separator + 0.5)] == COMBINED_CHANNEL_KEY:
+            for separator_index in range(len(channel_keys) - 1):
+                separator = y_base[separator_index] + 0.5 * row_spacing
+                if channel_keys[separator_index + 1] == COMBINED_CHANNEL_KEY:
                     ax.axhline(separator, color="#808080", linewidth=1.4, zorder=0)
                 else:
                     ax.axhline(separator, color="#D9D9D9", linewidth=0.8, zorder=0)
@@ -932,22 +964,129 @@ def plot_measurement_summaries(rows: list[dict[str, Any]], output_prefix: Path) 
                 title="Method / source",
                 frameon=False,
                 loc="upper center",
-                bbox_to_anchor=(0.5, 1.16),
+                bbox_to_anchor=(0.5, 1.18),
                 ncol=min(len(handles), 4),
             )
-            fig.subplots_adjust(right=0.74, top=0.82, left=0.16, bottom=0.16)
+            fig.subplots_adjust(right=0.74, top=0.80, left=0.16, bottom=0.16)
 
             plot_path = plot_dir / f"{sanitize_filename(group)}_{sanitize_filename(parameter)}.png"
             fig.savefig(plot_path)
             plt.close(fig)
             plot_summary[f"{group}:{parameter}"] = {
                 "plot": str(plot_path),
+                "plot_type": "value_comparison",
                 "num_points": len(parameter_rows),
                 "methods": methods,
                 "series": [series_label(method, source) for method, source in series],
                 "channels": channel_keys,
             }
             print(f"[qi-final] wrote_plot={plot_path}", flush=True)
+
+            sensitivity_rows = [row for row in parameter_rows if np.isfinite(sensitivity_value(row))]
+            if sensitivity_rows:
+                sensitivity_values = np.array([sensitivity_value(row) for row in sensitivity_rows], dtype=np.float64)
+                sens_min = float(np.nanmin(sensitivity_values))
+                sens_max = float(np.nanmax(sensitivity_values))
+                sens_span = sens_max - sens_min
+                sens_pad = max(0.22 * max(sens_span, 1.0), 0.8)
+
+                sens_fig_height = max(5.2, 0.92 * len(channel_keys) + 2.8)
+                sens_fig, sens_ax = plt.subplots(figsize=(11.6, sens_fig_height), dpi=200)
+                sens_ax.set_xlim(sens_min - sens_pad, sens_max + sens_pad)
+
+                max_rows_per_channel = max(
+                    len([row for row in parameter_rows if row["channel"] == key])
+                    for key in channel_keys
+                )
+                bar_height = min(0.22, 0.82 / max(max_rows_per_channel, 1))
+
+                for key in channel_keys:
+                    channel_rows = [row for row in parameter_rows if row["channel"] == key]
+                    channel_rows.sort(key=lambda row: series_index[(row["method"], row["source"])])
+                    offsets = (
+                        np.linspace(-0.42, 0.42, len(channel_rows))
+                        if len(channel_rows) > 1
+                        else np.array([0.0])
+                    )
+                    for offset, row in zip(offsets, channel_rows):
+                        sensitivity = sensitivity_value(row)
+                        if not np.isfinite(sensitivity):
+                            continue
+                        method_i = method_index[row["method"]]
+                        y = y_base[channel_index[key]] + offset
+                        color = method_color(row["method"], method_i)
+                        is_truth = row["source"] == "Truth"
+                        sens_ax.barh(
+                            y,
+                            sensitivity,
+                            height=bar_height,
+                            color="white" if is_truth else color,
+                            edgecolor=color,
+                            linewidth=1.3,
+                            zorder=2,
+                        )
+                        x_text = sensitivity + 0.03 * (sens_max - sens_min + 2.0) if sensitivity >= 0.0 else sensitivity - 0.03 * (sens_max - sens_min + 2.0)
+                        sens_ax.text(
+                            x_text,
+                            y,
+                            format_value_sigma(row),
+                            color=color,
+                            fontsize=7.6,
+                            va="center",
+                            ha="left" if sensitivity >= 0.0 else "right",
+                        )
+
+                sens_ax.axvline(0.0, color="#808080", linewidth=1.0, linestyle="--", zorder=1)
+                sens_ax.set_yticks(y_base)
+                sens_ax.set_yticklabels([channel_label(channel) for channel in channel_keys])
+                sens_ax.invert_yaxis()
+                sens_ax.grid(axis="y", alpha=0.18, linestyle=":")
+                for separator_index in range(len(channel_keys) - 1):
+                    separator = y_base[separator_index] + 0.5 * row_spacing
+                    if channel_keys[separator_index + 1] == COMBINED_CHANNEL_KEY:
+                        sens_ax.axhline(separator, color="#808080", linewidth=1.4, zorder=0)
+                    else:
+                        sens_ax.axhline(separator, color="#D9D9D9", linewidth=0.8, zorder=0)
+                sens_ax.set_xlabel("Sensitivity")
+                sens_ax.set_ylabel("Channel / combined")
+                sens_ax.set_title(f"{parameter_label(parameter)}: value / selected uncertainty")
+
+                sens_handles = [
+                    plt.Line2D(
+                        [0],
+                        [0],
+                        color=method_color(method, method_index[method]),
+                        marker="s",
+                        markerfacecolor="white" if source == "Truth" else method_color(method, method_index[method]),
+                        markeredgecolor=method_color(method, method_index[method]),
+                        markersize=7,
+                        linestyle="None",
+                        label=series_label(method, source),
+                    )
+                    for method, source in series
+                ]
+                sens_ax.legend(
+                    handles=sens_handles,
+                    title="Method / source",
+                    frameon=False,
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, 1.18),
+                    ncol=min(len(sens_handles), 4),
+                )
+                sens_fig.subplots_adjust(right=0.96, top=0.80, left=0.16, bottom=0.16)
+
+                sensitivity_plot_path = plot_dir / f"{sanitize_filename(group)}_{sanitize_filename(parameter)}_sensitivity.png"
+                sens_fig.savefig(sensitivity_plot_path)
+                plt.close(sens_fig)
+                plot_summary[f"{group}:{parameter}:sensitivity"] = {
+                    "plot": str(sensitivity_plot_path),
+                    "plot_type": "sensitivity",
+                    "num_points": len(sensitivity_rows),
+                    "methods": methods,
+                    "series": [series_label(method, source) for method, source in series],
+                    "channels": channel_keys,
+                }
+                print(f"[qi-final] wrote_plot={sensitivity_plot_path}", flush=True)
 
     return plot_summary
 
