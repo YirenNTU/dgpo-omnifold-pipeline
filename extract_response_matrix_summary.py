@@ -229,15 +229,65 @@ def parse_response_key(key_name: str, default_region: str | None) -> tuple[str, 
     return None
 
 
-def get_response_histogram(response_object: Any) -> Any:
-    if hasattr(response_object, "HresponseNoOverflow"):
-        histogram = response_object.HresponseNoOverflow()
-        histogram.SetDirectory(0)
-        return histogram
+def object_name(value: Any, fallback: str = "<unknown>") -> str:
+    get_name = getattr(value, "GetName", None)
+    if callable(get_name):
+        try:
+            return str(get_name())
+        except Exception:
+            pass
+    name = getattr(value, "name", None)
+    if name is not None:
+        return str(name)
+    return fallback
+
+
+def object_class_name(value: Any) -> str:
+    class_name = getattr(value, "ClassName", None)
+    if callable(class_name):
+        try:
+            return str(class_name())
+        except Exception:
+            pass
+    return type(value).__name__
+
+
+def detach_root_histogram(histogram: Any) -> Any:
+    set_directory = getattr(histogram, "SetDirectory", None)
+    if callable(set_directory):
+        try:
+            set_directory(0)
+        except Exception:
+            pass
+    return histogram
+
+
+def call_root_method(value: Any, method_name: str) -> Any | None:
+    method = getattr(value, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        return method()
+    except Exception:
+        return None
+
+
+def get_response_histogram(response_object: Any, key_name: str) -> Any:
+    for method_name in (
+        "HresponseNoOverflow",
+        "Hresponse",
+        "H2D",
+        "Mresponse",
+    ):
+        histogram = call_root_method(response_object, method_name)
+        if histogram is not None and hasattr(histogram, "GetNbinsX") and hasattr(histogram, "GetNbinsY"):
+            return detach_root_histogram(histogram)
     if hasattr(response_object, "GetNbinsX") and hasattr(response_object, "GetNbinsY"):
-        response_object.SetDirectory(0)
-        return response_object
-    raise TypeError(f"Object '{response_object.GetName()}' is not a supported response matrix.")
+        return detach_root_histogram(response_object)
+    raise TypeError(
+        f"Object '{object_name(response_object, key_name)}' (class {object_class_name(response_object)}) "
+        "is not a supported response matrix."
+    )
 
 
 def th2_to_numpy(histogram: Any) -> np.ndarray:
@@ -310,7 +360,7 @@ def collect_response_rows(methods: list[tuple[str, Path]], selected_observables:
                     if selected_observables is not None and observable not in selected_observables:
                         continue
                     response_object = root_handle.Get(key_name)
-                    histogram = get_response_histogram(response_object)
+                    histogram = get_response_histogram(response_object, key_name)
                     values = th2_to_numpy(histogram)
                     metrics = compute_matrix_metrics(values)
                     row = {
