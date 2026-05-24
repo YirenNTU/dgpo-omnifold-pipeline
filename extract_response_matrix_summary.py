@@ -211,6 +211,29 @@ def response_observable_names() -> list[str]:
     return [name for name in get_observable_names() if "cos_theta" in name]
 
 
+def maybe_load_roounfold() -> None:
+    candidates: list[str] = []
+    roounfold_lib = os.environ.get("ROOUNFOLD_LIB")
+    if roounfold_lib:
+        candidates.append(roounfold_lib)
+    repo_lib = Path(__file__).resolve().parents[1] / "RooUnfold" / "build" / "libRooUnfold.so"
+    if repo_lib.exists():
+        candidates.append(str(repo_lib))
+    candidates.extend(["libRooUnfold.so", "libRooUnfold"])
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            status = ROOT.gSystem.Load(candidate)
+        except Exception:
+            continue
+        if status >= 0:
+            return
+
+
 def parse_response_key(key_name: str, default_region: str | None) -> tuple[str, str, str] | None:
     for observable in sorted(response_observable_names(), key=len, reverse=True):
         suffix = f"_{observable}"
@@ -286,7 +309,8 @@ def get_response_histogram(response_object: Any, key_name: str) -> Any:
         return detach_root_histogram(response_object)
     raise TypeError(
         f"Object '{object_name(response_object, key_name)}' (class {object_class_name(response_object)}) "
-        "is not a supported response matrix."
+        "is not a supported response matrix. RooUnfold dictionaries may be missing; "
+        "source setup.sh or set ROOUNFOLD_LIB before running."
     )
 
 
@@ -830,6 +854,7 @@ def json_safe(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def main() -> None:
     args = parse_args()
+    maybe_load_roounfold()
     methods = parse_method_specs(args.method)
     selected_observables = None if args.observables is None else set(args.observables)
     rows = collect_response_rows(methods, selected_observables, args.debug)
