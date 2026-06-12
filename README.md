@@ -1,452 +1,461 @@
 # ML Pipeline
 
-This directory contains the ML pipeline scripts for the Ztautau analysis, including:
-- Build EveNet input parquet files from the baseline-selected parquet files
-- Generate the `generated_event_info.yaml` schema for EveNet training and prediction
-- Preprocess the EveNet input parquet files into train/val/test splits
-- Run EveNet prediction on the converted parquet files
-- Export the EveNet prediction into the central QI/unfolding parquet layout
-- Produce the pre-unfolding validation plots from the exported central-schema parquet trees
-- Run the unfolding / `tree_ana` preload workflow from the lite framework path
-- Extract the final QI measurements from `results.txt`, write JSON/CSV tables, and draw the per-channel comparison plots
-- Draw the prediction summary plots from the prediction parquet outputs
+This directory contains the Ztautau EveNet workflow used to go from central
+baseline parquet files to EveNet predictions and QI/unfolding-ready inputs.
 
+The README covers only the top-level `ml_pipeline` workflow:
 
+- build EveNet input shards from selected central parquet files
+- generate the EveNet event schema from the analysis configuration
+- preprocess shards into EveNet train/validation/test parquet files
+- train EveNet classification and invisible-particle generation models
+- run prediction on converted parquet files
+- export predictions to the central QI/unfolding layout
+- make the standard validation and summary plots
 
-## `build_evenet_input_from_parquet.py`
+## Directory Layout
 
-This rewrite keeps only the fields needed for later EveNet work:
+| Path | Purpose |
+| --- | --- |
+| `config/analysis.yaml` | Sample list, input parquet paths, raw parquet paths, luminosity, class labels, regions, and feature layout. |
+| `config/evenet_schema.yaml` | EveNet process/generation schema used to build `generated_event_info.yaml`. |
+| `config/preprocess_config.yaml` | EveNet preprocessing config. |
+| `config/train_*.yaml` | EveNet training configs for classification and diffusion/generation models. |
+| `build_evenet_input_from_parquet.py` | Convert central selected parquets into EveNet input shards. |
+| `generate_event_info_yaml.py` | Generate EveNet event-info YAML and a small JSON summary. |
+| `preprocess_evenet_parquet.py` | Convert input shards into EveNet train/validation/test files and normalization metadata. |
+| `predict_evenet.py` | Run EveNet inference on preprocessed/converted parquet files. |
+| `export_evenet_qi_inputs.py` | Export prediction parquets to the central processed-parquet layout for QI/unfolding. |
+| `monitor_input.py` | Optional input-level monitoring plots. |
+| `monitor_method_comparison.py` | Optional method-comparison monitoring plots. |
+| `plot_channel_purity_side_by_side.py` | Optional channel yield, purity, and significance comparison plot. |
+| `extract_qi_calibration_magnitude.py` | Optional calibration-shift summary after QI export. |
+| `extract_qi_final_measurements.py` | Optional parser and plotter for central `results.txt` files. |
+| `extract_response_matrix_summary.py` | Optional response-matrix summary from central ROOT outputs. |
 
-- filtered per-particle `Part_*` inputs needed by EveNet
-- `Global` condition features needed by EveNet
-- visible tau `a/b` four-vectors
-- truth tau `a/b` four-vectors for `Ztautau` only
-- target invisible slot `pt / eta / phi` for `Ztautau` only
-- classification target index / class name aligned with the generated EveNet class order
-- source slot mapping
-- simple event metadata and region cuts
-- recomputed truth angular observables
+## Environment
 
-It is designed for large parquet inputs:
+Run commands from the repository root unless a command explicitly says
+otherwise.
 
-- batch-wise parquet streaming
-- one worker per input parquet
-- bounded-memory parquet shard outputs
-- worker-side histogram filling with merged monitoring plots at the end
-- `input_files` are used first, so the baseline-selected parquet is the default source
-- MC normalization uses the sample-level sum of `initial_total_num_events` across all parquet files in the sample
+EveNet should be installed from the `tautau` branches below:
 
-### Example
+- `EveNet-Full`: <https://github.com/tihsu99/EveNet-Full/tree/tautau>
+- `Core`: <https://github.com/tihsu99/Core/tree/tautau>
+
+The `Core` repository provides the `evenet` Python package and must live at
+`ml_pipeline/EveNet-Full/evenet`.
+
+For a fresh setup, clone both repositories into the expected layout:
 
 ```bash
-python3 build_evenet_input_from_parquet.py   \
-  --analysis-config config/analysis.yaml   \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/  \
-  --batch-size 50000  \
+cd /path/to/lep_tree_ana/ml_pipeline
+
+git clone --branch tautau --single-branch \
+  https://github.com/tihsu99/EveNet-Full.git \
+  ml_pipeline/EveNet-Full
+
+git clone --branch tautau --single-branch \
+  https://github.com/tihsu99/Core.git \
+  ml_pipeline/EveNet-Full/evenet
+```
+
+After installation, expose the local `ml_pipeline` helpers and the vendored
+EveNet source tree:
+
+```bash
+export PYTHONPATH="$PWD/ml_pipeline:$PWD/ml_pipeline/EveNet-Full:$PYTHONPATH"
+```
+
+Verify the install before starting a campaign:
+
+```bash
+python3 -c "import evenet, awkward, torch; print(torch.__version__)"
+evenet-train --help
+```
+
+Training currently requires `WANDB_API_KEY` to be set because the EveNet
+training entry point initializes a Weights & Biases logger:
+
+```bash
+export WANDB_API_KEY="<your-key>"
+```
+
+## Configure a Campaign
+
+Before running a new production, edit `ml_pipeline/config/analysis.yaml`.
+
+Check these fields carefully:
+
+- `Samples.<sample>.input_files`: selected central parquet files, usually
+  `filtered___baseline.parquet`.
+- `Samples.<sample>.raw_files`: central raw parquet files, usually
+  `filtered___raw.parquet`; needed when exporting QI inputs.
+- `Samples.<sample>.is_data` and `is_signal`: used for class labels, targets,
+  truth fields, and event weights.
+- `Samples.<sample>.lumi`: data luminosity in pb.
+- `Samples.<sample>.norm_factor`: MC cross section or normalization factor in pb.
+- `Inputs.Part` and `Inputs.Global`: the features written into EveNet input
+  tensors.
+- `Subcategories` and `NeutrinoPrediction`: signal channel labels and channels
+  where invisible-particle prediction is trained/evaluated.
+
+For training, also edit the relevant `ml_pipeline/config/train_*.yaml` files:
+
+- `platform.data_parquet_dir`
+- `platform.data_parquet_val_dir`
+- `options.Training.model_checkpoint_save_path`
+- `options.Training.model_checkpoint_load_path`
+- `options.Training.pretrain_model_load_path`
+- `options.Dataset.normalization_file`
+- `logger`
+
+## End-to-End Workflow
+
+The examples below use shell variables to keep paths readable:
+
+```bash
+export CAMPAIGN_DIR=/path/to/campaign
+export INPUT_DIR="$CAMPAIGN_DIR/evenet-input-shards"
+export PREPROCESS_DIR="$CAMPAIGN_DIR/evenet-input"
+export PRED_DIR="$CAMPAIGN_DIR/evenet-prediction"
+export QI_DIR="$CAMPAIGN_DIR/qi-study"
+```
+
+### 1. Generate EveNet Event Info
+
+Generate `generated_event_info.yaml` after changing sample labels, feature
+definitions, or the EveNet schema.
+
+```bash
+python3 ml_pipeline/generate_event_info_yaml.py \
+  --analysis-config ml_pipeline/config/analysis.yaml \
+  --evenet-config ml_pipeline/config/evenet_schema.yaml \
+  --output ml_pipeline/config/generated_event_info.yaml
+```
+
+Outputs:
+
+- `ml_pipeline/config/generated_event_info.yaml`
+- `ml_pipeline/config/generated_event_info.summary.json`
+
+Keep this file aligned with `analysis.yaml`. The class order in this file must
+match the class order used when building input shards and training.
+
+### 2. Build EveNet Input Shards
+
+Convert central selected parquet files into EveNet-ready shards.
+
+```bash
+python3 ml_pipeline/build_evenet_input_from_parquet.py \
+  --analysis-config ml_pipeline/config/analysis.yaml \
+  --output-dir "$INPUT_DIR" \
+  --batch-size 50000 \
   --rows-per-shard 100000 \
+  --num-workers 4
+```
+
+Optional sample subset:
+
+```bash
+python3 ml_pipeline/build_evenet_input_from_parquet.py \
+  --analysis-config ml_pipeline/config/analysis.yaml \
+  --output-dir "$INPUT_DIR" \
+  --samples Ztautau Zll Zqq \
   --num-workers 4
 ```
 
 Outputs:
 
-- `shards/<sample>/*.parquet`
-- `monitoring/<sample>/*.png`
-- `monitoring/comparison/*.png` for data vs stacked MC control plots
-- `manifest.json`
+- `$INPUT_DIR/shards/<sample>/*.parquet`
+- `$INPUT_DIR/monitoring/<sample>/*.png`
+- `$INPUT_DIR/monitoring/comparison/*.png`
+- `$INPUT_DIR/manifest.json`
 
-The output parquet stores:
+Important behavior:
 
-- the filtered sequential EveNet inputs as `Part_*` jagged columns
-- the global condition inputs as flat scalar columns
-- `classification`
-- `classification_target_index`
-- `classification_target_name`
+- Data events receive unit event weight.
+- MC event weights use `lumi * norm_factor / sum(initial_total_num_events)`.
+- Signal samples get truth invisible targets and truth angular observables.
+- Data samples get classification index `-1`.
+- `manifest.json` is the input to the preprocessing step.
 
-with the same class ordering used by `generated_event_info.yaml`.
+### 3. Preprocess for EveNet
 
-If a required `Global` feature is not stored directly, `missing_p4` is used for
-the nominal fallback, including `missing_pz`.
-
-
-## `generate_event_info_yaml.py`
-
-Generate the `generated_event_info.yaml` schema consumed by:
-
-- `ml_pipeline/config/preprocess_config.yaml`
-- `ml_pipeline/config/train.yaml`
-- `ml_pipeline/config/train_pretrain.yaml`
-
-Example:
+Preprocess the input shards into train, validation, test, and data parquet
+files. The default split is `0.4,0.1,0.5`.
 
 ```bash
-python3 ml_pipeline_lite/generate_event_info_yaml.py \
-  --analysis-config ml_pipeline/config/analysis.yaml \
-  --evenet-config ml_pipeline/config/evenet_schema.yaml \
-  --output ml_pipeline_lite/generated_event_info.yaml
-```
-
-This writes:
-
-- `generated_event_info.yaml`
-- `generated_event_info.summary.json`
-
-
-## `preprocess_evenet_parquet.py`
-
-Preprocess the lite parquet shards into shuffled train/val/test parquet files
-using the standard EveNet preprocessing logic.
-
-This stage is intentionally simple:
-
-- read the lite shard manifest
-- use all non-data shards as training input
-- optionally preprocess data shards into `store-dir/data`
-- event-level split inside each shard
-- shuffle rows per written parquet file
-- keep `event_weight` unchanged
-
-Example:
-
-```bash
-python3 preprocess_evenet_parquet.py  \
-  --manifest /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/manifest.json \
-  --config config/preprocess_config.yaml  \
-  --store-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/evenet_input  \
-  --split-ratio 0.4,0.1,0.5  \
-  --num-workers 4  \
+python3 ml_pipeline/preprocess_evenet_parquet.py \
+  --manifest "$INPUT_DIR/manifest.json" \
+  --config ml_pipeline/config/preprocess_config.yaml \
+  --store-dir "$PREPROCESS_DIR" \
+  --split-ratio 0.4,0.1,0.5 \
+  --num-workers 4 \
   --verbose
 ```
 
 Outputs:
 
-- `train_*.parquet`
-- `val/val_*.parquet`
-- `test/test_*.parquet`
-- `data/data_*.parquet`
-- `shape_metadata.json`
-- `normalization.pt`
-- `preprocess_manifest.json`
+- `$PREPROCESS_DIR/train/*.parquet`
+- `$PREPROCESS_DIR/val/*.parquet`
+- `$PREPROCESS_DIR/test/*.parquet`
+- `$PREPROCESS_DIR/train-diffusion/*.parquet`
+- `$PREPROCESS_DIR/val-diffusion/*.parquet`
+- `$PREPROCESS_DIR/test-diffusion/*.parquet`
+- `$PREPROCESS_DIR/data/*.parquet`
+- `$PREPROCESS_DIR/shape_metadata.json`
+- `$PREPROCESS_DIR/normalization.pt`
+- `$PREPROCESS_DIR/preprocess_manifest.json`
 
+Use `train`, `val`, and `test` for classification. Use
+`train-diffusion`, `val-diffusion`, and `test-diffusion` for invisible-particle
+generation. The diffusion splits keep only events with valid invisible targets.
 
-## `predict_evenet_from_raw_parquet.py`
+### 4. Train EveNet Models
 
-Run EveNet prediction on the converted parquet files with the nominal weight rule:
+Update the chosen train config so that:
 
-- `evenet_weight = event_weight`
-- if a split fraction is provided, scale by `1 / split_fraction`
+- classification configs point to `$PREPROCESS_DIR/train` and
+  `$PREPROCESS_DIR/val`
+- diffusion configs point to `$PREPROCESS_DIR/train-diffusion` and
+  `$PREPROCESS_DIR/val-diffusion`
+- `options.Dataset.normalization_file` points to
+  `$PREPROCESS_DIR/normalization.pt`
+- checkpoint save/load paths point to your campaign directories
 
-This lite entry keeps only the converted-parquet workflow and the chunk/shard
-controls needed for large-scale production.
-
-Example:
+Classification examples:
 
 ```bash
-python3 predict_evenet_from_raw_parquet.py \
-  --analysis-config config/analysis.yaml \
-  --train-config config/train_pretrain.yaml \
-  --classification-checkpoint /path/to/checkpoint-pretrain-cls/best.ckpt \
-  --diffusion-checkpoint /path/to/checkpoint-pretrain-diffusion/best.ckpt \
-  --converted-parquet /path/to/evenet_input/test \
-  --shape-metadata /path/to/evenet_input/shape_metadata.json \
-  --output-dir /path/to/prediction-evenet-pretrain \
+evenet-train ml_pipeline/config/train_pretrain_cls.yaml \
+  --ray_dir "$CAMPAIGN_DIR/ray/pretrain-cls"
+
+evenet-train ml_pipeline/config/train_scratch_cls.yaml \
+  --ray_dir "$CAMPAIGN_DIR/ray/scratch-cls"
+```
+
+Diffusion/generation examples:
+
+```bash
+evenet-train ml_pipeline/config/train_pretrain.yaml \
+  --ray_dir "$CAMPAIGN_DIR/ray/pretrain-diffusion"
+
+evenet-train ml_pipeline/config/train_scratch.yaml \
+  --ray_dir "$CAMPAIGN_DIR/ray/scratch-diffusion"
+```
+
+The best checkpoints are written under
+`options.Training.model_checkpoint_save_path` in each train config.
+
+### 5. Run EveNet Prediction
+
+Run prediction on the converted test split. Pass both checkpoints when
+classification and diffusion were trained separately.
+
+```bash
+python3 ml_pipeline/predict_evenet.py \
+  --analysis-config ml_pipeline/config/analysis.yaml \
+  --train-config ml_pipeline/config/train_pretrain.yaml \
+  --classification-checkpoint /path/to/classification/best.ckpt \
+  --diffusion-checkpoint /path/to/diffusion/best.ckpt \
+  --converted-parquet "$PREPROCESS_DIR/test" \
+  --shape-metadata "$PREPROCESS_DIR/shape_metadata.json" \
+  --output-dir "$PRED_DIR/mc" \
   --converted-split-fraction 0.5 \
   --batch-size 8192 \
-  --num-gpus 4 \
-  --task-num-shards 4 \
-  --task-shard-index 0
+  --num-gpus 4
 ```
 
-
-## `export_evenet_prediction_to_qi.py`
-
-Export prediction parquet files into the central QI/unfolding parquet layout.
-
-The core behavior is intentionally simple:
-
-- use the prediction-parquet `evenet_weight` directly
-- rebuild the predicted baseline-selected rows with calibrated tau and QI observables
-- keep the raw complement outside the selected baseline rows and append it with default invalid reco fields
-- optionally write a truth-neutrino oracle tree
-
-Example:
+Run data prediction separately:
 
 ```bash
-python3 export_evenet_prediction_to_qi.py \
-  --analysis-config config/analysis.yaml \
-  --mc-pred-parquet /path/to/prediction-evenet-pretrain \
-  --data-pred-parquet /path/to/prediction-evenet-pretrain/data-pred \
-  --output-dir /path/to/prediction-evenet-pretrain/qi-export \
-  --qi-method-label pretrain \
-  --write-truth-neutrino-copy \
-  --truth-qi-method-label truth \
-  --raw-batch-size 50000 \
-  --prediction-batch-size 25000 \
-  --num-workers 4 \
-  --worker-backend thread
-```
-
-Outputs:
-
-- `<output-dir>/<qi-method-label>/<sample>/filtered___raw.parquet`
-- `<output-dir>/<qi-method-label>/<sample>/filtered___<region>.parquet`
-- optionally `<output-dir>/<truth-qi-method-label>/<sample>/...`
-- `<output-dir>/<qi-method-label>__qi_export_summary.json`
-
-
-## `export_evenet_qi_inputs.py`
-
-Export the EveNet prediction parquet files into the central processed-parquet
-layout expected by `tree_ana`.
-
-This path is designed to keep the central framework unchanged:
-
-- write `filtered___raw.parquet` and `filtered___<region>.parquet` for each sample
-- preserve the fields needed by `QIProcessor`, `ForwardFoldingProcessor`, and `ResponseMatricesManager`
-- recompute RAW-complement MC weights from
-  `luminosity * norm_factor / sum(initial_total_num_events over raw files)`
-- build a central-style config that can run both unfolding and forward folding
-
-`--prediction-parquet` does not identify data / MC from the file name. Each row
-must carry `sample_key` or `source_sample_index`, and the final data-vs-MC
-decision comes from `Samples.<sample>.is_data` in `ml_pipeline/config/analysis.yaml`.
-
-Example:
-
-```bash
-python3 export_evenet_qi_inputs.py \
+python3 ml_pipeline/predict_evenet.py \
   --analysis-config ml_pipeline/config/analysis.yaml \
-  --prediction-parquet /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_delta_tau_based/predict-evenet/ \
-  --mc-split-fraction 0.5 \
-  --num-workers 4 \
-  --base-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study
+  --train-config ml_pipeline/config/train_pretrain.yaml \
+  --classification-checkpoint /path/to/classification/best.ckpt \
+  --diffusion-checkpoint /path/to/diffusion/best.ckpt \
+  --converted-parquet "$PREPROCESS_DIR/data" \
+  --shape-metadata "$PREPROCESS_DIR/shape_metadata.json" \
+  --output-dir "$PRED_DIR/data" \
+  --batch-size 8192 \
+  --num-gpus 4
 ```
 
-Use `--mc-split-fraction` only when MC prediction parquets were produced from a
-split and did not already receive the corresponding `1 / split_fraction` weight
-correction during prediction. Data and RAW-complement events are not scaled by
-this option.
+Useful options:
+
+- `--task-num-shards` and `--task-shard-index`: split a prediction campaign
+  across independent scheduler jobs.
+- `--skip-merge`: keep per-chunk `*.part*.parquet` outputs.
+- `--merge-only`: merge existing part files without rerunning inference.
+- `--delete-merged-parts`: remove part files after a successful merge.
+- `--use-truth-classification`: use the truth class stored in the converted
+  parquet instead of running the classification checkpoint.
+
+Prediction outputs are written as:
+
+- `<input_stem>__evenet_pred.parquet`
+- optional `<input_stem>__evenet_pred.partNNN.parquet` chunk files
+
+### 6. Export Prediction to QI Inputs
+
+Export EveNet prediction parquets to the central processed-parquet layout used
+by QIProcessor and ForwardFoldingProcessor.
+
+```bash
+python3 ml_pipeline/export_evenet_qi_inputs.py \
+  --analysis-config ml_pipeline/config/analysis.yaml \
+  --prediction-parquet "$PRED_DIR/mc/*__evenet_pred.parquet" "$PRED_DIR/data/*__evenet_pred.parquet" \
+  --base-dir "$QI_DIR" \
+  --methods evenet \
+  --num-workers 4 \
+  --batch-size 50000
+```
+
+Use `--mc-split-fraction` only if the MC prediction parquets were produced from
+a split and the prediction step did not already apply `1 / split_fraction`.
+If prediction was run with `--skip-merge`, pass the part-file directories or a
+part-file glob instead.
 
 Outputs:
 
-- `<base-dir>/<method>/processed/<sample>/filtered___raw.parquet`
-- `<base-dir>/<method>/processed/<sample>/filtered___<region>.parquet`
-- `<base-dir>/<method>/config_<method>.yaml`
-- `<base-dir>/export_summary.json`
+- `$QI_DIR/evenet/processed/<sample>/filtered___raw.parquet`
+- `$QI_DIR/evenet/processed/<sample>/filtered___<region>.parquet`
+- `$QI_DIR/evenet/processed/<sample>/cutflow_<sample>.json`
+- `$QI_DIR/evenet/config_evenet.yaml`
+- `$QI_DIR/export_summary.json`
 
-For exported predicted events, the post-calibration direction change is also
-stored per event as:
+The generated `config_evenet.yaml` can be passed directly to the central
+`tree_ana` workflow.
 
-- `calibration_deltaR_a`
-- `calibration_deltaR_b`
-- `calibration_deltaR_sum = calibration_deltaR_a + calibration_deltaR_b`
+### 7. Run Central QI/Unfolding
 
+From the central analysis environment:
 
-### Next step: compare channel purity
+```bash
+python3 bin/tree_ana \
+  -c "$QI_DIR/evenet/config_evenet.yaml"
+```
 
-After `export_evenet_qi_inputs.py` finishes, draw side-by-side channel yield,
-purity, signal-yield, significance, and data/MC comparisons from the exported
-central-style parquet trees.
+The central run writes QI and response-matrix outputs under the `run` directory
+configured by `config_evenet.yaml`.
+
+## Optional Validation and Summaries
+
+### Monitor EveNet Inputs
+
+```bash
+python3 ml_pipeline/monitor_input.py \
+  --data-dir "$INPUT_DIR/shards/data94" \
+  --mc-dir "$INPUT_DIR/shards/Ztautau" "$INPUT_DIR/shards/Zll" "$INPUT_DIR/shards/Zqq" \
+  --config ml_pipeline/config/analysis.yaml \
+  --output-dir "$CAMPAIGN_DIR/monitor-input" \
+  --num-workers 4
+```
+
+### Compare Exported Channel Purity
 
 ```bash
 python3 ml_pipeline/plot_channel_purity_side_by_side.py \
-  --method Pretrain:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/slide/pretrain/evenet \
+  --method EveNet:"$QI_DIR/evenet" \
   --baseline-xlsx data/baseline_yield.xlsx \
-  --output /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/slide/pretrain/channel_purity_side_by_side.png
+  --output "$CAMPAIGN_DIR/channel_purity_side_by_side.png"
 ```
 
-By default, the baseline workbook is used as the baseline reference. Add one
-`--method NAME:PATH` argument for each exported method directory to compare.
-`PATH` may be either the method directory or its `processed` subdirectory.
-Data points and the `Data/MC` panel stay hidden unless `--unblind` is passed.
-The baseline input and `--method` paths may also point to XML yield files such
-as `data/ztautau_yields_full.xml`.
+Add `--unblind` only when data/MC panels should be shown.
 
-```bash
-python3 ml_pipeline/plot_channel_purity_side_by_side.py \
-  --method Pretrain:/path/to/pretrain/evenet \
-  --method Scratch:/path/to/scratch/evenet \
-  --unblind
-```
-
-### Next step: summarize calibration magnitude
-
-To compare the average post-calibration direction change across methods and
-selected channels:
+### Summarize Calibration Magnitude
 
 ```bash
 python3 ml_pipeline/extract_qi_calibration_magnitude.py \
-  --method Pretrain:/path/to/pretrain/evenet \
-  --method Scratch:/path/to/scratch/evenet \
-  --output-prefix /path/to/calibration_magnitude
+  --method EveNet:"$QI_DIR/evenet" \
+  --output-prefix "$CAMPAIGN_DIR/calibration_magnitude"
 ```
 
-This writes:
+Outputs:
 
 - `<prefix>.json`
 - `<prefix>.csv`
 - `<prefix>.png`
 - `<prefix>.pdf`
 
-### Next step: run the central code
-
-The generated `config_<method>.yaml` contains both `QIProcessor` and
-`ForwardFoldingProcessor`, so the central `tree_ana` can run directly on the
-exported ntuples.
-
-Example for EveNet:
+### Extract Final QI Measurements
 
 ```bash
-python3 bin/tree_ana \
-  -c /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/config_evenet.yaml
+python3 ml_pipeline/extract_qi_final_measurements.py \
+  --method EveNet:"$QI_DIR/evenet/run/QI_analysis/results.txt" \
+  --output-prefix "$CAMPAIGN_DIR/qi_results/evenet"
 ```
 
-This writes, under:
-
-- `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/run/QI_analysis/`
-- `/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/run/ForwardFoldingProcessor/`
-
-If you want to run only one central processor, keep the same generated config
-but remove the other block from `Processors` before running:
-
-- keep only `Processors.QIProcessor` to run unfolding only
-- keep only `Processors.ForwardFoldingProcessor` to run forward folding only
-
-### Next step: extract QI results
-
-After `tree_ana` finishes, extract the final QI summary from `results.txt`.
-Pass the exact `results.txt` path when possible.
+For multiple methods:
 
 ```bash
-python3 ml_pipeline/util/extract_qi_final_measurements.py \
-  --method EveNet:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/run/QI_analysis/results.txt \
-  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/summary/evenet
+python3 ml_pipeline/extract_qi_final_measurements.py \
+  --method Baseline:/path/to/baseline/results.txt \
+  --method EveNet:"$QI_DIR/evenet/run/QI_analysis/results.txt" \
+  --output-prefix "$CAMPAIGN_DIR/qi_results/baseline_vs_evenet"
 ```
 
-To compare multiple methods:
-
-```bash
-python3 ml_pipeline/util/extract_qi_final_measurements.py \
-  --method Baseline:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/baseline/run/QI_analysis/results.txt \
-  --method EveNet:/pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/evenet/run/QI_analysis/results.txt \
-  --output-prefix /pscratch/sd/t/tihsu/database/ZtautauAnalysis/qi-study/summary/baseline_vs_evenet
-```
-
-The extractor writes:
+Outputs:
 
 - `<prefix>_per_channel.csv`
 - `<prefix>_per_channel.json`
 - `<prefix>_combined.csv`
 - `<prefix>_combined.json`
-- comparison plots unless `--no-plots` is given
+- comparison plots unless `--no-plots` is passed
 
-
-## `plot_preunfolding_validation.py`
-
-Produce the lite pre-unfolding validation plots from the exported central-schema
-parquet trees.
-
-This rewrite keeps only the nominal summary path:
-
-- stored reco observables only
-- truth-vs-reco panels
-- truth-vs-reco summary plots
-- optional data-vs-MC control plots
-
-It intentionally does not run:
-
-- recomputed reco observables
-- truth-neutrino upper-limit plots
-- missing-neutrino / reco-tau / visible-tau validation branches
-
-Example:
+### Summarize Response Matrices
 
 ```bash
-python3 plot_preunfolding_validation.py \
-  --method Baseline:/path/to/baseline/qi-export \
-  --method EveNet-Pretrain:/path/to/pretrain/qi-export \
-  --signal-sample-name Ztautau \
-  --data-sample-name data94 \
-  --mc-sample-names Ztautau Zll Zqq \
-  --output-dir /path/to/preunfolding-validation \
-  --num-workers 8 \
-  --load-batch-size 50000
+python3 ml_pipeline/extract_response_matrix_summary.py \
+  --method EveNet:"$QI_DIR/evenet/run/ForwardFoldingProcessor/response_matrices" \
+  --output-prefix "$CAMPAIGN_DIR/response_matrix/evenet"
 ```
 
-Outputs:
+Outputs include per-matrix metric tables, summary plots, and per-observable
+matrix grids.
 
-- `truth_vs_reco/*.png`
-- `truth_vs_reco_summary/*.png`
-- `preunfolding_validation_summary.json`
-- `preunfolding_validation_report.md`
-- optionally the standard data-vs-MC control-plot PNGs
+## Troubleshooting
 
+### `ModuleNotFoundError: evenet`
 
-## `run_tree_ana_root_preload.py`
-
-Run the unfolding / `tree_ana` preload workflow from the lite framework path.
-
-This rewrite keeps the preload and region-parallel unfolding control in
-`ml_pipeline_lite`, while still launching the shared `tree_ana` executable.
-
-Example:
+Set `PYTHONPATH` from the repository root:
 
 ```bash
-python3 run_tree_ana_root_preload.py \
-  -c /path/to/config_qi.yaml \
-  --num-workers 4 \
-  --root-step-size 20000 \
-  --raw-batch-size 25000
+export PYTHONPATH="$PWD/ml_pipeline:$PWD/ml_pipeline/EveNet-Full:$PYTHONPATH"
 ```
 
-
-## `extract_qi_final_measurements.py`
-
-Extract the final QI measurements from `results.txt`, write JSON/CSV tables,
-and draw the per-channel comparison plots.
-
-This rewrite lives fully in `ml_pipeline_lite` and keeps the
-Truth/Reconstruction comparison support.
-
-Example:
+or install the vendored EveNet package:
 
 ```bash
-python3 extract_qi_final_measurements.py \
-  --method Baseline:/path/to/baseline/results.txt \
-  --method EveNet-Pretrain:/path/to/pretrain/results.txt \
-  --output-prefix /path/to/qi_compare \
-  --keep-truth
+python3 -m pip install -e ml_pipeline/EveNet-Full
 ```
 
+### Class Labels Do Not Match
 
-## `plot_evenet_prediction_summary.py`
-
-Draw the prediction summary plots from the prediction parquet outputs.
-
-This rewrite lives in `ml_pipeline_lite` and defaults the config paths to:
-
-- `ml_pipeline_lite/config/analysis.yaml`
-- `ml_pipeline_lite/config/evenet_schema.yaml`
-
-Example:
+Regenerate `generated_event_info.yaml` whenever `Samples`, `Subcategories`, or
+`NeutrinoPrediction` changes:
 
 ```bash
-python3 plot_evenet_prediction_summary.py \
-  --mc-parquet /path/to/prediction-evenet-pretrain \
-  --data-parquet /path/to/prediction-evenet-pretrain/data-pred \
-  --output-dir /path/to/prediction-evenet-pretrain/summary \
-  --weight-source evenet \
-  --unblind
+python3 ml_pipeline/generate_event_info_yaml.py \
+  --analysis-config ml_pipeline/config/analysis.yaml \
+  --evenet-config ml_pipeline/config/evenet_schema.yaml \
+  --output ml_pipeline/config/generated_event_info.yaml
 ```
 
-## Shuffle the processed EveNet input files
-This is an optional step to further shuffle the preprocessed EveNet input files. 
-This is useful for training stability when the number of input files is small and each file contains a large number of events. 
-The shuffling is done by reading the input parquet files in batches and writing out new parquet files with shuffled rows.
-```bash
-python3 mix_evenet_train_parquets.py \
-  --input-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/evenet_input/ \
-  --output-dir /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_v2/evenet_input_shuffled \
-  --rows-per-output 100000 \
-  --read-batch-size 8192  \
-  --seed 42
-```
+Then rebuild input shards and rerun preprocessing.
+
+### Prediction Weights Look Too Small
+
+If prediction used only a split of the MC sample, ensure exactly one of these
+steps applies the split correction:
+
+- prediction: `--converted-split-fraction 0.5`
+- export: `--mc-split-fraction 0.5`
+
+Do not apply both for the same MC prediction files.
+
+### Export Cannot Find Raw Complement Events
+
+Check that every sample in `analysis.yaml` has valid `raw_files`. The QI export
+uses these files to rebuild the raw complement outside the selected baseline
+rows.
