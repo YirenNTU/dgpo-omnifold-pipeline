@@ -170,6 +170,16 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
         "Event_totalChargedEnergy",
         "Event_totalEMEnergy",
         "Event_totalHadronicEnergy",
+        "lead_a_raw_muon_hits",
+        "lead_b_raw_muon_hits",
+        "lead_a_hpc_E",
+        "lead_b_hpc_E",
+        "lead_a_elid",
+        "lead_b_elid",
+        "lead_a_raw_wires",
+        "lead_b_raw_wires",
+        "hemisphere_a_visible_p4",
+        "hemisphere_b_visible_p4",
     }
     if "evtNumber" in schema_names:
         columns.add("evtNumber")
@@ -570,6 +580,16 @@ def build_output_events(
         "Event_totalChargedEnergy",
         "Event_totalEMEnergy",
         "Event_totalHadronicEnergy",
+        "lead_a_raw_muon_hits",
+        "lead_b_raw_muon_hits",
+        "lead_a_hpc_E",
+        "lead_b_hpc_E",
+        "lead_a_elid",
+        "lead_b_elid",
+        "lead_a_raw_wires",
+        "lead_b_raw_wires",
+        "hemisphere_a_visible_p4",
+        "hemisphere_b_visible_p4",
     }
     passthrough.update(f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"])
     passthrough.update(f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"])
