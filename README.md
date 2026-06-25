@@ -366,9 +366,10 @@ The best checkpoints are written below
 Run MC prediction on the converted test split:
 
 ```bash
-python3 ml_pipeline/predict_evenet.py \
-  --analysis-config ml_pipeline/config/analysis.yaml \
-  --train-config ml_pipeline/config/train_pretrain.yaml \
+python3 predict_evenet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train_pretrain.yaml \
+  --evenet-config config/evenet_schema.yaml \
   --classification-checkpoint /path/to/classification/best.ckpt \
   --diffusion-checkpoint /path/to/diffusion/best.ckpt \
   --converted-parquet "$PREPROCESS_DIR/test" \
@@ -376,7 +377,8 @@ python3 ml_pipeline/predict_evenet.py \
   --output-dir "$PRED_DIR/mc" \
   --converted-split-fraction 0.5 \
   --batch-size 8192 \
-  --num-gpus 4
+  --num-gpus 4 \
+  --num-steps [NUM STEP] \
 ```
 
 Run data prediction separately:
@@ -392,7 +394,9 @@ python3 predict_evenet.py \
   --shape-metadata "$PREPROCESS_DIR/shape_metadata.json" \
   --output-dir "$PRED_DIR/data" \
   --batch-size 8192 \
-  --num-gpus 4
+  --num-gpus 4 \
+  --num-steps [NUM STEP] \
+
 ```
 
 Useful options:
