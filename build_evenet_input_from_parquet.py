@@ -152,6 +152,21 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
         "weight",
         "central_weight",
         "Part_pdgId",
+        "is_leading_OS",
+        "charged_E",
+        "P_rad",
+        "lead_a_pdgId",
+        "lead_b_pdgId",
+        "lead_a_hpcTotalShowerEnergy",
+        "lead_b_hpcTotalShowerEnergy",
+        "lead_a_E_over_p",
+        "lead_b_E_over_p",
+        "lead_a_raw_muon_tag",
+        "lead_b_raw_muon_tag",
+        "lead_a_is_electron",
+        "lead_b_is_electron",
+        "lead_a_is_muon",
+        "lead_b_is_muon",
     }
     if "evtNumber" in schema_names:
         columns.add("evtNumber")
@@ -533,7 +548,22 @@ def build_output_events(
         "weight",
         "central_weight",
         "truth_theta_cm",
-        "truth_mtautau"
+        "truth_mtautau",
+        "is_leading_OS",
+        "charged_E",
+        "P_rad",
+        "lead_a_pdgId",
+        "lead_b_pdgId",
+        "lead_a_hpcTotalShowerEnergy",
+        "lead_b_hpcTotalShowerEnergy",
+        "lead_a_E_over_p",
+        "lead_b_E_over_p",
+        "lead_a_raw_muon_tag",
+        "lead_b_raw_muon_tag",
+        "lead_a_is_electron",
+        "lead_b_is_electron",
+        "lead_a_is_muon",
+        "lead_b_is_muon",
     }
     passthrough.update(f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"])
     passthrough.update(f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"])
