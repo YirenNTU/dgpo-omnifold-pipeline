@@ -167,6 +167,9 @@ def required_columns(schema_names: set[str], feature_config, sample: Sample) -> 
         "lead_b_is_electron",
         "lead_a_is_muon",
         "lead_b_is_muon",
+        "Event_totalChargedEnergy",
+        "Event_totalEMEnergy",
+        "Event_totalHadronicEnergy",
     }
     if "evtNumber" in schema_names:
         columns.add("evtNumber")
@@ -564,6 +567,9 @@ def build_output_events(
         "lead_b_is_electron",
         "lead_a_is_muon",
         "lead_b_is_muon",
+        "Event_totalChargedEnergy",
+        "Event_totalEMEnergy",
+        "Event_totalHadronicEnergy",
     }
     passthrough.update(f"truth_cos_theta_A_{r}" for r in ["k", "n", "r"])
     passthrough.update(f"truth_cos_theta_B_{r}" for r in ["k", "n", "r"])

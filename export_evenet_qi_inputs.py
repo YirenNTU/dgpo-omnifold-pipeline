@@ -82,6 +82,9 @@ FINAL_SCHEMA_FIELDS = (
     ("lead_b_is_electron", bool, False),
     ("lead_a_is_muon", bool, False),
     ("lead_b_is_muon", bool, False),
+    ("Event_totalChargedEnergy", np.float32, np.nan),
+    ("Event_totalEMEnergy", np.float32, np.nan),
+    ("Event_totalHadronicEnergy", np.float32, np.nan),
 )
 
 
