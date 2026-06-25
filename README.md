@@ -382,9 +382,10 @@ python3 ml_pipeline/predict_evenet.py \
 Run data prediction separately:
 
 ```bash
-python3 ml_pipeline/predict_evenet.py \
-  --analysis-config ml_pipeline/config/analysis.yaml \
-  --train-config ml_pipeline/config/train_pretrain.yaml \
+python3 predict_evenet.py \
+  --analysis-config config/analysis.yaml \
+  --train-config config/train_pretrain.yaml \
+  --evenet-config config/evenet_schema.yaml \
   --classification-checkpoint /path/to/classification/best.ckpt \
   --diffusion-checkpoint /path/to/diffusion/best.ckpt \
   --converted-parquet "$PREPROCESS_DIR/data" \
