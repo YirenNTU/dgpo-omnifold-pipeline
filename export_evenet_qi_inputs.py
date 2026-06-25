@@ -67,6 +67,32 @@ FINAL_SCHEMA_FIELDS = (
     ("calibration_deltaR_a", np.float32, np.nan),
     ("calibration_deltaR_b", np.float32, np.nan),
     ("calibration_deltaR_sum", np.float32, np.nan),
+    ("is_leading_OS", bool, False),
+    ("charged_E", np.float32, np.nan),
+    ("P_rad", np.float32, np.nan),
+    ("lead_a_pdgId", np.int32, 0),
+    ("lead_b_pdgId", np.int32, 0),
+    ("lead_a_hpcTotalShowerEnergy", np.float32, np.nan),
+    ("lead_b_hpcTotalShowerEnergy", np.float32, np.nan),
+    ("lead_a_E_over_p", np.float32, np.nan),
+    ("lead_b_E_over_p", np.float32, np.nan),
+    ("lead_a_raw_muon_tag", np.int32, 0),
+    ("lead_b_raw_muon_tag", np.int32, 0),
+    ("lead_a_is_electron", bool, False),
+    ("lead_b_is_electron", bool, False),
+    ("lead_a_is_muon", bool, False),
+    ("lead_b_is_muon", bool, False),
+    ("Event_totalChargedEnergy", np.float32, np.nan),
+    ("Event_totalEMEnergy", np.float32, np.nan),
+    ("Event_totalHadronicEnergy", np.float32, np.nan),
+    ("lead_a_raw_muon_hits", np.int32, 0),
+    ("lead_b_raw_muon_hits", np.int32, 0),
+    ("lead_a_hpc_E", np.float32, np.nan),
+    ("lead_b_hpc_E", np.float32, np.nan),
+    ("lead_a_elid", np.int32, 0),
+    ("lead_b_elid", np.int32, 0),
+    ("lead_a_raw_wires", np.int32, 0),
+    ("lead_b_raw_wires", np.int32, 0),
 )
 
 
@@ -732,6 +758,14 @@ def final_qi_events(events: ak.Array, sample_name: str, regions: list[str]) -> a
 
     fields["flags_valid"] = numeric_field(events, "flags_valid", bool, False)
     fields["mmc_likelihood"] = numeric_field(events, "mmc_likelihood", np.float32, 0.0)
+    for vec_name in (
+        "lead_a_visible_p4",
+        "lead_b_visible_p4",
+        "hemisphere_a_visible_p4",
+        "hemisphere_b_visible_p4",
+    ):
+        if vec_name in events.fields:
+            fields[vec_name] = events[vec_name]
     for region in regions:
         fields[f"{region}_cut"] = numeric_field(events, f"{region}_cut", bool, False)
     return ak.Array(fields)
