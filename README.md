@@ -142,6 +142,8 @@ the recorded commits for reproducibility.
 | `ml_pipeline/predict_evenet.py` | Run classification and invisible-particle inference. |
 | `ml_pipeline/export_evenet_qi_inputs.py` | Export predictions to the central QI/unfolding layout. |
 | `ml_pipeline/scripts/train_neutrino_backend.py` | Shared launcher for pure EveNet or DGPO-EveNet neutrino training. |
+| `ml_pipeline/scripts/run_ad_stage.py` | Stage 1 wrapper: freeze a classification backbone, export `event_token`/`object_token`, and train the latent constraint autoencoder. |
+| `ml_pipeline/scripts/run_dgpo_stage.py` | Stage 2 wrapper: launch DGPO/diffusion post-training on the AD-augmented parquet. |
 | `ml_pipeline/evenet_dgpo/` | Vendored EveNet + DGPO stack, including RL and latent-SWD constraint tooling. |
 | `ml_pipeline/monitor_input.py` | Produce optional input monitoring plots. |
 | `ml_pipeline/plot_channel_purity_side_by_side.py` | Compare channel yield, purity, and significance. |
@@ -230,6 +232,36 @@ export QI_DIR="$CAMPAIGN_DIR/qi-study"
 
 mkdir -p "$CAMPAIGN_DIR"
 ```
+
+## Two-Stage AD + DGPO
+
+The wrapped DGPO workflow is intentionally split into two commands:
+
+1. `AD`: use a frozen classification backbone to export `event_token` and
+   `object_token`, then train the latent constraint autoencoder
+2. `DGPO`: run diffusion/DGPO post-training on the augmented parquet from
+   stage 1
+
+Example:
+
+```bash
+python3 ml_pipeline/scripts/run_ad_stage.py \
+  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
+  --ad-backbone-checkpoint /path/to/ad_backbone.ckpt
+
+python3 ml_pipeline/scripts/run_dgpo_stage.py \
+  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
+  --dgpo-init-checkpoint /path/to/diffusion_init.ckpt
+```
+
+Notes:
+
+- `--ad-backbone-checkpoint` and `--dgpo-init-checkpoint` are intentionally
+  separate, so AD and DGPO can start from different checkpoints
+- `run_ad_stage.py` does not fine-tune the backbone; it only uses the frozen
+  checkpoint to export tokens for the AD stack
+- both commands share the same `--stage-root`; stage 1 writes the augmented
+  parquet and latent checkpoint there, and stage 2 reads them back
 
 ## End-to-End Workflow
 

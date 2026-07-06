@@ -11,7 +11,7 @@ ztautau_domain:
   enabled: true
   feature_names: [theta, phi]
   token_sources:
-    event_token: evenet_token
+    event_token: event_token
     object_token: object_token
   topology:
     kind: back_to_back

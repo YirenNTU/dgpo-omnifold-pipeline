@@ -26,7 +26,7 @@ ztautau_domain:
   enabled: true
   feature_names: [theta, phi]
   token_sources:
-    event_token: evenet_token
+    event_token: event_token
     object_token: object_token
   topology:
     kind: back_to_back
@@ -39,4 +39,3 @@ dgpo:
   diagnostic_plot_every: 5
   diagnostic_plot_names:
     - ztautau_back_to_back
-

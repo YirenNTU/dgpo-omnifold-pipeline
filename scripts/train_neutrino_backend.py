@@ -40,6 +40,21 @@ def deep_update(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+def absolutize_default_paths(payload: Any, base_dir: Path) -> Any:
+    if isinstance(payload, dict):
+        output: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key == "default" and isinstance(value, str):
+                candidate = Path(value).expanduser()
+                output[key] = str(candidate if candidate.is_absolute() else (base_dir / candidate).resolve())
+            else:
+                output[key] = absolutize_default_paths(value, base_dir)
+        return output
+    if isinstance(payload, list):
+        return [absolutize_default_paths(item, base_dir) for item in payload]
+    return payload
+
+
 def build_runtime_config(
     *,
     base_config: Path,
@@ -49,6 +64,7 @@ def build_runtime_config(
     merged = read_yaml(base_config)
     if overlay_config is not None:
         merged = deep_update(merged, read_yaml(overlay_config))
+    merged = absolutize_default_paths(merged, base_config.parent)
     merged.setdefault("compat", {})
     merged["compat"]["backend"] = backend
     merged["compat"]["repo_root"] = str(REPO_ROOT)

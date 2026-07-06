@@ -626,6 +626,7 @@ class EveNetModel(nn.Module):
                     "detections": detections,
                     "segmentation-out": segmentation_out,
                     "event_token": event_token,
+                    "object_token": embeddings,
                 }
 
             #######################################
@@ -682,6 +683,7 @@ class EveNetModel(nn.Module):
             "segmentation-mask": outputs.get("deterministic", {}).get("segmentation-out", {}).get("pred_masks", None),
             "segmentation-aux": outputs.get("deterministic", {}).get("segmentation-out", {}).get("aux_outputs", None),
             "event_token": outputs.get("deterministic", {}).get("event_token", None),
+            "object_token": outputs.get("deterministic", {}).get("object_token", None),
         }
 
     def predict_diffusion_vector(

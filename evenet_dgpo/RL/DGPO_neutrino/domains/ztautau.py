@@ -8,7 +8,7 @@ from torch import Tensor
 
 DEFAULT_FEATURE_NAMES: tuple[str, ...] = ("theta", "phi")
 DEFAULT_TOKEN_FIELDS: dict[str, str] = {
-    "event_token": "evenet_token",
+    "event_token": "event_token",
     "object_token": "object_token",
 }
 
