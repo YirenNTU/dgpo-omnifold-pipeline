@@ -1,0 +1,148 @@
+# Independent training config for the DGPO latent constraint autoencoder.
+# Reuses the TT2L nu2flow data pipeline (same parquet + normalization.pt as DGPO)
+# and adds a `latent_constraint:` block exposing the compact model-size knobs.
+# Paths under `default:` are relative to this file's directory.
+
+platform:
+  # === NERSC ===
+  # *_evttok = event_token + object_token augmented parquet
+  # (preprocessing/augment_event_token.py --object-tokens).
+  # REQUIRED: the object-token AE needs both columns; val dir must be augmented too.
+  data_parquet_dir: "/pscratch/sd/y/yiren/RL/nu2flow_data_evttok/mg5_train"
+  data_parquet_val_dir: "/pscratch/sd/y/yiren/RL/nu2flow_data_evttok/mg5_test"
+  number_of_workers: 4
+  resources_per_worker: { "CPU": 15, "GPU": 1 }
+  batch_size: 1024
+  prefetch_batches: 2
+  use_gpu: true
+
+  # === LOCAL TESTING (uncomment for CPU/single-GPU debugging) ===
+  # data_parquet_dir: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/parquet/train"
+  # number_of_workers: 1
+  # resources_per_worker: { "CPU": 4, "GPU": 0 }
+  # batch_size: 64
+  # prefetch_batches: 1
+  # use_gpu: false
+
+options:
+  default: ../../../reasoning_module/configs_TT2L/options.yaml
+
+  Training:
+    total_epochs: 150
+    epochs: 150
+    # Fresh save dir for the object-token AE (don't overwrite older encoders).
+    model_checkpoint_save_path: "/pscratch/sd/y/yiren/RL/latent_constraint_object_token/checkpoints"
+    # Resume: set to last.ckpt (or best.ckpt) to continue training with global_step restored.
+    # model_checkpoint_load_path: "/pscratch/sd/y/yiren/RL/latent_constraint/checkpoints/last.ckpt"
+    # === LOCAL TESTING ===
+    # model_checkpoint_save_path: "/tmp/latent_constraint/checkpoints"
+
+    Components:
+      # Only the data columns needed by the autoencoder are kept; everything else
+      # is disabled so unused parquet columns are dropped by make_process_fn.
+      Classification: { include: false }
+      Regression: { include: false }
+      # Assignment columns (assignments-indices/-mask) are needed by the val_mass/*
+      # W/top-mass diagnostics (pick b + lepton per top). No assignment head is
+      # built -- include:true only keeps the parquet columns in the batch.
+      Assignment: { include: true }
+      GlobalGeneration: { include: false }
+      ReconGeneration: { include: false }
+      TruthGeneration:
+        include: true       # keeps the neutrino targets in the batch
+        cartesian: false    # neutrino target = (log_pt, eta, phi) from x_invisible
+                            # set true for (px, py, pz) from x_invisible_cartesian
+
+  Dataset:
+    dataset_limit: 1.0
+    # === NERSC ===
+    # Spherical training reads invisible_mean/std from this file (same as DGPO / nu2flow).
+    normalization_file: "/global/cfs/cdirs/m5019/yiren/nu2flow_data/mg5_train/normalization.pt"
+    # === LOCAL TESTING ===
+    # normalization_file: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/parquet/train/normalization.pt"
+    val_split: [ 0.7, 1.0 ]
+
+network:
+  default: ../../../reasoning_module/configs_TT2L/pretrain.yaml
+
+event_info:
+  default: ../../../reasoning_module/configs_TT2L/event_info.yaml
+
+resonance:
+  default: ../../../reasoning_module/configs_TT2L/resonance.yaml
+
+logger:
+  type: "tensorboard"
+  save_dir: "/pscratch/sd/y/yiren/RL/latent_constraint/logs"
+  name: "latent_constraint_spherical"
+
+# W&B logging (rank 0 only). Disable from the CLI with --no-wandb.
+# Only the most decision-relevant scalars are logged (see README):
+#   train/loss, val/loss         -> reconstruction MSE (is it learning?)
+#   val/latent_rms               -> latent-collapse guard (should stay > 0)
+#   val/swd_null                 -> truth-vs-truth null SWD (should stay ~0)
+#   val/swd_shuffled             -> truth vs wrong nu<->event pairing (should grow)
+#   val/swd_separation           -> swd_shuffled / swd_null (constraint headroom; >1 is good)
+#   train/lr                     -> warmup/cosine schedule sanity
+wandb:
+  project: "nu2flow-RL"
+  entity: "ytchou97-university-of-washington"
+  run_name: "latent-constraint-object-token-ae"
+  id: null
+  resume: allow
+  tags: [ "NERSC", "latent-constraint", "object-token", "autoencoder", "SWD", "spherical" ]
+
+# ---------------------------------------------------------------------------
+# Latent constraint autoencoder.  Keep the model compact: these are the only
+# knobs you should need for ablations on capacity vs. speed.
+# ---------------------------------------------------------------------------
+latent_constraint:
+  model:
+    # OBJECT-TOKEN BOTTLENECK AE (the only supported model).
+    #   Inputs: frozen event CLS token (event_token) + full per-object token set
+    #   (object_token) from preprocessing/augment_event_token.py --object-tokens,
+    #   plus the two-neutrino kinematics. nu and anti-nu get separate MLP encoders;
+    #   tokens [z-cls, event_token, object_tokens..., nu, antinu] self-attend;
+    #   z-cls -> bottleneck z; the non-conditional decoder reconstructs BOTH the
+    #   normalized truth neutrinos and the (standardized) original pretrain event
+    #   token. Loss = mse_nu + mse_token (both unit-variance; no weight knob).
+    #   z is the deployment SWD latent for the DGPO constraint.
+    #   REQUIRES the *_evttok augmented parquet in platform.data_parquet_dir.
+    type: object_token_bottleneck_ae
+
+    token_dim: 256            # event_token / object_token dim (EveNet ObjectEncoder hidden_dim)
+    token_stats_batches: 16   # batches for the one-time event/object token mean/std pass
+
+    nu_kin_dim: 3        # neutrino kinematics per slot: spherical (log_pt, eta, phi) | cartesian (px, py, pz)
+    phi_index: 2         # inv-CDF Gaussianize phi (EveNet normalize_uniform); forced null when cartesian: true.
+    d_model: 256         # transformer width (defaults to token_dim when left at 64)
+    latent_dim: 32       # bottleneck z dimension -> the SWD space
+    num_layers: 3        # self-attention layers
+    num_heads: 4         # attention heads
+    ffn_mult: 2          # feed-forward width = ffn_mult * d_model
+    dropout: 0.1         # training dropout (set 0.0 for deterministic DGPO use)
+  train:
+    # AdamW + cosine schedule with warmup (warmup_ratio of total steps).
+    # 3e-4 is a robust default for a sub-1M-param transformer AE at batch 1024;
+    # drop to ~1e-4 if you see early instability, raise toward 5e-4 if it underfits.
+    lr: 3.0e-4
+    weight_decay: 0.01
+    warmup_ratio: 0.05
+    grad_clip_norm: 1.0
+    log_every: 1          # per-worker terminal log every N global_steps (batch size from platform)
+    early_stopping:
+      enabled: true
+      patience: 50        # stop after this many epochs without improvement on ``monitor``
+      min_delta: 1.0e-6   # minimum change to count as improvement
+      monitor: val_loss     # val_loss (lower is better) | swd_separation (higher is better)
+    # Physical pt-shift validation probe: for each value the truth neutrinos are
+    # re-encoded with raw pt shifted by N GeV, and SWD(truth, shifted) is logged to
+    # W&B as val/swd_pt_shift_{N}GeV. A useful latent makes these RISE during training
+    # (it reacts to a real kinematic shift). Set to [] to disable.
+    pt_shift_diagnostics_gev: [5.0, 10.0]
+    # Monitoring plots logged to W&B as images (truth-vs-reconstruction histograms +
+    # pred-vs-truth 2D + latent-z), in the same "generation-invisible/*" panel the
+    # main EveNet model uses. Gated to every N epochs (0 disables); only the first
+    # plot_max_batches validation batches feed them.
+    plot_every_n_epochs: 5
+    plot_max_batches: 16

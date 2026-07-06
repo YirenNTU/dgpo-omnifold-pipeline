@@ -1,0 +1,287 @@
+# TT2L EveNet training layout (aligned with reasoning_module/train_TT2L.yaml) plus DGPO-neutrino RL add-on.
+# Single RL method: DGPO + CPO + frozen latent-SWD constraint (``rl.enabled`` switch only).
+# default: paths are relative to this file's directory (RL/DGPO_neutrino/).
+
+platform:
+  # === NERSC ===
+  # Materialized 20% subset (see RL/DGPO_neutrino/data_preprocess/make_dataset_subset.py).
+  # *_evttok_obj = event_token + object_token augmented mirror
+  # (augment_event_token.py --object-tokens). REQUIRED by the object-token latent-SWD
+  # encoder: compute_latent_swd_constraint reads batch_kb["event_token"] AND
+  # batch_kb["object_token"] and aborts if either column is missing.
+  data_parquet_dir: "/pscratch/sd/y/yiren/RL/nu2flow_dataset/DGPO/mg5_train_subset_20pct_evttok_obj_packed/train"
+  # val = 20% slice of the held-out TEST mirror (subset_dataset_object_test.yaml), packed.
+  data_parquet_val_dir: "/pscratch/sd/y/yiren/RL/nu2flow_dataset/DGPO/mg5_test_subset_20pct_evttok_obj_packed/val"
+  # (pre-pack subsets / full test mirror, if you roll back:)
+  #data_parquet_dir: "/pscratch/sd/y/yiren/RL/nu2flow_dataset/DGPO/mg5_train_subset_20pct_evttok_obj/train"
+  #data_parquet_val_dir: "/pscratch/sd/y/yiren/RL/nu2flow_dataset/DGPO/mg5_test_subset_20pct_evttok_obj/val"
+  # 4 nodes × 4 GPUs per node = 16 workers for distributed training
+  number_of_workers: 16
+  resources_per_worker: { "CPU": 15, "GPU": 1 }
+  batch_size: 512
+  prefetch_batches: 2
+  use_gpu: true
+
+  #=== LOCAL TESTING (uncomment for local) ===
+  #data_parquet_dir: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/parquet/train"
+  #number_of_workers: 1
+  #resources_per_worker: { "CPU": 4, "GPU": 0 }
+  #batch_size: 16
+  #prefetch_batches: 1
+  #use_gpu: false
+
+
+options:
+  default: ../../reasoning_module/configs_TT2L/options.yaml
+
+  Training:
+    total_epochs: 150
+    epochs: 150
+    # === NERSC ===
+    #model_checkpoint_save_path: "/pscratch/sd/y/yiren/Physics_informed/checkpoints_50steps_no_physics"
+    #model_checkpoint_save_path: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/checkpoints"
+    #pretrain_model_load_path: "/pscratch/sd/y/yiren/checkpoints.20M.a4.last.ckpt"
+    #pretrain_model_load_path: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/checkpoints.20M.a4.last.ckpt"
+    # ROUND 2 RESUME: load round-1's last.ckpt. parse_dgpo_resume_from_checkpoint restores
+    # dgpo_next_epoch + global_step, the optimizer, EMA, and the latent-SWD constraint
+    # provenance, so training continues where round 1 stopped (same save dir keeps one lineage).
+    model_checkpoint_load_path: "/pscratch/sd/y/yiren/RL/DGPO_evetoken_anomaly/checkpoints/last.ckpt"
+    model_checkpoint_save_path: "/pscratch/sd/y/yiren/RL/DGPO_evetoken_anomaly/checkpoints"
+    model_checkpoint_save_top_k: 10
+    # ROUND 1 cold-start (from supervised E2E) -- was:
+    #model_checkpoint_load_path: "/pscratch/sd/y/yiren/RL/nu2flow_E2E_model_assignment/checkpoints/last.ckpt"
+    # Resume a prior latent-SWD DGPO run instead (comment fresh load above, uncomment):
+    #model_checkpoint_load_path: "/pscratch/sd/y/yiren/RL/DGPO_neutrino_latent_swd/checkpoints/last.ckpt"
+    #model_checkpoint_save_path: "/pscratch/sd/y/yiren/RL/DGPO_neutrino_latent_swd/checkpoints"
+
+    # === LOCAL TESTING (uncomment for local) ===
+    # model_checkpoint_save_path: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/checkpoints"
+    # pretrain_model_load_path: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/checkpoints.20M.a4.last.ckpt"
+
+    diffusion_every_n_epochs: 25 # how often to run diffusion
+    diffusion_every_n_steps: 1 # how often to run diffusion inside the valid epoch
+
+    learning_rate: &lr 0.00001
+#    learning_rate_obj: &lr_obj 0.000032
+    learning_rate_body: &lr_body 0.000001
+#    learning_rate_body: &lr_body 0.000025
+    weight_decay: &wd 0.01
+    Components:
+      GlobalEmbedding:
+        learning_rate: *lr_body
+        weight_decay: *wd
+        optimizer_type: "AdamW"
+        warm_up: true
+        freeze:
+          type: none
+      PET:
+        learning_rate: *lr_body
+        weight_decay: *wd
+        optimizer_type: "AdamW"
+        warm_up: true
+        freeze:
+          type: none
+      ObjectEncoder:
+        learning_rate: *lr_body
+        weight_decay: *wd
+        optimizer_type: "AdamW"
+        warm_up: true
+        freeze:
+          type: none
+      Classification:
+        include: false
+        include_cross_term: false
+      Regression:
+        include: false
+      Assignment:
+        include: true
+        warm_up: true
+        learning_rate: *lr
+        weight_decay: *wd
+        optimizer_type: "AdamW"
+        freeze:
+          type: none
+      GlobalGeneration:
+        include: false
+      ReconGeneration:
+        include: false
+      TruthGeneration:
+        include: true
+        warm_up: true
+        learning_rate: *lr
+        weight_decay: *wd
+        optimizer_type: "AdamW"
+        diffusion_steps: 100
+        cartesian: false   # match the cartesian policy (train_TT2L.yaml); drives the
+                          # policy coordinate AND the latent-SWD cartesian kin path
+        freeze:
+          type: none
+
+    EarlyStopping:
+      patience: 25
+      min_delta: 0.0
+      monitor: "val/loss"
+      mode: "min"
+      verbose: true
+
+    EMA:
+      enable: true               # Enable or disable EMA
+      # Save/eval EMA only (rollout EMA uses its own fast decay ramp). Window ~= 1/(1-decay) steps;
+      # steps/epoch~=13, so 0.985 -> ~5-epoch window for val/best.ckpt smoothing.
+      decay: 0.985               # save/eval EMA decay
+      start_epoch: 0             # Start updating EMA after this epoch
+      update_every_n_steps: 1   # Update EMA every N steps
+
+      replace_model_after_load: true    # After loading checkpoint, copy EMA weights into model
+      replace_model_at_end: false         # At training end, copy EMA weights into model (will not save EMA weights)
+
+  Dataset:
+    dataset_limit: 1.0   # fraction of parquet rows to use (1.0 = full); use 1.0 with materialized subset dirs
+    # === NERSC ===
+    normalization_file: "/global/cfs/cdirs/m5019/yiren/nu2flow_data/mg5_train/normalization.pt"
+    #normalization_file: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/parquet/train/normalization.pt"
+    # === LOCAL TESTING (uncomment for local) ===
+    # normalization_file: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/parquet/train/normalization.pt"
+    # dataset_limit: 0.1   # Use 10% of data for local testing
+    val_split: [ 0.7, 1.0 ]
+
+
+network:
+#  default: configs/model.yaml
+  #  default: configs/model_large.yaml
+  default: ../../reasoning_module/configs_TT2L/pretrain.yaml
+
+  # Disable all dropout for DGPO: current policy and reference model must
+  # produce deterministic outputs for precise log-likelihood comparison.
+  Body:
+    GlobalEmbedding:
+      dropout: 0.0
+    PET:
+      feature_drop: 0.0
+      dropout: 0.0
+      drop_probability: 0.0
+    ObjectEncoder:
+      dropout: 0.0
+  Assignment:
+    feature_drop: 0.0
+    dropout: 0.0
+  ReconGeneration:
+    feature_drop: 0.0
+    dropout: 0.0
+    drop_probability: 0.0
+  TruthGeneration:
+    feature_drop: 0.0
+    dropout: 0.0
+    drop_probability: 0.0
+
+event_info:
+  default: ../../reasoning_module/configs_TT2L/event_info.yaml
+
+  # overwrites
+  # ...
+
+resonance:
+  default: ../../reasoning_module/configs_TT2L/resonance.yaml
+
+  # overwrites
+  # ...
+wandb:
+  project: "nu2flow-RL"
+  entity: "ytchou97-university-of-washington"
+  name: "nu2flow-RL-DGPO-evetoken"
+  run_name: "nu2flow-RL-DGPO-evetoken"
+  # Set id to the original W&B run id (8-char hex) to append to the same run; null starts a new run.
+  id: null
+  resume: allow
+  tags: [ "NERSC", "RL", "Neutrinos", "QE", "DGPO", "CPO", "LatentSWD", "FrozenEncoder", "MultiSample8", "LinearPostAdam", "MultiNode", "emaDecay0.985", "rolloutRamp0.001" ]
+logger:
+  type: "tensorboard"
+  # Optional: same shape as evenet/train.py — if ``logger.wandb.project`` is set, DGPO uses it
+  # instead of the top-level ``wandb:`` block below.
+  # wandb:
+  #   project: "my-project"
+  #   entity: null
+  #   run_name: "run-1"
+  #   tags: []
+  #   id: null
+  # === NERSC ===
+  save_dir: "/pscratch/sd/y/yiren/RL/DGPO_evetoken_anomaly/logs"
+  #save_dir: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/logs"
+  # === LOCAL TESTING (uncomment for local) ===
+  # save_dir: "/Users/yirenwu/Machine Learning Research Reasoning Model/Dataset/logs"
+  name: "nu2flow_RL"
+
+# ---------------------------------------------------------------------------
+# RL add-on: DGPO + CPO + frozen latent-SWD constraint (``rl.enabled`` switch).
+#
+# Lifecycle:
+#   - Load frozen encoder from latent_swd.checkpoint_file at startup on every rank;
+#     broadcast rank-0 weights; no on-policy retrain/finetune.
+#   - Constraint: C_norm = (SWD_pred - SWD_tt) / (SWD_tt + eps).  W&B: ``swd/*`` panel.
+#   - Enforcement: post-AdamW CPO trust-region projection repair.
+# ---------------------------------------------------------------------------
+
+rl:
+  enabled: true
+
+dgpo:
+  beta: 5
+  K: 8
+  validation_K: 1
+  # Training-phase candidate-rollout step budget (online DGPO generation).
+  num_ddim_steps: 10
+  # Validation-phase candidate-rollout step budget. Kept separate from training so
+  # validation fidelity and training speed can be tuned independently. If null, falls
+  # back to num_ddim_steps (training value) for backward-compatible behavior.
+  validation_num_ddim_steps: 20
+  num_train_timesteps: 8
+  adv_clip_max: 5.0
+  grad_clip_norm: 1.0
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  ema_rollout_decay_max: 0.3
+  ema_rollout_decay_ramp: 0.001
+  log_every: 1
+  log_reward_dist_every: 5
+  diagnostic_plot_every: 5
+  validation_every_n_epochs: 1
+  validation_max_batches: null
+  validation_compute_winrate: true
+  validation_log_batches: true
+  validation_tqdm_k_chains: true
+  validation_tqdm_ddim: false
+  projection_constraint:
+    # The frozen latent-SWD encoder is the only constraint backend; enforcement is
+    # post-AdamW CPO trust-region projection repair (lambda = v/(b.p) puts the
+    # constraint gradient b in the DENOMINATOR -> coordinate-invariant, phi-safe).
+    type: latent_swd
+    epsilon: 0.1
+    min_b_norm2: 1.0e-12
+    trust_region_ratio: 1.0
+    damping: 0.0
+    multi_sample:
+      samples: 8
+    # Frozen latent-SWD constraint (active when type: latent_swd). Train the encoder
+    # independently first (RL/DGPO_neutrino/latent_constraint/train_latent_constraint.py),
+    # then point checkpoint_file at the resulting best.ckpt. Uses the **same**
+    # platform.number_of_workers / Ray cluster as policy training (e.g. 4 nodes × 4 GPUs
+    # = 16) — no extra distributed settings for the frozen encoder.
+    latent_swd:
+      # ACTIVE: OBJECT-TOKEN AE (object_token_bottleneck_ae). Spherical (log_pt, eta, phi),
+      # 32-D latent; conditions on the per-object token set + pooled event CLS; z reconstructs
+      # [nu ; event CLS token] (plain-sum loss). Requires the *_evttok_obj_packed DGPO data set
+      # above (event_token AND object_token columns); dgpo_constraint auto-forwards object_token.
+      checkpoint_file: "/pscratch/sd/y/yiren/RL/latent_constraint_object_token/checkpoints/best.ckpt"
+      normalization_file: "/global/cfs/cdirs/m5019/yiren/nu2flow_data/mg5_train/normalization.pt"
+      margin: 0.1                # CPO fires when C_norm > margin (0.5->0.1: token-bottleneck latent, tighter constraint); epsilon above defaults to this
+      eps: 1.0e-6                # ratio denominator floor: (swd_pred_truth - swd_tt)/(swd_tt + eps)
+      min_samples: 8             # skip batches with fewer valid rows
+      apply_to: all_candidates   # all_candidates | best_candidate
+      num_projections: 1024      # SWD random projection axes (averaged). The object-token AE
+                                 # latent is 32-D, so use more slices for a low-variance SWD
+                                 # estimate; cost is a cheap (KB x 1024) projection of 32-D vectors.
+
+reward_config:
+  weight: 1.0
+  component_normalized:
+    eps: 1.0e-8

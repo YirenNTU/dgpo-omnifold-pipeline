@@ -27,6 +27,10 @@ lep_tree_ana
                                          branch: tautau
 ```
 
+This repository also vendors a local DGPO compatibility layer under
+`ml_pipeline/evenet_dgpo/` so the neutrino-generation backend can be switched
+without changing the current prediction and export scripts.
+
 The commands in this README assume that the current working directory is the
 top-level `lep_tree_ana` directory:
 
@@ -54,6 +58,7 @@ source .venv-ml/bin/activate
 python3 -m pip install --upgrade pip
 python3 -m pip install -r ml_pipeline/EveNet-Full/requirements.txt
 python3 -m pip install -e ml_pipeline/EveNet-Full
+python3 -m pip install -r ml_pipeline/evenet_dgpo/requirements.txt
 ```
 
 Expose the local pipeline modules:
@@ -128,11 +133,14 @@ the recorded commits for reproducibility.
 | `ml_pipeline/config/train_*_cls.yaml` | Classification training configurations. |
 | `ml_pipeline/config/train_pretrain.yaml` | Pretrained diffusion/generation configuration. |
 | `ml_pipeline/config/train_scratch.yaml` | Scratch diffusion/generation configuration. |
+| `ml_pipeline/config/dgpo_ztautau_overlay.yaml` | Ztautau-specific overlay that enables the DGPO backend. |
 | `ml_pipeline/build_evenet_input_from_parquet.py` | Convert central selected parquets into EveNet input shards. |
 | `ml_pipeline/generate_event_info_yaml.py` | Generate the EveNet event schema and JSON summary. |
 | `ml_pipeline/preprocess_evenet_parquet.py` | Create training splits and normalization metadata. |
 | `ml_pipeline/predict_evenet.py` | Run classification and invisible-particle inference. |
 | `ml_pipeline/export_evenet_qi_inputs.py` | Export predictions to the central QI/unfolding layout. |
+| `ml_pipeline/scripts/train_neutrino_backend.py` | Shared launcher for pure EveNet or DGPO-EveNet neutrino training. |
+| `ml_pipeline/evenet_dgpo/` | Vendored EveNet + DGPO stack, including RL and latent-SWD constraint tooling. |
 | `ml_pipeline/monitor_input.py` | Produce optional input monitoring plots. |
 | `ml_pipeline/plot_channel_purity_side_by_side.py` | Compare channel yield, purity, and significance. |
 | `ml_pipeline/extract_qi_calibration_magnitude.py` | Summarize post-calibration shifts. |
@@ -360,6 +368,52 @@ evenet-train ml_pipeline/config/train_scratch.yaml \
 
 The best checkpoints are written below
 `options.Training.model_checkpoint_save_path`.
+
+### 4b. Fine-Tune the Neutrino Backend with DGPO
+
+The DGPO path reuses the same base training YAML, then overlays RL-specific
+settings at launch time.
+
+Before running DGPO, make sure:
+
+- `config/train_pretrain.yaml` points to the diffusion train/val parquet and the
+  correct `normalization.pt`
+- `options.Training.model_checkpoint_load_path` points to the supervised
+  diffusion checkpoint you want to fine-tune
+- the DGPO parquet carries `event_token` and `object_token`
+- `config/dgpo_ztautau_overlay.yaml` is adjusted for the current campaign,
+  especially the latent-SWD checkpoint inputs if you enable the frozen
+  constraint
+
+Launch the original foundation trainer through the shared wrapper:
+
+```bash
+python3 ml_pipeline/scripts/train_neutrino_backend.py \
+  --backend pure-evenet \
+  --base-config ml_pipeline/config/train_pretrain.yaml
+```
+
+Launch DGPO fine-tuning from the same base config:
+
+```bash
+python3 ml_pipeline/scripts/train_neutrino_backend.py \
+  --backend dgpo-evenet \
+  --base-config ml_pipeline/config/train_pretrain.yaml
+```
+
+Pass extra trainer arguments after `--`, for example:
+
+```bash
+python3 ml_pipeline/scripts/train_neutrino_backend.py \
+  --backend dgpo-evenet \
+  --base-config ml_pipeline/config/train_pretrain.yaml \
+  -- --ray_dir "$CAMPAIGN_DIR/ray/dgpo-diffusion"
+```
+
+The launcher writes a temporary merged runtime YAML, sets `PYTHONPATH` so the
+vendored `evenet_dgpo` package is importable, and then dispatches to either
+`evenet_dgpo/evenet/train.py` or
+`evenet_dgpo/RL/DGPO_neutrino/dgpo_trainer.py`.
 
 ### 5. Run EveNet Prediction
 

@@ -1,0 +1,131 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[ruled,linesnumbered,noend]{algorithm2e}
+\usepackage{float}    % provides the [H] placement specifier (inline float)
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{booktabs} 
+% --- Math shortcuts (namespaced to avoid clashes when pasted into a paper) ---
+\newcommand{\dgData}{\mathcal{D}}
+\newcommand{\dgBatch}{\mathcal{B}}
+\newcommand{\dgRew}{\mathcal{R}}
+\newcommand{\dgAdv}{A}
+\newcommand{\dgVcur}{v_{\theta}}
+\newcommand{\dgVref}{v_{\theta_{\mathrm{ref}}}}
+\newcommand{\dgLcur}{L_{\theta}}
+\newcommand{\dgLref}{L_{\theta_{\mathrm{ref}}}}
+\newcommand{\dgEMA}{\theta_{\mathrm{ema}}}
+\newcommand{\dgBdgpo}{\beta_{\mathrm{dgpo}}}
+\newcommand{\dgBkl}{\beta_{\mathrm{kl}}}
+\newcommand{\dgLanc}{\lambda_{\mathrm{anc}}}
+\newcommand{\sg}{\operatorname{sg}}        % stop-gradient
+\newcommand{\nupair}{\bm{\nu}}              % the (nu_1, nu_2) pair for one event
+\SetCommentSty{textit}
+\DontPrintSemicolon
+
+\begin{document}
+
+% =============================================================================
+% Method paragraph (concise; can be merged into your paper's Method section)
+% =============================================================================
+\section{Method}
+\paragraph{Overview.}
+EveNet provides the pretrained event representation and conditional diffusion
+decoder for TT2L neutrino reconstruction. DGPO fine-tunes this model with
+group-relative preferences over $K$ DDIM candidates per event, a frozen reference
+policy, and a rollout EMA for stable candidate generation.
+The review-branch pipeline adds a \emph{linear CPO} post-Adam repair step driven
+by a discriminator-Wasserstein constraint on neutrino kinematics.
+
+\paragraph{Group preference (DGPO).}
+For each event $e$ we draw $K$ candidates from the rollout EMA policy, score them
+with a component-normalized truth-distance reward, and form z-scored advantages
+$\dgAdv_{k,e}$ within the group. The backward pass uses only the pure DGPO term
+(no velocity KL anchor). Inner training performs $M$ policy-evaluation timesteps
+per batch with shared noise across candidates; gradients accumulate into one
+AdamW step.
+
+\paragraph{Discriminator-Wasserstein constraint.}
+A standalone MLP discriminator projects predicted and truth neutrino pairs to
+scalar scores. The batch constraint is the normalized Wasserstein-1 distance
+between projected prediction and truth distributions,
+$C_{\mathrm{norm}} = (W_1 - \mu_{TT}) / (\sigma_{TT} + \epsilon)$,
+with $\mu_{TT},\sigma_{TT}$ tracked by an EMA on truth-vs-truth pairs.
+CPO activates when $C_{\mathrm{norm}}$ exceeds the configured margin.
+
+\paragraph{Linear CPO repair.}
+After the unconstrained AdamW proposal $\delta_0$, we evaluate
+$b = \nabla_\theta C$ and $C_{\mathrm{old}}$ at $\theta_{\mathrm{old}}$ using
+multi-sample stratified diffusion timesteps. The linear violation
+$v = (C_{\mathrm{old}} + b^\top \delta_0) - \epsilon$ drives
+$\lambda = [v / (b^\top p + d)]_+$ with AdamW-preconditioned direction $p$.
+The final update $\delta_{\mathrm{final}}$ caps the composed step in the
+AdamW metric. The discriminator is retrained on-policy each epoch (BCE on truth
+vs EMA-rollout negatives).
+
+\begin{algorithm}[H]
+\caption{DGPO + linear CPO + discriminator-Wasserstein (implementation-aligned).}
+\label{alg:dgpo_cpo_disc}
+\KwIn{Batch events; policy $\theta$; reference $\thetaref$; rollout EMA $\dgEMA$;
+  candidates $K$; inner timesteps $M$; CPO margin $\epsilon$; trust ratio $\rho$.}
+\KwOut{Updated $\theta$ and $\dgEMA$.}
+\DontPrintSemicolon
+Generate $K$ DDIM candidates per event from $\dgEMA$; compute rewards and z-score advantages.\;
+Accumulate $\nabla_\theta \mathcal{L}_{\mathrm{DGPO}}/M$ over $M$ shared-noise timesteps.\;
+Snapshot $\theta_{\mathrm{old}}$; AdamW step $\rightarrow \theta_{\mathrm{adam}}$.\;
+At $\theta_{\mathrm{old}}$: average $C_{\mathrm{norm}}$ and $\nabla C$ over $S$ stratified $(t,\epsilon)$ draws.\;
+Linear violation $v \leftarrow C_{\mathrm{old}} + b^\top(\theta_{\mathrm{adam}}-\theta_{\mathrm{old}}) - \epsilon$.\;
+$\lambda \leftarrow [v/(b^\top p + d)]_+$; cap $\theta_{\mathrm{adam}}-\lambda p$ in AdamW metric.\;
+Update $\dgEMA$; optionally retrain discriminator on truth vs EMA negatives.\;
+\end{algorithm}
+
+\section{Config}
+\label{sec:dgpo_config}
+
+Canonical hyper-parameters are in \texttt{RL/DGPO\_neutrino/config.yaml}.
+The only RL switch is \texttt{rl.enabled}. When true, DGPO, CPO, and on-policy
+discriminator retraining are mandatory.
+
+\begin{table}[H]
+\centering
+\caption{Review-branch DGPO defaults (numeric; see YAML for paths).}
+\label{tab:cfg_review}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Setting} & \textbf{Value} \\
+\midrule
+Candidates per event $K$ & 8 \\
+Inner policy-eval timesteps $M$ & 8 \\
+DDIM steps & 20 \\
+Gate scale $\beta_{\mathrm{DGPO}}$ & 5 \\
+Reward & component-normalized truth distance \\
+CPO multi-sample draws $S$ & 8 \\
+Discriminator margin & 1.0 (dimensionless $C_{\mathrm{norm}}$) \\
+Discriminator retrain & every epoch, 40 inner BCE epochs \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Hardware}
+
+\paragraph{Base EveNet training:}
+\begin{itemize}
+    \item[-] GPU type: NVIDIA A100
+    \item[-] Number of GPUs: 4
+    \item[-] Training time: 4 hours
+\end{itemize}
+
+\vspace{0.5em}
+
+\paragraph{DGPO post training:}
+\begin{itemize}
+    \item[-] GPU type: NVIDIA A100
+    \item[-] Number of GPUs: 16
+    \item[-] Training time: 8 hours
+\end{itemize}
+
+\bibliographystyle{unsrt}
+\bibliography{References}
+\end{document}

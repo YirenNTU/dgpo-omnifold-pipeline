@@ -1,0 +1,26 @@
+# Materialize a 20% VAL slice from the OBJECT-token augmented mg5_TEST mirror.
+# Pairs with subset_dataset_object.yaml (which builds the 20% TRAIN slice from
+# mg5_train). val_split=[0.0,1.0] routes ALL kept rows into val_dir, so val_dir
+# holds the 20%-of-test slice and train_dir is just an empty placeholder.
+#
+# Usage:
+#   python RL/DGPO_neutrino/data_preprocess/make_dataset_subset.py \
+#          RL/DGPO_neutrino/data_preprocess/subset_dataset_object_test.yaml
+#
+# Then point RL/DGPO_neutrino/config.yaml platform.data_parquet_val_dir at output.val_dir.
+
+source:
+  # PACKED object_token test mirror (pack_object_token.py output).
+  data_parquet_dir: "/pscratch/sd/y/yiren/RL/nu2flow_data_evttok_obj_packed/mg5_test"
+
+output:
+  # train_dir is an unused placeholder (empty) -- everything goes to val_dir.
+  train_dir: "/pscratch/sd/y/yiren/RL/nu2flow_dataset/DGPO/mg5_test_subset_20pct_evttok_obj_packed/_train_unused"
+  val_dir:   "/pscratch/sd/y/yiren/RL/nu2flow_dataset/DGPO/mg5_test_subset_20pct_evttok_obj_packed/val"
+  copy_sidecars: true   # copies shape_metadata.json (with object_token) + normalization.pt
+
+subset:
+  fraction: 0.2          # keep 20% of mg5_test
+  val_split: [0.0, 1.0]  # entire kept slice -> val_dir (train_dir stays empty)
+  seed: 42
+  shuffle: true

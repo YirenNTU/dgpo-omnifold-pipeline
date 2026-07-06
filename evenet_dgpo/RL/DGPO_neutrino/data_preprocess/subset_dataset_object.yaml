@@ -1,0 +1,32 @@
+# Materialize a 20% DGPO train/val subset from the OBJECT-token augmented full set.
+# Slicing copies rows verbatim, so the resulting subset carries BOTH the event_token
+# and object_token columns + the augmented shape_metadata.json (with object_token:[P,D])
+# and normalization.pt -- everything the object-token latent-SWD constraint needs.
+#
+# Usage:
+#   python RL/DGPO_neutrino/data_preprocess/make_dataset_subset.py \
+#          RL/DGPO_neutrino/data_preprocess/subset_dataset_object.yaml
+#
+# After running, point RL/DGPO_neutrino/config.yaml at:
+#   platform.data_parquet_dir      -> output.train_dir
+#   platform.data_parquet_val_dir  -> output.val_dir
+#   options.Dataset.dataset_limit  -> 1.0
+#   dgpo.projection_constraint.latent_swd.checkpoint_file -> object AE best.ckpt
+
+source:
+  # PACKED object_token full training set (pack_object_token.py output). Slicing copies
+  # the packed FixedSizeList column verbatim, so the subset inherits the fast layout.
+  data_parquet_dir: "/pscratch/sd/y/yiren/RL/nu2flow_data_evttok_obj_packed/mg5_train"
+
+output:
+  train_dir: "/pscratch/sd/y/yiren/RL/nu2flow_dataset/DGPO/mg5_train_subset_20pct_evttok_obj_packed/train"
+  val_dir:   "/pscratch/sd/y/yiren/RL/nu2flow_dataset/DGPO/mg5_train_subset_20pct_evttok_obj_packed/val"
+  copy_sidecars: true   # copies shape_metadata.json (with object_token) + normalization.pt
+
+subset:
+  fraction: 0.2           # keep 20% of the full row count
+  # All kept rows -> train_dir (DGPO val comes from the mg5_test mirror, not a
+  # slice of train). Use [0.75, 1.0] instead if you want a self-contained train/val split.
+  val_split: [1.0, 1.0]   # empty val range -> 100% of the 20% goes to train
+  seed: 42
+  shuffle: true           # random (reproducible) 20%; false = first-N in file order
