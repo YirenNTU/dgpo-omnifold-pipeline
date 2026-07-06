@@ -34,6 +34,8 @@ ztautau_domain:
     target_delta_phi_to_pi: 0.0
 
 dgpo:
+  train_dataset_limit: 0.1
+  val_dataset_limit: 20000
   K: 8
   num_ddim_steps: 20
   validation_num_ddim_steps: 20
