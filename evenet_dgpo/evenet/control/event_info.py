@@ -322,7 +322,13 @@ class EventInfo:
         self.process_to_segment_tags: dict[str, dict[str, float]] = compute_segment_tags(
             self.product_mappings, self.pairing_topology, self.resonance_info
         )
-        self.total_segment_tags = max(v for _, tags in self.process_to_segment_tags.items() for v in tags.values()) + 1
+        segment_tag_values = [
+            v for _, tags in self.process_to_segment_tags.items() for v in tags.values()
+        ]
+        # Ztautau configs can omit segmentation-tag annotations entirely. Keep the
+        # source tree self-contained and compatible with the original pure-EveNet
+        # settings by falling back to a single default segment class in that case.
+        self.total_segment_tags = (max(segment_tag_values) + 1) if segment_tag_values else 1
         self.segment_label = {
             label: clsnum for clsnum, label in enumerate(resonance_label[0])
         } if len(resonance_label) > 0 else {}
