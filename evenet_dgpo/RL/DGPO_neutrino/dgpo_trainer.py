@@ -5702,14 +5702,14 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     _vm_raw,
                 )
             val_max_batches = None
-    K = int(dg.K)
+    K = int(_dgpo_cfg_get(dg, "K", 1))
     val_K = max(1, int(dg.get("validation_K", 1)))
     validation_every_n_epochs = max(1, int(dg.get("validation_every_n_epochs", 1)))
-    beta = float(dg.beta)
+    beta = float(_dgpo_cfg_get(dg, "beta", 1.0))
     # Training and validation use independent DDIM rollout-step budgets: training uses
     # num_ddim, validation uses num_ddim_val. The validation-specific key falls back
     # to the training value when unset (null) for backward-compatible behavior.
-    num_ddim = int(dg.num_ddim_steps)
+    num_ddim = int(_dgpo_cfg_get(dg, "num_ddim_steps", 1))
     _val_steps_raw = dg.get("validation_num_ddim_steps", None)
     num_ddim_val = int(_val_steps_raw) if _val_steps_raw is not None else num_ddim
     if is_rank0:
