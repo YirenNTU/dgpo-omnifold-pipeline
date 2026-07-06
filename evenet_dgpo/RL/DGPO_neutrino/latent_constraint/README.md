@@ -211,8 +211,8 @@ encoder is frozen/eval, synthetic encode + SWD returns finite scalars. Exit code
 At DGPO startup (rank 0) you should also see:
 
 ```
-[latent_swd] loaded encoder: ckpt=... latent_dim=32 ... val_loss=... requires_grad=False
-[DGPO] DGPO + CPO + latent-SWD (frozen): checkpoint=... latent_dim=32 ... world_size=16 ...
+[latent_swd] loaded encoder: ckpt=... latent_dim=16 ... val_loss=... requires_grad=False
+[DGPO] DGPO + CPO + latent-SWD (frozen): checkpoint=... latent_dim=16 ... world_size=16 ...
 ```
 
 ## 3. Manual use (lower-level building blocks)

@@ -268,7 +268,7 @@ dgpo:
     # = 16) — no extra distributed settings for the frozen encoder.
     latent_swd:
       # ACTIVE: OBJECT-TOKEN AE (object_token_bottleneck_ae). Spherical (log_pt, eta, phi),
-      # 32-D latent; conditions on the per-object token set + pooled event CLS; z reconstructs
+      # 16-D latent; conditions on the per-object token set + pooled event CLS; z reconstructs
       # [nu ; event CLS token] (plain-sum loss). Requires the *_evttok_obj_packed DGPO data set
       # above (event_token AND object_token columns); dgpo_constraint auto-forwards object_token.
       checkpoint_file: "/pscratch/sd/y/yiren/RL/latent_constraint_object_token/checkpoints/best.ckpt"
@@ -278,7 +278,7 @@ dgpo:
       min_samples: 8             # skip batches with fewer valid rows
       apply_to: all_candidates   # all_candidates | best_candidate
       num_projections: 1024      # SWD random projection axes (averaged). The object-token AE
-                                 # latent is 32-D, so use more slices for a low-variance SWD
+                                 # latent is 16-D, so use more slices for a low-variance SWD
                                  # estimate; cost is a cheap (KB x 1024) projection of 32-D vectors.
 
 reward_config:

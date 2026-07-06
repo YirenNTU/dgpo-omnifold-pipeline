@@ -71,7 +71,7 @@ class ObjectTokenBottleneckAutoencoder(nn.Module):
         nu_kin_dim: int = 3,
         feature_names: tuple[str, ...] | None = None,
         d_model: int | None = None,
-        latent_dim: int = 32,
+        latent_dim: int = 16,
         num_layers: int = 3,
         num_heads: int = 4,
         ffn_mult: int = 2,

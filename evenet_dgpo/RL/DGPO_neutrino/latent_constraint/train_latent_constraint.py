@@ -272,7 +272,7 @@ def _resolve_lc_cfg() -> dict[str, Any]:
         "nu_kin_dim": int(model_cfg.get("nu_kin_dim", 0)),
         "feature_names": feature_names,
         "d_model": int(model_cfg.get("d_model", 64)),
-        "latent_dim": int(model_cfg.get("latent_dim", 32)),
+        "latent_dim": int(model_cfg.get("latent_dim", 16)),
         "num_layers": int(model_cfg.get("num_layers", 3)),
         "num_heads": int(model_cfg.get("num_heads", 4)),
         "ffn_mult": int(model_cfg.get("ffn_mult", 2)),

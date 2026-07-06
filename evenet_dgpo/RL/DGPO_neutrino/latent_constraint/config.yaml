@@ -120,7 +120,7 @@ latent_constraint:
     nu_kin_dim: 0        # optional override; 0 means "infer from normalization.pt"
     phi_index: null      # optional override; defaults to the index of "phi" in feature_names, if present
     d_model: 256         # transformer width (defaults to token_dim when left at 64)
-    latent_dim: 32       # bottleneck z dimension -> the SWD space
+    latent_dim: 16       # bottleneck z dimension -> the SWD space
     num_layers: 3        # self-attention layers
     num_heads: 4         # attention heads
     ffn_mult: 2          # feed-forward width = ffn_mult * d_model
