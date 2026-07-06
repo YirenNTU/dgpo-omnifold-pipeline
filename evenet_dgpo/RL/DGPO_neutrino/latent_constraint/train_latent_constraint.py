@@ -56,8 +56,12 @@ from RL.DGPO_neutrino.latent_constraint.sliced_wasserstein import (  # noqa: E40
 )
 from RL.DGPO_neutrino.latent_constraint.plots import ReconPlotState  # noqa: E402
 from RL.DGPO_neutrino.latent_constraint.mass_diagnostics import MassDiagState  # noqa: E402
+from RL.DGPO_neutrino.latent_constraint.normalizers import load_normalizers_from_pt  # noqa: E402
 
 _log = logging.getLogger("latent_constraint.train")
+
+_DEFAULT_SPHERICAL_FEATURES: tuple[str, ...] = ("log_pt", "eta", "phi")
+_DEFAULT_CARTESIAN_FEATURES: tuple[str, ...] = ("px", "py", "pz")
 
 
 class _LCForward(torch.nn.Module):
@@ -262,15 +266,18 @@ def _resolve_lc_cfg() -> dict[str, Any]:
             "latent_constraint.model.type must be object_token_bottleneck_ae "
             f"(the only supported model), got {mtype!r}"
         )
+    feature_names_raw = model_cfg.get("feature_names", None)
+    feature_names = tuple(str(name) for name in feature_names_raw) if feature_names_raw else ()
     return {
-        "nu_kin_dim": int(model_cfg.get("nu_kin_dim", 3)),
+        "nu_kin_dim": int(model_cfg.get("nu_kin_dim", 0)),
+        "feature_names": feature_names,
         "d_model": int(model_cfg.get("d_model", 64)),
         "latent_dim": int(model_cfg.get("latent_dim", 32)),
         "num_layers": int(model_cfg.get("num_layers", 3)),
         "num_heads": int(model_cfg.get("num_heads", 4)),
         "ffn_mult": int(model_cfg.get("ffn_mult", 2)),
         "dropout": float(model_cfg.get("dropout", 0.1)),
-        "phi_index": model_cfg.get("phi_index", 2),
+        "phi_index": model_cfg.get("phi_index", None),
         # event_token / object_token columns from augment_event_token.py
         "token_dim": int(model_cfg.get("token_dim", 256)),
         "token_stats_batches": max(1, int(model_cfg.get("token_stats_batches", 16))),
@@ -283,8 +290,8 @@ def _resolve_lc_cfg() -> dict[str, Any]:
         "early_stopping_patience": max(1, int(es_cfg.get("patience", 15))),
         "early_stopping_min_delta": float(es_cfg.get("min_delta", 0.0)),
         "early_stopping_monitor": monitor,
-        "pt_shift_diagnostics_gev": [
-            float(s) for s in (train_cfg.get("pt_shift_diagnostics_gev", [5.0, 10.0]) or [])
+        "feature_shift_diagnostics_pct": [
+            float(s) for s in (train_cfg.get("feature_shift_diagnostics_pct", [5.0, 10.0]) or [])
         ],
         # Monitoring plots (truth-vs-recon histograms) logged to W&B as images,
         # mirroring the main model's generation plots. Gated to every N epochs
@@ -292,6 +299,63 @@ def _resolve_lc_cfg() -> dict[str, Any]:
         "plot_every_n_epochs": int(train_cfg.get("plot_every_n_epochs", 5)),
         "plot_max_batches": max(1, int(train_cfg.get("plot_max_batches", 16))),
     }
+
+
+def _infer_feature_layout(
+    *,
+    lc: dict[str, Any],
+    event_info: Any,
+    normalization_file: str | Path,
+    cartesian: bool,
+) -> tuple[tuple[str, ...], tuple[bool, ...], tuple[bool, ...], int, int | None]:
+    """Resolve invisible feature metadata from event_info first, then validate against normalization."""
+    _, _, inv_norm = load_normalizers_from_pt(normalization_file, cartesian=cartesian)
+    n_inv = int(inv_norm.mean.numel())
+
+    feature_names_cfg = tuple(lc.get("feature_names", ()) or ())
+    if cartesian:
+        feature_names = feature_names_cfg or _DEFAULT_CARTESIAN_FEATURES[:n_inv]
+        log_scaled = tuple(False for _ in range(len(feature_names)))
+        uniform = tuple(False for _ in range(len(feature_names)))
+    else:
+        event_feature_names = tuple(str(name) for name in event_info.invisible_feature_names)
+        if feature_names_cfg and feature_names_cfg != event_feature_names:
+            raise ValueError(
+                "latent_constraint.model.feature_names does not match event_info invisible feature names: "
+                f"cfg={feature_names_cfg} event_info={event_feature_names}"
+            )
+        feature_names = event_feature_names
+        log_scaled = tuple(bool(feature.log_scale) for feature in event_info.invisible_input_features)
+        uniform = tuple(bool(feature.uniform) for feature in event_info.invisible_input_features)
+
+    if len(feature_names) != n_inv:
+        raise ValueError(
+            f"invisible feature count {len(feature_names)} != normalization invisible dim {n_inv}"
+        )
+
+    nu_kin_dim_cfg = int(lc["nu_kin_dim"])
+    if nu_kin_dim_cfg != n_inv:
+        _log.warning(
+            "[lc] overriding latent_constraint.model.nu_kin_dim=%s with normalization invisible dim=%s",
+            nu_kin_dim_cfg,
+            n_inv,
+        )
+    nu_kin_dim = n_inv
+
+    phi_index_cfg = lc.get("phi_index", None)
+    if cartesian:
+        phi_index = None
+    elif phi_index_cfg is not None:
+        phi_index = int(phi_index_cfg)
+    elif getattr(event_info, "invisible_inv_cdf_index", None):
+        indices = tuple(int(index) for index in event_info.invisible_inv_cdf_index)
+        phi_index = indices[0] if len(indices) == 1 else None
+    elif "phi" in feature_names:
+        phi_index = feature_names.index("phi")
+    else:
+        phi_index = None
+
+    return feature_names, log_scaled, uniform, nu_kin_dim, phi_index
 
 
 def _early_stopping_mode(monitor: str) -> str:
@@ -429,71 +493,54 @@ def _latent_separation_diagnostics(
     }
 
 
-def _pt_shift_tag(shift_gev: float) -> str:
-    """Stable W&B-friendly tag for a pt shift, e.g. ``5.0 -> '5GeV'``."""
-    return f"{shift_gev:g}GeV"
+def _feature_shift_tag(feature_name: str, shift_pct: float) -> str:
+    safe_name = feature_name.replace("/", "_")
+    return f"{safe_name}_{shift_pct:g}pct"
 
 
-def _shift_pt_log1p(x_invisible: torch.Tensor, shift_gev: float) -> torch.Tensor:
-    """Shift raw pt by ``shift_gev`` GeV in the ``(log1p(pt), eta, phi)`` layout.
+def _wrap_periodic_feature(x: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(x), torch.cos(x))
 
-    Channel 0 is ``log1p(pt)``: recover raw ``pt = expm1(log1p_pt)``, add the GeV
-    shift (clamped at 0 so pt stays physical), then re-apply ``log1p``. ``eta``/``phi``
-    are untouched. Returns a new tensor (input is not mutated).
+
+def _shift_feature_percent(
+    x_invisible: torch.Tensor,
+    *,
+    feature_index: int,
+    shift_pct: float,
+    log_scaled: bool,
+    periodic: bool,
+) -> torch.Tensor:
+    """Apply a multiplicative raw-feature shift to one invisible feature column.
+
+    For ``log_*`` features, the shift is applied in raw space and then mapped
+    back with ``log1p`` so the perturbation respects the feature definition.
     """
     out = x_invisible.clone()
-    pt = torch.expm1(out[..., 0])
-    pt_shifted = (pt + float(shift_gev)).clamp_min(0.0)
-    out[..., 0] = torch.log1p(pt_shifted)
+    scale = 1.0 + float(shift_pct) / 100.0
+    col = out[..., feature_index]
+    if log_scaled:
+        raw = torch.expm1(col)
+        shifted = raw * scale
+        col_shifted = torch.log1p(shifted.clamp_min(0.0))
+    else:
+        col_shifted = col * scale
+    if periodic:
+        col_shifted = _wrap_periodic_feature(col_shifted)
+    out[..., feature_index] = col_shifted
     return out
-
-
-def _shift_pt_cartesian(x_invisible: torch.Tensor, shift_gev: float) -> torch.Tensor:
-    """Shift raw pt by ``shift_gev`` GeV in the ``(px, py, pz)`` layout.
-
-    pt = sqrt(px^2 + py^2); the (px, py) vector is rescaled to ``pt + shift`` GeV
-    (preserving its azimuthal direction), pz untouched. When pt is ~0 the
-    direction is undefined, so the shift is applied along +px there. Returns a new
-    tensor (input is not mutated).
-    """
-    out = x_invisible.clone()
-    px, py = out[..., 0], out[..., 1]
-    pt = torch.sqrt(px * px + py * py)
-    pt_shifted = (pt + float(shift_gev)).clamp_min(0.0)
-    eps = 1e-8
-    safe = pt > eps
-    scale = torch.where(safe, pt_shifted / pt.clamp_min(eps), torch.ones_like(pt))
-    out[..., 0] = torch.where(safe, px * scale, pt_shifted)  # pt~0 -> push along +px
-    out[..., 1] = torch.where(safe, py * scale, torch.zeros_like(py))
-    return out
-
-
-def _shift_pt(x_invisible: torch.Tensor, shift_gev: float, *, cartesian: bool) -> torch.Tensor:
-    """Dispatch the pt-shift physics probe by coordinate system."""
-    if cartesian:
-        return _shift_pt_cartesian(x_invisible, shift_gev)
-    return _shift_pt_log1p(x_invisible, shift_gev)
 
 
 @torch.no_grad()
-def _pt_shift_diagnostics(
+def _feature_shift_diagnostics(
     z_truth: torch.Tensor,
-    z_shifted_by_gev: dict[float, torch.Tensor],
+    z_shifted: dict[str, torch.Tensor],
 ) -> dict[str, float]:
-    """SWD between truth latents and latents of pt-shifted neutrinos.
-
-    A *physically meaningful* perturbation (unlike the wrong-pairing shuffle): the
-    truth neutrino raw pt is shifted by a fixed number of GeV, everything else held
-    fixed. As the encoder learns event-relative structure, the latents of pt-shifted
-    neutrinos should drift away from the truth latents, so ``swd_pt_shift_{g}GeV``
-    should **rise** during training. Fixed projection ``seed`` keeps the curve
-    comparable epoch-to-epoch.
-    """
+    """SWD between truth latents and feature-shifted truth latents."""
     out: dict[str, float] = {}
-    for shift_gev, z_shift in z_shifted_by_gev.items():
+    for tag, z_shift in z_shifted.items():
         if z_shift.shape[0] != z_truth.shape[0] or z_truth.shape[0] < 1:
             continue
-        out[f"swd_pt_shift_{_pt_shift_tag(shift_gev)}"] = float(
+        out[f"swd_feature_shift_{tag}"] = float(
             sliced_wasserstein_distance(z_truth, z_shift, num_projections=128, seed=0)
         )
     return out
@@ -554,6 +601,7 @@ def _train_loop(cfg: dict[str, Any]) -> None:
     platform_info = global_config.platform
     normalization_file = global_config.options.Dataset.normalization_file
     truth_generation = global_config.options.Training.Components.TruthGeneration
+    event_info = global_config.event_info
     if not bool(getattr(truth_generation, "include", False)):
         raise ValueError(
             "[lc] latent-constraint training needs truth neutrinos in the batch: "
@@ -561,10 +609,16 @@ def _train_loop(cfg: dict[str, Any]) -> None:
         )
     cartesian = bool(getattr(truth_generation, "cartesian", False))
     invisible_key = "x_invisible_cartesian" if cartesian else "x_invisible"
-    plot_feature_names = ("px", "py", "pz") if cartesian else ("log_pt", "eta", "phi")
-    if cartesian:
-        # px, py, pz have no uniform azimuthal channel -> no inverse-CDF transform.
-        lc["phi_index"] = None
+    feature_names, feature_log_scaled, feature_uniform, resolved_nu_kin_dim, resolved_phi_index = _infer_feature_layout(
+        lc=lc,
+        event_info=event_info,
+        normalization_file=normalization_file,
+        cartesian=cartesian,
+    )
+    lc["feature_names"] = feature_names
+    lc["nu_kin_dim"] = resolved_nu_kin_dim
+    lc["phi_index"] = resolved_phi_index
+    plot_feature_names = feature_names
     if is_rank0:
         if cartesian:
             _log.info(
@@ -575,8 +629,19 @@ def _train_loop(cfg: dict[str, Any]) -> None:
         else:
             _log.info(
                 "[lc][truth-check] using TruthGeneration.include=true cartesian=false; "
-                "x_invisible is truth (log_pt, eta, phi), not model prediction.",
+                "%s is truth with feature_names=%s, not model prediction.",
+                invisible_key,
+                feature_names,
             )
+        _log.info(
+            "[lc] latent feature layout: feature_names=%s log_scaled=%s uniform=%s nu_kin_dim=%s phi_index=%s cartesian=%s",
+            feature_names,
+            feature_log_scaled,
+            feature_uniform,
+            lc["nu_kin_dim"],
+            lc["phi_index"],
+            cartesian,
+        )
     epochs = int(global_config.options.Training.epochs)
     total_events = int(cfg["total_events"])
     val_events = int(cfg.get("val_events", 0) or 0)
@@ -735,12 +800,13 @@ def _train_loop(cfg: dict[str, Any]) -> None:
             es_monitor, es_mode, es_patience, es_min_delta,
         )
 
-    # Physical pt-shift validation probe (GeV). For each shift we re-encode the
-    # truth neutrinos with raw pt += shift and log SWD(truth, shifted); it should
-    # RISE during training as the latent becomes pt-sensitive.
-    pt_shifts: list[float] = list(lc["pt_shift_diagnostics_gev"])
-    if pt_shifts and is_rank0:
-        _log.info("[lc] pt-shift validation probes (GeV): %s", pt_shifts)
+    feature_shift_pcts: list[float] = list(lc["feature_shift_diagnostics_pct"])
+    if feature_shift_pcts and is_rank0:
+        _log.info(
+            "[lc] feature-shift validation probes: feature_names=%s shifts=%s%%",
+            feature_names,
+            feature_shift_pcts,
+        )
 
     stop_training = False
     for epoch in range(start_epoch, epochs):
@@ -803,15 +869,19 @@ def _train_loop(cfg: dict[str, Any]) -> None:
         val_loss = float("nan")
         latent_rms = float("nan")
         sep: dict[str, float] = {}
-        pt_shift_metrics: dict[str, float] = {}
+        feature_shift_metrics: dict[str, float] = {}
         mass_scalars: dict[str, float] = {}
         # Extra per-model scalar metrics (rank-identical key list so all-reduce stays
         # symmetric): recon_nu_mse, recon_token_mse, res_mse/* residuals.
         extra_keys = list(core.metric_keys)
         extra_reduced = {k: float("nan") for k in extra_keys}
-        # Deterministic, rank-identical pt-shift keys (from config) so the
+        # Deterministic, rank-identical feature-shift keys (from config) so the
         # all-reduce loop below issues the SAME collectives on every rank.
-        pt_shift_keys = [f"swd_pt_shift_{_pt_shift_tag(g)}" for g in pt_shifts]
+        feature_shift_keys = [
+            f"swd_feature_shift_{_feature_shift_tag(feature_name, shift_pct)}"
+            for feature_name in feature_names
+            for shift_pct in feature_shift_pcts
+        ]
         if val_shard is not None:
             _dbg(debug, rank, world_size, f"epoch={epoch} starting validation")
             ddp_model.eval()
@@ -819,19 +889,34 @@ def _train_loop(cfg: dict[str, Any]) -> None:
             v_extra = {k: 0.0 for k in extra_keys}
             z_truth_chunks: list[torch.Tensor] = []
             z_shuf_chunks: list[torch.Tensor] = []
-            z_shift_chunks: dict[float, list[torch.Tensor]] = {g: [] for g in pt_shifts}
+            z_shift_chunks: dict[str, list[torch.Tensor]] = {
+                _feature_shift_tag(feature_name, shift_pct): []
+                for feature_name in feature_names
+                for shift_pct in feature_shift_pcts
+            }
             n_diag_batches = 0
             v_batch_idx = 0
             # Monitoring plots: truth-vs-recon histograms (every plot_every_n_epochs).
             # Gated purely on epoch (rank-identical) so the all-reduce below is symmetric.
             plot_every = lc["plot_every_n_epochs"]
             plot_on = plot_every > 0 and (epoch % plot_every) == (plot_every - 1)
-            plot_state = ReconPlotState(plot_feature_names, cartesian=cartesian) if plot_on else None
+            plot_state = ReconPlotState(
+                plot_feature_names,
+                cartesian=cartesian,
+                include_pt_overlay=(cartesian or feature_names == _DEFAULT_SPHERICAL_FEATURES),
+            ) if plot_on else None
             n_plot_batches = 0
             # Physics diagnostics (every epoch): neutrino |p| + W/top mass, truth vs
             # AE-recon vs SHUFFLED pairing. Scalars (val_mass/*_jsd_*) log every epoch;
             # figures only on plot epochs.
-            mass_state = MassDiagState(cartesian=cartesian)
+            supports_mass_diag = cartesian or feature_names == _DEFAULT_SPHERICAL_FEATURES
+            mass_state = MassDiagState(cartesian=cartesian) if supports_mass_diag else None
+            if not supports_mass_diag and is_rank0 and plot_on:
+                _log.warning(
+                    "[lc] skipping mass diagnostics for feature_names=%s; they require cartesian or %s.",
+                    feature_names,
+                    _DEFAULT_SPHERICAL_FEATURES,
+                )
             with torch.no_grad():
                 for batch_cpu in val_shard.iter_torch_batches(**val_loader_cfg):
                     batch = _batch_to_device(batch_cpu, device)
@@ -850,7 +935,7 @@ def _train_loop(cfg: dict[str, Any]) -> None:
                     val_step += 1
                     if wandb_run is not None and is_rank0:
                         wandb_run.log({"val/step": val_step, "val/loss_step": vloss_f})
-                    # Latent-separation + pt-shift diagnostics on the first few val batches.
+                    # Latent-separation + feature-shift diagnostics on the first few val batches.
                     if n_diag_batches < swd_diag_max_batches and bs >= 4:
                         z_t = core.encode_latent(batch, detach_neutrinos=True)
                         shuf = {k: v for k, v in batch.items()}
@@ -859,13 +944,19 @@ def _train_loop(cfg: dict[str, Any]) -> None:
                         z_s = core.encode_latent(shuf, detach_neutrinos=True)
                         z_truth_chunks.append(z_t)
                         z_shuf_chunks.append(z_s)
-                        # Physical perturbation: shift raw pt by a fixed GeV, re-encode.
-                        for shift_gev in pt_shifts:
-                            shifted = {k: v for k, v in batch.items()}
-                            shifted[invisible_key] = _shift_pt(batch[invisible_key], shift_gev, cartesian=cartesian)
-                            z_shift_chunks[shift_gev].append(
-                                core.encode_latent(shifted, detach_neutrinos=True)
-                            )
+                        for feature_index, feature_name in enumerate(feature_names):
+                            for shift_pct in feature_shift_pcts:
+                                shifted = {k: v for k, v in batch.items()}
+                                shifted[invisible_key] = _shift_feature_percent(
+                                    batch[invisible_key],
+                                    feature_index=feature_index,
+                                    shift_pct=shift_pct,
+                                    log_scaled=feature_log_scaled[feature_index],
+                                    periodic=feature_uniform[feature_index],
+                                )
+                                z_shift_chunks[_feature_shift_tag(feature_name, shift_pct)].append(
+                                    core.encode_latent(shifted, detach_neutrinos=True)
+                                )
                         # Physics diagnostics on the same batches (reuses the shuffle
                         # perm above so "shuffled" = same wrong nu<->event pairing the
                         # latent SWD is supposed to flag).
@@ -900,13 +991,13 @@ def _train_loop(cfg: dict[str, Any]) -> None:
                 local_rms = float(z_truth.pow(2).mean().sqrt().cpu())
                 local_sep = _latent_separation_diagnostics(z_truth, z_shuf)
                 z_shift_cat = {
-                    g: torch.cat(chunks, dim=0)
-                    for g, chunks in z_shift_chunks.items() if chunks
+                    tag: torch.cat(chunks, dim=0)
+                    for tag, chunks in z_shift_chunks.items() if chunks
                 }
-                local_pt_shift = _pt_shift_diagnostics(z_truth, z_shift_cat)
+                local_feature_shift = _feature_shift_diagnostics(z_truth, z_shift_cat)
                 w = float(z_truth.shape[0])
             else:
-                local_rms, local_sep, local_pt_shift, w = 0.0, {}, {}, 0.0
+                local_rms, local_sep, local_feature_shift, w = 0.0, {}, {}, 0.0
 
             _dbg(debug, rank, world_size, f"epoch={epoch} reducing latent_rms + sep diagnostics")
             latent_rms = _all_reduce_mean(local_rms, w, device, world_size)
@@ -915,12 +1006,12 @@ def _train_loop(cfg: dict[str, Any]) -> None:
                 k: _all_reduce_mean(local_sep.get(k, 0.0), w_sep, device, world_size)
                 for k in ("swd_null", "swd_shuffled", "swd_separation")
             }
-            # Iterate the rank-identical key list (not local_pt_shift.keys()) so the
+            # Iterate the rank-identical key list (not local_feature_shift.keys()) so the
             # collective count matches across ranks even when a rank has no data.
-            w_pt = w if local_pt_shift else 0.0
-            pt_shift_metrics = {
-                k: _all_reduce_mean(local_pt_shift.get(k, 0.0), w_pt, device, world_size)
-                for k in pt_shift_keys
+            w_pt = w if local_feature_shift else 0.0
+            feature_shift_metrics = {
+                k: _all_reduce_mean(local_feature_shift.get(k, 0.0), w_pt, device, world_size)
+                for k in feature_shift_keys
             }
             _dbg(debug, rank, world_size, f"epoch={epoch} validation collectives done")
 
@@ -979,7 +1070,7 @@ def _train_loop(cfg: dict[str, Any]) -> None:
             "train/lr": lr_now,
             **{_route_extra_metric_key(k): v for k, v in extra_reduced.items()},
             **{f"val/{k}": v for k, v in sep.items()},
-            **{f"val/{k}": v for k, v in pt_shift_metrics.items()},
+            **{f"val/{k}": v for k, v in feature_shift_metrics.items()},
             **{f"val_mass/{k}": v for k, v in mass_scalars.items()},
         }
         _dbg(debug, rank, world_size, f"epoch={epoch} ray.train.report")
@@ -991,8 +1082,8 @@ def _train_loop(cfg: dict[str, Any]) -> None:
                 epoch, global_step, val_step, train_loss, val_loss,
                 sep.get("swd_separation", float("nan")),
                 "".join(
-                    f" {k.replace('swd_pt_shift_', 'pt+')}={v:.4f}"
-                    for k, v in pt_shift_metrics.items()
+                    f" {k.replace('swd_feature_shift_', 'shift:')}={v:.4f}"
+                    for k, v in feature_shift_metrics.items()
                 ),
             )
             if wandb_run is not None:
@@ -1013,7 +1104,7 @@ def _train_loop(cfg: dict[str, Any]) -> None:
                         "val/latent_rms": latent_rms,
                         **{_route_extra_metric_key(k): v for k, v in extra_reduced.items()},
                         **{f"val/{k}": v for k, v in sep.items()},
-                        **{f"val/{k}": v for k, v in pt_shift_metrics.items()},
+                        **{f"val/{k}": v for k, v in feature_shift_metrics.items()},
                         **{f"val_mass/{k}": v for k, v in mass_scalars.items()},
                     }
                 )

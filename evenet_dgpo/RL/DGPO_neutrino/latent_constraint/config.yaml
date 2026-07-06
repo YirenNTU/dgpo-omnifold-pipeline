@@ -113,8 +113,12 @@ latent_constraint:
     token_dim: 256            # event_token / object_token dim (EveNet ObjectEncoder hidden_dim)
     token_stats_batches: 16   # batches for the one-time event/object token mean/std pass
 
-    nu_kin_dim: 3        # neutrino kinematics per slot: spherical (log_pt, eta, phi) | cartesian (px, py, pz)
-    phi_index: 2         # inv-CDF Gaussianize phi (EveNet normalize_uniform); forced null when cartesian: true.
+    # Optional explicit neutrino feature layout. If omitted, training infers the
+    # dimension from normalization.pt and chooses a matching feature_names layout.
+    # Example Ztautau layout: [theta, phi]
+    feature_names: []
+    nu_kin_dim: 0        # optional override; 0 means "infer from normalization.pt"
+    phi_index: null      # optional override; defaults to the index of "phi" in feature_names, if present
     d_model: 256         # transformer width (defaults to token_dim when left at 64)
     latent_dim: 32       # bottleneck z dimension -> the SWD space
     num_layers: 3        # self-attention layers
@@ -135,11 +139,11 @@ latent_constraint:
       patience: 50        # stop after this many epochs without improvement on ``monitor``
       min_delta: 1.0e-6   # minimum change to count as improvement
       monitor: val_loss     # val_loss (lower is better) | swd_separation (higher is better)
-    # Physical pt-shift validation probe: for each value the truth neutrinos are
-    # re-encoded with raw pt shifted by N GeV, and SWD(truth, shifted) is logged to
-    # W&B as val/swd_pt_shift_{N}GeV. A useful latent makes these RISE during training
-    # (it reacts to a real kinematic shift). Set to [] to disable.
-    pt_shift_diagnostics_gev: [5.0, 10.0]
+    # Generic feature-shift validation probe: for each invisible feature and each
+    # percentage below, re-encode truth after applying a raw-space multiplicative
+    # shift. For log_* features the shift happens before log1p is re-applied.
+    # Logged as val/swd_feature_shift_<feature>_<pct>pct. Set to [] to disable.
+    feature_shift_diagnostics_pct: [5.0, 10.0]
     # Monitoring plots logged to W&B as images (truth-vs-reconstruction histograms +
     # pred-vs-truth 2D + latent-z), in the same "generation-invisible/*" panel the
     # main EveNet model uses. Gated to every N epochs (0 disables); only the first

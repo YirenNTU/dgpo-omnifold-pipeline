@@ -70,9 +70,10 @@ class ReconPlotState:
     ranks with a single rank-symmetric all-reduce per buffer.
     """
 
-    def __init__(self, feature_names: Sequence[str], *, cartesian: bool) -> None:
+    def __init__(self, feature_names: Sequence[str], *, cartesian: bool, include_pt_overlay: bool = True) -> None:
         self.feature_names = list(feature_names)
         self.cartesian = bool(cartesian)
+        self.include_pt_overlay = bool(include_pt_overlay)
         self.bins = {n: _feature_bins(n, cartesian) for n in self.feature_names}
         nslot = len(_SLOT_NAMES)
         nfeat = len(self.feature_names)
@@ -81,8 +82,8 @@ class ReconPlotState:
         self.truth_1d = {n: np.zeros((nslot, nb)) for n in self.feature_names}
         self.pred_1d = {n: np.zeros((nslot, nb)) for n in self.feature_names}
         self.hist2d = {n: np.zeros((nslot, nb, nb)) for n in self.feature_names}
-        self.pt_truth = np.zeros((nslot, len(_PT_BINS) - 1))
-        self.pt_pred = np.zeros((nslot, len(_PT_BINS) - 1))
+        self.pt_truth = np.zeros((nslot, len(_PT_BINS) - 1)) if self.include_pt_overlay else None
+        self.pt_pred = np.zeros((nslot, len(_PT_BINS) - 1)) if self.include_pt_overlay else None
         self.z_hist = np.zeros(len(_Z_BINS) - 1)
 
     @torch.no_grad()
@@ -108,8 +109,9 @@ class ReconPlotState:
                 self.hist2d[name][s] += np.histogram2d(
                     ps[:, fi], ts[:, fi], bins=[edges, edges]
                 )[0]
-            self.pt_truth[s] += np.histogram(_pt_from_features(ts, self.cartesian), bins=_PT_BINS)[0]
-            self.pt_pred[s] += np.histogram(_pt_from_features(ps, self.cartesian), bins=_PT_BINS)[0]
+            if self.include_pt_overlay:
+                self.pt_truth[s] += np.histogram(_pt_from_features(ts, self.cartesian), bins=_PT_BINS)[0]
+                self.pt_pred[s] += np.histogram(_pt_from_features(ps, self.cartesian), bins=_PT_BINS)[0]
         self.z_hist += np.histogram(z.detach().float().cpu().numpy().reshape(-1), bins=_Z_BINS)[0]
 
     def all_reduce(self, device: torch.device, world_size: int) -> None:
@@ -120,8 +122,9 @@ class ReconPlotState:
         for d in (self.truth_1d, self.pred_1d):
             buffers += [d[n][s] for n in self.feature_names for s in range(len(_SLOT_NAMES))]
         buffers += [self.hist2d[n][s] for n in self.feature_names for s in range(len(_SLOT_NAMES))]
-        buffers += [self.pt_truth[s] for s in range(len(_SLOT_NAMES))]
-        buffers += [self.pt_pred[s] for s in range(len(_SLOT_NAMES))]
+        if self.include_pt_overlay:
+            buffers += [self.pt_truth[s] for s in range(len(_SLOT_NAMES))]
+            buffers += [self.pt_pred[s] for s in range(len(_SLOT_NAMES))]
         buffers.append(self.z_hist)
         for arr in buffers:
             t = torch.as_tensor(arr, device=device, dtype=torch.float64)
@@ -180,10 +183,11 @@ class ReconPlotState:
                 if np.sum(self.hist2d[name][s]) > 0:
                     figs[f"neutrino-2D_{name}_{slot}"] = self._hist2d(
                         self.hist2d[name][s], edges, f"2D {name} - {slot}")
-        fig_pt, jsd_pt = self._overlay_1d(self.pt_truth, self.pt_pred, _PT_BINS, "pT [GeV]")
-        figs["neutrino-pt-1d"] = fig_pt
-        for slot, score in jsd_pt.items():
-            jsd_results[f"neutrino-pt-{slot}"] = score
+        if self.include_pt_overlay:
+            fig_pt, jsd_pt = self._overlay_1d(self.pt_truth, self.pt_pred, _PT_BINS, "pT [GeV]")
+            figs["neutrino-pt-1d"] = fig_pt
+            for slot, score in jsd_pt.items():
+                jsd_results[f"neutrino-pt-{slot}"] = score
         # latent z distribution (single series)
         zc = 0.5 * (_Z_BINS[:-1] + _Z_BINS[1:])
         zw = np.diff(_Z_BINS)
