@@ -287,7 +287,10 @@ class ObjectTokenBottleneckAutoencoder(nn.Module):
     def _normalize_neutrinos(self, nu_kin: Tensor) -> Tensor:
         """Differentiable mirror of ``Normalizer.forward`` (matches DGPO/EveNet)."""
         inv = self.invisible_normalizer
-        out = (nu_kin - inv.mean) / inv.std
+        dtype = self.nu_embed[0].weight.dtype
+        mean = inv.mean.to(device=nu_kin.device, dtype=dtype)
+        std = inv.std.to(device=nu_kin.device, dtype=dtype)
+        out = (nu_kin.to(dtype=dtype) - mean) / std
         if len(inv.inv_cdf_index) > 0:
             idx = torch.as_tensor(inv.inv_cdf_index, device=nu_kin.device, dtype=torch.long)
             partial = out.index_select(-1, idx)
@@ -298,13 +301,16 @@ class ObjectTokenBottleneckAutoencoder(nn.Module):
 
     def denormalize_neutrinos(self, nu_norm: Tensor) -> Tensor:
         inv = self.invisible_normalizer
-        out = nu_norm
+        dtype = self.nu_embed[0].weight.dtype
+        mean = inv.mean.to(device=nu_norm.device, dtype=dtype)
+        std = inv.std.to(device=nu_norm.device, dtype=dtype)
+        out = nu_norm.to(dtype=dtype)
         if len(inv.inv_cdf_index) > 0:
             idx = torch.as_tensor(inv.inv_cdf_index, device=nu_norm.device, dtype=torch.long)
             partial = inv.normal.cdf(out.index_select(-1, idx))
             partial = partial * (2 * math.sqrt(3)) - math.sqrt(3)
             out = out.index_copy(-1, idx, partial.to(out.dtype))
-        return out * inv.std + inv.mean
+        return out * std + mean
 
     # ------------------------------------------------------------------ encode / decode
     def encode_latent(
@@ -320,7 +326,7 @@ class ObjectTokenBottleneckAutoencoder(nn.Module):
         obj = self.object_token_from_batch(batch)               # (B, P, D)
         num_obj = int(obj.shape[1])
         obj_valid = self.object_mask_from_batch(batch, num_obj)  # (B, P) bool
-        nu_kin = self.neutrino_kin_from_batch(batch)
+        nu_kin = self.neutrino_kin_from_batch(batch).to(dtype=self.nu_embed[0].weight.dtype)
         if detach_neutrinos:
             nu_kin = nu_kin.detach()
         bsz = nu_kin.shape[0]
