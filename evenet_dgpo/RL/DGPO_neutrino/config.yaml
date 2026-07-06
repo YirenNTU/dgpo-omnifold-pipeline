@@ -186,10 +186,10 @@ resonance:
   # overwrites
   # ...
 wandb:
-  project: "nu2flow-RL"
+  project: "Ztautau-RL"
   entity: "ytchou97-university-of-washington"
-  name: "nu2flow-RL-DGPO-evetoken"
-  run_name: "nu2flow-RL-DGPO-evetoken"
+  name: "Ztautau-RL-DGPO-evetoken"
+  run_name: "Ztautau-RL-DGPO-evetoken"
   # Set id to the original W&B run id (8-char hex) to append to the same run; null starts a new run.
   id: null
   resume: allow

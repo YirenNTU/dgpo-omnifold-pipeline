@@ -85,7 +85,7 @@ logger:
 #   val/swd_separation           -> swd_shuffled / swd_null (constraint headroom; >1 is good)
 #   train/lr                     -> warmup/cosine schedule sanity
 wandb:
-  project: "nu2flow-RL"
+  project: "ztautau-RL"
   entity: "ytchou97-university-of-washington"
   run_name: "latent-constraint-object-token-ae"
   id: null
