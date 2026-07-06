@@ -925,3 +925,24 @@ class EveNetModel(nn.Module):
 
         else:
             raise ValueError(f"Unsupported freeze type: {freeze_type}")
+
+
+def build_evenet_model_from_training_config(
+    config: DotDict,
+    normalization_dict: dict,
+    device,
+) -> EveNetModel:
+    """Backward-compatible builder used by the local DGPO utilities."""
+    components = config.options.Training.Components
+    return EveNetModel(
+        config=config,
+        device=device,
+        classification=components.Classification.include,
+        regression=components.Regression.include,
+        global_generation=components.GlobalGeneration.include,
+        point_cloud_generation=components.ReconGeneration.include,
+        neutrino_generation=components.TruthGeneration.include,
+        assignment=components.Assignment.include,
+        segmentation=components.Segmentation.include,
+        normalization_dict=normalization_dict,
+    )
