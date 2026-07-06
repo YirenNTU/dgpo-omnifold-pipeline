@@ -35,6 +35,8 @@ ztautau_domain:
 
 dgpo:
   validation_compute_winrate: false
+  rollout_parallel_chains: 2
+  validation_rollout_parallel_chains: 4
   validation_log_batches: true
   diagnostic_plot_every: 5
   diagnostic_plot_names:
