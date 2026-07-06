@@ -46,6 +46,7 @@ class Normalizer(nn.Module):
         """
         # Apply the log mask to the input tensor
         # x = torch.where(self.log_mask_expanded, torch.log1p(x), x)  # log1p(x) = log(1 + x) to avoid log(0) issues # TODO
+        x = x.to(dtype=self.mean.dtype)
         x = (x - self.mean) / self.std
         if mask is not None:
             x = x * mask
@@ -80,6 +81,8 @@ class Normalizer(nn.Module):
         else:
             current_mean = self.mean
             current_std = self.std
+
+        x = x.to(dtype=current_mean.dtype)
 
         if len(self.inv_cdf_index) > 0:
             if index is not None:
