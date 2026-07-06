@@ -15,6 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+from tqdm.auto import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EVENET_DGPO_ROOT = REPO_ROOT / "evenet_dgpo"
@@ -123,15 +124,28 @@ def augment_file(
     output_path: Path,
     shape_metadata: dict[str, list[int]],
     batch_size: int,
+    progress_desc: str | None = None,
 ) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
     parquet = pq.ParquetFile(input_path)
     writer: pq.ParquetWriter | None = None
     total_rows = 0
     event_token_shape: tuple[int, ...] | None = None
     object_token_shape: tuple[int, ...] | None = None
+    total_batches = parquet.metadata.num_rows // batch_size
+    if parquet.metadata.num_rows % batch_size:
+        total_batches += 1
 
     with torch.no_grad():
-        for record_batch in parquet.iter_batches(batch_size=batch_size):
+        batch_iterator = parquet.iter_batches(batch_size=batch_size)
+        if progress_desc is not None:
+            batch_iterator = tqdm(
+                batch_iterator,
+                total=total_batches,
+                desc=progress_desc,
+                leave=False,
+                dynamic_ncols=True,
+            )
+        for record_batch in batch_iterator:
             flat_batch = load_flat_batch(record_batch)
             batch_np = unflatten_dict(flat_batch, shape_metadata, drop_column_prefix=None)
             batch_torch = to_torch_batch(batch_np, device=device)
@@ -189,6 +203,9 @@ def augment_files_on_device(
     model = bundle.model.eval()
     results: list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
     for input_path, output_path in zip(input_paths, output_paths, strict=True):
+        progress_desc = None
+        if len(input_paths) == 1:
+            progress_desc = f"{Path(input_path).parent.name}/{Path(input_path).name} [{device_name}]"
         results.append(
             augment_file(
                 model=model,
@@ -197,6 +214,7 @@ def augment_files_on_device(
                 output_path=Path(output_path),
                 shape_metadata=shape_metadata,
                 batch_size=batch_size,
+                progress_desc=progress_desc,
             )
         )
     return results
@@ -283,7 +301,14 @@ def augment_split(
                 )
 
             results = []
-            for future in futures:
+            progress = tqdm(
+                futures,
+                total=len(futures),
+                desc=f"augment {input_dir.name}",
+                leave=True,
+                dynamic_ncols=True,
+            )
+            for future in progress:
                 results.extend(future.result())
 
     for _, file_event_shape, file_object_shape in results:
@@ -345,7 +370,9 @@ def main() -> None:
         flush=True,
     )
 
-    for split in args.splits:
+    split_iterator = tqdm(args.splits, desc="AD token export", leave=True, dynamic_ncols=True)
+    for split in split_iterator:
+        split_iterator.set_postfix_str(split)
         augment_split(
             config_path=config_path,
             checkpoint_path=checkpoint,
