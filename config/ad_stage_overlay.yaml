@@ -1,0 +1,14 @@
+options:
+  Training:
+    # Stage 1: supervised AD/foundation-style training.
+    # Keep model_checkpoint_load_path null unless you explicitly want Lightning resume.
+    model_checkpoint_load_path: null
+    pretrain_model_load_path: /path/to/ad_pretrain_checkpoint.ckpt
+    model_checkpoint_save_path: /path/to/output/ad_stage/checkpoints
+
+logger:
+  wandb:
+    run_name: EveNet-AD-Stage
+  local:
+    name: EveNet-AD-Stage
+

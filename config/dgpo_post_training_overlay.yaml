@@ -1,0 +1,42 @@
+options:
+  Training:
+    # Stage 2: DGPO post-training.
+    # Point model_checkpoint_load_path at a supervised diffusion checkpoint for
+    # DGPO cold start, or at a DGPO last.ckpt for full DGPO resume.
+    model_checkpoint_load_path: /path/to/post_training_init_checkpoint.ckpt
+    pretrain_model_load_path: null
+    model_checkpoint_save_path: /path/to/output/dgpo_post_training/checkpoints
+
+logger:
+  wandb:
+    run_name: EveNet-DGPO-PostTraining
+  local:
+    name: EveNet-DGPO-PostTraining
+
+rl:
+  enabled: true
+
+reward_config:
+  weight: 1.0
+  feature_names: [theta, phi]
+  component_normalized:
+    eps: 1.0e-8
+
+ztautau_domain:
+  enabled: true
+  feature_names: [theta, phi]
+  token_sources:
+    event_token: evenet_token
+    object_token: object_token
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1.0
+    target_delta_phi_to_pi: 0.0
+
+dgpo:
+  validation_compute_winrate: false
+  validation_log_batches: true
+  diagnostic_plot_every: 5
+  diagnostic_plot_names:
+    - ztautau_back_to_back
+

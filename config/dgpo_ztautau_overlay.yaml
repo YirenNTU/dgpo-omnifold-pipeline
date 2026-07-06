@@ -1,0 +1,26 @@
+rl:
+  enabled: true
+
+reward_config:
+  weight: 1.0
+  feature_names: [theta, phi]
+  component_normalized:
+    eps: 1.0e-8
+
+ztautau_domain:
+  enabled: true
+  feature_names: [theta, phi]
+  token_sources:
+    event_token: evenet_token
+    object_token: object_token
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1.0
+    target_delta_phi_to_pi: 0.0
+
+dgpo:
+  validation_compute_winrate: false
+  validation_log_batches: true
+  diagnostic_plot_every: 5
+  diagnostic_plot_names:
+    - ztautau_back_to_back

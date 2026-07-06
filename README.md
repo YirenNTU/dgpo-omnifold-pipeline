@@ -133,7 +133,9 @@ the recorded commits for reproducibility.
 | `ml_pipeline/config/train_*_cls.yaml` | Classification training configurations. |
 | `ml_pipeline/config/train_pretrain.yaml` | Pretrained diffusion/generation configuration. |
 | `ml_pipeline/config/train_scratch.yaml` | Scratch diffusion/generation configuration. |
+| `ml_pipeline/config/ad_stage_overlay.yaml` | Stage-specific overlay for supervised AD/foundation training with its own checkpoint lineage. |
 | `ml_pipeline/config/dgpo_ztautau_overlay.yaml` | Ztautau-specific overlay that enables the DGPO backend. |
+| `ml_pipeline/config/dgpo_post_training_overlay.yaml` | Stage-specific overlay for DGPO post-training with its own checkpoint lineage. |
 | `ml_pipeline/build_evenet_input_from_parquet.py` | Convert central selected parquets into EveNet input shards. |
 | `ml_pipeline/generate_event_info_yaml.py` | Generate the EveNet event schema and JSON summary. |
 | `ml_pipeline/preprocess_evenet_parquet.py` | Create training splits and normalization metadata. |
@@ -390,7 +392,8 @@ Launch the original foundation trainer through the shared wrapper:
 ```bash
 python3 ml_pipeline/scripts/train_neutrino_backend.py \
   --backend pure-evenet \
-  --base-config ml_pipeline/config/train_pretrain.yaml
+  --base-config ml_pipeline/config/train_pretrain.yaml \
+  --overlay-config ml_pipeline/config/ad_stage_overlay.yaml
 ```
 
 Launch DGPO fine-tuning from the same base config:
@@ -398,7 +401,8 @@ Launch DGPO fine-tuning from the same base config:
 ```bash
 python3 ml_pipeline/scripts/train_neutrino_backend.py \
   --backend dgpo-evenet \
-  --base-config ml_pipeline/config/train_pretrain.yaml
+  --base-config ml_pipeline/config/train_pretrain.yaml \
+  --overlay-config ml_pipeline/config/dgpo_post_training_overlay.yaml
 ```
 
 Pass extra trainer arguments after `--`, for example:
@@ -414,6 +418,16 @@ The launcher writes a temporary merged runtime YAML, sets `PYTHONPATH` so the
 vendored `evenet_dgpo` package is importable, and then dispatches to either
 `evenet_dgpo/evenet/train.py` or
 `evenet_dgpo/RL/DGPO_neutrino/dgpo_trainer.py`.
+
+Recommended stage split:
+
+- `config/ad_stage_overlay.yaml`: use a dedicated `pretrain_model_load_path`
+  and output directory for the supervised AD/foundation stage.
+- `config/dgpo_post_training_overlay.yaml`: use a dedicated
+  `model_checkpoint_load_path` and output directory for DGPO post-training.
+- `config/dgpo_ztautau_overlay.yaml`: keep as the minimal domain/RL overlay
+  when you only want to switch the base config into DGPO mode without defining
+  a separate stage lineage.
 
 ### 5. Run EveNet Prediction
 
