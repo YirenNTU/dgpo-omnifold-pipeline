@@ -253,45 +253,53 @@ def run_ad_stage(
     token_batch_size: int,
     token_workers: int | None,
     token_devices: str | None,
+    skip_export: bool = False,
 ) -> tuple[Path, Path]:
     ad_config_dict = merged_config(ad_base_config, ad_overlay_config)
-    ad_runtime_config = build_ad_runtime_config(
-        base_config=ad_base_config,
-        overlay_config=ad_overlay_config,
-    )
-    resolved_ad_checkpoint = resolve_ad_checkpoint(
-        ad_config=ad_config_dict,
-        ad_checkpoint=ad_checkpoint,
-    )
     input_root = ensure_split_root(ad_config_dict)
     augmented_root = stage_root / augmented_dirname
 
-    command = [
-        sys.executable,
-        str(REPO_ROOT / "scripts" / "augment_event_tokens.py"),
-        "--train-config",
-        str(ad_runtime_config),
-        "--checkpoint",
-        str(resolved_ad_checkpoint),
-        "--input-dir",
-        str(input_root),
-        "--output-dir",
-        str(augmented_root),
-        "--splits",
-        "train",
-        "val",
-        "--batch-size",
-        str(token_batch_size),
-        "--use-gpu" if ad_config_dict["platform"].get("use_gpu", True) else "--no-use-gpu",
-        "--devices",
-        token_devices if token_devices is not None else "auto",
-    ]
-    if token_workers is not None:
-        command.extend([
-            "--num-workers",
-            str(token_workers),
-        ])
-    run_command(command)
+    if skip_export:
+        if not (augmented_root / "train").is_dir() or not (augmented_root / "val").is_dir():
+            raise FileNotFoundError(
+                f"--skip-export was set, but augmented AD parquet was not found under {augmented_root}. "
+                "Expected precomputed train/ and val/ folders."
+            )
+    else:
+        ad_runtime_config = build_ad_runtime_config(
+            base_config=ad_base_config,
+            overlay_config=ad_overlay_config,
+        )
+        resolved_ad_checkpoint = resolve_ad_checkpoint(
+            ad_config=ad_config_dict,
+            ad_checkpoint=ad_checkpoint,
+        )
+        command = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "augment_event_tokens.py"),
+            "--train-config",
+            str(ad_runtime_config),
+            "--checkpoint",
+            str(resolved_ad_checkpoint),
+            "--input-dir",
+            str(input_root),
+            "--output-dir",
+            str(augmented_root),
+            "--splits",
+            "train",
+            "val",
+            "--batch-size",
+            str(token_batch_size),
+            "--use-gpu" if ad_config_dict["platform"].get("use_gpu", True) else "--no-use-gpu",
+            "--devices",
+            token_devices if token_devices is not None else "auto",
+        ]
+        if token_workers is not None:
+            command.extend([
+                "--num-workers",
+                str(token_workers),
+            ])
+        run_command(command)
 
     if latent_checkpoint is None:
         latent_runtime = build_latent_runtime_config(
@@ -363,6 +371,11 @@ def main() -> None:
     parser.add_argument("--ad-checkpoint", type=Path, default=None, help="Existing frozen backbone checkpoint for token export.")
     parser.add_argument("--latent-checkpoint", type=Path, default=None, help="Existing latent constraint checkpoint.")
     parser.add_argument(
+        "--skip-export",
+        action="store_true",
+        help="Skip frozen token export and train AD directly from the existing augmented parquet under <stage-root>/<augmented-dirname>.",
+    )
+    parser.add_argument(
         "--dgpo-init-checkpoint",
         type=Path,
         default=None,
@@ -411,6 +424,7 @@ def main() -> None:
             token_batch_size=args.token_batch_size,
             token_workers=args.token_workers,
             token_devices=args.token_devices,
+            skip_export=args.skip_export,
         )
     else:
         augmented_root = stage_root / args.augmented_dirname

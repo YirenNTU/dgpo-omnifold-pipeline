@@ -9,7 +9,7 @@ from run_ad_dgpo_pipeline import AD_TEMPLATE, REPO_ROOT, run_ad_stage
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Stage 1 (AD): export frozen EveNet tokens and train the latent constraint autoencoder."
+        description="Stage 1 (AD): export frozen EveNet tokens and train the latent constraint autoencoder, or skip export and train directly from existing augmented parquet."
     )
     parser.add_argument("--stage-root", type=Path, required=True, help="Shared output directory for the two-stage pipeline.")
     parser.add_argument("--ad-base-config", type=Path, default=REPO_ROOT / "config" / "train_pretrain_cls.yaml")
@@ -30,6 +30,11 @@ def main() -> None:
     parser.add_argument("--token-batch-size", type=int, default=1024)
     parser.add_argument("--token-workers", type=int, default=None, help="Parallel workers for token export. Defaults to one worker per selected device.")
     parser.add_argument("--token-devices", default=None, help="Comma-separated GPU device list for token export, or 'auto'.")
+    parser.add_argument(
+        "--skip-export",
+        action="store_true",
+        help="Skip frozen token export and train AD directly from the existing augmented parquet under <stage-root>/<augmented-dirname>.",
+    )
     args = parser.parse_args()
 
     run_ad_stage(
@@ -42,6 +47,7 @@ def main() -> None:
         token_batch_size=args.token_batch_size,
         token_workers=args.token_workers,
         token_devices=args.token_devices,
+        skip_export=args.skip_export,
     )
 
 
