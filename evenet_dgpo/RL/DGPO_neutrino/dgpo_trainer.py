@@ -762,6 +762,45 @@ def _profile_axis_labels(profile_name: str) -> tuple[str, str, str]:
     return f"Truth {display}", f"Mean delta {display}", display
 
 
+def _invisible_feature_names() -> tuple[str, ...]:
+    """Invisible feature names from ``event_info.yaml`` (fallback: reward_config)."""
+    event_info = getattr(global_config, "event_info", None)
+    raw = getattr(event_info, "invisible_feature_names", None)
+    if raw:
+        return tuple(str(name) for name in raw)
+    reward_names = _reward_feature_names()
+    return tuple(reward_names) if reward_names is not None else ()
+
+
+def _invisible_periodic_feature_indices() -> tuple[int, ...]:
+    """Periodic invisible-feature indices from ``event_info.yaml`` uniform/inv-CDF metadata."""
+    event_info = getattr(global_config, "event_info", None)
+    raw = getattr(event_info, "invisible_inv_cdf_index", None)
+    if raw is None:
+        return ()
+    return tuple(int(index) for index in raw)
+
+
+def _supports_legacy_invisible_kinematics(*, cartesian: bool, feature_dim: int | None = None) -> bool:
+    """Whether legacy ``(log_pt, eta, phi)`` / Cartesian diagnostics are valid."""
+    if cartesian:
+        return feature_dim is None or int(feature_dim) >= 3
+    feature_names = _invisible_feature_names()
+    if len(feature_names) < 3:
+        return False
+    if tuple(feature_names[:3]) != ("log_pt", "eta", "phi"):
+        return False
+    return feature_dim is None or int(feature_dim) >= 3
+
+
+def _validation_profile_feature_names(*, cartesian: bool) -> tuple[str, ...]:
+    """Validation residual-profile features derived from ``event_info.yaml``."""
+    if _supports_legacy_invisible_kinematics(cartesian=cartesian):
+        return ("pt", "eta")
+    feature_names = _invisible_feature_names()
+    return feature_names if feature_names else ("feature_0",)
+
+
 def _delta_selection_profiles_figure(
     truth_all: np.ndarray,
     delta_all: np.ndarray,
@@ -3378,31 +3417,35 @@ def train_step(
     out.update(nonfinite_diag)
 
     cartesian = _truth_generation_cartesian()
-    k_sel = _kin_hist_candidate_indices_per_event(
-        rewards, candidates_phys, batch, cartesian=cartesian
-    )
-    ppt, peta, pphi, tpt, teta, tphi = _val_pred_truth_kin_flat(
-        candidates_phys, batch, k_sel, cartesian=cartesian, device=device
-    )
-    k1_sel = torch.zeros(B, device=device, dtype=torch.long)
-    k1_pt, k1_eta, k1_phi, k1_tpt, k1_teta, k1_tphi = _val_pred_truth_kin_flat(
-        candidates_phys, batch, k1_sel, cartesian=cartesian, device=device
-    )
-    _td_pt_edges = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
-    _td_eta_edges = np.linspace(-4.0, 4.0, _VAL_KIN_NUM_BINS + 1)
-    _td_phi_edges = np.linspace(-3.2, 3.2, _VAL_KIN_NUM_BINS + 1)
-    out["_kin_h_pt_p"] = np.histogram(ppt, bins=_td_pt_edges)[0].astype(np.float64)
-    out["_kin_h_pt_t"] = np.histogram(tpt, bins=_td_pt_edges)[0].astype(np.float64)
-    out["_kin_h_e_p"] = np.histogram(peta, bins=_td_eta_edges)[0].astype(np.float64)
-    out["_kin_h_e_t"] = np.histogram(teta, bins=_td_eta_edges)[0].astype(np.float64)
-    out["_kin_h_p_p"] = np.histogram(pphi, bins=_td_phi_edges)[0].astype(np.float64)
-    out["_kin_h_p_t"] = np.histogram(tphi, bins=_td_phi_edges)[0].astype(np.float64)
-    out["_kin_h_pt_k1_p"] = np.histogram(k1_pt, bins=_td_pt_edges)[0].astype(np.float64)
-    out["_kin_h_pt_k1_t"] = np.histogram(k1_tpt, bins=_td_pt_edges)[0].astype(np.float64)
-    out["_kin_h_e_k1_p"] = np.histogram(k1_eta, bins=_td_eta_edges)[0].astype(np.float64)
-    out["_kin_h_e_k1_t"] = np.histogram(k1_teta, bins=_td_eta_edges)[0].astype(np.float64)
-    out["_kin_h_p_k1_p"] = np.histogram(k1_phi, bins=_td_phi_edges)[0].astype(np.float64)
-    out["_kin_h_p_k1_t"] = np.histogram(k1_tphi, bins=_td_phi_edges)[0].astype(np.float64)
+    if _supports_legacy_invisible_kinematics(
+        cartesian=cartesian,
+        feature_dim=int(batch["x_invisible"].shape[-1]),
+    ):
+        k_sel = _kin_hist_candidate_indices_per_event(
+            rewards, candidates_phys, batch, cartesian=cartesian
+        )
+        ppt, peta, pphi, tpt, teta, tphi = _val_pred_truth_kin_flat(
+            candidates_phys, batch, k_sel, cartesian=cartesian, device=device
+        )
+        k1_sel = torch.zeros(B, device=device, dtype=torch.long)
+        k1_pt, k1_eta, k1_phi, k1_tpt, k1_teta, k1_tphi = _val_pred_truth_kin_flat(
+            candidates_phys, batch, k1_sel, cartesian=cartesian, device=device
+        )
+        _td_pt_edges = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
+        _td_eta_edges = np.linspace(-4.0, 4.0, _VAL_KIN_NUM_BINS + 1)
+        _td_phi_edges = np.linspace(-3.2, 3.2, _VAL_KIN_NUM_BINS + 1)
+        out["_kin_h_pt_p"] = np.histogram(ppt, bins=_td_pt_edges)[0].astype(np.float64)
+        out["_kin_h_pt_t"] = np.histogram(tpt, bins=_td_pt_edges)[0].astype(np.float64)
+        out["_kin_h_e_p"] = np.histogram(peta, bins=_td_eta_edges)[0].astype(np.float64)
+        out["_kin_h_e_t"] = np.histogram(teta, bins=_td_eta_edges)[0].astype(np.float64)
+        out["_kin_h_p_p"] = np.histogram(pphi, bins=_td_phi_edges)[0].astype(np.float64)
+        out["_kin_h_p_t"] = np.histogram(tphi, bins=_td_phi_edges)[0].astype(np.float64)
+        out["_kin_h_pt_k1_p"] = np.histogram(k1_pt, bins=_td_pt_edges)[0].astype(np.float64)
+        out["_kin_h_pt_k1_t"] = np.histogram(k1_tpt, bins=_td_pt_edges)[0].astype(np.float64)
+        out["_kin_h_e_k1_p"] = np.histogram(k1_eta, bins=_td_eta_edges)[0].astype(np.float64)
+        out["_kin_h_e_k1_t"] = np.histogram(k1_teta, bins=_td_eta_edges)[0].astype(np.float64)
+        out["_kin_h_p_k1_p"] = np.histogram(k1_phi, bins=_td_phi_edges)[0].astype(np.float64)
+        out["_kin_h_p_k1_t"] = np.histogram(k1_tphi, bins=_td_phi_edges)[0].astype(np.float64)
 
     optimizer.scheduler_step()
     return out
@@ -4581,56 +4624,84 @@ def _val_selected_delta_arrays(
 
     b_idx = torch.arange(B, device=device)
     pred = candidates[k_sel, b_idx]
-    if cartesian:
-        truth = batch_d["x_invisible_cartesian"].to(device=device, dtype=dtype)
-        plp, pred_eta, _pred_phi = cartesian_to_log_pt_eta_phi(
-            pred[..., 0], pred[..., 1], pred[..., 2]
-        )
-        tlp, truth_eta, _truth_phi = cartesian_to_log_pt_eta_phi(
-            truth[..., 0], truth[..., 1], truth[..., 2]
-        )
-        pred_xyz = pred[:, :2, :3].contiguous()
-        truth_xyz = truth[:, :2, :3].contiguous()
-    else:
-        truth = batch_d["x_invisible"].to(device=device, dtype=dtype)
-        plp, pred_eta = pred[..., 0], pred[..., 1]
-        pred_phi = pred[..., 2]
-        tlp, truth_eta = truth[..., 0], truth[..., 1]
-        truth_phi = truth[..., 2]
-        pred_xyz = log_pt_eta_phi_to_cartesian(
-            plp.clamp(-10.0, 10.0), pred_eta, pred_phi
-        )[:, :2, :].contiguous()
-        truth_xyz = log_pt_eta_phi_to_cartesian(
-            tlp.clamp(-10.0, 10.0), truth_eta, truth_phi
-        )[:, :2, :].contiguous()
+    if _supports_legacy_invisible_kinematics(
+        cartesian=cartesian,
+        feature_dim=min(int(pred.shape[-1]), int(batch_d["x_invisible"].shape[-1])),
+    ):
+        if cartesian:
+            truth = batch_d["x_invisible_cartesian"].to(device=device, dtype=dtype)
+            plp, pred_eta, _pred_phi = cartesian_to_log_pt_eta_phi(
+                pred[..., 0], pred[..., 1], pred[..., 2]
+            )
+            tlp, truth_eta, _truth_phi = cartesian_to_log_pt_eta_phi(
+                truth[..., 0], truth[..., 1], truth[..., 2]
+            )
+            pred_xyz = pred[:, :2, :3].contiguous()
+            truth_xyz = truth[:, :2, :3].contiguous()
+        else:
+            truth = batch_d["x_invisible"].to(device=device, dtype=dtype)
+            plp, pred_eta = pred[..., 0], pred[..., 1]
+            pred_phi = pred[..., 2]
+            tlp, truth_eta = truth[..., 0], truth[..., 1]
+            truth_phi = truth[..., 2]
+            pred_xyz = log_pt_eta_phi_to_cartesian(
+                plp.clamp(-10.0, 10.0), pred_eta, pred_phi
+            )[:, :2, :].contiguous()
+            truth_xyz = log_pt_eta_phi_to_cartesian(
+                tlp.clamp(-10.0, 10.0), truth_eta, truth_phi
+            )[:, :2, :].contiguous()
 
-    pred_pt = torch.expm1(plp.clamp(-10.0, 10.0))
-    truth_pt = torch.expm1(tlp.clamp(-10.0, 10.0))
-    delta_pt = pred_pt - truth_pt
-    delta_eta = pred_eta - truth_eta
-    delta_xyz = pred_xyz - truth_xyz
+        pred_pt = torch.expm1(plp.clamp(-10.0, 10.0))
+        truth_pt = torch.expm1(tlp.clamp(-10.0, 10.0))
+        delta_pt = pred_pt - truth_pt
+        delta_eta = pred_eta - truth_eta
+        delta_xyz = pred_xyz - truth_xyz
 
-    slot_count = valid_slots.sum(dim=-1)
-    valid_events_with_slots = slot_count > 0
-    pt_delta_event_mean = (
-        (delta_pt * valid_slots.to(delta_pt.dtype)).sum(dim=-1)
-        / slot_count.clamp(min=1).to(delta_pt.dtype)
+        slot_count = valid_slots.sum(dim=-1)
+        valid_events_with_slots = slot_count > 0
+        pt_delta_event_mean = (
+            (delta_pt * valid_slots.to(delta_pt.dtype)).sum(dim=-1)
+            / slot_count.clamp(min=1).to(delta_pt.dtype)
+        )
+
+        return {
+            "pt_truth": truth_pt[valid_slots].detach().float().cpu().numpy(),
+            "pt_delta": delta_pt[valid_slots].detach().float().cpu().numpy(),
+            "px_delta": delta_xyz[..., 0][valid_slots].detach().float().cpu().numpy(),
+            "py_delta": delta_xyz[..., 1][valid_slots].detach().float().cpu().numpy(),
+            "pz_delta": delta_xyz[..., 2][valid_slots].detach().float().cpu().numpy(),
+            "eta_truth": truth_eta[valid_slots].detach().float().cpu().numpy(),
+            "eta_delta": delta_eta[valid_slots].detach().float().cpu().numpy(),
+            "pt_delta_event_mean": pt_delta_event_mean[valid_events_with_slots]
+            .detach()
+            .float()
+            .cpu()
+            .numpy(),
+        }
+
+    truth = batch_d["x_invisible"].to(device=device, dtype=dtype)
+    feature_dim = min(int(pred.shape[-1]), int(truth.shape[-1]))
+    feature_names = list(_invisible_feature_names())
+    if len(feature_names) < feature_dim:
+        feature_names.extend(f"feature_{index}" for index in range(len(feature_names), feature_dim))
+    periodic_indices = set(
+        index for index in _invisible_periodic_feature_indices() if 0 <= index < feature_dim
     )
+    pred_sel = pred[..., :feature_dim]
+    truth_sel = truth[..., :feature_dim]
+    delta = pred_sel - truth_sel
+    for index in periodic_indices:
+        delta[..., index] = wrapped_delta_phi(pred_sel[..., index], truth_sel[..., index])
 
-    return {
-        "pt_truth": truth_pt[valid_slots].detach().float().cpu().numpy(),
-        "pt_delta": delta_pt[valid_slots].detach().float().cpu().numpy(),
-        "px_delta": delta_xyz[..., 0][valid_slots].detach().float().cpu().numpy(),
-        "py_delta": delta_xyz[..., 1][valid_slots].detach().float().cpu().numpy(),
-        "pz_delta": delta_xyz[..., 2][valid_slots].detach().float().cpu().numpy(),
-        "eta_truth": truth_eta[valid_slots].detach().float().cpu().numpy(),
-        "eta_delta": delta_eta[valid_slots].detach().float().cpu().numpy(),
-        "pt_delta_event_mean": pt_delta_event_mean[valid_events_with_slots]
-        .detach()
-        .float()
-        .cpu()
-        .numpy(),
-    }
+    out: dict[str, np.ndarray] = {}
+    for index, feature_name in enumerate(feature_names[:feature_dim]):
+        out[f"{feature_name}_truth"] = (
+            truth_sel[..., index][valid_slots].detach().float().cpu().numpy()
+        )
+        out[f"{feature_name}_delta"] = (
+            delta[..., index][valid_slots].detach().float().cpu().numpy()
+        )
+    return out
 
 
 def _concat_np_chunks(chunks: list[np.ndarray]) -> np.ndarray:
@@ -4984,13 +5055,20 @@ def run_validation_epoch(
 
     local_reward_chunks: list[np.ndarray] = []
     local_reward_event_chunks: list[np.ndarray] = []
+    legacy_kinematics = _supports_legacy_invisible_kinematics(
+        cartesian=cartesian,
+        feature_dim=len(_invisible_feature_names()) or None,
+    )
+    profile_feature_names = tuple(_validation_profile_feature_names(cartesian=cartesian))
     local_pt_delta_event_mean_chunks: list[np.ndarray] = []
     local_profile_chunks: dict[str, list[np.ndarray]] = {
-        "pt_truth": [],
-        "pt_delta": [],
-        "eta_truth": [],
-        "eta_delta": [],
+        f"{profile_name}_truth": []
+        for profile_name in profile_feature_names
     }
+    local_profile_chunks.update({
+        f"{profile_name}_delta": []
+        for profile_name in profile_feature_names
+    })
     # pT in GeV (original physics scale, after expm1 inversion of log1p).
     bin_pt_edges = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
     bin_eta_edges = np.linspace(-4.0, 4.0, _VAL_KIN_NUM_BINS + 1)
@@ -5129,67 +5207,71 @@ def run_validation_epoch(
             dtype=dtype,
         )
         for key in local_profile_chunks:
-            local_profile_chunks[key].append(selected_delta_arrays[key])
-        local_pt_delta_event_mean_chunks.append(
-            selected_delta_arrays["pt_delta_event_mean"]
-        )
+            local_profile_chunks[key].append(
+                selected_delta_arrays.get(key, np.array([], dtype=np.float64))
+            )
+        if "pt_delta_event_mean" in selected_delta_arrays:
+            local_pt_delta_event_mean_chunks.append(
+                selected_delta_arrays["pt_delta_event_mean"]
+            )
 
-        ppt, peta, pphi, tpt, teta, tphi = _val_pred_truth_kin_flat(
-            candidates,
-            batch_d,
-            k_sel,
-            cartesian=cartesian,
-            device=device,
-        )
-        h_pt_p += np.histogram(ppt, bins=bin_pt_edges)[0]
-        h_pt_t += np.histogram(tpt, bins=bin_pt_edges)[0]
-        h_e_p += np.histogram(peta, bins=bin_eta_edges)[0]
-        h_e_t += np.histogram(teta, bins=bin_eta_edges)[0]
-        h_p_p += np.histogram(pphi, bins=bin_phi_edges)[0]
-        h_p_t += np.histogram(tphi, bins=bin_phi_edges)[0]
+        if legacy_kinematics:
+            ppt, peta, pphi, tpt, teta, tphi = _val_pred_truth_kin_flat(
+                candidates,
+                batch_d,
+                k_sel,
+                cartesian=cartesian,
+                device=device,
+            )
+            h_pt_p += np.histogram(ppt, bins=bin_pt_edges)[0]
+            h_pt_t += np.histogram(tpt, bins=bin_pt_edges)[0]
+            h_e_p += np.histogram(peta, bins=bin_eta_edges)[0]
+            h_e_t += np.histogram(teta, bins=bin_eta_edges)[0]
+            h_p_p += np.histogram(pphi, bins=bin_phi_edges)[0]
+            h_p_t += np.histogram(tphi, bins=bin_phi_edges)[0]
 
-        ppx, ppy, ppz, tpx, tpy, tpz = _val_pred_truth_cartesian_flat(
-            candidates,
-            batch_d,
-            k_sel,
-            cartesian=cartesian,
-            device=device,
-            dtype=dtype,
-        )
-        h_x_p += np.histogram(ppx, bins=bin_px_edges)[0]
-        h_x_t += np.histogram(tpx, bins=bin_px_edges)[0]
-        h_y_p += np.histogram(ppy, bins=bin_py_edges)[0]
-        h_y_t += np.histogram(tpy, bins=bin_py_edges)[0]
-        h_z_p += np.histogram(ppz, bins=bin_pz_edges)[0]
-        h_z_t += np.histogram(tpz, bins=bin_pz_edges)[0]
+            ppx, ppy, ppz, tpx, tpy, tpz = _val_pred_truth_cartesian_flat(
+                candidates,
+                batch_d,
+                k_sel,
+                cartesian=cartesian,
+                device=device,
+                dtype=dtype,
+            )
+            h_x_p += np.histogram(ppx, bins=bin_px_edges)[0]
+            h_x_t += np.histogram(tpx, bins=bin_px_edges)[0]
+            h_y_p += np.histogram(ppy, bins=bin_py_edges)[0]
+            h_y_t += np.histogram(tpy, bins=bin_py_edges)[0]
+            h_z_p += np.histogram(ppz, bins=bin_pz_edges)[0]
+            h_z_t += np.histogram(tpz, bins=bin_pz_edges)[0]
 
-        b_idx = torch.arange(B, device=device)
-        pred_nu_kin = candidates[k_sel, b_idx][:, :2, :3]
-        truth_nu_kin = _truth_invisible_kin_phys(
-            batch_d, cartesian=cartesian, device=device, dtype=dtype
-        )[:, :2, :]
-        w_p, top_p = _val_mass_reconstruction_masses(
-            batch_d,
-            pred_nu_kin,
-            cartesian=cartesian,
-            device=device,
-            dtype=dtype,
-        )
-        w_t, top_t = _val_mass_reconstruction_masses(
-            batch_d,
-            truth_nu_kin,
-            cartesian=cartesian,
-            device=device,
-            dtype=dtype,
-        )
-        if w_p.size:
-            h_wm_p += np.histogram(w_p, bins=bin_wmass_edges)[0]
-        if top_p.size:
-            h_tm_p += np.histogram(top_p, bins=bin_topmass_edges)[0]
-        if w_t.size:
-            h_wm_t += np.histogram(w_t, bins=bin_wmass_edges)[0]
-        if top_t.size:
-            h_tm_t += np.histogram(top_t, bins=bin_topmass_edges)[0]
+            b_idx = torch.arange(B, device=device)
+            pred_nu_kin = candidates[k_sel, b_idx][:, :2, :3]
+            truth_nu_kin = _truth_invisible_kin_phys(
+                batch_d, cartesian=cartesian, device=device, dtype=dtype
+            )[:, :2, :]
+            w_p, top_p = _val_mass_reconstruction_masses(
+                batch_d,
+                pred_nu_kin,
+                cartesian=cartesian,
+                device=device,
+                dtype=dtype,
+            )
+            w_t, top_t = _val_mass_reconstruction_masses(
+                batch_d,
+                truth_nu_kin,
+                cartesian=cartesian,
+                device=device,
+                dtype=dtype,
+            )
+            if w_p.size:
+                h_wm_p += np.histogram(w_p, bins=bin_wmass_edges)[0]
+            if top_p.size:
+                h_tm_p += np.histogram(top_p, bins=bin_topmass_edges)[0]
+            if w_t.size:
+                h_wm_t += np.histogram(w_t, bins=bin_wmass_edges)[0]
+            if top_t.size:
+                h_tm_t += np.histogram(top_t, bins=bin_topmass_edges)[0]
 
         # Always run one ref-policy DDIM pass (K=1) for val_neutrino overlays; reuse for winrate.
         ref_core = _unwrap_core_evenet(ref_model)
@@ -5214,37 +5296,39 @@ def run_validation_epoch(
                 time.perf_counter() - t_ref,
             )
         k_sel_ref = torch.zeros(B, dtype=torch.long, device=device)
-        rpt, reta, rphi, _, _, _ = _val_pred_truth_kin_flat(
-            r_one, batch_d, k_sel_ref, cartesian=cartesian, device=device
-        )
-        h_pt_r += np.histogram(rpt, bins=bin_pt_edges)[0]
-        h_e_r += np.histogram(reta, bins=bin_eta_edges)[0]
-        h_p_r += np.histogram(rphi, bins=bin_phi_edges)[0]
+        if legacy_kinematics:
+            rpt, reta, rphi, _, _, _ = _val_pred_truth_kin_flat(
+                r_one, batch_d, k_sel_ref, cartesian=cartesian, device=device
+            )
+            h_pt_r += np.histogram(rpt, bins=bin_pt_edges)[0]
+            h_e_r += np.histogram(reta, bins=bin_eta_edges)[0]
+            h_p_r += np.histogram(rphi, bins=bin_phi_edges)[0]
 
-        rpx, rpy, rpz, _, _, _ = _val_pred_truth_cartesian_flat(
-            r_one,
-            batch_d,
-            k_sel_ref,
-            cartesian=cartesian,
-            device=device,
-            dtype=dtype,
-        )
-        h_x_r += np.histogram(rpx, bins=bin_px_edges)[0]
-        h_y_r += np.histogram(rpy, bins=bin_py_edges)[0]
-        h_z_r += np.histogram(rpz, bins=bin_pz_edges)[0]
+            rpx, rpy, rpz, _, _, _ = _val_pred_truth_cartesian_flat(
+                r_one,
+                batch_d,
+                k_sel_ref,
+                cartesian=cartesian,
+                device=device,
+                dtype=dtype,
+            )
+            h_x_r += np.histogram(rpx, bins=bin_px_edges)[0]
+            h_y_r += np.histogram(rpy, bins=bin_py_edges)[0]
+            h_z_r += np.histogram(rpz, bins=bin_pz_edges)[0]
 
-        ref_nu_kin = r_one[k_sel_ref, b_idx][:, :2, :3]
-        w_r, top_r = _val_mass_reconstruction_masses(
-            batch_d,
-            ref_nu_kin,
-            cartesian=cartesian,
-            device=device,
-            dtype=dtype,
-        )
-        if w_r.size:
-            h_wm_r += np.histogram(w_r, bins=bin_wmass_edges)[0]
-        if top_r.size:
-            h_tm_r += np.histogram(top_r, bins=bin_topmass_edges)[0]
+        if legacy_kinematics:
+            ref_nu_kin = r_one[k_sel_ref, b_idx][:, :2, :3]
+            w_r, top_r = _val_mass_reconstruction_masses(
+                batch_d,
+                ref_nu_kin,
+                cartesian=cartesian,
+                device=device,
+                dtype=dtype,
+            )
+            if w_r.size:
+                h_wm_r += np.histogram(w_r, bins=bin_wmass_edges)[0]
+            if top_r.size:
+                h_tm_r += np.histogram(top_r, bins=bin_topmass_edges)[0]
 
         if compute_winrate:
             d_cur = compute_truth_l2_distances_kb(
@@ -5365,23 +5449,26 @@ def run_validation_epoch(
     local_state = {
         "reward": _concat_np_chunks(local_reward_event_chunks),
         "pt_delta_mean": _concat_np_chunks(local_pt_delta_event_mean_chunks),
-        "pt_truth": _concat_np_chunks(local_profile_chunks["pt_truth"]),
-        "pt_delta": _concat_np_chunks(local_profile_chunks["pt_delta"]),
-        "eta_truth": _concat_np_chunks(local_profile_chunks["eta_truth"]),
-        "eta_delta": _concat_np_chunks(local_profile_chunks["eta_delta"]),
     }
-    profile_compare_local = {
-        "pt_truth": local_state["pt_truth"],
-        "pt_delta": local_state["pt_delta"],
-        "eta_truth": local_state["eta_truth"],
-        "eta_delta": local_state["eta_delta"],
-    }
+    for profile_name in profile_feature_names:
+        local_state[f"{profile_name}_truth"] = _concat_np_chunks(
+            local_profile_chunks[f"{profile_name}_truth"]
+        )
+        local_state[f"{profile_name}_delta"] = _concat_np_chunks(
+            local_profile_chunks[f"{profile_name}_delta"]
+        )
+    profile_compare_local = {}
+    for profile_name in profile_feature_names:
+        profile_compare_local[f"{profile_name}_truth"] = local_state[f"{profile_name}_truth"]
+        profile_compare_local[f"{profile_name}_delta"] = local_state[f"{profile_name}_delta"]
     if initial_state is not None:
-        for key in ("pt_truth", "pt_delta", "eta_truth", "eta_delta"):
-            profile_compare_local[f"initial_{key}"] = np.asarray(
-                initial_state.get(key, np.array([], dtype=np.float64)),
-                dtype=np.float64,
-            ).reshape(-1)
+        for profile_name in profile_feature_names:
+            for suffix in ("truth", "delta"):
+                key = f"{profile_name}_{suffix}"
+                profile_compare_local[f"initial_{key}"] = np.asarray(
+                    initial_state.get(key, np.array([], dtype=np.float64)),
+                    dtype=np.float64,
+                ).reshape(-1)
     profile_merged = _gather_val_array_dict(
         profile_compare_local, rank=rank, world_size=world_size
     )
@@ -5429,7 +5516,7 @@ def run_validation_epoch(
     _val_kin_suffix = f"val: {val_K} candidate{'s' if val_K != 1 else ''} vs truth"
     _pred_lbl = "Pred (val)" if val_K == 1 else f"Pred (val, best-of-{val_K})"
     if is_rank0:
-        for profile_name in ("pt", "eta"):
+        for profile_name in profile_feature_names:
             truth_key = f"{profile_name}_truth"
             delta_key = f"{profile_name}_delta"
             truth_arr = profile_merged.get(truth_key, np.array([], dtype=np.float64))
@@ -5462,87 +5549,92 @@ def run_validation_epoch(
                     title="Validation 2D correlation: initial reward vs current reward",
                 )
             )
-            out["val/response/pt_delta_mean_initial_vs_current"] = (
-                _response_matrix_figure(
-                    response_merged.get("pt_delta_initial", np.array([], dtype=np.float64)),
-                    response_merged.get("pt_delta_current", np.array([], dtype=np.float64)),
-                    xlabel="Initial event mean delta pT [GeV]",
-                    ylabel="Current event mean delta pT [GeV]",
-                    title="Validation 2D correlation: initial vs current event mean delta pT",
+            if (
+                response_merged.get("pt_delta_initial", np.array([], dtype=np.float64)).size > 0
+                or response_merged.get("pt_delta_current", np.array([], dtype=np.float64)).size > 0
+            ):
+                out["val/response/pt_delta_mean_initial_vs_current"] = (
+                    _response_matrix_figure(
+                        response_merged.get("pt_delta_initial", np.array([], dtype=np.float64)),
+                        response_merged.get("pt_delta_current", np.array([], dtype=np.float64)),
+                        xlabel="Initial event mean delta pT [GeV]",
+                        ylabel="Current event mean delta pT [GeV]",
+                        title="Validation 2D correlation: initial vs current event mean delta pT",
+                    )
                 )
+        if legacy_kinematics:
+            out["val_neutrino/pt"] = _val_overlay_kin_figure(
+                h_pt_t,
+                h_pt_p,
+                bin_pt_edges,
+                f"Neutrino pT [GeV] ({_val_kin_suffix})",
+                pred_label=_pred_lbl,
+                counts_ref=h_pt_r,
+                xlabel="pT [GeV]",
             )
-        out["val_neutrino/pt"] = _val_overlay_kin_figure(
-            h_pt_t,
-            h_pt_p,
-            bin_pt_edges,
-            f"Neutrino pT [GeV] ({_val_kin_suffix})",
-            pred_label=_pred_lbl,
-            counts_ref=h_pt_r,
-            xlabel="pT [GeV]",
-        )
-        out["val_neutrino/eta"] = _val_overlay_kin_figure(
-            h_e_t,
-            h_e_p,
-            bin_eta_edges,
-            f"Neutrino η ({_val_kin_suffix})",
-            pred_label=_pred_lbl,
-            counts_ref=h_e_r,
-            xlabel="η",
-        )
-        out["val_neutrino/phi"] = _val_overlay_kin_figure(
-            h_p_t,
-            h_p_p,
-            bin_phi_edges,
-            f"Neutrino φ ({_val_kin_suffix})",
-            pred_label=_pred_lbl,
-            counts_ref=h_p_r,
-            xlabel="φ [rad]",
-        )
-        out["val_neutrino/px"] = _val_overlay_kin_figure(
-            h_x_t,
-            h_x_p,
-            bin_px_edges,
-            f"Neutrino p_x [GeV] ({_val_kin_suffix})",
-            pred_label=_pred_lbl,
-            counts_ref=h_x_r,
-            xlabel="p_x [GeV]",
-        )
-        out["val_neutrino/py"] = _val_overlay_kin_figure(
-            h_y_t,
-            h_y_p,
-            bin_py_edges,
-            f"Neutrino p_y [GeV] ({_val_kin_suffix})",
-            pred_label=_pred_lbl,
-            counts_ref=h_y_r,
-            xlabel="p_y [GeV]",
-        )
-        out["val_neutrino/pz"] = _val_overlay_kin_figure(
-            h_z_t,
-            h_z_p,
-            bin_pz_edges,
-            f"Neutrino p_z [GeV] ({_val_kin_suffix})",
-            pred_label=_pred_lbl,
-            counts_ref=h_z_r,
-            xlabel="p_z [GeV]",
-        )
-        out["val_mass/w_mass"] = _val_overlay_kin_figure(
-            h_wm_t,
-            h_wm_p,
-            bin_wmass_edges,
-            f"W mass reconstruction vs truth resonance ({_val_kin_suffix})",
-            pred_label=_pred_lbl,
-            counts_ref=h_wm_r,
-            xlabel="W mass [GeV]",
-        )
-        out["val_mass/top_mass"] = _val_overlay_kin_figure(
-            h_tm_t,
-            h_tm_p,
-            bin_topmass_edges,
-            f"Top mass reconstruction vs truth resonance ({_val_kin_suffix})",
-            pred_label=_pred_lbl,
-            counts_ref=h_tm_r,
-            xlabel="Top mass [GeV]",
-        )
+            out["val_neutrino/eta"] = _val_overlay_kin_figure(
+                h_e_t,
+                h_e_p,
+                bin_eta_edges,
+                f"Neutrino η ({_val_kin_suffix})",
+                pred_label=_pred_lbl,
+                counts_ref=h_e_r,
+                xlabel="η",
+            )
+            out["val_neutrino/phi"] = _val_overlay_kin_figure(
+                h_p_t,
+                h_p_p,
+                bin_phi_edges,
+                f"Neutrino φ ({_val_kin_suffix})",
+                pred_label=_pred_lbl,
+                counts_ref=h_p_r,
+                xlabel="φ [rad]",
+            )
+            out["val_neutrino/px"] = _val_overlay_kin_figure(
+                h_x_t,
+                h_x_p,
+                bin_px_edges,
+                f"Neutrino p_x [GeV] ({_val_kin_suffix})",
+                pred_label=_pred_lbl,
+                counts_ref=h_x_r,
+                xlabel="p_x [GeV]",
+            )
+            out["val_neutrino/py"] = _val_overlay_kin_figure(
+                h_y_t,
+                h_y_p,
+                bin_py_edges,
+                f"Neutrino p_y [GeV] ({_val_kin_suffix})",
+                pred_label=_pred_lbl,
+                counts_ref=h_y_r,
+                xlabel="p_y [GeV]",
+            )
+            out["val_neutrino/pz"] = _val_overlay_kin_figure(
+                h_z_t,
+                h_z_p,
+                bin_pz_edges,
+                f"Neutrino p_z [GeV] ({_val_kin_suffix})",
+                pred_label=_pred_lbl,
+                counts_ref=h_z_r,
+                xlabel="p_z [GeV]",
+            )
+            out["val_mass/w_mass"] = _val_overlay_kin_figure(
+                h_wm_t,
+                h_wm_p,
+                bin_wmass_edges,
+                f"W mass reconstruction vs truth resonance ({_val_kin_suffix})",
+                pred_label=_pred_lbl,
+                counts_ref=h_wm_r,
+                xlabel="W mass [GeV]",
+            )
+            out["val_mass/top_mass"] = _val_overlay_kin_figure(
+                h_tm_t,
+                h_tm_p,
+                bin_topmass_edges,
+                f"Top mass reconstruction vs truth resonance ({_val_kin_suffix})",
+                pred_label=_pred_lbl,
+                counts_ref=h_tm_r,
+                xlabel="Top mass [GeV]",
+            )
     return out
 
 
@@ -5871,7 +5963,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     val_baseline_state: dict[str, np.ndarray] | None = None
     val_profile_history: dict[str, dict[str, list[float]]] = {
         name: {"epoch": [], "delta_mean": [], "slope": [], "zero": []}
-        for name in ("pt", "eta")
+        for name in _validation_profile_feature_names(cartesian=_truth_generation_cartesian())
     }
 
     def _append_validation_history_plots(
@@ -6068,17 +6160,19 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
 
         if is_rank0:
             _append_validation_history_plots(initial_val_metrics, epoch_value=-1)
+            profile_summary = " ".join(
+                (
+                    f"{profile_name}_slope="
+                    f"{initial_val_metrics.get(f'val_diagnostics/profile/{profile_name}/slope', float('nan')):.6g} "
+                    f"{profile_name}_zero="
+                    f"{initial_val_metrics.get(f'val_diagnostics/profile/{profile_name}/zero_delta_truth', float('nan')):.6g}"
+                )
+                for profile_name in val_profile_history.keys()
+            )
             _log.info(
-                "[DGPO] initial val r_mean=%.6f pt_slope=%.6g pt_zero=%.6g eta_slope=%.6g eta_zero=%.6g",
+                "[DGPO] initial val r_mean=%.6f %s",
                 initial_val_metrics["val/reward/mean"],
-                initial_val_metrics.get("val_diagnostics/profile/pt/slope", float("nan")),
-                initial_val_metrics.get(
-                    "val_diagnostics/profile/pt/zero_delta_truth", float("nan")
-                ),
-                initial_val_metrics.get("val_diagnostics/profile/eta/slope", float("nan")),
-                initial_val_metrics.get(
-                    "val_diagnostics/profile/eta/zero_delta_truth", float("nan")
-                ),
+                profile_summary.strip(),
             )
             if wandb_mod is not None:
                 _wandb_log_validation(
