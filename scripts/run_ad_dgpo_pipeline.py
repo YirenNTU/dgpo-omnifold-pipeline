@@ -5,7 +5,6 @@ import argparse
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -57,8 +56,9 @@ def absolutize_default_paths(payload: Any, base_dir: Path) -> Any:
     return payload
 
 
-def write_runtime_yaml(prefix: str, payload: dict[str, Any]) -> Path:
-    runtime_dir = Path(tempfile.mkdtemp(prefix=prefix))
+def write_runtime_yaml(prefix: str, payload: dict[str, Any], *, runtime_root: Path) -> Path:
+    runtime_dir = runtime_root / prefix.rstrip("_")
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     runtime_path = runtime_dir / "runtime.yaml"
     with runtime_path.open("w") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
@@ -107,6 +107,7 @@ def build_latent_runtime_config(
     augmented_root: Path,
     stage_root: Path,
 ) -> Path:
+    runtime_root = (stage_root / "runtime_configs").resolve()
     template = read_yaml(LATENT_TEMPLATE)
     payload = deep_update(template, {
         "platform": {
@@ -155,21 +156,23 @@ def build_latent_runtime_config(
             "run_name": "latent-constraint-ztautau",
         },
     })
-    return write_runtime_yaml("ad_latent_", payload)
+    return write_runtime_yaml("ad_latent_", payload, runtime_root=runtime_root)
 
 
 def build_ad_runtime_config(
     *,
     base_config: Path,
     overlay_config: Path | None,
+    stage_root: Path,
 ) -> Path:
+    runtime_root = (stage_root / "runtime_configs").resolve()
     payload = merged_config(base_config, overlay_config)
     payload.setdefault("compat", {})
     payload["compat"]["backend"] = "pure-evenet"
     payload["compat"]["repo_root"] = str(REPO_ROOT)
     payload.setdefault("rl", {})
     payload["rl"]["enabled"] = False
-    return write_runtime_yaml("ad_runtime_", payload)
+    return write_runtime_yaml("ad_runtime_", payload, runtime_root=runtime_root)
 
 
 def build_dgpo_runtime_overlay(
@@ -180,6 +183,7 @@ def build_dgpo_runtime_overlay(
     stage_root: Path,
     dgpo_init_checkpoint: Path | None,
 ) -> Path:
+    runtime_root = (stage_root / "runtime_configs").resolve()
     template = read_yaml(DGPO_TEMPLATE)
     payload = deep_update(template, {
         "platform": {
@@ -220,7 +224,7 @@ def build_dgpo_runtime_overlay(
     if dgpo_init_checkpoint is not None:
         payload["options"]["Training"]["model_checkpoint_load_path"] = str(dgpo_init_checkpoint.resolve())
         payload["options"]["Training"]["pretrain_model_load_path"] = None
-    return write_runtime_yaml("dgpo_overlay_", payload)
+    return write_runtime_yaml("dgpo_overlay_", payload, runtime_root=runtime_root)
 
 
 def resolve_ad_checkpoint(
@@ -269,6 +273,7 @@ def run_ad_stage(
         ad_runtime_config = build_ad_runtime_config(
             base_config=ad_base_config,
             overlay_config=ad_overlay_config,
+            stage_root=stage_root,
         )
         resolved_ad_checkpoint = resolve_ad_checkpoint(
             ad_config=ad_config_dict,
