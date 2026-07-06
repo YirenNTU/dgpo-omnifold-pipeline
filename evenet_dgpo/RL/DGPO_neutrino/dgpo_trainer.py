@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -5581,6 +5582,23 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     total_events = int(cfg["total_events"])
     val_events_in = cfg.get("val_events", 0)
     val_events: int | None = int(val_events_in) if val_events_in else None
+    config_yaml_text = cfg.get("config_yaml", None)
+
+    if not config_path.is_file():
+        if not isinstance(config_yaml_text, str) or not config_yaml_text.strip():
+            raise FileNotFoundError(
+                f"DGPO worker cannot access config path {config_path} and no config_yaml payload was provided."
+            )
+        worker_runtime_dir = Path(
+            tempfile.mkdtemp(prefix="dgpo_worker_runtime_", dir=os.environ.get("TMPDIR", None))
+        )
+        config_path = worker_runtime_dir / config_path.name
+        config_path.write_text(config_yaml_text)
+        _log.info(
+            "[DGPO][boot] rank=%s materialized worker-local runtime config at %s",
+            rank,
+            config_path,
+        )
 
     global_config.load_yaml(config_path)
     _assert_rl_enabled()
@@ -6519,6 +6537,7 @@ def main() -> None:
     )
     trainer_config = {
         "config_path": str(config_path),
+        "config_yaml": config_path.read_text(),
         "max_steps": args.max_steps,
         "wandb": not args.no_wandb,
         "total_events": int(total_events),
