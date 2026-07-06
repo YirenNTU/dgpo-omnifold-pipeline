@@ -21,7 +21,7 @@ from evenet.network.metrics.assignment import SingleProcessAssignmentMetrics
 from evenet.network.metrics.debug_evaluator import SymmetricEvaluator
 from evenet.network.metrics.generation import GenerationMetrics
 
-from preprocessing.preprocess import unflatten_dict
+from evenet.dataset.preprocess import unflatten_dict
 
 import torch
 from evenet.network.metrics.classification import ClassificationMetrics

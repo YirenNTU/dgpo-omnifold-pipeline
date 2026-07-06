@@ -1,8 +1,95 @@
 import numpy as np
 import torch
 import time
+from collections.abc import Mapping
 
 from evenet.dataset.types import Batch, Source, AssignmentTargets
+
+
+def flatten_column_name(base: str, indices: tuple[int, ...]) -> str:
+    return base if not indices else base + ":" + ":".join(str(index) for index in indices)
+
+
+def flatten_dict(
+    data: Mapping[str, object],
+    parent_key: str = "",
+    sep: str = ":",
+) -> dict:
+    """Flatten nested mappings and arrays into EveNet parquet column names.
+
+    Array-like values are flattened into ``base:i:j`` columns so they align with
+    the original EveNet parquet/``shape_metadata.json`` convention.
+    """
+    items: dict[str, object] = {}
+    for key, value in data.items():
+        new_key = f"{parent_key}{sep}{key}" if parent_key else str(key)
+        if isinstance(value, Mapping):
+            items.update(flatten_dict(value, parent_key=new_key, sep=sep))
+        else:
+            array = np.asarray(value)
+            if array.ndim <= 1:
+                items[new_key] = value
+                continue
+            trailing_shape = array.shape[1:]
+            for index in np.ndindex(trailing_shape):
+                items[flatten_column_name(new_key, tuple(int(i) for i in index))] = array[(slice(None),) + index]
+    return items
+
+
+def _stack_unflattened_columns(
+    flat_batch: Mapping[str, np.ndarray],
+    base: str,
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    columns: list[np.ndarray] = []
+    for index in np.ndindex(shape):
+        column = flatten_column_name(base, tuple(int(i) for i in index))
+        if column not in flat_batch:
+            raise KeyError(f"Missing flattened column {column!r} for base={base!r} shape={shape}.")
+        columns.append(np.asarray(flat_batch[column]))
+
+    if not columns:
+        raise ValueError(f"Cannot reconstruct {base!r}: empty shape metadata {shape}.")
+
+    num_events = int(np.asarray(columns[0]).shape[0])
+    stacked = np.stack(columns, axis=1)
+    return stacked.reshape((num_events,) + shape)
+
+
+def unflatten_dict(
+    flat_batch: Mapping[str, np.ndarray],
+    shape_metadata: Mapping[str, list[int] | tuple[int, ...]],
+    drop_column_prefix: list[str] | str | None = None,
+) -> dict[str, np.ndarray]:
+    """Reconstruct structured EveNet tensors from flattened parquet columns."""
+    if isinstance(drop_column_prefix, str):
+        drop_prefixes = [drop_column_prefix]
+    else:
+        drop_prefixes = list(drop_column_prefix or [])
+
+    output: dict[str, np.ndarray] = {}
+    consumed: set[str] = set()
+
+    for base, raw_shape in shape_metadata.items():
+        if any(base.startswith(prefix) for prefix in drop_prefixes):
+            continue
+        shape = tuple(int(item) for item in raw_shape)
+        if len(shape) == 0:
+            if base in flat_batch:
+                output[base] = np.asarray(flat_batch[base])
+                consumed.add(base)
+            continue
+        output[base] = _stack_unflattened_columns(flat_batch, base, shape)
+        consumed.update(flatten_column_name(base, tuple(int(i) for i in index)) for index in np.ndindex(shape))
+
+    for key, value in flat_batch.items():
+        if key in consumed:
+            continue
+        if any(key.startswith(prefix) for prefix in drop_prefixes):
+            continue
+        output[key] = np.asarray(value)
+
+    return output
 
 
 def process_event_batch_old(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -105,4 +192,3 @@ def convert_batch_to_torch_tensor(batch: dict[str, np.ndarray]) -> dict[str, tor
     :return: Batch of data as a dictionary with torch tensors.
     """
     return {k: torch.tensor(v) for k, v in batch.items()}
-

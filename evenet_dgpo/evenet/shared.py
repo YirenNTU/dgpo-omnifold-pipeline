@@ -18,8 +18,7 @@ import ray.train
 from ray.train import Checkpoint
 
 from evenet.control.global_config import global_config
-from evenet.dataset.preprocess import process_event_batch
-from preprocessing.preprocess import unflatten_dict
+from evenet.dataset.preprocess import process_event_batch, unflatten_dict
 import logging
 
 
