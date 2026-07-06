@@ -666,6 +666,7 @@ def _train_loop(cfg: dict[str, Any]) -> None:
         normalization_file=normalization_file,
         token_dim=lc["token_dim"],
         nu_kin_dim=lc["nu_kin_dim"],
+        feature_names=feature_names,
         d_model=lc["d_model"] if lc["d_model"] != 64 else None,  # default: token_dim
         latent_dim=lc["latent_dim"],
         num_layers=lc["num_layers"],

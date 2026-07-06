@@ -69,6 +69,7 @@ class ObjectTokenBottleneckAutoencoder(nn.Module):
         normalizers: tuple[Normalizer, Normalizer, Normalizer] | None = None,
         token_dim: int = 256,
         nu_kin_dim: int = 3,
+        feature_names: tuple[str, ...] | None = None,
         d_model: int | None = None,
         latent_dim: int = 32,
         num_layers: int = 3,
@@ -90,10 +91,16 @@ class ObjectTokenBottleneckAutoencoder(nn.Module):
         self.requires_event_token = True
         self.requires_object_token = True
         self.reconstructs_raw_neutrinos = True
+        self.feature_names = tuple(feature_names) if feature_names else tuple(
+            ("px", "py", "pz") if self.cartesian else (f"feature_{i}" for i in range(nu_kin_dim))
+        )
+        if len(self.feature_names) != int(nu_kin_dim):
+            raise ValueError(
+                f"feature_names length {len(self.feature_names)} != nu_kin_dim {nu_kin_dim}"
+            )
         # res_mse/* = per-component physical-space neutrino reconstruction residual (MSE)
-        # vs truth (pt,eta,phi spherical | px,py,pz cartesian) -- the "is the error going
-        # down?" diagnostic. Aggregated over val, logged in its own residual/ W&B section.
-        self._res_names = ("px", "py", "pz") if self.cartesian else ("pt", "eta", "phi")
+        # vs truth in the configured invisible feature space.
+        self._res_names = self.feature_names
         self.metric_keys = ["recon_nu_mse", "recon_token_mse"]
         for _nm in self._res_names:
             self.metric_keys.append(f"res_mse/{_nm}")
@@ -129,6 +136,7 @@ class ObjectTokenBottleneckAutoencoder(nn.Module):
             "model_type": MODEL_TYPE,
             "token_dim": self.token_dim,
             "nu_kin_dim": self.nu_kin_dim,
+            "feature_names": list(self.feature_names),
             "d_model": self.d_model,
             "latent_dim": self.latent_dim,
             "num_layers": int(num_layers),
@@ -368,22 +376,24 @@ class ObjectTokenBottleneckAutoencoder(nn.Module):
         """Per-component PHYSICAL MSE of reconstructed vs truth neutrinos.
 
         Denormalizes the reconstruction back to physical space and reports the squared
-        error per kinematic component, masked to valid neutrino slots. Spherical:
-        (pt = expm1(log_pt), eta, phi with 2*pi wrap). Cartesian: (px, py, pz).
+        error per kinematic component, masked to valid neutrino slots.
         Diagnostic only -- no gradient.
         """
         reco = self.denormalize_neutrinos(nu_reco_norm.detach())      # (B, 2, kd) physical
         truth = self.neutrino_kin_from_batch(batch).detach()          # (B, 2, kd) physical
-        if self.cartesian:
-            diff = reco - truth
-        else:
-            d_pt = torch.expm1(reco[..., 0].clamp(-10.0, 10.0)) - torch.expm1(
-                truth[..., 0].clamp(-10.0, 10.0)
-            )
-            d_eta = reco[..., 1] - truth[..., 1]
-            d_phi = reco[..., 2] - truth[..., 2]
-            d_phi = torch.atan2(torch.sin(d_phi), torch.cos(d_phi))   # wrap to [-pi, pi]
-            diff = torch.stack([d_pt, d_eta, d_phi], dim=-1)          # (B, 2, kd)
+        diff = reco - truth
+        if not self.cartesian and self.phi_index is not None and self.phi_index < diff.shape[-1]:
+            d_phi = diff[..., self.phi_index]
+            diff[..., self.phi_index] = torch.atan2(torch.sin(d_phi), torch.cos(d_phi))
+        if not self.cartesian:
+            for index, name in enumerate(self.feature_names):
+                if name.startswith("log_"):
+                    raw_name = name.removeprefix("log_")
+                    if raw_name in ("pt", "energy", "e"):
+                        diff[..., index] = (
+                            torch.expm1(reco[..., index].clamp(-10.0, 10.0))
+                            - torch.expm1(truth[..., index].clamp(-10.0, 10.0))
+                        )
 
         slot_mask = batch.get("x_invisible_mask")
         if slot_mask is not None:
@@ -549,6 +559,7 @@ def load_checkpoint(
         normalization_file=norm_file,
         token_dim=hparams["token_dim"],
         nu_kin_dim=hparams["nu_kin_dim"],
+        feature_names=tuple(hparams.get("feature_names", ())),
         d_model=hparams["d_model"],
         latent_dim=hparams["latent_dim"],
         num_layers=hparams["num_layers"],
@@ -556,7 +567,7 @@ def load_checkpoint(
         ffn_mult=hparams["ffn_mult"],
         dropout=hparams["dropout"],
         cartesian=hparams.get("cartesian", False),
-        phi_index=hparams.get("phi_index", 2),
+        phi_index=hparams.get("phi_index", None),
         device=dev,
     )
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
