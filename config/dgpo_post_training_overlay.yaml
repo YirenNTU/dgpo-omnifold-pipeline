@@ -34,6 +34,9 @@ ztautau_domain:
     target_delta_phi_to_pi: 0.0
 
 dgpo:
+  K: 8
+  num_ddim_steps: 20
+  validation_num_ddim_steps: 20
   validation_compute_winrate: false
   rollout_parallel_chains: 2
   validation_rollout_parallel_chains: 4
