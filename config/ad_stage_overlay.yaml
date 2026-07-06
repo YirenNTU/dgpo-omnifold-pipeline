@@ -13,4 +13,4 @@ logger:
     name: EveNet-AD-Stage
 
 platform:
-  batch_size: 16384
+  batch_size: 4096
