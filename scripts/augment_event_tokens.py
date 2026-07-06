@@ -232,7 +232,7 @@ def copy_sidecars(
     for path in input_dir.iterdir():
         if not path.is_file():
             continue
-        if path.name == "shape_metadata.json":
+        if path.name == "shape_metadata.json" or path.suffix == ".parquet":
             continue
         shutil.copy2(path, output_dir / path.name)
 
@@ -240,6 +240,22 @@ def copy_sidecars(
     updated_shape["event_token"] = [int(v) for v in event_token_shape]
     updated_shape["object_token"] = [int(v) for v in object_token_shape]
     (output_dir / "shape_metadata.json").write_text(json.dumps(updated_shape))
+
+
+def validate_augmented_split(output_dir: Path) -> None:
+    parquet_paths = sorted(output_dir.glob("*.parquet"))
+    if not parquet_paths:
+        raise RuntimeError(f"No augmented parquet files found in {output_dir}")
+    schema = pq.ParquetFile(parquet_paths[0]).schema_arrow
+    column_names = set(schema.names)
+    if not any(name == "event_token" or name.startswith("event_token:") for name in column_names):
+        raise RuntimeError(
+            f"Augmented split {output_dir} is missing event_token columns after export."
+        )
+    if not any(name == "object_token" or name.startswith("object_token:") for name in column_names):
+        raise RuntimeError(
+            f"Augmented split {output_dir} is missing object_token columns after export."
+        )
 
 
 def augment_split(
@@ -327,6 +343,7 @@ def augment_split(
         event_token_shape=event_shape,
         object_token_shape=object_shape,
     )
+    validate_augmented_split(output_dir)
 
 
 def main() -> None:
