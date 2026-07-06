@@ -29,8 +29,7 @@ class GenerationMetrics:
             point_cloud_generation=False,
             neutrino_generation=False,
             use_generation_result=False,
-            special_bin_configs: dict[str, list] = None,
-            coordinate_system: str = "pt_eta_phi",
+            special_bin_configs: dict[str, list] = None
     ):
 
         self.sampler = DDIMSampler(device)
@@ -40,7 +39,6 @@ class GenerationMetrics:
         self.point_cloud_generation = point_cloud_generation
         self.neutrino_generation = neutrino_generation
         self.use_generation_result = use_generation_result
-        self.coordinate_system = coordinate_system
 
         # Default values for histogram
         self.num_bins = num_bins
@@ -64,33 +62,6 @@ class GenerationMetrics:
 
         self.histogram_2d = dict()
         self.pearson_stats = dict()
-        self.neutrino_pt_bins = np.linspace(0.0, 300.0, self.num_bins + 1)
-        self.neutrino_rel_pt_bins = np.linspace(-1.5, 1.5, self.num_bins + 1)
-        self.neutrino_profile_bins = {
-            "pt": np.linspace(0.0, 300.0, 31),
-            "eta": np.linspace(-4.0, 4.0, 31),
-            "phi": np.linspace(-3.2, 3.2, 31),
-            "px": np.linspace(-300.0, 300.0, 31),
-            "py": np.linspace(-300.0, 300.0, 31),
-            "pz": np.linspace(-300.0, 300.0, 31),
-        }
-        self.neutrino_pt_profile_bins = self.neutrino_profile_bins["pt"]
-        self.neutrino_pt_histogram = dict()
-        self.neutrino_truth_pt_histogram = dict()
-        self.neutrino_rel_pt_histogram = dict()
-        self.neutrino_delta_profiles = {
-            name: dict() for name in self.neutrino_profile_bins
-        }
-        self.neutrino_pt_delta_profile = self.neutrino_delta_profiles["pt"]
-
-        # Per-variable neutrino kinematic distributions (pred vs truth). These are
-        # recovered from the generated (px, py, pz) via ``_neutrino_profile_values``
-        # so that eta/phi/pt are always available (even in Cartesian mode) and
-        # px/py/pz are histogrammed with physical (GeV) binning instead of the
-        # generic [-15, 15] window used by ``self.bins``.
-        self.neutrino_kin_vars = ["pt", "eta", "phi", "px", "py", "pz"]
-        self.neutrino_pred_dist = {name: dict() for name in self.neutrino_kin_vars}
-        self.neutrino_truth_dist = {name: dict() for name in self.neutrino_kin_vars}
 
         self.special_bins = dict()
         self.special_bins_centers = dict()
@@ -108,7 +79,7 @@ class GenerationMetrics:
             num_steps_point_cloud=40,
             num_steps_neutrino=40,
             eta=1.0,
-            schedules: Union[None, dict] = None,
+            schedules: Union[None, dict] = None
     ):
         model.eval()
 
@@ -204,9 +175,8 @@ class GenerationMetrics:
             #####################################
             ## Generate invisible point cloud  ##
             #####################################
-            # When cartesian: use x_invisible_cartesian (px, py, pz) from parquet
-            invisible_key = 'x_invisible_cartesian' if self.coordinate_system == "cartesian" else 'x_invisible'
-            data_shape = input_set[invisible_key].shape
+
+            data_shape = input_set['x_invisible'].shape
             process_id = input_set['classification'] if 'classification' in input_set else torch.zeros_like(
                 input_set['conditions_mask'].flatten()).long()  # (batch_size, 1)
 
@@ -225,26 +195,13 @@ class GenerationMetrics:
                 num_steps=num_steps_neutrino,
                 use_tqdm=False,
                 process_name=f"Neutrino",
-                remove_padding=True,
+                remove_padding=(getattr(model, "invisible_padding", 0) > 0),
             )
 
-            # In Cartesian mode the raw (px, py, pz) span hundreds of GeV, so the
-            # generic [-15, 15] 1D/2D histograms are meaningless (they only capture
-            # a flat sliver around 0, which is why they look "uniform"). Skip them
-            # and rely on the dedicated, physically-binned kinematic distributions
-            # produced in ``update_neutrino_pt_diagnostics`` below.
-            if self.coordinate_system != "cartesian":
-                for i in range(data_shape[-1]):
-                    masking[f"neutrino-{self.invisible_feature_names[i]}"] = input_set["x_invisible_mask"]
-                    predict_distribution[f"neutrino-{self.invisible_feature_names[i]}"] = generated_distribution[..., i]
-                    truth_distribution[f"neutrino-{self.invisible_feature_names[i]}"] = input_set[invisible_key][..., i]
-
-            self.update_neutrino_pt_diagnostics(
-                generated_distribution=generated_distribution,
-                truth_distribution=input_set[invisible_key],
-                mask=input_set["x_invisible_mask"],
-                process_id=process_id,
-            )
+            for i in range(data_shape[-1]):
+                masking[f"neutrino-{self.invisible_feature_names[i]}"] = input_set["x_invisible_mask"]
+                predict_distribution[f"neutrino-{self.invisible_feature_names[i]}"] = generated_distribution[..., i]
+                truth_distribution[f"neutrino-{self.invisible_feature_names[i]}"] = input_set['x_invisible'][..., i]
 
         # --------------- working line -----------------
         for distribution_name, distribution in predict_distribution.items():
@@ -321,194 +278,6 @@ class GenerationMetrics:
 
         self.histogram_2d = dict()
         self.pearson_stats = dict()
-        self.neutrino_pt_histogram = dict()
-        self.neutrino_truth_pt_histogram = dict()
-        self.neutrino_rel_pt_histogram = dict()
-        self.neutrino_delta_profiles = {
-            name: dict() for name in self.neutrino_profile_bins
-        }
-        self.neutrino_pt_delta_profile = self.neutrino_delta_profiles["pt"]
-        self.neutrino_pred_dist = {name: dict() for name in self.neutrino_kin_vars}
-        self.neutrino_truth_dist = {name: dict() for name in self.neutrino_kin_vars}
-
-    def _pt_from_neutrino_features(self, features: torch.Tensor) -> torch.Tensor:
-        """Return neutrino pT [GeV] from Cartesian or log-pT/eta/phi features."""
-        if self.coordinate_system == "cartesian":
-            return torch.sqrt(features[..., 0] * features[..., 0] + features[..., 1] * features[..., 1] + 1e-12)
-        return torch.expm1(features[..., 0].clamp(-10.0, 10.0))
-
-    def _neutrino_profile_values(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Return physical variables used by DGPO-style truth-binned profiles."""
-        if self.coordinate_system == "cartesian":
-            px = features[..., 0]
-            py = features[..., 1]
-            pz = features[..., 2]
-            pt = torch.sqrt(px * px + py * py + 1e-12)
-            eta = torch.where(pt > 1e-8, torch.asinh(pz / pt), torch.zeros_like(pz))
-            phi = torch.atan2(py, px)
-        else:
-            log_pt = features[..., 0].clamp(-10.0, 10.0)
-            eta = features[..., 1]
-            phi = features[..., 2]
-            pt = torch.expm1(log_pt)
-            px = pt * torch.cos(phi)
-            py = pt * torch.sin(phi)
-            pz = pt * torch.sinh(eta)
-
-        return {
-            "pt": pt,
-            "eta": eta,
-            "phi": phi,
-            "px": px,
-            "py": py,
-            "pz": pz,
-        }
-
-    @staticmethod
-    def _profile_delta(profile_name: str, pred: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
-        """Return signed residuals, wrapping phi into [-pi, pi]."""
-        delta = pred - truth
-        if profile_name == "phi":
-            delta = torch.atan2(torch.sin(delta), torch.cos(delta))
-        return delta
-
-    def _ensure_neutrino_pt_diagnostic_buffers(self, class_name: str):
-        if class_name not in self.neutrino_pt_histogram:
-            self.neutrino_pt_histogram[class_name] = np.zeros(len(self.neutrino_pt_bins) - 1, dtype=np.float64)
-            self.neutrino_truth_pt_histogram[class_name] = np.zeros(len(self.neutrino_pt_bins) - 1, dtype=np.float64)
-            self.neutrino_rel_pt_histogram[class_name] = np.zeros(len(self.neutrino_rel_pt_bins) - 1, dtype=np.float64)
-
-        for profile_name, bins in self.neutrino_profile_bins.items():
-            if class_name in self.neutrino_delta_profiles[profile_name]:
-                continue
-            n_profile = len(bins) - 1
-            self.neutrino_delta_profiles[profile_name][class_name] = {
-                "sum": np.zeros(n_profile, dtype=np.float64),
-                "sum_sq": np.zeros(n_profile, dtype=np.float64),
-                "count": np.zeros(n_profile, dtype=np.float64),
-            }
-        self.neutrino_pt_delta_profile = self.neutrino_delta_profiles["pt"]
-
-        for var in self.neutrino_kin_vars:
-            if class_name in self.neutrino_pred_dist[var]:
-                continue
-            n_dist = len(self.neutrino_profile_bins[var]) - 1
-            self.neutrino_pred_dist[var][class_name] = np.zeros(n_dist, dtype=np.float64)
-            self.neutrino_truth_dist[var][class_name] = np.zeros(n_dist, dtype=np.float64)
-
-    def _accumulate_delta_profile(
-            self,
-            profile_name: str,
-            class_name: str,
-            pred_values: torch.Tensor,
-            truth_values: torch.Tensor,
-    ):
-        delta_values = self._profile_delta(profile_name, pred_values, truth_values)
-        truth = truth_values.detach().float().cpu().numpy()
-        delta = delta_values.detach().float().cpu().numpy()
-        finite = np.isfinite(truth) & np.isfinite(delta)
-        if profile_name == "pt":
-            finite &= truth >= 0.0
-        truth = truth[finite]
-        delta = delta[finite]
-        if truth.size == 0:
-            return
-
-        bins = self.neutrino_profile_bins[profile_name]
-        bin_idx = np.digitize(truth, bins) - 1
-        valid_bins = (bin_idx >= 0) & (bin_idx < len(bins) - 1)
-        if not np.any(valid_bins):
-            return
-
-        profile = self.neutrino_delta_profiles[profile_name][class_name]
-        idx = bin_idx[valid_bins]
-        vals = delta[valid_bins]
-        profile["sum"] += np.bincount(idx, weights=vals, minlength=profile["sum"].size)
-        profile["sum_sq"] += np.bincount(idx, weights=vals * vals, minlength=profile["sum_sq"].size)
-        profile["count"] += np.bincount(idx, minlength=profile["count"].size)
-
-    def _accumulate_kin_distribution(
-            self,
-            var: str,
-            class_name: str,
-            pred_values: torch.Tensor,
-            truth_values: torch.Tensor,
-    ):
-        """Accumulate pred/truth distribution histograms for a kinematic variable."""
-        bins = self.neutrino_profile_bins[var]
-        pred = pred_values.detach().float().cpu().numpy()
-        truth = truth_values.detach().float().cpu().numpy()
-        pred = pred[np.isfinite(pred)]
-        truth = truth[np.isfinite(truth)]
-        if pred.size:
-            hist, _ = np.histogram(pred, bins=bins)
-            self.neutrino_pred_dist[var][class_name] += hist
-        if truth.size:
-            hist, _ = np.histogram(truth, bins=bins)
-            self.neutrino_truth_dist[var][class_name] += hist
-
-    def update_neutrino_pt_diagnostics(
-            self,
-            generated_distribution: torch.Tensor,
-            truth_distribution: torch.Tensor,
-            mask: torch.Tensor,
-            process_id: torch.Tensor,
-    ):
-        """Accumulate neutrino histograms and DGPO-style truth-binned profiles."""
-        pred_profiles = self._neutrino_profile_values(generated_distribution)
-        truth_profiles = self._neutrino_profile_values(truth_distribution)
-        pred_pt = pred_profiles["pt"]
-        truth_pt = truth_profiles["pt"]
-
-        slot_mask = mask
-        if slot_mask.dim() == 3 and slot_mask.shape[-1] == 1:
-            slot_mask = slot_mask.squeeze(-1)
-        slot_mask = slot_mask > 0
-        proc = process_id.reshape(-1)
-
-        for class_index, class_name in enumerate(self.class_names):
-            self._ensure_neutrino_pt_diagnostic_buffers(class_name)
-            event_mask = proc == class_index
-            if not bool(event_mask.any().item()):
-                continue
-
-            valid_slots = slot_mask[event_mask]
-            pred = pred_pt[event_mask][valid_slots].detach().float().cpu().numpy()
-            truth = truth_pt[event_mask][valid_slots].detach().float().cpu().numpy()
-            finite = np.isfinite(pred) & np.isfinite(truth) & (truth >= 0.0)
-            pred = pred[finite]
-            truth = truth[finite]
-            if pred.size == 0:
-                continue
-
-            pred_hist, _ = np.histogram(pred, bins=self.neutrino_pt_bins)
-            truth_hist, _ = np.histogram(truth, bins=self.neutrino_pt_bins)
-            self.neutrino_pt_histogram[class_name] += pred_hist
-            self.neutrino_truth_pt_histogram[class_name] += truth_hist
-
-            delta = pred - truth
-            rel_mask = truth > 1e-6
-            rel_pt = pred[rel_mask] / truth[rel_mask] - 1.0
-            rel_pt = rel_pt[np.isfinite(rel_pt)]
-            rel_hist, _ = np.histogram(rel_pt, bins=self.neutrino_rel_pt_bins)
-            self.neutrino_rel_pt_histogram[class_name] += rel_hist
-
-            for profile_name in self.neutrino_profile_bins:
-                pred_values = pred_profiles[profile_name][event_mask][valid_slots]
-                truth_values = truth_profiles[profile_name][event_mask][valid_slots]
-                self._accumulate_delta_profile(
-                    profile_name=profile_name,
-                    class_name=class_name,
-                    pred_values=pred_values,
-                    truth_values=truth_values,
-                )
-                if profile_name in self.neutrino_kin_vars:
-                    self._accumulate_kin_distribution(
-                        var=profile_name,
-                        class_name=class_name,
-                        pred_values=pred_values,
-                        truth_values=truth_values,
-                    )
 
     def reduce_across_gpus(self):
         if not torch.distributed.is_initialized():
@@ -522,29 +291,9 @@ class GenerationMetrics:
                     torch.distributed.all_reduce(tensor_, op=torch.distributed.ReduceOp.SUM)
                     nested_hist[name_][class_name_] = tensor_.cpu().numpy()
 
-        def reduce_class_histogram(class_hist, dtype=torch.float32):
-            for class_name_, data in class_hist.items():
-                tensor_ = torch.tensor(data, dtype=dtype, device=self.device)
-                torch.distributed.all_reduce(tensor_, op=torch.distributed.ReduceOp.SUM)
-                class_hist[class_name_] = tensor_.cpu().numpy()
-
         reduce_nested_histogram(self.histogram, dtype=torch.long)
         reduce_nested_histogram(self.truth_histogram, dtype=torch.long)
         reduce_nested_histogram(self.histogram_2d, dtype=torch.long)
-        reduce_class_histogram(self.neutrino_pt_histogram, dtype=torch.float32)
-        reduce_class_histogram(self.neutrino_truth_pt_histogram, dtype=torch.float32)
-        reduce_class_histogram(self.neutrino_rel_pt_histogram, dtype=torch.float32)
-
-        for profiles in self.neutrino_delta_profiles.values():
-            for class_name, profile in profiles.items():
-                for key in ["sum", "sum_sq", "count"]:
-                    tensor = torch.tensor(profile[key], dtype=torch.float32, device=self.device)
-                    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
-                    profile[key] = tensor.cpu().numpy()
-
-        for var in self.neutrino_kin_vars:
-            reduce_class_histogram(self.neutrino_pred_dist[var], dtype=torch.float32)
-            reduce_class_histogram(self.neutrino_truth_dist[var], dtype=torch.float32)
 
         for name, stats_group in self.pearson_stats.items():
             for class_name, stats in stats_group.items():
@@ -622,206 +371,6 @@ class GenerationMetrics:
         ax.set_title(title)
         return fig
 
-    def plot_neutrino_pt_histogram_func(self):
-        """Overlay generated and truth neutrino pT histograms."""
-        fig, ax = plt.subplots(figsize=(6.8, 4.2))
-        centers = 0.5 * (self.neutrino_pt_bins[:-1] + self.neutrino_pt_bins[1:])
-        widths = np.diff(self.neutrino_pt_bins)
-        colors = [
-            "#40B0A6", "#6D8EF7", "#6E579A", "#A38E89", "#A5C8DD",
-            "#CD5582", "#E1BE6A", "#E89A7A", "#EC6B2D"
-        ]
-        jsd = dict()
-        for cls, class_name in enumerate(self.class_names):
-            if class_name not in self.neutrino_pt_histogram:
-                continue
-            pred_counts = self.neutrino_pt_histogram[class_name]
-            truth_counts = self.neutrino_truth_pt_histogram[class_name]
-            color = colors[cls % len(colors)]
-            if np.sum(pred_counts) > 0:
-                pred_density = pred_counts / (np.sum(pred_counts) * widths)
-                ax.plot(
-                    centers,
-                    pred_density,
-                    color=color,
-                    linestyle="--",
-                    marker="o",
-                    linewidth=2,
-                    markersize=4,
-                    label=f"{class_name} pred",
-                )
-            if np.sum(truth_counts) > 0:
-                truth_density = truth_counts / (np.sum(truth_counts) * widths)
-                ax.bar(
-                    centers,
-                    truth_density,
-                    width=widths,
-                    color=color,
-                    alpha=0.7,
-                    edgecolor=color,
-                    fill=False,
-                    label=f"{class_name} truth",
-                )
-            if np.sum(pred_counts) > 0 and np.sum(truth_counts) > 0:
-                p = truth_counts / np.sum(truth_counts)
-                q = pred_counts / np.sum(pred_counts)
-                jsd[class_name] = jensenshannon(p, q)
-        ax.set_xlabel(r"$p_T$ [GeV]")
-        ax.set_ylabel("Normalized density")
-        ax.set_title("Neutrino pT distribution")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
-        return fig, jsd
-
-    def plot_neutrino_rel_pt_histogram_func(self):
-        """Plot the relative pT residual distribution, matching DGPO diagnostics."""
-        fig, ax = plt.subplots(figsize=(6.8, 4.2))
-        centers = 0.5 * (self.neutrino_rel_pt_bins[:-1] + self.neutrino_rel_pt_bins[1:])
-        widths = np.diff(self.neutrino_rel_pt_bins)
-        colors = [
-            "#40B0A6", "#6D8EF7", "#6E579A", "#A38E89", "#A5C8DD",
-            "#CD5582", "#E1BE6A", "#E89A7A", "#EC6B2D"
-        ]
-        for cls, class_name in enumerate(self.class_names):
-            counts = self.neutrino_rel_pt_histogram.get(class_name)
-            if counts is None or np.sum(counts) <= 0:
-                continue
-            density = counts / (np.sum(counts) * widths)
-            mean = np.sum(centers * counts) / np.sum(counts)
-            ax.plot(
-                centers,
-                density,
-                color=colors[cls % len(colors)],
-                linestyle="-",
-                linewidth=2,
-                label=f"{class_name}: mean={mean:+.3f}",
-            )
-        ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
-        ax.set_xlabel(r"$p_T^{pred} / p_T^{truth} - 1$")
-        ax.set_ylabel("Normalized density")
-        ax.set_title("Relative pT residual distribution")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
-        return fig
-
-    def plot_neutrino_kin_distribution_func(self, var: str):
-        """Overlay generated vs truth neutrino distribution for a kinematic variable.
-
-        In Cartesian mode the predicted (px, py, pz) are recovered into
-        (pt, eta, phi) via ``_neutrino_profile_values`` before accumulation, so
-        eta/phi distributions are available and px/py/pz use physical GeV bins.
-        """
-        fig, ax = plt.subplots(figsize=(6.8, 4.2))
-        bins = self.neutrino_profile_bins[var]
-        centers = 0.5 * (bins[:-1] + bins[1:])
-        widths = np.diff(bins)
-        colors = [
-            "#40B0A6", "#6D8EF7", "#6E579A", "#A38E89", "#A5C8DD",
-            "#CD5582", "#E1BE6A", "#E89A7A", "#EC6B2D"
-        ]
-        jsd = dict()
-        for cls, class_name in enumerate(self.class_names):
-            pred_counts = self.neutrino_pred_dist[var].get(class_name)
-            truth_counts = self.neutrino_truth_dist[var].get(class_name)
-            color = colors[cls % len(colors)]
-            if pred_counts is not None and np.sum(pred_counts) > 0:
-                density = pred_counts / (np.sum(pred_counts) * widths)
-                ax.plot(
-                    centers, density, color=color, linestyle="--", marker="o",
-                    linewidth=2, markersize=4, label=f"{class_name} (Pred)",
-                )
-            if truth_counts is not None and np.sum(truth_counts) > 0:
-                truth_density = truth_counts / (np.sum(truth_counts) * widths)
-                ax.bar(
-                    centers, truth_density, width=widths, color=color, alpha=0.7,
-                    edgecolor=color, fill=False, label=f"{class_name} (Truth)",
-                )
-            if (pred_counts is not None and truth_counts is not None
-                    and np.sum(pred_counts) > 0 and np.sum(truth_counts) > 0):
-                p = truth_counts / np.sum(truth_counts)
-                q = pred_counts / np.sum(pred_counts)
-                jsd[class_name] = jensenshannon(p, q)
-        unit = " [GeV]" if var in {"pt", "px", "py", "pz"} else (" [rad]" if var == "phi" else "")
-        ax.set_xlabel(f"{var}{unit}")
-        ax.set_ylabel("Normalized density")
-        ax.set_title(f"Neutrino {var} distribution")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
-        return fig, jsd
-
-    @staticmethod
-    def _profile_axis_labels(profile_name: str) -> tuple[str, str, str]:
-        display = {
-            "pt": "pT",
-            "eta": "eta",
-            "phi": "phi",
-            "px": "px",
-            "py": "py",
-            "pz": "pz",
-        }.get(profile_name, profile_name)
-        if profile_name in {"pt", "px", "py", "pz"}:
-            return f"Truth {display} [GeV]", f"Mean delta {display} [GeV]", display
-        if profile_name == "phi":
-            return "Truth phi [rad]", "Mean wrapped delta phi [rad]", display
-        return f"Truth {display}", f"Mean delta {display}", display
-
-    def plot_neutrino_delta_profile_func(self, profile_name: str):
-        """Plot mean ``pred - truth`` in truth-variable bins, DGPO-style."""
-        fig, ax = plt.subplots(figsize=(6.8, 4.2))
-        bins = self.neutrino_profile_bins[profile_name]
-        centers = 0.5 * (bins[:-1] + bins[1:])
-        width = float(bins[1] - bins[0])
-        total_counts = np.zeros_like(centers)
-        x_label, y_label, display = self._profile_axis_labels(profile_name)
-        colors = [
-            "#40B0A6", "#6D8EF7", "#6E579A", "#A38E89", "#A5C8DD",
-            "#CD5582", "#E1BE6A", "#E89A7A", "#EC6B2D"
-        ]
-        for cls, class_name in enumerate(self.class_names):
-            profile = self.neutrino_delta_profiles[profile_name].get(class_name)
-            if profile is None:
-                continue
-            counts = profile["count"]
-            valid = counts > 0
-            total_counts += counts
-            if not np.any(valid):
-                continue
-            means = np.full_like(centers, np.nan, dtype=np.float64)
-            errors = np.full_like(centers, np.nan, dtype=np.float64)
-            means[valid] = profile["sum"][valid] / counts[valid]
-            variance = np.maximum(profile["sum_sq"][valid] / counts[valid] - means[valid] ** 2, 0.0)
-            errors[valid] = np.sqrt(variance / counts[valid])
-            ax.errorbar(
-                centers[valid],
-                means[valid],
-                yerr=errors[valid],
-                fmt="o-",
-                linewidth=1.8,
-                markersize=4,
-                capsize=2,
-                color=colors[cls % len(colors)],
-                label=f"{class_name} mean delta {display}",
-            )
-        ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
-        ax.set_xlabel(x_label)
-        ax.set_ylabel(y_label)
-        ax.set_title(f"Neutrino {display} bias vs truth {display}")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=8)
-
-        ax_count = ax.twinx()
-        ax_count.bar(centers, total_counts, width=width * 0.85, alpha=0.12, color="gray", label="entries")
-        ax_count.set_ylabel("Entries")
-        fig.tight_layout()
-        return fig
-
-    def plot_neutrino_pt_delta_profile_func(self):
-        """Plot mean ``pT_pred - pT_truth`` in truth-pT bins, DGPO-style."""
-        return self.plot_neutrino_delta_profile_func("pt")
-
     def plot_histogram(self):
         figs = dict()
 
@@ -856,34 +405,6 @@ class GenerationMetrics:
                     title=f"2D Histogram {name} - {class_name}"
                 )
                 figs[f"2D_{name}_{class_name}"] = fig
-
-        if self.neutrino_pt_histogram:
-            fig_pt, jsd_pt = self.plot_neutrino_pt_histogram_func()
-            figs["neutrino-pt-1d"] = fig_pt
-            for cls_name, score in jsd_pt.items():
-                jsd_results[f"neutrino-pt-{cls_name}"] = score
-
-        if self.neutrino_rel_pt_histogram:
-            figs["neutrino-rel_pt-1d"] = self.plot_neutrino_rel_pt_histogram_func()
-
-        for var in self.neutrino_kin_vars:
-            has_pred = any(np.sum(c) > 0 for c in self.neutrino_pred_dist[var].values())
-            has_truth = any(np.sum(c) > 0 for c in self.neutrino_truth_dist[var].values())
-            if not (has_pred or has_truth):
-                continue
-            fig_var, jsd_var = self.plot_neutrino_kin_distribution_func(var)
-            figs[f"neutrino-{var}-dist-1d"] = fig_var
-            for cls_name, score in jsd_var.items():
-                jsd_results[f"neutrino-{var}-dist-{cls_name}"] = score
-
-        for profile_name, profiles in self.neutrino_delta_profiles.items():
-            if profiles:
-                figs[f"neutrino-profile/{profile_name}_delta_vs_truth_{profile_name}"] = (
-                    self.plot_neutrino_delta_profile_func(profile_name)
-                )
-
-        if self.neutrino_pt_delta_profile:
-            figs["neutrino-pt-delta_vs_truth_pt"] = self.plot_neutrino_pt_delta_profile_func()
 
         # Pearson correlation
         pearson_results = dict()

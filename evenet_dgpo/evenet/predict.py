@@ -1,3 +1,4 @@
+import argparse
 import copy
 import os
 from pathlib import Path
@@ -6,18 +7,16 @@ import glob
 
 import ray
 from ray.actor import ActorHandle
-from ray.train import ScalingConfig, RunConfig
+from ray.train import DataConfig, RunConfig, ScalingConfig
 from ray.train.torch import TorchTrainer
 from ray.train.lightning import RayDDPStrategy, RayLightningEnvironment, prepare_trainer
 
-from ray.train import DataConfig, ScalingConfig
 from ray.data import Dataset, DataIterator, NodeIdStr, ExecutionResources
 
 import lightning as L
 from evenet.control.global_config import global_config
-from evenet.engine import EveNetEngine
 from evenet.network.callbacks.predict_writer import PredWriter
-from evenet.utilities.ray_tmpdir import ensure_short_ray_tmpdir
+from evenet.engine import EveNetEngine
 from shared import make_process_fn, prepare_datasets
 
 
@@ -30,6 +29,8 @@ def predict_func(cfg):
         prefetch_batches=cfg['prefetch_batches'],
     )
 
+    global_config.load_yaml(cfg['global_config_path'], current_dir=cfg['current_dir'])
+
     if global_config.options.Training.model_checkpoint_load_path:
         if Path(global_config.options.Training.model_checkpoint_load_path).is_dir():
             checkpoint_dir = global_config.options.Training.model_checkpoint_load_path
@@ -37,7 +38,7 @@ def predict_func(cfg):
             if ckpt_files:
                 ckpt_path = max(ckpt_files, key=os.path.getmtime)
             else:
-                ckpt_path = None
+                ckpt_path = None  # or raise an error/log a message
         else:
             ckpt_path = global_config.options.Training.model_checkpoint_load_path
         print(f"Loading checkpoint from model_checkpoint_load_path: {ckpt_path}")
@@ -59,6 +60,7 @@ def predict_func(cfg):
         "accelerator": "auto",
         "devices": "auto",
     }
+    # if this is macOS, set the accelerator to "cpu"
     if os.uname().sysname == "Darwin":
         accelerator_config["accelerator"] = "cpu"
         accelerator_config["devices"] = 1
@@ -68,7 +70,7 @@ def predict_func(cfg):
     if predict_write_config:
         pred_writer = PredWriter(
             output_dir=Path(cfg['current_dir']) / predict_write_config["output_dir"],
-            filename_prefix=predict_write_config["filename"],
+            filename=predict_write_config["filename"],
         )
         callbacks.append(pred_writer)
     else:
@@ -116,33 +118,34 @@ class PredictDataControl(DataConfig):
         return [{name: it} for it in iterator_shards]
 
 
-if __name__ == '__main__':
-    import argparse
-
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="EveNet Prediction Program")
     parser.add_argument("config", help="Path to config YAML")
+    return parser
 
-    args = parser.parse_args()
 
+def main(args: argparse.Namespace) -> None:
     runtime_env = {
         "env_vars": {
-            "PYTHONPATH": f"{Path(__file__).resolve().parent.parent}:{os.environ.get('PYTHONPATH', '')}",
+            "PYTHONPATH": f"{Path(__file__).resolve().parent}:{os.environ.get('PYTHONPATH', '')}",
         }
     }
 
-    global_config.load_yaml(args.config)
-    global_config.display()
+    # Expand ~ and convert to absolute path
+    config_path = os.path.abspath(os.path.expanduser(args.config))
+    # Check existence
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Config file does not exist: {config_path}")
 
-    ensure_short_ray_tmpdir()
-    _rt = os.environ.get("RAY_TMPDIR")
-    if _rt:
-        runtime_env["env_vars"]["RAY_TMPDIR"] = _rt
+    # Load your config
+    global_config.load_yaml(config_path)
 
     ray.init(runtime_env=runtime_env)
     platform_info = global_config.platform
-
     base_dir = Path(platform_info.data_parquet_dir)
+
     process_fn = make_process_fn(base_dir)
+
     predict_ds, _, predict_count, _ = prepare_datasets(
         base_dir, process_fn, platform_info, predict=True
     )
@@ -154,6 +157,7 @@ if __name__ == '__main__':
             "prefetch_batches": platform_info.prefetch_batches,
             "total_events": predict_count,
             "current_dir": os.getcwd(),
+            "global_config_path": config_path,
         },
         scaling_config=ScalingConfig(
             num_workers=platform_info.number_of_workers,
@@ -165,5 +169,15 @@ if __name__ == '__main__':
         dataset_config=PredictDataControl()
     )
 
-    result = trainer.fit()
+    trainer.fit()
     print("Prediction finished.")
+
+
+def cli() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    main(args)
+
+
+if __name__ == '__main__':
+    cli()

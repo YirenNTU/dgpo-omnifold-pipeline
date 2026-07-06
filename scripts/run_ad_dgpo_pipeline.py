@@ -251,6 +251,8 @@ def run_ad_stage(
     ad_checkpoint: Path | None,
     latent_checkpoint: Path | None,
     token_batch_size: int,
+    token_workers: int | None,
+    token_devices: str | None,
 ) -> tuple[Path, Path]:
     ad_config_dict = merged_config(ad_base_config, ad_overlay_config)
     ad_runtime_config = build_ad_runtime_config(
@@ -264,7 +266,7 @@ def run_ad_stage(
     input_root = ensure_split_root(ad_config_dict)
     augmented_root = stage_root / augmented_dirname
 
-    run_command([
+    command = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "augment_event_tokens.py"),
         "--train-config",
@@ -280,7 +282,16 @@ def run_ad_stage(
         "val",
         "--batch-size",
         str(token_batch_size),
-    ])
+        "--use-gpu" if ad_config_dict["platform"].get("use_gpu", True) else "--no-use-gpu",
+        "--devices",
+        token_devices if token_devices is not None else "auto",
+    ]
+    if token_workers is not None:
+        command.extend([
+            "--num-workers",
+            str(token_workers),
+        ])
+    run_command(command)
 
     if latent_checkpoint is None:
         latent_runtime = build_latent_runtime_config(
@@ -358,6 +369,8 @@ def main() -> None:
         help="Checkpoint used to initialize DGPO stage 2. This is independent from the AD frozen backbone checkpoint.",
     )
     parser.add_argument("--token-batch-size", type=int, default=1024)
+    parser.add_argument("--token-workers", type=int, default=None)
+    parser.add_argument("--token-devices", default=None, help="Comma-separated GPU device list for AD token export, or 'auto'.")
     args = parser.parse_args()
 
     stage_root = args.stage_root.expanduser().resolve()
@@ -396,6 +409,8 @@ def main() -> None:
             ad_checkpoint=ad_checkpoint,
             latent_checkpoint=latent_checkpoint,
             token_batch_size=args.token_batch_size,
+            token_workers=args.token_workers,
+            token_devices=args.token_devices,
         )
     else:
         augmented_root = stage_root / args.augmented_dirname

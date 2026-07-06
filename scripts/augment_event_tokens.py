@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +67,54 @@ def flatten_token_array(base: str, values: np.ndarray) -> dict[str, np.ndarray]:
     raise ValueError(f"Unsupported token array shape for {base}: {values.shape}")
 
 
+def parse_device_list(raw: str | None, *, use_gpu: bool) -> list[str]:
+    if raw is None:
+        if use_gpu and torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            return [f"cuda:{index}" for index in range(count)] or ["cpu"]
+        return ["cpu"]
+
+    value = raw.strip()
+    if not value:
+        return ["cpu"]
+    if value.lower() == "auto":
+        if use_gpu and torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            return [f"cuda:{index}" for index in range(count)] or ["cpu"]
+        return ["cpu"]
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def resolve_worker_devices(
+    *,
+    requested_devices: str | None,
+    requested_workers: int | None,
+    explicit_device: str | None,
+    use_gpu: bool,
+) -> list[str]:
+    if explicit_device and requested_devices is None and requested_workers is None:
+        return [explicit_device]
+
+    devices = parse_device_list(requested_devices, use_gpu=use_gpu)
+    if explicit_device and requested_devices is None:
+        devices = [explicit_device]
+
+    if requested_workers is None or requested_workers <= 0:
+        return devices
+
+    if not devices:
+        return ["cpu"]
+
+    if len(devices) >= requested_workers:
+        return devices[:requested_workers]
+
+    if all(device.startswith("cuda:") for device in devices):
+        return devices
+
+    repeats = math.ceil(requested_workers / len(devices))
+    return (devices * repeats)[:requested_workers]
+
+
 def augment_file(
     *,
     model: torch.nn.Module,
@@ -119,6 +170,38 @@ def augment_file(
     return total_rows, event_token_shape, object_token_shape
 
 
+def augment_files_on_device(
+    *,
+    config_path: str,
+    checkpoint_path: str,
+    input_paths: list[str],
+    output_paths: list[str],
+    shape_metadata: dict[str, list[int]],
+    batch_size: int,
+    device_name: str,
+) -> list[tuple[int, tuple[int, ...], tuple[int, ...]]]:
+    device = torch.device(device_name)
+    bundle = load_evenet_model_for_dgpo(
+        config_path=Path(config_path),
+        checkpoint_path=Path(checkpoint_path),
+        device=device,
+    )
+    model = bundle.model.eval()
+    results: list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
+    for input_path, output_path in zip(input_paths, output_paths, strict=True):
+        results.append(
+            augment_file(
+                model=model,
+                device=device,
+                input_path=Path(input_path),
+                output_path=Path(output_path),
+                shape_metadata=shape_metadata,
+                batch_size=batch_size,
+            )
+        )
+    return results
+
+
 def copy_sidecars(
     *,
     input_dir: Path,
@@ -148,35 +231,69 @@ def augment_split(
     input_dir: Path,
     output_dir: Path,
     batch_size: int,
-    device: torch.device,
+    worker_devices: list[str],
 ) -> None:
     shape_metadata = read_shape_metadata(input_dir)
-    bundle = load_evenet_model_for_dgpo(
-        config_path=config_path,
-        checkpoint_path=checkpoint_path,
-        device=device,
-    )
-    model = bundle.model.eval()
-
     event_shape: tuple[int, ...] | None = None
     object_shape: tuple[int, ...] | None = None
-    for parquet_path in sorted(input_dir.glob("*.parquet")):
-        out_path = output_dir / parquet_path.name
-        _, file_event_shape, file_object_shape = augment_file(
-            model=model,
-            device=device,
-            input_path=parquet_path,
-            output_path=out_path,
+    parquet_paths = sorted(input_dir.glob("*.parquet"))
+    if not parquet_paths:
+        raise RuntimeError(f"No parquet files found in {input_dir}")
+
+    output_paths = [output_dir / parquet_path.name for parquet_path in parquet_paths]
+    device_names = worker_devices or ["cpu"]
+    num_workers = min(len(device_names), len(parquet_paths))
+    device_names = device_names[:num_workers]
+
+    if num_workers <= 1:
+        results = augment_files_on_device(
+            config_path=str(config_path),
+            checkpoint_path=str(checkpoint_path),
+            input_paths=[str(path) for path in parquet_paths],
+            output_paths=[str(path) for path in output_paths],
             shape_metadata=shape_metadata,
             batch_size=batch_size,
+            device_name=device_names[0],
         )
+    else:
+        chunks_input: list[list[str]] = [[] for _ in range(num_workers)]
+        chunks_output: list[list[str]] = [[] for _ in range(num_workers)]
+        for index, (input_path, output_path) in enumerate(zip(parquet_paths, output_paths, strict=True)):
+            bucket = index % num_workers
+            chunks_input[bucket].append(str(input_path))
+            chunks_output[bucket].append(str(output_path))
+
+        ctx = get_context("spawn")
+        futures = []
+        with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
+            for device_name, input_chunk, output_chunk in zip(device_names, chunks_input, chunks_output, strict=True):
+                if not input_chunk:
+                    continue
+                futures.append(
+                    executor.submit(
+                        augment_files_on_device,
+                        config_path=str(config_path),
+                        checkpoint_path=str(checkpoint_path),
+                        input_paths=input_chunk,
+                        output_paths=output_chunk,
+                        shape_metadata=shape_metadata,
+                        batch_size=batch_size,
+                        device_name=device_name,
+                    )
+                )
+
+            results = []
+            for future in futures:
+                results.extend(future.result())
+
+    for _, file_event_shape, file_object_shape in results:
         event_shape = file_event_shape if event_shape is None else event_shape
         object_shape = file_object_shape if object_shape is None else object_shape
         if event_shape != file_event_shape or object_shape != file_object_shape:
             raise ValueError("Inconsistent token shapes across parquet files.")
 
     if event_shape is None or object_shape is None:
-        raise RuntimeError(f"No parquet files found in {input_dir}")
+        raise RuntimeError(f"No rows were processed while augmenting {input_dir}")
 
     copy_sidecars(
         input_dir=input_dir,
@@ -195,12 +312,38 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True, help="Base directory where augmented splits are written.")
     parser.add_argument("--splits", nargs="+", default=["train", "val"])
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default=None, help="Single-device fallback, for example cuda:0 or cpu.")
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated device list for parallel token export, or 'auto' to use all visible GPUs.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Number of parallel export workers. Defaults to the number of selected devices.",
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether token export should target GPUs when available.",
+    )
     args = parser.parse_args()
 
-    device = torch.device(args.device)
     checkpoint = args.checkpoint.expanduser().resolve()
     config_path = args.train_config.expanduser().resolve()
+    worker_devices = resolve_worker_devices(
+        requested_devices=args.devices,
+        requested_workers=args.num_workers,
+        explicit_device=args.device,
+        use_gpu=args.use_gpu,
+    )
+    print(
+        f"[augment_event_tokens] using {len(worker_devices)} worker(s) on devices: {', '.join(worker_devices)}",
+        flush=True,
+    )
 
     for split in args.splits:
         augment_split(
@@ -209,7 +352,7 @@ def main() -> None:
             input_dir=(args.input_dir / split).resolve(),
             output_dir=(args.output_dir / split).resolve(),
             batch_size=args.batch_size,
-            device=device,
+            worker_devices=worker_devices,
         )
 
 

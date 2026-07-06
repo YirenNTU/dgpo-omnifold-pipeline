@@ -3,9 +3,11 @@ import pickle
 from evenet.control.global_config import DotDict
 
 from evenet.network.layers.utils import RandomDrop
+from evenet.network.layers.invisible_input_projector import InvisibleInputProjector
 
 from evenet.network.body.normalizer import Normalizer
 from evenet.network.body.embedding import GlobalVectorEmbedding, PETBody
+from evenet.network.body.grouped_sequential_embedding import GroupedSequentialEmbedding
 from evenet.network.body.object_encoder import ObjectEncoder
 from evenet.network.heads.classification.classification_head import ClassificationHead, RegressionHead
 from evenet.network.heads.assignment.assignment_head import SharedAssignmentHead
@@ -36,7 +38,6 @@ class EveNetModel(nn.Module):
             assignment: bool = False,
             segmentation: bool = False,
             normalization_dict: dict = None,
-            coordinate_system: str = "pt_eta_phi",
     ):
         super().__init__()
         # # Initialize the model with the given configuration
@@ -52,7 +53,7 @@ class EveNetModel(nn.Module):
         self.include_assignment = assignment
         self.include_segmentation = segmentation
         self.device = device
-        self.coordinate_system = coordinate_system
+        self.grouped_sequential_cfg = getattr(self.event_info, "grouped_sequential_config", None)
 
         # self.normalization_dict = normalization_dict
 
@@ -87,11 +88,13 @@ class EveNetModel(nn.Module):
         )
 
         self.global_input_dim: int = global_normalizer_info["norm_mask"].size()[-1]
-        self.sequential_input_dim: int = input_normalizers_setting["SEQUENTIAL"]["norm_mask"].size()[-1]
+        self.raw_sequential_input_dim: int = input_normalizers_setting["SEQUENTIAL"]["norm_mask"].size()[-1]
+        self.sequential_input_dim: int = getattr(
+            self.event_info,
+            "projected_sequential_input_dim",
+            self.raw_sequential_input_dim,
+        )
         self.local_feature_indices = self.network_cfg.Body.PET.local_point_index
-        self.invisible_input_dim: int = len(normalization_dict["invisible_mean"]["Source"])
-        self.invisible_padding: int = self.sequential_input_dim - self.invisible_input_dim
-        assert self.invisible_padding >= 0, f"Invisible Padding size {self.invisible_padding} is negative. "
 
         self.sequential_normalizer = Normalizer(
             norm_mask=input_normalizers_setting["SEQUENTIAL"]["norm_mask"].to(self.device),
@@ -106,6 +109,16 @@ class EveNetModel(nn.Module):
             std=global_normalizer_info["std"].to(self.device),
         )
 
+        grouped_embedding_cfg = self.network_cfg.Body.get("GroupedSequentialEmbedding", {})
+        self.GroupedSequentialEmbedding = None
+        if self.grouped_sequential_cfg is not None:
+            self.GroupedSequentialEmbedding = GroupedSequentialEmbedding(
+                raw_feature_names=self._raw_sequential_feature_names(),
+                grouped_config=self.grouped_sequential_cfg,
+                hidden_dim_scale=grouped_embedding_cfg.get("hidden_dim_scale", 2.0),
+                dropout=grouped_embedding_cfg.get("dropout", 0.0),
+            )
+
         if self.include_point_cloud_generation:
             self.num_point_cloud_normalizer = Normalizer(
                 mean=normalization_dict["input_num_mean"]["Source"].unsqueeze(-1).to(self.device),
@@ -113,29 +126,20 @@ class EveNetModel(nn.Module):
                 norm_mask=torch.tensor([1], device=self.device, dtype=torch.bool)
             )
 
+        self.invisible_padding: int = 0
         if self.include_neutrino_generation:
-            if self.coordinate_system == "cartesian":
-                # Use Cartesian (px, py, pz) from parquet with mean/std from normalization.pt
-                if "invisible_cartesian_mean" not in normalization_dict or "invisible_cartesian_std" not in normalization_dict:
-                    raise ValueError(
-                        "cartesian=True requires invisible_cartesian_mean and invisible_cartesian_std in normalization.pt. "
-                        "Re-run preprocessing to generate them."
-                    )
-                self.invisible_normalizer = Normalizer(
-                    mean=normalization_dict["invisible_cartesian_mean"]["Source"].to(self.device),
-                    std=normalization_dict["invisible_cartesian_std"]["Source"].to(self.device),
-                    norm_mask=torch.tensor([1], device=self.device, dtype=torch.bool),
-                    inv_cdf_index=[],  # px, py, pz: no inv_cdf transform
-                    padding_size=self.invisible_padding,
-                )
-            else:
-                self.invisible_normalizer = Normalizer(
-                    mean=normalization_dict["invisible_mean"]["Source"].to(self.device),
-                    std=normalization_dict["invisible_std"]["Source"].to(self.device),
-                    norm_mask=torch.tensor([1], device=self.device, dtype=torch.bool),
-                    inv_cdf_index=self.event_info.invisible_inv_cdf_index,
-                    padding_size=self.invisible_padding,
-                )
+            self.invisible_input_dim: int = len(normalization_dict["invisible_mean"]["Source"])
+
+            self.invisible_normalizer = Normalizer(
+                mean=normalization_dict["invisible_mean"]["Source"].to(self.device),
+                std=normalization_dict["invisible_std"]["Source"].to(self.device),
+                norm_mask=torch.tensor([1], device=self.device, dtype=torch.bool),
+                inv_cdf_index=self.event_info.invisible_inv_cdf_index,
+            )
+            self.InvisibleInputProjector = InvisibleInputProjector(
+                input_dim=self.invisible_input_dim,
+                output_dim=self.sequential_input_dim,
+            )
 
         # [1] Body
         global_embedding_cfg = self.network_cfg.Body.GlobalEmbedding
@@ -297,7 +301,7 @@ class EveNetModel(nn.Module):
                 projection_dim=self.network_cfg.TruthGeneration.hidden_dim,
                 num_global_cond=global_embedding_cfg.hidden_dim,
                 num_classes=self.event_info.num_classes_total,
-                output_dim=self.invisible_input_dim + self.invisible_padding,
+                output_dim=self.invisible_input_dim,
                 num_layers=self.network_cfg.TruthGeneration.num_layers,
                 num_heads=self.network_cfg.TruthGeneration.num_heads,
                 dropout=self.network_cfg.TruthGeneration.dropout,
@@ -331,6 +335,33 @@ class EveNetModel(nn.Module):
             ("neutrino_generation", self.include_neutrino_generation),
             ("deterministic", self.include_classification or self.include_assignment or self.include_regression or self.include_segmentation),
         ]
+
+    def _raw_sequential_feature_names(self) -> list[str]:
+        raw_feature_names = getattr(self.event_info, "raw_sequential_feature_names", None)
+        if raw_feature_names is not None:
+            return list(raw_feature_names)
+
+        feature_names: list[str] = []
+        for input_name, input_type in self.event_info.input_types.items():
+            if str(input_type).upper() != "SEQUENTIAL":
+                continue
+            for feature_info in self.event_info.input_features[input_name]:
+                feature_names.append(feature_info.name)
+        return feature_names
+
+    def project_sequential_inputs(self, x: Tensor, mask: Tensor) -> Tensor:
+        """
+        Convert normalized raw sequential inputs [B, N, F_raw] into the projected
+        PET basis [B, N, F_projected] when grouped inputs are enabled.
+        """
+        if self.GroupedSequentialEmbedding is None:
+            return x
+        return self.GroupedSequentialEmbedding(x=x, mask=mask)
+
+    def project_invisible_inputs(self, x: Tensor, mask: Tensor) -> Tensor:
+        if not self.include_neutrino_generation:
+            return x
+        return self.InvisibleInputProjector(x=x, mask=mask)
 
     def forward(
             self, x: Dict[str, Tensor], time: Tensor,
@@ -366,8 +397,7 @@ class EveNetModel(nn.Module):
                 - 1: valid assignment
                 - 0: invalid assignment
 
-            - x['x_invisible']: invisible point cloud (pt_eta_phi), shape (batch_size, num_objects, num_features)
-            - x['x_invisible_cartesian']: invisible point cloud (px, py, pz) when coordinate_system=="cartesian"
+            - x['x_invisible']: invisible point cloud, shape (batch_size, num_objects, num_features)
             - x['x_invisible_mask']: Mask for invisible point cloud, shape (batch_size, num_objects)
         """
 
@@ -379,7 +409,7 @@ class EveNetModel(nn.Module):
 
         _, alpha, _ = get_logsnr_alpha_sigma(time)
 
-        input_point_cloud = x['x']
+        input_point_cloud_raw = x['x']
         input_point_cloud_mask = x['x_mask'].unsqueeze(-1)
         global_conditions = x['conditions'].unsqueeze(1)  # (batch_size, 1, num_conditions)
         global_conditions_mask = x['conditions_mask'].unsqueeze(-1)  # (batch_size, 1, 1)
@@ -391,23 +421,12 @@ class EveNetModel(nn.Module):
         if self.include_global_generation or self.include_point_cloud_generation:
             num_point_cloud = x['num_sequential_vectors'].unsqueeze(-1)  # (batch_size, 1)
 
-        B, _, num_features = input_point_cloud.shape
-        # When cartesian: use x_invisible_cartesian (px, py, pz) from parquet; else use x_invisible (pt, eta, phi)
-        invisible_key = 'x_invisible_cartesian' if self.coordinate_system == "cartesian" else 'x_invisible'
-        if invisible_key in x:
-            invisible_point_cloud = x[invisible_key]
-            pad_size = self.invisible_padding
-
-            # Pad invisible features to match input
-            invisible_point_cloud = F.pad(invisible_point_cloud, (0, pad_size), value=0.0)
-        elif self.include_neutrino_generation:
-            raise KeyError(
-                f"TruthGeneration with coordinate_system={self.coordinate_system!r} "
-                f"requires batch key {invisible_key!r}. Re-run preprocessing so the "
-                "parquet dataset contains x_invisible_cartesian for Cartesian training."
-            )
-        else:
-            invisible_point_cloud = torch.zeros(B, 1, num_features, device=input_point_cloud.device)
+        B = input_point_cloud_raw.shape[0]
+        if self.include_neutrino_generation:
+            if 'x_invisible' in x:
+                invisible_point_cloud = x['x_invisible']
+            else:
+                invisible_point_cloud = torch.zeros(B, 1, self.invisible_input_dim, device=input_point_cloud_raw.device)
 
         invisible_point_cloud_mask = x['x_invisible_mask'].unsqueeze(
             -1) if 'x_invisible_mask' in x else torch.zeros_like(input_point_cloud_mask[:, [0], :]).bool()
@@ -432,8 +451,14 @@ class EveNetModel(nn.Module):
         ## Input normalization ##
         #########################
 
-        input_point_cloud = self.sequential_normalizer(
-            x=input_point_cloud,
+        input_point_cloud_raw = self.sequential_normalizer(
+            x=input_point_cloud_raw,
+            mask=input_point_cloud_mask,
+        )
+
+
+        input_point_cloud = self.project_sequential_inputs(
+            x=input_point_cloud_raw,
             mask=input_point_cloud_mask,
         )
 
@@ -531,11 +556,14 @@ class EveNetModel(nn.Module):
 
 
             else:
-                # Neutrino generation: velocity prediction
                 invisible_point_cloud_noised, truth_invisible_point_cloud_vector = add_noise(
                     invisible_point_cloud, time
                 )
-                full_input_point_cloud = torch.cat([input_point_cloud, invisible_point_cloud_noised], dim=1)
+                invisible_point_cloud_projected = self.project_invisible_inputs(
+                    x=invisible_point_cloud_noised,
+                    mask=invisible_point_cloud_mask,
+                )
+                full_input_point_cloud = torch.cat([input_point_cloud, invisible_point_cloud_projected], dim=1)
                 full_input_point_cloud_mask = torch.cat([input_point_cloud_mask, invisible_point_cloud_mask], dim=1)
                 full_attn_mask = invisible_attn_mask
                 full_time = time
@@ -552,7 +580,7 @@ class EveNetModel(nn.Module):
                 x=global_conditions * global_feature_mask,
                 mask=global_conditions_mask
             )
-            ### feed point cloud and time to PET
+
             local_points = full_input_point_cloud[..., self.local_feature_indices]
             full_input_point_cloud = self.PET(
                 input_features=full_input_point_cloud,
@@ -651,7 +679,6 @@ class EveNetModel(nn.Module):
                 }
 
             if self.include_neutrino_generation and schedule_name == "neutrino_generation":
-                # === First Prediction at time t (for L_data) ===
                 pred_point_cloud_vector = self.TruthGeneration(
                     x=full_input_point_cloud,
                     x_mask=full_input_point_cloud_mask,
@@ -679,6 +706,8 @@ class EveNetModel(nn.Module):
             "regression-noised": outputs.get("generation", {}).get("regression", None),
             "generations": generations,
             "segmentation-cls": outputs.get("deterministic", {}).get("segmentation-out", {}).get("pred_logits", None),
+            # "full_input_point_cloud": full_input_point_cloud,
+            # "full_global_conditions": full_global_conditions,
             "alpha": alpha,
             "segmentation-mask": outputs.get("deterministic", {}).get("segmentation-out", {}).get("pred_masks", None),
             "segmentation-aux": outputs.get("deterministic", {}).get("segmentation-out", {}).get("aux_outputs", None),
@@ -767,11 +796,15 @@ class EveNetModel(nn.Module):
             class_label = cond_x['classification'].unsqueeze(-1) if 'classification' in cond_x else torch.zeros_like(
                 cond_x['conditions_mask']).long()  # (batch_size, 1)
             # num_point_cloud = cond_x['num_sequential_vectors'].unsqueeze(-1)  # (batch_size, 1)
-            input_point_cloud = cond_x['x']
+            input_point_cloud_raw = cond_x['x']
             input_point_cloud_mask = cond_x['x_mask'].unsqueeze(-1)
 
-            input_point_cloud = self.sequential_normalizer(
-                x=input_point_cloud,
+            input_point_cloud_raw = self.sequential_normalizer(
+                x=input_point_cloud_raw,
+                mask=input_point_cloud_mask,
+            )
+            input_point_cloud = self.project_sequential_inputs(
+                x=input_point_cloud_raw,
                 mask=input_point_cloud_mask,
             )
 
@@ -787,12 +820,10 @@ class EveNetModel(nn.Module):
 
             invisible_point_cloud_noised = noise_x
             invisible_point_cloud_mask = noise_mask
-
-            # padding invisible features to match input
-            if self.invisible_padding > 0:
-                invisible_point_cloud_noised = F.pad(
-                    invisible_point_cloud_noised, (0, self.invisible_padding), value=0.0
-                )
+            invisible_point_cloud_projected = self.project_invisible_inputs(
+                x=invisible_point_cloud_noised,
+                mask=invisible_point_cloud_mask,
+            )
 
             # Create attention mask
             n_vis = input_point_cloud_mask.shape[1]
@@ -804,7 +835,7 @@ class EveNetModel(nn.Module):
             # Rule: visible query (False) cannot attend to invisible key (True)
             invisible_attn_mask = (~is_invisible_query[:, None]) & is_invisible_query[None, :]  # (L, L) , Q->K
 
-            full_input_point_cloud = torch.cat([input_point_cloud, invisible_point_cloud_noised], dim=1)
+            full_input_point_cloud = torch.cat([input_point_cloud, invisible_point_cloud_projected], dim=1)
             full_input_point_cloud_mask = torch.cat([input_point_cloud_mask, invisible_point_cloud_mask], dim=1)
             full_attn_mask = invisible_attn_mask
             full_time = time
@@ -838,10 +869,6 @@ class EveNetModel(nn.Module):
                 time_masking=time_masking,
                 position_encode=self.neutrino_position_encode
             )
-
-            # remove the padding
-            if self.invisible_padding > 0:
-                pred_point_cloud_vector = pred_point_cloud_vector[..., :-self.invisible_padding]
 
             return pred_point_cloud_vector[:, is_invisible_query, :]
         return None
@@ -898,27 +925,3 @@ class EveNetModel(nn.Module):
 
         else:
             raise ValueError(f"Unsupported freeze type: {freeze_type}")
-
-
-def build_evenet_model_from_training_config(
-    config: Any,
-    normalization_dict: dict,
-    device: torch.device,
-) -> EveNetModel:
-    """Same ``EveNetModel(...)`` wiring as ``EveNetEngine.configure_model``."""
-    cc = config.options.Training.Components
-    truth = cc.TruthGeneration
-    coordinate_system = "cartesian" if truth.get("cartesian", False) else "pt_eta_phi"
-    return EveNetModel(
-        config=config,
-        device=device,
-        classification=cc.Classification.include,
-        regression=cc.Regression.include,
-        global_generation=cc.GlobalGeneration.include,
-        point_cloud_generation=cc.ReconGeneration.include,
-        neutrino_generation=cc.TruthGeneration.include,
-        assignment=cc.Assignment.include,
-        segmentation=cc.Segmentation.include,
-        normalization_dict=normalization_dict,
-        coordinate_system=coordinate_system,
-    )

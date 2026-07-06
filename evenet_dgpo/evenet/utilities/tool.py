@@ -8,6 +8,8 @@ import torch.nn as nn
 from collections import OrderedDict
 import logging
 
+import pyarrow as pa
+
 
 def gather_index(x: Union[Dict, Tensor, List, None], index: Tensor):
     if x is None:

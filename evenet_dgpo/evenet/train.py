@@ -19,10 +19,15 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, Learning
 from lightning.pytorch.profilers import PyTorchProfiler
 
 from evenet.control.global_config import global_config
-from shared import make_process_fn, prepare_datasets, EveNetTrainCallback
+from shared import (
+    make_process_fn,
+    prepare_datasets,
+    EveNetTrainCallback,
+    ProgressiveEarlyStoppingReset,
+    ProgressiveCheckpointReset,
+)
 from evenet.engine import EveNetEngine
 from evenet.utilities.logger import LocalLogger, setup_logging
-from evenet.utilities.ray_tmpdir import ensure_short_ray_tmpdir
 
 
 def train_func(cfg):
@@ -32,6 +37,7 @@ def train_func(cfg):
     total_events = cfg['total_events']
     total_val_events = cfg['total_val_events']
     world_rank = ray.train.get_context().get_world_rank()
+    global_config.load_yaml(cfg['global_config_path'], current_dir=cfg['current_dir'])
 
     log_cfg = cfg.get('logger', {})
     loggers = []
@@ -109,9 +115,11 @@ def train_func(cfg):
         callbacks=[
             EveNetTrainCallback(),
             checkpoint_callback,
+            ProgressiveCheckpointReset(),
+            ProgressiveEarlyStoppingReset(),
             early_stop_callback,
             LearningRateMonitor(),
-            RichModelSummary(max_depth=2),
+            RichModelSummary(max_depth=3),
         ],
         enable_progress_bar=True,
         logger=loggers,
@@ -140,7 +148,16 @@ def train_func(cfg):
     )
 
 
-def main(args):
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="EveNet Training Program")
+    parser.add_argument("config", help="Path to config file")
+    # argument for loading all dataset files into RAM
+    parser.add_argument("--load_all", action="store_true", help="Load all dataset files into RAM")
+    parser.add_argument("--ray_dir", type=str, default="~/ray_results")
+    return parser
+
+
+def main(args: argparse.Namespace) -> None:
     assert (
             "WANDB_API_KEY" in os.environ
     ), 'Please set WANDB_API_KEY="abcde" when running this script.'
@@ -156,12 +173,15 @@ def main(args):
             "TORCH_NCCL_TRACE_BUFFER_SIZE": "1000000",
         }
     }
-    ensure_short_ray_tmpdir()
-    _rt = os.environ.get("RAY_TMPDIR")
-    if _rt:
-        runtime_env["env_vars"]["RAY_TMPDIR"] = _rt
 
-    global_config.load_yaml(args.config)
+    # Expand ~ and convert to absolute path
+    config_path = os.path.abspath(os.path.expanduser(args.config))
+    # Check existence
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Config file does not exist: {config_path}")
+
+    # Load your config
+    global_config.load_yaml(config_path)
     global_config.display()
 
     if "logger" not in global_config._global_config:
@@ -208,6 +228,8 @@ def main(args):
         "total_events": total_events,
         "total_val_events": total_val_events,
         "early_stopping": global_config.options.Training.EarlyStopping,
+        "global_config_path": config_path,
+        "current_dir": os.getcwd(),
     }
 
     trainer = TorchTrainer(
@@ -227,13 +249,11 @@ def main(args):
         dist.destroy_process_group()
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="EveNet Training Program")
-    parser.add_argument("config", help="Path to config file")
-    # argument for loading all dataset files into RAM
-    parser.add_argument("--load_all", action="store_true", help="Load all dataset files into RAM")
-    parser.add_argument("--ray_dir", type=str, default="~/ray_results")
-
+def cli() -> None:
+    parser = build_parser()
     args, _ = parser.parse_known_args()
-
     main(args)
+
+
+if __name__ == '__main__':
+    cli()

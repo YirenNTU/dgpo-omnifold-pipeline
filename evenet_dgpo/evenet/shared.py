@@ -1,4 +1,5 @@
 import json
+import math
 import numpy as np
 from pathlib import Path
 from functools import partial
@@ -12,6 +13,8 @@ import os
 from tempfile import TemporaryDirectory
 
 from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+import torch
 
 import ray
 import ray.train
@@ -225,3 +228,114 @@ class EveNetTrainCallback(Callback):
 
         # Report to train session
         ray.train.report(metrics=metrics, checkpoint=None)
+
+
+class ProgressiveEarlyStoppingReset(Callback):
+    def __init__(self):
+        super().__init__()
+        self._reset_stages: set[str] = set()
+
+    @staticmethod
+    def _reset_early_stopping(callback: EarlyStopping, trainer) -> None:
+        callback.wait_count = 0
+        callback.stopped_epoch = 0
+
+        best_score = getattr(callback, "best_score", None)
+        reset_scalar = math.inf if getattr(callback, "mode", "min") == "min" else -math.inf
+        if isinstance(best_score, torch.Tensor):
+            callback.best_score = torch.tensor(
+                reset_scalar,
+                device=best_score.device,
+                dtype=best_score.dtype,
+            )
+        else:
+            callback.best_score = reset_scalar
+
+        trainer.should_stop = False
+
+    def on_validation_start(self, trainer, pl_module) -> None:
+        task_scheduler = getattr(pl_module, "task_scheduler", None)
+        if task_scheduler is None:
+            return
+
+        stage = task_scheduler.get_current_stage(trainer.current_epoch)
+        stage_name = stage.get("name", "default")
+        transition_end_epoch = float(stage.get("transition_end_epoch", stage.get("epoch_start", 0)))
+        if transition_end_epoch <= float(stage.get("epoch_start", 0)):
+            return
+
+        reset_epoch = int(math.ceil(transition_end_epoch))
+        if trainer.current_epoch < reset_epoch:
+            return
+        if stage_name in self._reset_stages:
+            return
+
+        reset_any = False
+        for callback in trainer.callbacks:
+            if isinstance(callback, EarlyStopping):
+                self._reset_early_stopping(callback, trainer)
+                reset_any = True
+
+        if reset_any:
+            self._reset_stages.add(stage_name)
+            if hasattr(pl_module, "l"):
+                pl_module.l.info(
+                    f"[Epoch {trainer.current_epoch:03d}] Reset early stopping after progressive transition "
+                    f"for stage '{stage_name}' (transition_end_epoch={transition_end_epoch:.2f})."
+                )
+
+
+class ProgressiveCheckpointReset(Callback):
+    def __init__(self):
+        super().__init__()
+        self._reset_stages: set[str] = set()
+
+    @staticmethod
+    def _reset_checkpoint(callback: ModelCheckpoint) -> None:
+        callback.best_k_models = {}
+        callback.kth_best_model_path = ""
+        callback.best_model_path = ""
+        callback.best_model_score = None
+        callback.current_score = None
+
+        kth_value = getattr(callback, "kth_value", None)
+        reset_scalar = math.inf if getattr(callback, "mode", "min") == "min" else -math.inf
+        if isinstance(kth_value, torch.Tensor):
+            callback.kth_value = torch.tensor(
+                reset_scalar,
+                device=kth_value.device,
+                dtype=kth_value.dtype,
+            )
+        else:
+            callback.kth_value = reset_scalar
+
+    def on_validation_start(self, trainer, pl_module) -> None:
+        task_scheduler = getattr(pl_module, "task_scheduler", None)
+        if task_scheduler is None:
+            return
+
+        stage = task_scheduler.get_current_stage(trainer.current_epoch)
+        stage_name = stage.get("name", "default")
+        transition_end_epoch = float(stage.get("transition_end_epoch", stage.get("epoch_start", 0)))
+        if transition_end_epoch <= float(stage.get("epoch_start", 0)):
+            return
+
+        reset_epoch = int(math.ceil(transition_end_epoch))
+        if trainer.current_epoch < reset_epoch:
+            return
+        if stage_name in self._reset_stages:
+            return
+
+        reset_any = False
+        for callback in trainer.callbacks:
+            if isinstance(callback, ModelCheckpoint):
+                self._reset_checkpoint(callback)
+                reset_any = True
+
+        if reset_any:
+            self._reset_stages.add(stage_name)
+            if hasattr(pl_module, "l"):
+                pl_module.l.info(
+                    f"[Epoch {trainer.current_epoch:03d}] Reset checkpoint top-k ranking after progressive transition "
+                    f"for stage '{stage_name}' (transition_end_epoch={transition_end_epoch:.2f})."
+                )

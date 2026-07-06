@@ -58,6 +58,7 @@ def compute_head_weights_per_process(product_mappings, pairing_topology) -> dict
         process_to_head_weights[process] = weights
     return process_to_head_weights
 
+
 def compute_segment_tags(product_mappings, pairing_topology, resonance_info) -> dict[str, dict[str, float]]:
     process_to_segment_tags = {}
     for process, particles in product_mappings.items():
@@ -65,7 +66,9 @@ def compute_segment_tags(product_mappings, pairing_topology, resonance_info) -> 
         for resonance_name, child_map in particles.items():
             topology_key = build_topology_key(resonance_name, child_map)
             if topology_key in pairing_topology:
-                process_to_segment_tags[process][resonance_name] = resonance_info[pairing_topology[topology_key]["pairing_topology_category"]][topology_key].get('segment_tag', 0)
+                process_to_segment_tags[process][resonance_name] = \
+                resonance_info[pairing_topology[topology_key]["pairing_topology_category"]][topology_key].get(
+                    'segment_tag', 0)
             # else:
             #     print(f"[warn] '{topology_key}' not found in pairing_topology")
     return process_to_segment_tags
@@ -92,6 +95,7 @@ class EventInfo:
             resonance_particle_properties: List,
             generations: Dict[str, Dict],
             invisible_input_features: Tuple[FeatureInfo, ...],
+            grouped_inputs: Dict[str, Dict] | None = None,
             resonance_label=None,
     ):
 
@@ -100,6 +104,7 @@ class EventInfo:
         self.input_types = input_types
         self.input_names = list(input_types.keys())
         self.input_features = input_features
+        self.grouped_inputs = grouped_inputs or {}
 
         self.event_particles = event_particles
         self.event_mapping = OrderedDict()
@@ -112,7 +117,7 @@ class EventInfo:
         self.process_names = list(self.event_particles.keys())
         self.resonance_info = resonance_info
         self.resonance_particle_properties = resonance_particle_properties
-        self.segmentation_indices = []# 0: null class
+        self.segmentation_indices = []  # 0: null class
         for decay_mode in self.resonance_info:
             for decay_channel in self.resonance_info[decay_mode]:
                 if 'segment_tag' in self.resonance_info[decay_mode][decay_channel]:
@@ -255,6 +260,7 @@ class EventInfo:
         # Generation Head setting
         # For point cloud generation
         self.sequential_feature_names = []
+        self.raw_sequential_feature_names = []
         self.sequential_inv_cdf_index = []
         iglobal_index = 0
         seq_index = 0
@@ -284,6 +290,7 @@ class EventInfo:
                 for input_feature_element in input_feature:
                     log_prefix = "log_" if input_feature_element.log_scale else ""
                     name = f"{log_prefix}{input_feature_element.name}"
+                    self.raw_sequential_feature_names.append(input_feature_element.name)
                     self.sequential_feature_names.append(name)
                     if input_feature_element.uniform:
                         self.sequential_inv_cdf_index.append(seq_index)
@@ -302,6 +309,16 @@ class EventInfo:
             self.invisible_feature_names.append(name)
             if input_feature_element.uniform:
                 self.invisible_inv_cdf_index.append(idx)
+
+        grouped_sequential_cfg = self.grouped_inputs.get("SEQUENTIAL", {}).get("Source", {})
+        self.grouped_sequential_config = grouped_sequential_cfg if grouped_sequential_cfg else None
+        if self.grouped_sequential_config is not None:
+            self.projected_sequential_feature_names = list(
+                self.grouped_sequential_config.get("projected_feature_names", self.sequential_feature_names)
+            )
+        else:
+            self.projected_sequential_feature_names = list(self.sequential_feature_names)
+        self.projected_sequential_input_dim = len(self.projected_sequential_feature_names)
 
         search_name = ["pt", "eta", "phi", "energy"]
         self.ptetaphienergy_index = []
@@ -325,9 +342,6 @@ class EventInfo:
         segment_tag_values = [
             v for _, tags in self.process_to_segment_tags.items() for v in tags.values()
         ]
-        # Ztautau configs can omit segmentation-tag annotations entirely. Keep the
-        # source tree self-contained and compatible with the original pure-EveNet
-        # settings by falling back to a single default segment class in that case.
         self.total_segment_tags = (max(segment_tag_values) + 1) if segment_tag_values else 1
         self.segment_label = {
             label: clsnum for clsnum, label in enumerate(resonance_label[0])
@@ -460,8 +474,41 @@ class EventInfo:
                     for name, normalize in input_information.items()
                 )
 
+        def synthesize_permutations_from_symmetry():
+            cfg = deepcopy(config)
+            if SpecialKey.Permutations in cfg:
+                return cfg
+            if SpecialKey.Event not in cfg:
+                return cfg
+
+            perms = defaultdict(dict)
+
+            for proc, node in cfg[SpecialKey.Event].items():
+                diag = node.get("diagram", node)
+
+                # event-level SYMMETRY
+                evt_groups = diag.get("SYMMETRY")
+                if isinstance(evt_groups, list):
+                    perms[proc][SpecialKey.Event] = [evt_groups]
+
+                # product-level SYMMETRY for each event particle
+                for ep, prods in diag.items():
+                    if ep == "SYMMETRY":
+                        continue
+                    if isinstance(prods, dict):
+                        groups = prods.get("SYMMETRY")
+                        if isinstance(groups, list):
+                            perms[proc][ep] = [groups]
+
+                if proc not in perms:
+                    perms[proc] = {}
+
+            cfg[SpecialKey.Permutations] = dict(perms)
+            return cfg
+
         # Extract event and permutation information.
         # ------------------------------------------
+        config = synthesize_permutations_from_symmetry()
         permutation_config = key_with_default(config, SpecialKey.Permutations, default={})
 
         event_particles_summary = OrderedDict()
@@ -471,14 +518,19 @@ class EventInfo:
         product_particles = OrderedDict()  # Default value
 
         for process in permutation_config:
-            event_names = tuple(config[SpecialKey.Event][process].keys())
+            event_cfg = config[SpecialKey.Event].get(process, {})
+            diagram = event_cfg.get("diagram", event_cfg)
+            event_names = tuple([k for k in diagram.keys() if k != "SYMMETRY"])
             event_permutations = key_with_default(permutation_config[process], SpecialKey.Event, default=[])
             event_permutations = expand_permutations(event_permutations)
             event_particles = Particles(event_names, event_permutations)
             product_particles = OrderedDict()
 
             for event_particle in event_particles:
-                products = config[SpecialKey.Event][process][event_particle]
+                if isinstance(diagram[event_particle], list):
+                    products = diagram[event_particle]
+                else:
+                    products = {k: v for k, v in diagram[event_particle].items() if k != "SYMMETRY"}
 
                 product_names = [
                     next(iter(product.keys())) if isinstance(product, dict) else product
@@ -508,7 +560,6 @@ class EventInfo:
         # -------------------------------
         segmentations = key_with_default(config, SpecialKey.Segmentations, default={})
 
-
         # Extract Regression Information.
         # -------------------------------
         regressions = key_with_default(config, SpecialKey.Regressions, default={})
@@ -529,9 +580,10 @@ class EventInfo:
         classifications = feynman_fill(classifications, event_particles, product_particles, constructor=list)
 
         class_label = key_with_default(config, SpecialKey.ClassLabel, default={})
-        resonance_label = key_with_default(config, "RESONANCE_LABEL", default = [])
+        resonance_label = key_with_default(config, "RESONANCE_LABEL", default=[])
 
         generations = key_with_default(config, SpecialKey.Generations, default={})
+        grouped_inputs = key_with_default(config, SpecialKey.GroupedInputs, default={})
 
         resonance_particle_property = key_with_default(config, SpecialKey.ParticleProperties, default=[])
 
@@ -550,8 +602,6 @@ class EventInfo:
             for name, normalize in invisible.items()
         )
 
-        # TODO: feynman_fill (not necessary, but would be nice)
-
         return cls(
             input_types,
             input_features,
@@ -565,5 +615,6 @@ class EventInfo:
             resonance_particle_property,
             generations,
             invisible_input_features,
+            grouped_inputs,
             resonance_label
         )

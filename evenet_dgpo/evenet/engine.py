@@ -1,7 +1,7 @@
 import math
 from collections import defaultdict
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import wandb
 import lightning as L
@@ -15,7 +15,7 @@ from lion_pytorch import Lion
 from matplotlib import pyplot as plt
 from transformers import get_cosine_schedule_with_warmup
 
-from evenet.network.evenet_model import EveNetModel, build_evenet_model_from_training_config
+from evenet.network.evenet_model import EveNetModel
 from evenet.network.loss.assignment import convert_target_assignment
 
 from evenet.network.metrics.general_comparison import GenericMetrics
@@ -26,6 +26,7 @@ from evenet.network.metrics.assignment import shared_step as ass_step, shared_ep
 from evenet.network.metrics.assignment import SingleProcessAssignmentMetrics
 from evenet.network.metrics.generation import GenerationMetrics
 from evenet.network.metrics.generation import shared_step as gen_step, shared_epoch_end as gen_end
+from evenet.network.metrics.object_tag_embedding import ObjectTagEmbeddingLogger
 from evenet.network.metrics.segmentation import SegmentationMetrics
 from evenet.network.metrics.segmentation import shared_step as seg_step, shared_epoch_end as seg_end
 from evenet.network.loss.famo import FAMO
@@ -37,9 +38,6 @@ from evenet.utilities.tool import get_transition, check_param_overlap, print_par
 
 from evenet.utilities.logger import LocalLogger
 import logging
-
-# Allowed Reinforcement_Learning.rewards_source values (offline .pt pipeline).
-RL_REWARD_SOURCES_OFFLINE_PT = frozenset({"truth_based_reward"})
 
 
 def get_total_gradient(module, norm_type="l1"):
@@ -86,7 +84,8 @@ class EveNetEngine(L.LightningModule):
         self.pretrain_ckpt_path: str = global_config.options.Training.pretrain_model_load_path
 
         self.num_classes: list[str] = (
-            signal[0] if isinstance((signal := global_config.event_info.class_label.get("EVENT", {}).get("signal")), list)
+            signal[0] if isinstance((signal := global_config.event_info.class_label.get("EVENT", {}).get("signal")),
+                                    list)
             else [1]
         )
 
@@ -108,48 +107,7 @@ class EveNetEngine(L.LightningModule):
         self.recon_generation_cfg = self.component_cfg.ReconGeneration
         self.truth_generation_cfg = self.component_cfg.TruthGeneration
         self.segmentation_cfg = self.component_cfg.Segmentation
-        self.reinforcement_learning_cfg = getattr(self.component_cfg, "Reinforcement_Learning", None)
-        self.rl_reward_source: Optional[str] = None
-        self.rl_active = False
-        self.rl_offline_pt_mode = False
-        self.rl_truth_based_reward_mode = False
-
-        if self.reinforcement_learning_cfg and getattr(self.reinforcement_learning_cfg, "include", False):
-            raw = getattr(self.reinforcement_learning_cfg, "rewards_source", None)
-            rs = str(raw).strip().lower().replace(" ", "_") if raw else ""
-            if rs not in RL_REWARD_SOURCES_OFFLINE_PT:
-                raise ValueError(
-                    f"Reinforcement_Learning.rewards_source={raw!r} invalid. "
-                    f"Supported: {sorted(RL_REWARD_SOURCES_OFFLINE_PT)}"
-                )
-            self.rl_reward_source = rs
-            self.rl_active = self.rl_offline_pt_mode = True
-            self.rl_truth_based_reward_mode = rs == "truth_based_reward"
-
-        ###### RL: load rl_dataset (normalization comes from Dataset.normalization_file) ######
-        self.rl_dataset_data = None
-        if self.rl_offline_pt_mode:
-            rl_cfg = self.reinforcement_learning_cfg
-            if not getattr(rl_cfg, "rl_dataset", None):
-                raise ValueError("Reinforcement_Learning.rl_dataset is required when include=true.")
-            self.rl_dataset_data = torch.load(rl_cfg.rl_dataset, map_location="cpu", weights_only=False)
-            self.l.info(
-                f"[RL] source={self.rl_reward_source}, "
-                f"data keys={list(self.rl_dataset_data.keys())}"
-            )
-
         self.generation_include = self.global_generation_cfg.include or self.recon_generation_cfg.include or self.truth_generation_cfg.include
-
-        ### Cartesian coordinate switch ###
-        # Parse cartesian switch and decide which coordinate system the model should use for kinematics
-        cartesian_switch = self.truth_generation_cfg.get("cartesian", False)
-        if cartesian_switch:
-            self.coordinate_system = "cartesian"  # model outputs (px, py, pz) or (px, py, pz, E)
-        else:
-            self.coordinate_system = "pt_eta_phi"  # model outputs (log_pt, eta, phi) - existing method
-
-        # Inference: when True, compute log p(x0) per sample (for ranking / best-of-K)
-        self.sample_with_probability = self.truth_generation_cfg.get("sample_with_probability", False)
 
         self.target_segmentation_cls_key = 'segmentation-full-class' if self.segmentation_cfg.use_full_mask else 'segmentation-class'
         self.target_segmentation_reg_key = 'segmentation-momentum'
@@ -157,14 +115,24 @@ class EveNetEngine(L.LightningModule):
 
         ###### Initialize Normalizations and Balance #####
         self.normalization_dict: dict = torch.load(self.config.options.Dataset.normalization_file)
-        # RL uses the same Dataset.normalization_file as the main pipeline — no override.
         self.balance_dict: dict = self.normalization_dict
         if self.config.options.Dataset.get("balance_file", None) is not None:
             self.balance_dict = torch.load(self.config.options.Dataset.balance_file)
 
         self.class_weight = None
         if self.classification_cfg.include:
+            base = list(self.balance_dict["class_balance"])
             self.class_weight = self.balance_dict["class_balance"]
+            # If extra class weights are provided, validate and combine
+            extra = getattr(self.classification_cfg, "class_weight", None)
+            if extra is not None:
+                extra = list(extra)
+                if len(extra) != len(base):
+                    raise ValueError(
+                        f"class_weight must have length {len(base)}, "
+                        f"but got {len(extra)}"
+                    )
+                self.class_weight = torch.tensor([b * e for b, e in zip(base, extra)], dtype=torch.float32)
 
         self.assignment_weight = None
         self.subprocess_balance = None
@@ -174,7 +142,9 @@ class EveNetEngine(L.LightningModule):
 
         self.segmentation_cls_balance = None
         if self.segmentation_cfg.include:
-            self.segmentation_cls_balance = self.balance_dict["segment_full_class_balance"] if self.segmentation_cfg.use_full_mask else self.balance_dict["segment_class_balance"]
+            self.segmentation_cls_balance = self.balance_dict[
+                "segment_full_class_balance"] if self.segmentation_cfg.use_full_mask else self.balance_dict[
+                "segment_class_balance"]
 
         self.l.info(f"normalization dicts initialized")
 
@@ -259,6 +229,9 @@ class EveNetEngine(L.LightningModule):
 
         ###### For general log ######
         self.general_log = GenericMetrics()
+        self.object_tag_embedding_logger = ObjectTagEmbeddingLogger(
+            self.config.options.get("Metrics", {}).get("ObjectTag-Embedding", {})
+        )
         self.log_gradient_step = global_config.options.Training.get("log_gradient_step", 100)
         self.simplified_log: bool = global_config.get('logger', {}).get("wandb", {}).get("simplified", False)
         self.local_logger: Union[None, LocalLogger] = None
@@ -276,155 +249,6 @@ class EveNetEngine(L.LightningModule):
 
         ###### Last ######
         # self.save_hyperparameters()
-
-    def build_rl_truth_reward_dataloaders(self):
-        """
-        Build train/val DataLoaders for RL (18-slot + neutrino candidate format).
-
-        Uses event-level + within-event candidate shuffling:
-          - Level 1 (event): DataLoader(shuffle=True)
-          - Level 2 (candidate): torch.randperm(K) inside __getitem__
-
-        Each __getitem__ returns one event with all K candidates.  The
-        rl_diffusion_step flattens (B, K) → B*K so every candidate becomes
-        its own diffusion training sample, matching TruthGeneration convention.
-        """
-        from torch.utils.data import Dataset as _Dataset, DataLoader, Subset
-
-        rl_cfg = self.reinforcement_learning_cfg
-        val_split = self.config.options.Dataset.val_split
-        dataset_limit = self.config.options.Dataset.get("dataset_limit", 1.0)
-
-        class RLDiffusionDataset(_Dataset):
-            """
-            Event-level dataset for RL (18-slot layout from preprocess_18slots.py).
-
-            Stores data at (N, K, ...) granularity.  On every access the K
-            candidates are randomly permuted (training) to break ordering bias.
-
-            Returns per event:
-              x                 (K, 18, 7)
-              x_mask            (K, 18)
-              neutrino_candidate_3feat  (K, 2, 3)   log_pt, eta, phi
-              conditions        (C,)
-              conditions_mask   (1,)
-              score_label       (K,)
-              neutrino_target   (2, 3)   or absent
-            """
-            INVISIBLE_FEAT_IDX = [1, 2, 3]  # log_pt, eta, phi in 7-feat layout
-
-            def __init__(self, data: dict, shuffle_candidates: bool = True,
-                         dataset_limit: float = 1.0):
-                self.x = data["x"]                            # (N, K, 18, 7)
-                self.x_mask = data["x_mask"]                  # (N, K, 18)
-                nu_cand = data["neutrino_candidate"]          # (N, K, 2, 7)
-                self.nu_cand_3feat = nu_cand[..., self.INVISIBLE_FEAT_IDX]  # (N, K, 2, 3)
-                self.conditions = data["conditions"]          # (N, C)
-                self.conditions_mask = data["conditions_mask"]  # (N, 1)
-                self.score_label = data["score_label"]        # (N, K)
-                self.neutrino_target = data.get("neutrino_target")  # (N, 2, 3) or None
-                self.shuffle_candidates = shuffle_candidates
-
-                if dataset_limit < 1.0:
-                    N = max(1, int(self.x.shape[0] * dataset_limit))
-                    self.x = self.x[:N]
-                    self.x_mask = self.x_mask[:N]
-                    self.nu_cand_3feat = self.nu_cand_3feat[:N]
-                    self.conditions = self.conditions[:N]
-                    self.conditions_mask = self.conditions_mask[:N]
-                    self.score_label = self.score_label[:N]
-                    if self.neutrino_target is not None:
-                        self.neutrino_target = self.neutrino_target[:N]
-
-            def __len__(self):
-                return self.x.shape[0]
-
-            def __getitem__(self, idx):
-                x = self.x[idx]                            # (K, 18, 7)
-                x_mask = self.x_mask[idx]                  # (K, 18)
-                nu = self.nu_cand_3feat[idx]               # (K, 2, 3)
-                score = self.score_label[idx]              # (K,)
-
-                if self.shuffle_candidates:
-                    perm = torch.randperm(x.shape[0])
-                    x = x[perm]
-                    x_mask = x_mask[perm]
-                    nu = nu[perm]
-                    score = score[perm]
-
-                result = {
-                    "x": x,                                                    # (K, 18, 7)
-                    "x_mask": x_mask,                                          # (K, 18)
-                    "neutrino_candidate_3feat": nu,                            # (K, 2, 3)
-                    "conditions": self.conditions[idx],                        # (C,)
-                    "conditions_mask": self.conditions_mask[idx],              # (1,)
-                    "score_label": score,                                      # (K,)
-                }
-                if self.neutrino_target is not None:
-                    result["neutrino_target"] = self.neutrino_target[idx]       # (2, 3)
-                return result
-
-        full_ds = RLDiffusionDataset(
-            self.rl_dataset_data,
-            shuffle_candidates=rl_cfg.get("shuffle_candidates", True),
-            dataset_limit=dataset_limit,
-        )
-        N = len(full_ds)
-        val_start = int(N * val_split[0])
-        val_end = int(N * val_split[1])
-        train_indices = list(range(0, val_start)) + list(range(val_end, N))
-        val_indices = list(range(val_start, val_end))
-
-        train_loader = DataLoader(
-            Subset(full_ds, train_indices),
-            batch_size=self.hyper_par_cfg["batch_size"],
-            shuffle=True, num_workers=0, pin_memory=True, drop_last=False,
-        )
-
-        val_ds = RLDiffusionDataset(
-            self.rl_dataset_data,
-            shuffle_candidates=False,
-            dataset_limit=dataset_limit,
-        )
-        val_loader = DataLoader(
-            Subset(val_ds, val_indices),
-            batch_size=self.hyper_par_cfg["batch_size"],
-            shuffle=False, num_workers=0, pin_memory=True, drop_last=False,
-        )
-
-        self.rl_train_loader = train_loader
-        self.rl_val_loader = val_loader
-        self.total_events = len(train_indices)
-        self.total_val_events = len(val_indices)
-
-        self.l.info(
-            f"[RL] DataLoaders built (18-slot): "
-            f"train={self.total_events} events, val={self.total_val_events} events, "
-            f"batch_size={self.hyper_par_cfg['batch_size']}, "
-            f"K={full_ds.x.shape[1]} candidates/event, "
-            f"shuffle_candidates={rl_cfg.get('shuffle_candidates', True)}"
-        )
-
-    def train_dataloader(self):
-        if self.rl_offline_pt_mode:
-            if not hasattr(self, "rl_train_loader"):
-                self.build_rl_truth_reward_dataloaders()
-            return self.rl_train_loader
-        return None
-
-    def val_dataloader(self):
-        if self.rl_offline_pt_mode:
-            if not hasattr(self, "rl_train_loader"):
-                self.build_rl_truth_reward_dataloaders()
-            return self.rl_val_loader
-        return None
-
-    def predict_dataloader(self):
-        if self.rl_offline_pt_mode:
-            if not hasattr(self, "rl_train_loader"):
-                self.build_rl_truth_reward_dataloaders()
-            return self.rl_val_loader
-        return None
 
     def forward(self, x):
         return self.model(x)
@@ -585,6 +409,7 @@ class EveNetEngine(L.LightningModule):
             loss_head_dict: dict,
             update_metric: bool = True
     ):
+
         batch_size = batch["x"].shape[0]
         device = self.device
         if self.apply_event_weight:
@@ -668,6 +493,8 @@ class EveNetEngine(L.LightningModule):
             inputs, outputs,
             batch, device, loss_head_dict, update_metric, event_weight, batch_idx, schedules, batch_size,
         )
+
+        self.general_log.update(loss_detailed_dict, is_train=self.training)
 
         loss = torch.zeros(1, device=self.device, requires_grad=True)
 
@@ -763,79 +590,6 @@ class EveNetEngine(L.LightningModule):
         # print(f"train batch end: {batch_idx}")
         pass
 
-    def rl_diffusion_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        """
-        Forward + diffusion loss for RL training (18-slot + neutrino candidate).
-
-        The DataLoader returns event-level batches with K candidates per event.
-        This method flattens (B, K) → B*K
-        so each candidate becomes its own diffusion sample, then runs the
-        standard neutrino_generation diffusion path (noise injection →
-        TruthGeneration head → denoising loss).
-
-        The score_label (reward) is stored in batch but not used for loss here;
-        it will be consumed by the RL policy gradient step later.
-        """
-        device = self.device
-        prefix = "train" if self.training else "val"
-
-        x = batch["x"]                                    # (B, K, 18, 7)
-        x_mask = batch["x_mask"]                          # (B, K, 18)
-        nu_3feat = batch["neutrino_candidate_3feat"]      # (B, K, 2, 3)
-        conditions = batch["conditions"]                  # (B, C)
-        conditions_mask = batch["conditions_mask"]        # (B, 1)
-
-        B, K = x.shape[0], x.shape[1]
-        BK = B * K
-
-        flat_inputs = {
-            "x": x.reshape(BK, 18, 7).to(device),
-            "x_mask": x_mask.reshape(BK, 18).to(device),
-            "x_invisible": nu_3feat.reshape(BK, 2, 3).to(device),
-            "x_invisible_mask": torch.ones(BK, 2, device=device),
-            "conditions": conditions.unsqueeze(1).expand(-1, K, -1).reshape(BK, -1).to(device),
-            "conditions_mask": conditions_mask.unsqueeze(1).expand(-1, K, -1).reshape(BK, -1).to(device),
-        }
-
-        outputs = self.model.shared_step(
-            batch=flat_inputs,
-            batch_size=BK,
-            train_parameters={},
-            schedules=[
-                ("generation", False),
-                ("neutrino_generation", True),
-                ("deterministic", False),
-            ],
-        )
-
-        generations = outputs.get("generations", {})
-        if not generations:
-            raise RuntimeError(
-                "[RL] No generation outputs — is TruthGeneration.include=true in the config?"
-            )
-
-        loss_head_dict: dict = {}
-        gen_loss, _ = gen_step(
-            batch=flat_inputs,
-            outputs=generations,
-            gen_metrics=(self.generation_metrics_train if self.training else self.generation_metrics_valid),
-            model=self.model,
-            global_loss_scale=0.0,
-            event_loss_scale=0.0,
-            invisible_loss_scale=self.truth_generation_cfg.loss_scale,
-            device=device,
-            loss_head_dict=loss_head_dict,
-            num_steps_neutrino=self.neutrino_diffusion_steps,
-            diffusion_on=False,
-            invisible_padding=self.model.invisible_padding,
-            update_metric=False,
-        )
-
-        self.log(f"{prefix}/rl_diffusion_loss", gen_loss, prog_bar=True, sync_dist=True)
-        self.log(f"{prefix}/loss", gen_loss, prog_bar=False, sync_dist=True)
-
-        return gen_loss
-
     @time_decorator()
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
 
@@ -844,22 +598,6 @@ class EveNetEngine(L.LightningModule):
 
         self.current_step = int(schedulers[0].state_dict().get("last_epoch", self.current_step))
         step = self.current_step
-
-        # --- RL diffusion training: self-contained forward + backward ---
-        if self.rl_offline_pt_mode:
-            loss = self.rl_diffusion_step(batch, batch_idx)
-            for opt in optimizers:
-                opt.zero_grad()
-            self.safe_manual_backward(loss.mean())
-            clip_grad_norm_(self.model.parameters(), 1.0)
-            for opt in optimizers:
-                opt.step()
-            for sch in schedulers:
-                sch.step()
-            if self.ema_model is not None:
-                self.ema_model.update(self.model)
-            return loss.mean()
-
         batch_size = batch["x"].shape[0]
 
         # print(f"[Step {step}] train step start", flush=True)
@@ -974,9 +712,6 @@ class EveNetEngine(L.LightningModule):
 
     # @time_decorator
     def validation_step(self, batch, batch_idx) -> STEP_OUTPUT:
-        if self.rl_offline_pt_mode:
-            return self.rl_diffusion_step(batch, batch_idx).mean()
-
         step = self.current_step
         epoch = self.current_epoch
 
@@ -986,21 +721,10 @@ class EveNetEngine(L.LightningModule):
             loss_head_dict=loss_head,
             update_metric=self.eval_metrics,
         )
+        if self.eval_metrics:
+            self.object_tag_embedding_logger.update(model=self.model, batch=batch)
 
         return loss.mean()
-
-    def get_neutrino_prediction_options(self):
-        """
-        Parse prediction config for neutrino sampling. Modular helper so parsing
-        stays in one place; does not modify other code paths.
-        Returns:
-            num_samples: int, number of samples per event (>= 1)
-            sample_with_probability: bool, whether to compute log p(x0) per sample
-        """
-        num_samples = self.config.options.prediction.get("num_neutrino_samples", 1)
-        num_samples = max(1, int(num_samples))
-        sample_with_probability = self.truth_generation_cfg.get("sample_with_probability", False)
-        return num_samples, sample_with_probability
 
     def predict_step(self, batch, batch_idx) -> STEP_OUTPUT:
         batch_size = batch["x"].shape[0]
@@ -1073,10 +797,8 @@ class EveNetEngine(L.LightningModule):
                 "predict": {},
                 "target": {}
             }
-            # When cartesian: use x_invisible_cartesian (px, py, pz) from parquet
-            invisible_key = 'x_invisible_cartesian' if self.coordinate_system == "cartesian" else 'x_invisible'
-            data_shape = inputs[invisible_key].shape
-            feature_names = ("px", "py", "pz") if self.coordinate_system == "cartesian" else self.config.event_info.invisible_feature_names
+            data_shape = inputs['x_invisible'].shape
+            feature_names = self.config.event_info.invisible_feature_names
 
             predict_for_neutrino = partial(
                 self.model.predict_diffusion_vector,
@@ -1085,58 +807,20 @@ class EveNetEngine(L.LightningModule):
                 noise_mask=inputs["x_invisible_mask"].unsqueeze(-1)  # [B, T, 1] to match noise x
             )
 
-            num_samples, sample_with_prob = self.get_neutrino_prediction_options()
-
-            rollout_num_steps = self.neutrino_diffusion_steps
-
-            sampler_kwargs = dict(
+            generated_distribution = self.sampler.sample(
                 data_shape=data_shape,
                 pred_fn=predict_for_neutrino,
                 normalize_fn=self.model.invisible_normalizer,
                 eta=1.0,
-                num_steps=rollout_num_steps,
+                num_steps=self.neutrino_diffusion_steps,
                 use_tqdm=False,
-                process_name="Neutrino",
-                remove_padding=True,
+                process_name=f"Neutrino",
+                remove_padding=(getattr(self.model, "invisible_padding", 0) > 0),
             )
 
-            if sample_with_prob:
-                # Use sample_with_log_prob (velocity prediction only); supports single and multi-sample
-                sampler_kwargs_logprob = dict(sampler_kwargs)
-                samples_list = []
-                logprobs_list = []
-                for _ in range(num_samples):
-                    gen, lp = self.sampler.sample_with_log_prob(**sampler_kwargs_logprob)
-                    samples_list.append(gen)
-                    logprobs_list.append(lp)
-                stacked = torch.stack(samples_list, dim=0)       # [K, B, 2, 3]
-                log_probs = torch.stack(logprobs_list, dim=0)    # [K, B]
-                for i in range(data_shape[-1]):
-                    outputs["neutrinos"]["predict"][feature_names[i]] = stacked[0, ..., i]
-                    outputs["neutrinos"]["target"][feature_names[i]] = inputs[invisible_key][..., i]
-                outputs["neutrinos"]["predict_samples"] = {
-                    feature_names[i]: stacked[..., i]
-                    for i in range(data_shape[-1])
-                }
-                outputs["neutrinos"]["predict_log_probs"] = log_probs  # [K, B]
-            elif num_samples == 1:
-                generated_distribution = self.sampler.sample(**sampler_kwargs)
-                for i in range(data_shape[-1]):
-                    outputs["neutrinos"]["predict"][feature_names[i]] = generated_distribution[..., i]
-                    outputs["neutrinos"]["target"][feature_names[i]] = inputs[invisible_key][..., i]
-            else:
-                samples_list = []
-                for _ in range(num_samples):
-                    gen = self.sampler.sample(**sampler_kwargs)
-                    samples_list.append(gen)
-                stacked = torch.stack(samples_list, dim=0)  # [K, B, 2, 3]
-                for i in range(data_shape[-1]):
-                    outputs["neutrinos"]["predict"][feature_names[i]] = stacked[0, ..., i]
-                    outputs["neutrinos"]["target"][feature_names[i]] = inputs[invisible_key][..., i]
-                outputs["neutrinos"]["predict_samples"] = {
-                    feature_names[i]: stacked[..., i]  # [K, B, 2]
-                    for i in range(data_shape[-1])
-                }
+            for i in range(data_shape[-1]):
+                outputs["neutrinos"]["predict"][feature_names[i]] = generated_distribution[..., i]
+                outputs["neutrinos"]["target"][feature_names[i]] = inputs['x_invisible'][..., i]
 
         return outputs
 
@@ -1171,7 +855,7 @@ class EveNetEngine(L.LightningModule):
                 loss,
                 shared_params,
                 retain_graph=True,
-                allow_unused=True,
+                allow_unused=False,
                 create_graph=False
             )
             flat = [g.view(-1) for g in grads if g is not None]
@@ -1285,8 +969,7 @@ class EveNetEngine(L.LightningModule):
             generation_kwargs = {
                 "class_names": self.config.event_info.class_label.get("EVENT", {}).get("signal", ["a"])[0],
                 "sequential_feature_names": self.config.event_info.sequential_feature_names,
-                "invisible_feature_names": ("px", "py", "pz") if self.coordinate_system == "cartesian" else self.config.event_info.invisible_feature_names,
-                "coordinate_system": self.coordinate_system,
+                "invisible_feature_names": self.config.event_info.invisible_feature_names,
                 "device": self.device,
                 "global_generation": self.global_generation_cfg.include,
                 "point_cloud_generation": self.recon_generation_cfg.include,
@@ -1411,6 +1094,12 @@ class EveNetEngine(L.LightningModule):
                 metrics_train=self.segmentation_metrics_train,
                 logger=self.logger.experiment
             )
+
+        self.object_tag_embedding_logger.log(
+            loggers=self.loggers,
+            epoch=self.current_epoch,
+            global_rank=self.global_rank,
+        )
 
         self.general_log.finalize_epoch(is_train=False)
 
@@ -1564,8 +1253,17 @@ class EveNetEngine(L.LightningModule):
                 torch.set_float32_matmul_precision("medium")
                 self.l.info(" --> A100 detected, using medium precision for matmul")
 
-        self.model = build_evenet_model_from_training_config(
-            self.config, self.normalization_dict, self.device
+        self.model = EveNetModel(
+            config=self.config,
+            device=self.device,
+            classification=self.classification_cfg.include,
+            regression=self.regression_cfg.include,
+            global_generation=self.global_generation_cfg.include,
+            point_cloud_generation=self.recon_generation_cfg.include,
+            neutrino_generation=self.truth_generation_cfg.include,
+            assignment=self.assignment_cfg.include,
+            segmentation=self.segmentation_cfg.include,
+            normalization_dict=self.normalization_dict,
         )
 
         if self.global_rank == 0:
@@ -1590,13 +1288,20 @@ class EveNetEngine(L.LightningModule):
                     model=self.model, decay=self.ema_cfg.get("decay", 0.999)
                 )
 
+        for module_name in self.config.options.Training.get("freeze_modules", []):
+            module = getattr(self.model, module_name, None)
+            if module is None:
+                self.l.warning(f"[Model] --> Requested freeze for unknown module '{module_name}', skipping.")
+                continue
+            for param in module.parameters():
+                param.requires_grad = False
+            if self.global_rank == 0:
+                self.l.warning(f"[Model] --> Froze module: {module_name}")
+
         # Define Freezing
         # self.model.freeze_module("Classification", self.classification_cfg.get("freeze", {}))
         # self.model.freeze_module("Regression", self.regression_cfg.get("freeze", {}))
         # self.model.freeze_module("Assignment", self.assignment_cfg.get("freeze", {}))
-
-        if self.rl_offline_pt_mode:
-            self.build_rl_truth_reward_dataloaders()
 
         # Define model part groups
         self.model_parts = {}
@@ -1648,14 +1353,13 @@ class EveNetEngine(L.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         orig_model = getattr(self.model, "_orig_mod", self.model)
 
-        # Save current model state_dict (includes all submodules, e.g. famo)
+        # Save current model state_dict
         checkpoint["state_dict"] = {f"model.{k}": v for k, v in orig_model.state_dict().items()}
 
-        # Optionally overlay EMA backbone weights on top of the full state dict.
-        # We merge rather than replace so non-EMA submodules (e.g. famo) are kept.
+        # Optionally replace what’s saved (but not in memory) with EMA weights
         if self.ema_model is not None and self.ema_cfg.get("replace_model_at_end", False):
             ema_sd = {f"model.{k}": v for k, v in self.ema_model.state_dict().items()}
-            checkpoint["state_dict"].update(ema_sd)
+            checkpoint["state_dict"] = ema_sd
             self.l.warning(f"[Model] --> Saved EMA weights instead of current model weights")
 
         # Always save EMA weights separately as well
@@ -1772,9 +1476,16 @@ class EveNetEngine(L.LightningModule):
         def filter_trainable(params):
             return [p for p in params if p.requires_grad]
 
+        shared_modules = [
+            self.model.PET,
+            self.model.GlobalEmbedding,
+        ]
+        grouped_module = getattr(self.model, "GroupedSequentialEmbedding", None)
+        if grouped_module is not None:
+            shared_modules.append(grouped_module)
+
         shared_params = filter_trainable(
-            list(self.model.PET.parameters()) +
-            list(self.model.GlobalEmbedding.parameters())
+            [param for module in shared_modules for param in module.parameters()]
         )
 
         task_param_sets = []

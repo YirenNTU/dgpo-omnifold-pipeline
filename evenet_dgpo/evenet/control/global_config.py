@@ -13,17 +13,6 @@ from rich.console import Console
 from evenet.control.event_info import EventInfo
 
 
-def _deep_merge_yaml_dict(base: dict, override: dict) -> dict:
-    """Recursively merge ``override`` onto a copy of ``base`` (for top-level config defaults)."""
-    out = deepcopy(base)
-    for key, value in override.items():
-        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
-            out[key] = _deep_merge_yaml_dict(out[key], value)
-        else:
-            out[key] = deepcopy(value)
-    return out
-
-
 class DotDict(dict):
     """Recursive dict with attribute-style access."""
 
@@ -88,22 +77,10 @@ class Config:
         self.loaded = False
         self.skip_keys = ["event_info", "resonance"]
 
-    def load_yaml(self, path: str | Path):
+    def load_yaml(self, path: str | Path, current_dir: Path = None):
         path = Path(path)
         with open(path, 'r') as f:
             data = yaml.safe_load(f) or {}
-
-        default_top = data.pop("default", None)
-        if isinstance(default_top, str) and default_top.strip():
-            default_path = (path.parent / default_top).resolve()
-            if not default_path.is_file():
-                raise FileNotFoundError(
-                    f"Config default base not found: {default_path} "
-                    f"(from default: {default_top!r} in {path})"
-                )
-            with open(default_path, 'r') as f:
-                base_data = yaml.safe_load(f) or {}
-            data = _deep_merge_yaml_dict(base_data, data)
 
         for section, content in data.items():
             if isinstance(content, dict) and "default" in content:
@@ -122,7 +99,6 @@ class Config:
                 else:
                     self._global_config[section] = content
 
-
         required = self.skip_keys
         missing = [key for key in required if key not in self._global_config]
         if missing:
@@ -137,6 +113,53 @@ class Config:
 
         if 'process_info' in self._global_config:
             self._global_config['process_info'].pop('EXCLUDE', None)
+
+        # special deal with file paths
+        def resolve_path(d, key):
+            if key not in d or d[key] is None:
+                return
+            raw = Path(d[key]).expanduser()
+            if current_dir is not None:
+                d[key] = (Path(current_dir) / raw).resolve()
+            else:
+                d[key] = raw.resolve()
+
+        # Mapping of dict → list of keys
+        path_fields = {
+            'platform': ['data_parquet_dir', 'data_parquet_val_dir'],
+            'logger': ['save_dir'],
+            'options.Training': [
+                'model_checkpoint_save_path',
+                'model_checkpoint_load_path',
+                'pretrain_model_load_path'
+            ],
+            'options.Dataset': ['normalization_file'],
+        }
+
+        # Helper to walk nested dicts
+        def get_nested(cfg, dotted_key):
+            parts = dotted_key.split('.')
+            for p in parts:
+                cfg = cfg[p]
+            return cfg
+
+        def has_path(cfg, path: str):
+            node = cfg
+            for key in path.split("."):
+                if key not in node:
+                    return False
+                node = node[key]
+            return True
+
+        # Apply the resolver
+        for section, keys in path_fields.items():
+            if not has_path(self._global_config, section):
+                print(f"==> {section} not in global_config")
+                continue
+
+            d = get_nested(self._global_config, section)
+            for k in keys:
+                resolve_path(d, k)
 
         self.loaded = True
 

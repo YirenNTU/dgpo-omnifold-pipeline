@@ -28,6 +28,8 @@ def main() -> None:
     )
     parser.add_argument("--augmented-dirname", default="ad_augmented")
     parser.add_argument("--token-batch-size", type=int, default=1024)
+    parser.add_argument("--token-workers", type=int, default=None, help="Parallel workers for token export. Defaults to one worker per selected device.")
+    parser.add_argument("--token-devices", default=None, help="Comma-separated GPU device list for token export, or 'auto'.")
     args = parser.parse_args()
 
     run_ad_stage(
@@ -38,6 +40,8 @@ def main() -> None:
         ad_checkpoint=args.ad_backbone_checkpoint.expanduser().resolve() if args.ad_backbone_checkpoint else None,
         latent_checkpoint=args.latent_checkpoint.expanduser().resolve() if args.latent_checkpoint else None,
         token_batch_size=args.token_batch_size,
+        token_workers=args.token_workers,
+        token_devices=args.token_devices,
     )
 
 

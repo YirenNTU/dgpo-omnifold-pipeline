@@ -74,22 +74,6 @@ class Normalizer(nn.Module):
         :param index: index of features to apply inverse transformation
         :return: tensor (batch_size, num_objects, num_features)
         """
-        return self._denormalize_impl(x, mask=mask, remove_padding=remove_padding, index=index)
-
-    def denormalize_grad(self, x: Tensor, mask: Tensor = None, remove_padding: bool = False, index: List = None) -> Tensor:
-        """Gradient-capable denormalize.
-
-        Identical math to :meth:`denormalize` but **without** the ``@torch.no_grad()``
-        guard, so the autograd graph is preserved. Required by paths that backprop
-        through generated/predicted values into the policy network (e.g. the DGPO
-        discriminator-Wasserstein projection constraint). Inference/rollout/eval code
-        should keep using :meth:`denormalize`.
-        """
-        return self._denormalize_impl(x, mask=mask, remove_padding=remove_padding, index=index)
-
-    def _denormalize_impl(self, x: Tensor, mask: Tensor = None, remove_padding: bool = False, index: List = None) -> Tensor:
-        """Shared denormalize math. Written out-of-place so it stays autograd-safe
-        when called with grad enabled (no in-place writes into a grad-tracked tensor)."""
         if remove_padding:
             current_mean = self.mean[:-self.padding]
             current_std = self.std[:-self.padding]
@@ -107,17 +91,11 @@ class Normalizer(nn.Module):
                 inv_cdf_index = self.inv_cdf_index
 
             x_partial = x[..., inv_cdf_index].contiguous()
-            # ``Normal.cdf._validate_sample`` rejects any NaN/inf even on masked-out
-            # slots; sanitize so a single bad row cannot abort the whole rollout.
-            x_partial = torch.nan_to_num(x_partial, nan=0.0, posinf=8.0, neginf=-8.0)
             x_partial = self.normal.cdf(x_partial)
             # x_partial = x_partial * 2 * (math.sqrt(3) + 0.1) - (math.sqrt(3) + 0.1)
             # Yulei: Don't add extra 0.1
             x_partial = x_partial * 2 * (math.sqrt(3)) - (math.sqrt(3))
-            # Out-of-place scatter into the inv-CDF feature columns (avoids the
-            # in-place ``x[..., idx] = ...`` that breaks autograd under grad-enabled use).
-            idx_tensor = torch.as_tensor(inv_cdf_index, device=x.device, dtype=torch.long)
-            x = x.index_copy(-1, idx_tensor, x_partial.to(dtype=x.dtype))
+            x[..., inv_cdf_index] = x_partial
             if mask is not None:
                 x = x * mask
 
