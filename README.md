@@ -242,7 +242,7 @@ The wrapped DGPO workflow is intentionally split into two commands:
 2. `DGPO`: run diffusion/DGPO post-training on the augmented parquet from
    stage 1
 
-Example:
+Minimal example:
 
 ```bash
 python3 ml_pipeline/scripts/run_ad_stage.py \
@@ -253,6 +253,106 @@ python3 ml_pipeline/scripts/run_dgpo_stage.py \
   --stage-root "$CAMPAIGN_DIR/dgpo_run" \
   --dgpo-init-checkpoint /path/to/diffusion_init.ckpt
 ```
+
+Those are only the smallest useful invocations. In practice, both wrappers also
+inherit a lot of behavior from their base config and overlay config files, so
+you usually need to know which defaults you are accepting.
+
+Stage 1 `run_ad_stage.py` defaults:
+
+- `--ad-base-config ml_pipeline/config/train_pretrain_cls.yaml`
+- `--ad-overlay-config ml_pipeline/config/ad_stage_overlay.yaml`
+- `--augmented-dirname ad_augmented`
+- `--token-batch-size 1024`
+- `--token-devices auto`
+- if `--ad-backbone-checkpoint` is omitted, the script falls back to
+  `options.Training.model_checkpoint_load_path` or
+  `options.Training.pretrain_model_load_path` from the AD config
+- if `--latent-checkpoint` is omitted, the script trains a new latent
+  constraint model and writes it under
+  `<stage-root>/latent_constraint/checkpoints`
+
+Stage 2 `run_dgpo_stage.py` defaults:
+
+- `--diffusion-base-config ml_pipeline/config/train_pretrain.yaml`
+- `--diffusion-overlay-config ml_pipeline/config/dgpo_post_training_overlay.yaml`
+- `--augmented-dirname ad_augmented`
+- if `--latent-checkpoint` is omitted, the script expects stage 1 to have
+  already produced `<stage-root>/latent_constraint/checkpoints/last.ckpt`
+- if `--dgpo-init-checkpoint` is omitted, the diffusion init checkpoint comes
+  from `options.Training.model_checkpoint_load_path` in the DGPO config / overlay
+
+Important prerequisites:
+
+- the AD base config must point to a split root in the form
+  `platform.data_parquet_dir=<root>/train` and
+  `platform.data_parquet_val_dir=<root>/val`; the wrapper validates this and
+  exports tokens for both splits together
+- the diffusion stage expects the augmented parquet from stage 1 to exist under
+  `<stage-root>/<augmented-dirname>/train` and
+  `<stage-root>/<augmented-dirname>/val`
+- the normalization file, Ray worker count, GPU usage, and most dataset /
+  training settings are not passed on the CLI here; they are inherited from the
+  selected base config plus overlay config
+
+Recommended explicit invocation:
+
+```bash
+python3 ml_pipeline/scripts/run_ad_stage.py \
+  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
+  --ad-base-config ml_pipeline/config/train_pretrain_cls.yaml \
+  --ad-overlay-config ml_pipeline/config/ad_stage_overlay.yaml \
+  --ad-backbone-checkpoint /path/to/ad_backbone.ckpt \
+  --token-batch-size 1024 \
+  --token-devices auto
+
+python3 ml_pipeline/scripts/run_dgpo_stage.py \
+  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
+  --diffusion-base-config ml_pipeline/config/train_pretrain.yaml \
+  --diffusion-overlay-config ml_pipeline/config/dgpo_post_training_overlay.yaml \
+  --latent-checkpoint "$CAMPAIGN_DIR/dgpo_run/latent_constraint/checkpoints/last.ckpt" \
+  --dgpo-init-checkpoint /path/to/diffusion_init.ckpt
+```
+
+Useful variants:
+
+- reuse precomputed token parquet and skip frozen token export:
+
+```bash
+python3 ml_pipeline/scripts/run_ad_stage.py \
+  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
+  --skip-export
+```
+
+- reuse an existing latent constraint checkpoint instead of retraining it:
+
+```bash
+python3 ml_pipeline/scripts/run_ad_stage.py \
+  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
+  --ad-backbone-checkpoint /path/to/ad_backbone.ckpt \
+  --latent-checkpoint /path/to/existing_latent.ckpt
+```
+
+- point stage 2 at a latent checkpoint stored somewhere else:
+
+```bash
+python3 ml_pipeline/scripts/run_dgpo_stage.py \
+  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
+  --latent-checkpoint /path/to/existing_latent.ckpt \
+  --dgpo-init-checkpoint /path/to/diffusion_init.ckpt
+```
+
+What each stage writes:
+
+- stage 1 token export writes augmented parquet under
+  `<stage-root>/<augmented-dirname>/train` and
+  `<stage-root>/<augmented-dirname>/val`
+- stage 1 latent training writes runtime YAML under
+  `<stage-root>/runtime_configs/` and checkpoints / logs under
+  `<stage-root>/latent_constraint/`
+- stage 2 writes a generated DGPO overlay under
+  `<stage-root>/runtime_configs/` and DGPO checkpoints under
+  `<stage-root>/diffusion/checkpoints`
 
 Notes:
 

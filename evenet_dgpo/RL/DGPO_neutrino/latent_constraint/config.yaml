@@ -11,8 +11,8 @@ platform:
   data_parquet_dir: "/pscratch/sd/y/yiren/RL/nu2flow_data_evttok/mg5_train"
   data_parquet_val_dir: "/pscratch/sd/y/yiren/RL/nu2flow_data_evttok/mg5_test"
   number_of_workers: 4
-  resources_per_worker: { "CPU": 15, "GPU": 1 }
-  batch_size: 1024
+  resources_per_worker: { "CPU": 20, "GPU": 1 }
+  batch_size: 8096
   prefetch_batches: 2
   use_gpu: true
 
