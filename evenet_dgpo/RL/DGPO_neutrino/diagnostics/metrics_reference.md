@@ -70,6 +70,12 @@ Also logged: `projection/multi_sample/C_mean` (mean C_norm over multi-sample dra
 
 `train_dist/{pt,eta,phi}`: best-of-K reward argmax vs truth, accumulated over the epoch.
 
+## `diagnostics/ztautau_back_to_back/*`
+
+Ztautau-only scalar topology diagnostics from the reconstructed tau directions when `feature_names: [theta, phi]`.
+Logged per train step for both `all/*` rollout candidates and reward-selected `best/*` candidates:
+`cos_opening`, `delta_phi_to_pi`, `back_to_back_loss`.
+
 ## `val/*` and `val_neutrino/*`
 
 End-of-epoch DDIM validation (`validation_K` candidates). `val/reward/mean` drives top-K checkpoint selection. `val_neutrino/*` overlays truth / current policy / frozen reference for neutrino kinematics (pT, η, φ, and p_x/p_y/p_z in GeV).

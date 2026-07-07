@@ -8,7 +8,10 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from RL.DGPO_neutrino.domains.ztautau import wrapped_delta_phi
+from RL.DGPO_neutrino.domains.ztautau import (
+    tau_back_to_back_metrics,
+    wrapped_delta_phi,
+)
 
 
 def log_pt_eta_phi_to_cartesian(log_pt: Tensor, eta: Tensor, phi: Tensor) -> Tensor:
@@ -132,6 +135,7 @@ class ComponentNormalizedTruthDistanceReward(BaseReward):
         self._last_component_deltas: dict[str, Tensor] | None = None
         self._last_component_truths: dict[str, Tensor] | None = None
         self._last_kinematic_deltas: dict[str, Tensor] | None = None
+        self._last_topology_metrics: dict[str, Tensor] | None = None
 
     @property
     def name(self) -> str:
@@ -152,6 +156,9 @@ class ComponentNormalizedTruthDistanceReward(BaseReward):
 
     def last_kinematic_deltas(self) -> dict[str, Tensor] | None:
         return self._last_kinematic_deltas
+
+    def last_topology_metrics(self) -> dict[str, Tensor] | None:
+        return self._last_topology_metrics
 
     @staticmethod
     def _resolve_component_order(feature_names: tuple[str, ...] | None) -> tuple[str, ...]:
@@ -221,6 +228,17 @@ class ComponentNormalizedTruthDistanceReward(BaseReward):
             kin_deltas[feature_name] = (feat_delta * valid_kb.unsqueeze(-1)).detach().contiguous()
             kin_deltas[f"truth_{feature_name}"] = (truth_feat * valid_kb.unsqueeze(-1)).detach().contiguous()
         self._last_kinematic_deltas = kin_deltas
+        self._last_topology_metrics = None
+        if feature_names == ("theta", "phi"):
+            topology = tau_back_to_back_metrics(
+                candidates,
+                batch,
+                feature_names=feature_names,
+            )
+            self._last_topology_metrics = {
+                name: (values * valid_kb).detach().contiguous()
+                for name, values in topology.items()
+            }
         return reward
 
     def compute(
@@ -358,6 +376,7 @@ class ComponentNormalizedTruthDistanceReward(BaseReward):
             "eta": ((cand_eta2 - truth_eta2) * kin_mask).detach().contiguous(),
             "phi": (delta_phi * kin_mask).detach().contiguous(),
         }
+        self._last_topology_metrics = None
         return reward
 
 

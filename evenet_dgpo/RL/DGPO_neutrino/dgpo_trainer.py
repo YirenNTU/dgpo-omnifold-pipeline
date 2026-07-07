@@ -1699,6 +1699,11 @@ def _build_reward_extra_metrics(
             out[f"{prefix}/delta_abs_mean"] = float("nan")
         return finite
 
+    def _log_mean(prefix: str, values: Tensor) -> None:
+        finite = values.reshape(-1)
+        finite = finite[torch.isfinite(finite)]
+        out[prefix] = float(finite.mean().detach().cpu()) if finite.numel() > 0 else float("nan")
+
     if vb.sum() > 0:
         r = rewards[:, vb]
         out["reward/raw/mean"] = float(r.mean().detach().cpu())
@@ -1755,6 +1760,13 @@ def _build_reward_extra_metrics(
                             truth_axis = torch.stack((truths[a], truths[b]), dim=-1)
                             delta_axis = torch.stack((deltas[a], deltas[b]), dim=-1)
                             profile_tensors[axis] = (truth_axis, delta_axis)
+                topology = src.last_topology_metrics()
+                if topology is not None:
+                    for name, values in topology.items():
+                        all_values = values[:, vb]
+                        best_values = all_values[best_k, cols]
+                        _log_mean(f"diagnostics/ztautau_back_to_back/all/{name}", all_values)
+                        _log_mean(f"diagnostics/ztautau_back_to_back/best/{name}", best_values)
                 kin_deltas = src.last_kinematic_deltas()
                 if kin_deltas is not None:
                     rel_pt = kin_deltas.get("rel_pt")
@@ -3718,6 +3730,12 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "diagnostics/reward_hacking/all/phi/delta_abs_mean": "Mean absolute wrapped φ residual over all valid rollout candidates and both ν slots.",
         "diagnostics/reward_hacking/best/phi/delta_mean": "Signed mean wrapped φ residual on reward-best candidates.",
         "diagnostics/reward_hacking/best/phi/delta_abs_mean": "Mean absolute wrapped φ residual on reward-best candidates.",
+        "diagnostics/ztautau_back_to_back/all/cos_opening": "Mean cos(opening angle) between the two reconstructed tau directions over all valid rollout candidates. Ideal back-to-back topology is near -1.",
+        "diagnostics/ztautau_back_to_back/best/cos_opening": "Same cos(opening angle) metric after selecting the combined-reward argmax candidate per valid event.",
+        "diagnostics/ztautau_back_to_back/all/delta_phi_to_pi": "Mean ||Delta phi| - pi| over all valid rollout candidates. Smaller is more back-to-back in azimuth.",
+        "diagnostics/ztautau_back_to_back/best/delta_phi_to_pi": "Same azimuthal back-to-back metric on reward-best candidates.",
+        "diagnostics/ztautau_back_to_back/all/back_to_back_loss": "Mean (cos_opening + 1)^2 + (|Delta phi| - pi)^2 over all valid rollout candidates.",
+        "diagnostics/ztautau_back_to_back/best/back_to_back_loss": "Same combined back-to-back loss on reward-best candidates.",
         "diagnostics/reward_hacking/all/rel_pt/mean": "Mean pT_pred / pT_truth - 1 over all valid rollout candidates and both ν slots. Negative values indicate pT shrink.",
         "diagnostics/reward_hacking/all/rel_pt/abs_mean": "Mean abs(pT_pred / pT_truth - 1) over all valid rollout candidates and both ν slots.",
         "diagnostics/reward_hacking/best/rel_pt/mean": "Mean pT_pred / pT_truth - 1 after selecting the combined-reward argmax candidate per valid event. Compare to all/rel_pt/mean to spot reward-driven pT shrink.",

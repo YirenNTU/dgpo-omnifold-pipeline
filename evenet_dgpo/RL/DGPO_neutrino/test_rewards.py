@@ -68,6 +68,48 @@ class TestComponentNormalizedTruthDistanceReward(unittest.TestCase):
         self.assertEqual(r.shape, (K, B))
         self.assertGreater(r[0, 0].item(), r[1, 0].item())
 
+    def test_theta_phi_topology_metrics_are_exposed(self):
+        truth = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+        batch = {
+            "x_invisible": truth,
+            "x_invisible_mask": torch.ones(1, 2),
+            "lead_a_visible_px": torch.tensor([1.0]),
+            "lead_a_visible_py": torch.tensor([0.0]),
+            "lead_a_visible_pz": torch.tensor([0.0]),
+            "lead_b_visible_px": torch.tensor([-1.0]),
+            "lead_b_visible_py": torch.tensor([0.0]),
+            "lead_b_visible_pz": torch.tensor([0.0]),
+        }
+        candidates = torch.tensor(
+            [
+                [[[0.0, 0.0], [0.0, 0.0]]],
+                [[[0.0, 0.4], [0.0, -0.6]]],
+            ],
+            dtype=torch.float32,
+        )
+        reward = ComponentNormalizedTruthDistanceReward(
+            {
+                "nu1_theta": 1.0,
+                "nu1_phi": 1.0,
+                "nu2_theta": 1.0,
+                "nu2_phi": 1.0,
+            },
+            feature_names=("theta", "phi"),
+        )
+
+        reward.compute(candidates, batch)
+        topology = reward.last_topology_metrics()
+
+        self.assertIsNotNone(topology)
+        assert topology is not None
+        self.assertIn("back_to_back_loss", topology)
+        self.assertAlmostEqual(float(topology["cos_opening"][0, 0]), -1.0, places=5)
+        self.assertAlmostEqual(float(topology["delta_phi_to_pi"][0, 0]), 0.0, places=5)
+        self.assertLess(
+            float(topology["back_to_back_loss"][0, 0]),
+            float(topology["back_to_back_loss"][1, 0]),
+        )
+
 
 class TestGetEventValidMask(unittest.TestCase):
     def test_event_weight_zeros_event(self):

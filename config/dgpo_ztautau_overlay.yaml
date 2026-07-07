@@ -29,7 +29,7 @@ ztautau_domain:
 
 dgpo:
   validation_max_batches: 10
-  validation_compute_winrate: false
+  validation_compute_winrate: true
   validation_log_batches: true
   diagnostic_plot_every: 5
   diagnostic_plot_names:
