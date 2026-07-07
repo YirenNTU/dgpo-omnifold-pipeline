@@ -50,7 +50,7 @@ ztautau_domain:
 
 dgpo:
   K: 4
-  num_ddim_steps: 10
+  num_ddim_steps: 20
   validation_num_ddim_steps: 20
   # Cap validation work directly; val_dataset_limit under dgpo is not consumed
   # by the current trainer path.
