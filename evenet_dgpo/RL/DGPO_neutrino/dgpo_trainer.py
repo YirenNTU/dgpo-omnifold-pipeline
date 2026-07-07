@@ -814,6 +814,14 @@ def _supports_legacy_invisible_kinematics(*, cartesian: bool, feature_dim: int |
     return feature_dim is None or int(feature_dim) >= 3
 
 
+def _validation_winrate_enabled(*, compute_winrate: bool, cartesian: bool, feature_dim: int | None = None) -> bool:
+    """Win-rate needs a truth-L2 geometry we can actually build for this feature layout."""
+    return bool(compute_winrate) and _supports_legacy_invisible_kinematics(
+        cartesian=cartesian,
+        feature_dim=feature_dim,
+    )
+
+
 def _validation_profile_feature_names(*, cartesian: bool) -> tuple[str, ...]:
     """Validation residual-profile features derived from ``event_info.yaml``."""
     if _supports_legacy_invisible_kinematics(cartesian=cartesian):
@@ -5395,6 +5403,17 @@ def run_validation_epoch(
         cartesian=cartesian,
         feature_dim=len(_invisible_feature_names()) or None,
     )
+    winrate_enabled = _validation_winrate_enabled(
+        compute_winrate=compute_winrate,
+        cartesian=cartesian,
+        feature_dim=len(_invisible_feature_names()) or None,
+    )
+    if compute_winrate and not winrate_enabled and is_rank0 and val_log_batches:
+        _log.warning(
+            "[DGPO] val/winrate skipped: truth L2 needs legacy 3D neutrino kinematics, got feature_names=%s cartesian=%s.",
+            _invisible_feature_names(),
+            cartesian,
+        )
     profile_feature_names = tuple(_validation_profile_feature_names(cartesian=cartesian))
     local_pt_delta_event_mean_chunks: list[np.ndarray] = []
     local_profile_chunks: dict[str, list[np.ndarray]] = {
@@ -5699,7 +5718,7 @@ def run_validation_epoch(
             if top_r.size:
                 h_tm_r += np.histogram(top_r, bins=bin_topmass_edges)[0]
 
-        if compute_winrate:
+        if winrate_enabled:
             d_cur = compute_truth_l2_distances_kb(
                 candidates, batch_d, cartesian=cartesian, mask=None
             )[0]
@@ -5813,7 +5832,7 @@ def run_validation_epoch(
     def _mean(num: float, den: int) -> float:
         return float(num / den) if den > 0 else float("nan")
 
-    win_metric = _mean(sum_win, cnt_win) if compute_winrate else float("nan")
+    win_metric = _mean(sum_win, cnt_win) if winrate_enabled else float("nan")
 
     local_state = {
         "reward": _concat_np_chunks(local_reward_event_chunks),

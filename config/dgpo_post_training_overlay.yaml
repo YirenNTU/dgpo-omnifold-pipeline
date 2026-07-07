@@ -2,7 +2,7 @@ platform:
   # DGPO expands the effective forward size by K and policy-eval timesteps.
   # Keeping the pretraining batch of 2048 is too large here and tends to OOM.
   batch_size: 256
-  number_of_workers: 16
+  number_of_workers:4
   resources_per_worker: {
     "CPU": 10,
     "GPU": 1,
