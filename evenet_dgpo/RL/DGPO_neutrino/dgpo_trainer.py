@@ -779,6 +779,29 @@ def _invisible_periodic_feature_indices() -> tuple[int, ...]:
     return tuple(int(index) for index in raw)
 
 
+def _generation_monitor_feature_names(*, cartesian: bool) -> tuple[str, ...]:
+    """Feature names for generation-style monitoring plots."""
+    if cartesian:
+        return ("px", "py", "pz")
+    return _invisible_feature_names()
+
+
+def _generation_special_bin_edges(feature_name: str) -> np.ndarray | None:
+    """Mirror EveNet ``Generation-Binning`` lookup for ``neutrino-{feature}``."""
+    metrics_cfg = getattr(global_config.options, "Metrics", None)
+    if metrics_cfg is None:
+        return None
+    bins_cfg = metrics_cfg.get("Generation-Binning", {})
+    raw = bins_cfg.get(f"neutrino-{feature_name}")
+    if raw is None or len(raw) != 3:
+        return None
+    nbins, lo, hi = raw
+    try:
+        return np.linspace(float(lo), float(hi), int(nbins))
+    except (TypeError, ValueError):
+        return None
+
+
 def _supports_legacy_invisible_kinematics(*, cartesian: bool, feature_dim: int | None = None) -> bool:
     """Whether legacy ``(log_pt, eta, phi)`` / Cartesian diagnostics are valid."""
     if cartesian:
@@ -3496,20 +3519,33 @@ def train_step(
         out["_kin_h_e_k1_t"] = np.histogram(k1_teta, bins=_td_eta_edges)[0].astype(np.float64)
         out["_kin_h_p_k1_p"] = np.histogram(k1_phi, bins=_td_phi_edges)[0].astype(np.float64)
         out["_kin_h_p_k1_t"] = np.histogram(k1_tphi, bins=_td_phi_edges)[0].astype(np.float64)
-        all_pt_p, all_eta_p, all_phi_p, all_pt_t, all_eta_t, all_phi_t = (
-            _val_pred_truth_kin_flat_all_candidates(
+        all_plot_feature_names = _generation_monitor_feature_names(cartesian=cartesian)
+        if cartesian:
+            all_px_p, all_py_p, all_pz_p, all_px_t, all_py_t, all_pz_t = (
+                _val_pred_truth_cartesian_flat_all_candidates(
+                    candidates_phys,
+                    batch,
+                    device=device,
+                    dtype=dtype,
+                )
+            )
+            out["_kin_all_px_p"] = all_px_p
+            out["_kin_all_px_t"] = all_px_t
+            out["_kin_all_py_p"] = all_py_p
+            out["_kin_all_py_t"] = all_py_t
+            out["_kin_all_pz_p"] = all_pz_p
+            out["_kin_all_pz_t"] = all_pz_t
+        else:
+            feature_arrays = _val_pred_truth_feature_flat_all_candidates(
                 candidates_phys,
                 batch,
-                cartesian=cartesian,
+                feature_names=all_plot_feature_names,
                 device=device,
             )
-        )
-        out["_kin_all_pt_p"] = all_pt_p
-        out["_kin_all_pt_t"] = all_pt_t
-        out["_kin_all_eta_p"] = all_eta_p
-        out["_kin_all_eta_t"] = all_eta_t
-        out["_kin_all_phi_p"] = all_phi_p
-        out["_kin_all_phi_t"] = all_phi_t
+            for key, values in feature_arrays.items():
+                suffix = "p" if key.endswith("_pred") else "t"
+                feature_name = key.rsplit("_", 1)[0]
+                out[f"_kin_all_{feature_name}_{suffix}"] = values
 
     optimizer.scheduler_step()
     return out
@@ -3839,9 +3875,9 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "val_neutrino/pt": "1D density overlay: truth vs current-policy vs frozen-reference prediction for pT [GeV] (original scale, expm1 of log1p(pT)) (wandb.Image); x-axis **epoch**. Current-policy histogram uses the same per-event candidate index rule as train_dist/* (combined-reward argmax).",
         "val_neutrino/eta": "Same three-way overlay for η; same candidate selection as val_neutrino/pt.",
         "val_neutrino/phi": "Same three-way overlay for φ [rad]; same candidate selection as val_neutrino/pt.",
-        "val_neutrino/all/pt_truth_vs_pred": "2D density matrix of truth pT vs current-policy predicted pT for all validation candidates and valid neutrino slots (wandb.Image); x-axis epoch.",
-        "val_neutrino/all/eta_truth_vs_pred": "2D density matrix of truth η vs current-policy predicted η for all validation candidates and valid neutrino slots (wandb.Image); x-axis epoch.",
-        "val_neutrino/all/phi_truth_vs_pred": "2D density matrix of truth φ vs current-policy predicted φ for all validation candidates and valid neutrino slots (wandb.Image); x-axis epoch.",
+        "val_neutrino/all/pt_truth_vs_pred": "Example 2D truth-vs-pred key. Actual validation 2D keys follow event_info.invisible_feature_names as val_neutrino/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
+        "val_neutrino/all/eta_truth_vs_pred": "Example 2D truth-vs-pred key. Actual validation 2D keys follow event_info.invisible_feature_names as val_neutrino/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
+        "val_neutrino/all/phi_truth_vs_pred": "Example 2D truth-vs-pred key. Actual validation 2D keys follow event_info.invisible_feature_names as val_neutrino/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "val_neutrino/px": "Same three-way overlay for neutrino p_x [GeV]; truth is denormalized invisible target, pred/ref from DDIM output.",
         "val_neutrino/py": "Same three-way overlay for neutrino p_y [GeV].",
         "val_neutrino/pz": "Same three-way overlay for neutrino p_z [GeV].",
@@ -3851,9 +3887,9 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "train_dist/pt": "1D density overlay: truth vs best-of-K training prediction for pT [GeV] (original scale), accumulated over all training batches in the epoch (wandb.Image). x-axis **epoch**. \"Best\" = combined-reward argmax among K candidates.",
         "train_dist/eta": "Same overlay for η (training); same candidate selection as train_dist/pt.",
         "train_dist/phi": "Same overlay for φ [rad] (training); same candidate selection as train_dist/pt.",
-        "train_dist/all/pt_truth_vs_pred": "2D density matrix of truth pT vs predicted pT for all training candidates and valid neutrino slots accumulated over the epoch (wandb.Image).",
-        "train_dist/all/eta_truth_vs_pred": "2D density matrix of truth η vs predicted η for all training candidates and valid neutrino slots accumulated over the epoch (wandb.Image).",
-        "train_dist/all/phi_truth_vs_pred": "2D density matrix of truth φ vs predicted φ for all training candidates and valid neutrino slots accumulated over the epoch (wandb.Image).",
+        "train_dist/all/pt_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
+        "train_dist/all/eta_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
+        "train_dist/all/phi_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "train_dist_k1/pt": "1D density overlay: truth vs candidate-0 training rollout prediction for pT [GeV], accumulated over all training batches in the epoch. This is a K=1 / single-sample proxy on the train rollout pool, separate from reward-best train_dist/*.",
         "train_dist_k1/eta": "Same overlay for η using candidate 0 as the train K=1 proxy.",
         "train_dist_k1/phi": "Same overlay for φ using candidate 0 as the train K=1 proxy.",
@@ -4551,6 +4587,37 @@ def _val_pred_truth_kin_flat_all_candidates(
 
 
 @torch.no_grad()
+def _val_pred_truth_feature_flat_all_candidates(
+    candidates: Tensor,
+    batch_d: dict[str, Any],
+    *,
+    feature_names: tuple[str, ...],
+    device: torch.device,
+) -> dict[str, np.ndarray]:
+    """Masked flattened feature arrays for all candidates vs repeated truth slots."""
+    K = int(candidates.shape[0])
+    B = int(batch_d["x"].shape[0])
+    N_nu = int(candidates.shape[2])
+    max_features = min(len(feature_names), int(candidates.shape[-1]), int(batch_d["x_invisible"].shape[-1]))
+    xm = batch_d["x_invisible_mask"]
+    if xm.dim() == 3 and xm.shape[-1] == 1:
+        mask = xm.squeeze(-1).to(device=device, dtype=candidates.dtype)
+    else:
+        mask = xm.to(device=device, dtype=candidates.dtype)
+    mask = (mask > 0).reshape(B, N_nu)
+    mask_k = mask.unsqueeze(0).expand(K, -1, -1)
+    truth = batch_d["x_invisible"]
+    out: dict[str, np.ndarray] = {}
+    for i in range(max_features):
+        feature_name = str(feature_names[i])
+        pred = candidates[..., i][mask_k].detach().float().cpu().numpy()
+        target = truth[..., i].unsqueeze(0).expand(K, -1, -1)[mask_k].detach().float().cpu().numpy()
+        out[f"{feature_name}_pred"] = pred
+        out[f"{feature_name}_truth"] = target
+    return out
+
+
+@torch.no_grad()
 def _truth_invisible_kin_phys(
     batch_d: dict[str, Any],
     *,
@@ -4615,6 +4682,38 @@ def _val_pred_truth_cartesian_flat(
     tpx = truth_xyz[..., 0][m].detach().float().cpu().numpy()
     tpy = truth_xyz[..., 1][m].detach().float().cpu().numpy()
     tpz = truth_xyz[..., 2][m].detach().float().cpu().numpy()
+    return ppx, ppy, ppz, tpx, tpy, tpz
+
+
+@torch.no_grad()
+def _val_pred_truth_cartesian_flat_all_candidates(
+    candidates: Tensor,
+    batch_d: dict[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Masked flattened ``px``, ``py``, ``pz`` [GeV] for all candidates vs repeated truth."""
+    K = int(candidates.shape[0])
+    B = int(batch_d["x"].shape[0])
+    N_nu = int(candidates.shape[2])
+    xm = batch_d["x_invisible_mask"]
+    if xm.dim() == 3 and xm.shape[-1] == 1:
+        mask = xm.squeeze(-1).to(device=device) > 0
+    else:
+        mask = xm.to(device=device) > 0
+    mask = mask.reshape(B, N_nu)
+    mask_k = mask.unsqueeze(0).expand(K, -1, -1)
+    pred_xyz = candidates[..., :3]
+    truth_xyz = _truth_invisible_kin_phys(
+        batch_d, cartesian=True, device=device, dtype=dtype
+    )[:, :N_nu, :].unsqueeze(0).expand(K, -1, -1, -1)
+    ppx = pred_xyz[..., 0][mask_k].detach().float().cpu().numpy()
+    ppy = pred_xyz[..., 1][mask_k].detach().float().cpu().numpy()
+    ppz = pred_xyz[..., 2][mask_k].detach().float().cpu().numpy()
+    tpx = truth_xyz[..., 0][mask_k].detach().float().cpu().numpy()
+    tpy = truth_xyz[..., 1][mask_k].detach().float().cpu().numpy()
+    tpz = truth_xyz[..., 2][mask_k].detach().float().cpu().numpy()
     return ppx, ppy, ppz, tpx, tpy, tpz
 
 
@@ -5165,6 +5264,7 @@ def _truth_pred_matrix_figure(
     xlabel: str,
     ylabel: str,
     title: str,
+    bin_edges: np.ndarray | None = None,
 ) -> Any:
     """2D density matrix for truth-vs-pred comparisons."""
     import wandb
@@ -5181,17 +5281,23 @@ def _truth_pred_matrix_figure(
         x = np.array([0.0], dtype=np.float64)
         y = np.array([0.0], dtype=np.float64)
 
-    stacked = np.concatenate([x, y], axis=0)
-    lo, hi = [float(v) for v in np.nanpercentile(stacked, [1.0, 99.0])]
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        center = float(np.nanmean(stacked)) if stacked.size > 0 else 0.0
-        lo, hi = center - 1.0, center + 1.0
-    pad = max(0.05 * (hi - lo), 1e-6)
-    lo -= pad
-    hi += pad
+    if bin_edges is not None and len(bin_edges) >= 2:
+        edges = np.asarray(bin_edges, dtype=np.float64)
+        lo = float(edges[0])
+        hi = float(edges[-1])
+    else:
+        stacked = np.concatenate([x, y], axis=0)
+        lo, hi = [float(v) for v in np.nanpercentile(stacked, [1.0, 99.0])]
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            center = float(np.nanmean(stacked)) if stacked.size > 0 else 0.0
+            lo, hi = center - 1.0, center + 1.0
+        pad = max(0.05 * (hi - lo), 1e-6)
+        lo -= pad
+        hi += pad
+        edges = np.linspace(lo, hi, 51)
 
     fig, ax = plt.subplots(figsize=(5.4, 4.8))
-    hist = ax.hist2d(x, y, bins=50, range=[[lo, hi], [lo, hi]], cmap="viridis")
+    hist = ax.hist2d(x, y, bins=[edges, edges], cmap="viridis")
     fig.colorbar(hist[3], ax=ax, label="Samples")
     ax.plot([lo, hi], [lo, hi], color="white", linestyle="--", linewidth=1.0, alpha=0.85)
     ax.set_xlabel(xlabel)
@@ -5299,13 +5405,11 @@ def run_validation_epoch(
         f"{profile_name}_delta": []
         for profile_name in profile_feature_names
     })
+    all_plot_feature_names = _generation_monitor_feature_names(cartesian=cartesian)
     local_truth_pred_all_chunks: dict[str, list[np.ndarray]] = {
-        "pt_truth": [],
-        "pt_pred": [],
-        "eta_truth": [],
-        "eta_pred": [],
-        "phi_truth": [],
-        "phi_pred": [],
+        f"{feature_name}_{suffix}": []
+        for feature_name in all_plot_feature_names
+        for suffix in ("truth", "pred")
     }
     # pT in GeV (original physics scale, after expm1 inversion of log1p).
     bin_pt_edges = _diagnostic_bin_edges("pt")
@@ -5469,20 +5573,30 @@ def run_validation_epoch(
             h_e_t += np.histogram(teta, bins=bin_eta_edges)[0]
             h_p_p += np.histogram(pphi, bins=bin_phi_edges)[0]
             h_p_t += np.histogram(tphi, bins=bin_phi_edges)[0]
-            all_pt_p, all_eta_p, all_phi_p, all_pt_t, all_eta_t, all_phi_t = (
-                _val_pred_truth_kin_flat_all_candidates(
+            if cartesian:
+                all_px_p, all_py_p, all_pz_p, all_px_t, all_py_t, all_pz_t = (
+                    _val_pred_truth_cartesian_flat_all_candidates(
+                        candidates,
+                        batch_d,
+                        device=device,
+                        dtype=dtype,
+                    )
+                )
+                local_truth_pred_all_chunks["px_truth"].append(all_px_t)
+                local_truth_pred_all_chunks["px_pred"].append(all_px_p)
+                local_truth_pred_all_chunks["py_truth"].append(all_py_t)
+                local_truth_pred_all_chunks["py_pred"].append(all_py_p)
+                local_truth_pred_all_chunks["pz_truth"].append(all_pz_t)
+                local_truth_pred_all_chunks["pz_pred"].append(all_pz_p)
+            else:
+                feature_arrays = _val_pred_truth_feature_flat_all_candidates(
                     candidates,
                     batch_d,
-                    cartesian=cartesian,
+                    feature_names=all_plot_feature_names,
                     device=device,
                 )
-            )
-            local_truth_pred_all_chunks["pt_truth"].append(all_pt_t)
-            local_truth_pred_all_chunks["pt_pred"].append(all_pt_p)
-            local_truth_pred_all_chunks["eta_truth"].append(all_eta_t)
-            local_truth_pred_all_chunks["eta_pred"].append(all_eta_p)
-            local_truth_pred_all_chunks["phi_truth"].append(all_phi_t)
-            local_truth_pred_all_chunks["phi_pred"].append(all_phi_p)
+                for key, values in feature_arrays.items():
+                    local_truth_pred_all_chunks[key].append(values)
 
             ppx, ppy, ppz, tpx, tpy, tpz = _val_pred_truth_cartesian_flat(
                 candidates,
@@ -5826,27 +5940,20 @@ def run_validation_epoch(
                     )
                 )
         if legacy_kinematics:
-            out["val_neutrino/all/pt_truth_vs_pred"] = _truth_pred_matrix_figure(
-                truth_pred_all_merged.get("pt_truth", np.array([], dtype=np.float64)),
-                truth_pred_all_merged.get("pt_pred", np.array([], dtype=np.float64)),
-                xlabel="Truth pT [GeV]",
-                ylabel="Pred pT [GeV]",
-                title=f"Validation 2D truth vs pred pT ({val_K} candidate{'s' if val_K != 1 else ''}, all)",
-            )
-            out["val_neutrino/all/eta_truth_vs_pred"] = _truth_pred_matrix_figure(
-                truth_pred_all_merged.get("eta_truth", np.array([], dtype=np.float64)),
-                truth_pred_all_merged.get("eta_pred", np.array([], dtype=np.float64)),
-                xlabel="Truth η",
-                ylabel="Pred η",
-                title=f"Validation 2D truth vs pred η ({val_K} candidate{'s' if val_K != 1 else ''}, all)",
-            )
-            out["val_neutrino/all/phi_truth_vs_pred"] = _truth_pred_matrix_figure(
-                truth_pred_all_merged.get("phi_truth", np.array([], dtype=np.float64)),
-                truth_pred_all_merged.get("phi_pred", np.array([], dtype=np.float64)),
-                xlabel="Truth φ [rad]",
-                ylabel="Pred φ [rad]",
-                title=f"Validation 2D truth vs pred φ ({val_K} candidate{'s' if val_K != 1 else ''}, all)",
-            )
+            for feature_name in all_plot_feature_names:
+                truth_key = f"{feature_name}_truth"
+                pred_key = f"{feature_name}_pred"
+                out[f"val_neutrino/all/{feature_name}_truth_vs_pred"] = _truth_pred_matrix_figure(
+                    truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
+                    truth_pred_all_merged.get(pred_key, np.array([], dtype=np.float64)),
+                    xlabel=f"Truth {feature_name}",
+                    ylabel=f"Pred {feature_name}",
+                    title=(
+                        f"Validation 2D truth vs pred {feature_name} "
+                        f"({val_K} candidate{'s' if val_K != 1 else ''}, all)"
+                    ),
+                    bin_edges=_generation_special_bin_edges(feature_name),
+                )
             out["val_neutrino/pt"] = _val_overlay_kin_figure(
                 h_pt_t,
                 h_pt_p,
@@ -6511,13 +6618,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             td_k1_e_t = np.zeros(num_diag_bins, dtype=np.float64)
             td_k1_p_p = np.zeros(num_diag_bins, dtype=np.float64)
             td_k1_p_t = np.zeros(num_diag_bins, dtype=np.float64)
+            td_all_feature_names = _generation_monitor_feature_names(
+                cartesian=_truth_generation_cartesian()
+            )
             td_all_chunks: dict[str, list[np.ndarray]] = {
-                "pt_truth": [],
-                "pt_pred": [],
-                "eta_truth": [],
-                "eta_pred": [],
-                "phi_truth": [],
-                "phi_pred": [],
+                f"{feature_name}_{suffix}": []
+                for feature_name in td_all_feature_names
+                for suffix in ("truth", "pred")
             }
             stop_epoch = False
             while True:
@@ -6601,12 +6708,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     td_k1_e_t += metrics["_kin_h_e_k1_t"]
                     td_k1_p_p += metrics["_kin_h_p_k1_p"]
                     td_k1_p_t += metrics["_kin_h_p_k1_t"]
-                    td_all_chunks["pt_truth"].append(metrics["_kin_all_pt_t"])
-                    td_all_chunks["pt_pred"].append(metrics["_kin_all_pt_p"])
-                    td_all_chunks["eta_truth"].append(metrics["_kin_all_eta_t"])
-                    td_all_chunks["eta_pred"].append(metrics["_kin_all_eta_p"])
-                    td_all_chunks["phi_truth"].append(metrics["_kin_all_phi_t"])
-                    td_all_chunks["phi_pred"].append(metrics["_kin_all_phi_p"])
+                    for feature_name in td_all_feature_names:
+                        td_all_chunks[f"{feature_name}_truth"].append(
+                            metrics[f"_kin_all_{feature_name}_t"]
+                        )
+                        td_all_chunks[f"{feature_name}_pred"].append(
+                            metrics[f"_kin_all_{feature_name}_p"]
+                        )
 
                 if is_rank0 and global_step % log_every == 0:
                     _log.info(
@@ -6691,29 +6799,17 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             "Neutrino φ (train: candidate 0 / K=1 proxy vs truth, all batches)",
                             pred_label="Pred (train K=1 proxy)", xlabel="φ [rad]",
                         ),
-                        "train_dist/all/pt_truth_vs_pred": _truth_pred_matrix_figure(
-                            td_all_merged.get("pt_truth", np.array([], dtype=np.float64)),
-                            td_all_merged.get("pt_pred", np.array([], dtype=np.float64)),
-                            xlabel="Truth pT [GeV]",
-                            ylabel="Pred pT [GeV]",
-                            title="Train 2D truth vs pred pT (all candidates, all batches)",
-                        ),
-                        "train_dist/all/eta_truth_vs_pred": _truth_pred_matrix_figure(
-                            td_all_merged.get("eta_truth", np.array([], dtype=np.float64)),
-                            td_all_merged.get("eta_pred", np.array([], dtype=np.float64)),
-                            xlabel="Truth η",
-                            ylabel="Pred η",
-                            title="Train 2D truth vs pred η (all candidates, all batches)",
-                        ),
-                        "train_dist/all/phi_truth_vs_pred": _truth_pred_matrix_figure(
-                            td_all_merged.get("phi_truth", np.array([], dtype=np.float64)),
-                            td_all_merged.get("phi_pred", np.array([], dtype=np.float64)),
-                            xlabel="Truth φ [rad]",
-                            ylabel="Pred φ [rad]",
-                            title="Train 2D truth vs pred φ (all candidates, all batches)",
-                        ),
                         "epoch": float(epoch),
                     }
+                    for feature_name in td_all_feature_names:
+                        td_log[f"train_dist/all/{feature_name}_truth_vs_pred"] = _truth_pred_matrix_figure(
+                            td_all_merged.get(f"{feature_name}_truth", np.array([], dtype=np.float64)),
+                            td_all_merged.get(f"{feature_name}_pred", np.array([], dtype=np.float64)),
+                            xlabel=f"Truth {feature_name}",
+                            ylabel=f"Pred {feature_name}",
+                            title=f"Train 2D truth vs pred {feature_name} (all candidates, all batches)",
+                            bin_edges=_generation_special_bin_edges(feature_name),
+                        )
                     _wandb_log_with_step(
                         wandb_mod,
                         td_log,
