@@ -126,16 +126,15 @@ def _candidate_mask_kb(
     return torch.ones(KB, device=device, dtype=torch.bool)
 
 
-def _pred_truth_kin_log_pt_eta_phi(
+def _pred_truth_kin_encoder_space(
     nu_phys_kb: Tensor,
     batch_kb: Mapping[str, Any],
     *,
     cartesian: bool,
 ) -> tuple[Tensor, Tensor]:
-    """``pred_kin``, ``truth_kin`` each ``(KB, 2, 3)`` with channels ``[log_pt, eta, phi]``."""
+    """Return ``pred_kin`` and ``truth_kin`` in the non-cartesian encoder feature space."""
     from RL.DGPO_neutrino.rewards import cartesian_to_log_pt_eta_phi
 
-    KB = nu_phys_kb.shape[0]
     if cartesian:
         pred_log_pt, pred_eta, pred_phi = cartesian_to_log_pt_eta_phi(
             nu_phys_kb[:, :2, 0],
@@ -152,21 +151,25 @@ def _pred_truth_kin_log_pt_eta_phi(
             truth_xyz[..., 1],
             truth_xyz[..., 2],
         )
+        pred_kin = torch.stack((pred_log_pt, pred_eta, pred_phi), dim=-1)
+        truth_kin = torch.stack((truth_log_pt, truth_eta, truth_phi), dim=-1)
     else:
-        pred_log_pt = nu_phys_kb[:, :2, 0]
-        pred_eta = nu_phys_kb[:, :2, 1]
-        pred_phi = nu_phys_kb[:, :2, 2]
         if not isinstance(batch_kb.get("x_invisible"), Tensor):
             raise KeyError("latent_swd constraint requires batch['x_invisible']")
         truth = batch_kb["x_invisible"].to(device=nu_phys_kb.device, dtype=nu_phys_kb.dtype)[:, :2, :]
-        truth_log_pt = truth[..., 0]
-        truth_eta = truth[..., 1]
-        truth_phi = truth[..., 2]
-    pred_kin = torch.stack((pred_log_pt, pred_eta, pred_phi), dim=-1)
-    truth_kin = torch.stack((truth_log_pt, truth_eta, truth_phi), dim=-1)
-    if tuple(pred_kin.shape) != (KB, 2, 3) or tuple(truth_kin.shape) != (KB, 2, 3):
+        pred_dim = int(nu_phys_kb.shape[-1])
+        truth_dim = int(truth.shape[-1])
+        if pred_dim < 1 or truth_dim < 1:
+            raise ValueError(f"expected invisible feature dim >= 1, got {pred_dim} vs {truth_dim}")
+        if pred_dim != truth_dim:
+            raise ValueError(
+                f"pred/truth invisible feature dims differ: {pred_dim} vs {truth_dim}"
+            )
+        pred_kin = nu_phys_kb[:, :2, :pred_dim]
+        truth_kin = truth[:, :2, :truth_dim]
+    if pred_kin.shape[:2] != (nu_phys_kb.shape[0], 2) or truth_kin.shape != pred_kin.shape:
         raise ValueError(
-            f"expected kin shape (KB, 2, 3), got {tuple(pred_kin.shape)} vs {tuple(truth_kin.shape)}"
+            f"expected matching kin shape (KB, 2, D), got {tuple(pred_kin.shape)} vs {tuple(truth_kin.shape)}"
         )
     return pred_kin, truth_kin
 
@@ -578,8 +581,8 @@ def compute_latent_swd_constraint(
         raise ValueError(f"expected KB=K*B, got KB={KB}, K={K}, B={B}")
 
     # 2) pred/truth kin in the ENCODER's coordinate system + validity mask.
-    #    A cartesian-trained encoder wants (px, py, pz); the spherical encoder
-    #    wants (log_pt, eta, phi). Feed whatever the loaded encoder was trained in.
+    #    A cartesian-trained encoder wants (px, py, pz); otherwise feed the
+    #    exact invisible feature layout the loaded encoder was trained on.
     if bool(getattr(state.model, "cartesian", False)):
         if cartesian:
             pred_kin = nu_phys[:, :2, :3]                       # policy already cartesian
@@ -595,7 +598,9 @@ def compute_latent_swd_constraint(
             )
         truth_kin = truth_xyz.to(device=nu_phys.device, dtype=nu_phys.dtype)[:, :2, :3]
     else:
-        pred_kin, truth_kin = _pred_truth_kin_log_pt_eta_phi(nu_phys, batch_kb, cartesian=cartesian)
+        pred_kin, truth_kin = _pred_truth_kin_encoder_space(
+            nu_phys, batch_kb, cartesian=cartesian
+        )
     event_ok = _event_mask_kb(batch_kb, K=int(K), KB=KB, device=nu_phys.device, dtype=nu_phys.dtype)
     cand_ok = _candidate_mask_kb(
         candidate_weights_kb, K=int(K), B=B, device=nu_phys.device, apply_to=cfg.apply_to
