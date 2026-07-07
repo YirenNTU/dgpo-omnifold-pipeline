@@ -111,3 +111,41 @@ class Normalizer(nn.Module):
             x = x * mask
 
         return x
+
+    def denormalize_grad(self, x: Tensor, mask: Tensor = None, remove_padding: bool = False, index: List = None) -> Tensor:
+        """
+        Differentiable mirror of ``denormalize`` for DGPO projection constraints.
+        """
+        if remove_padding and self.padding > 0:
+            current_mean = self.mean[:-self.padding]
+            current_std = self.std[:-self.padding]
+        else:
+            current_mean = self.mean
+            current_std = self.std
+
+        x = x.to(dtype=current_mean.dtype)
+
+        if len(self.inv_cdf_index) > 0:
+            if index is not None:
+                inv_cdf_index = [idx for idx in index if idx in self.inv_cdf_index]
+            else:
+                inv_cdf_index = self.inv_cdf_index
+
+            if len(inv_cdf_index) > 0:
+                x_partial = x[..., inv_cdf_index].contiguous()
+                x_partial = torch.nan_to_num(x_partial, nan=0.0, posinf=8.0, neginf=-8.0)
+                x_partial = self.normal.cdf(x_partial)
+                x_partial = x_partial * 2 * math.sqrt(3) - math.sqrt(3)
+                x = x.clone()
+                x[..., inv_cdf_index] = x_partial
+                if mask is not None:
+                    x = x * mask
+
+        if index is not None:
+            x = x * current_std[index] + current_mean[index]
+        else:
+            x = (x * current_std) + current_mean
+        if mask is not None:
+            x = x * mask
+
+        return x
