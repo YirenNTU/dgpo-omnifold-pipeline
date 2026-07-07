@@ -49,7 +49,7 @@ ztautau_domain:
     target_delta_phi_to_pi: 0.0
 
 dgpo:
-  K: 8
+  K: 4
   num_ddim_steps: 10
   validation_num_ddim_steps: 20
   # Cap validation work directly; val_dataset_limit under dgpo is not consumed
