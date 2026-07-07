@@ -3,6 +3,10 @@ platform:
   # Keeping the pretraining batch of 2048 is too large here and tends to OOM.
   batch_size: 128
   number_of_workers: 4
+  resources_per_worker: {
+    "CPU": 10,
+    "GPU": 1,
+  }
 
 options:
   Dataset:
