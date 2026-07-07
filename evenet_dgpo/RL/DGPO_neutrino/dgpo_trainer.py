@@ -91,7 +91,6 @@ from RL.DGPO_neutrino.rewards import (
     ComponentNormalizedTruthDistanceReward,
     RewardAggregator,
     cartesian_to_log_pt_eta_phi,
-    compute_truth_l2_distances_kb,
     get_event_valid_mask,
     log_pt_eta_phi_to_cartesian,
 )
@@ -802,6 +801,29 @@ def _generation_special_bin_edges(feature_name: str) -> np.ndarray | None:
         return None
 
 
+def _available_truth_pred_features(
+    arrays: Mapping[str, np.ndarray],
+    feature_names: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Feature names that have non-empty truth/pred arrays for 2D truth-vs-pred plots."""
+    available: list[str] = []
+    for feature_name in feature_names:
+        truth = np.asarray(
+            arrays.get(f"{feature_name}_truth", np.array([], dtype=np.float64)),
+            dtype=np.float64,
+        ).reshape(-1)
+        pred = np.asarray(
+            arrays.get(f"{feature_name}_pred", np.array([], dtype=np.float64)),
+            dtype=np.float64,
+        ).reshape(-1)
+        if min(truth.size, pred.size) == 0:
+            continue
+        if not np.isfinite(truth).any() or not np.isfinite(pred).any():
+            continue
+        available.append(str(feature_name))
+    return tuple(available)
+
+
 def _supports_legacy_invisible_kinematics(*, cartesian: bool, feature_dim: int | None = None) -> bool:
     """Whether legacy ``(log_pt, eta, phi)`` / Cartesian diagnostics are valid."""
     if cartesian:
@@ -815,11 +837,9 @@ def _supports_legacy_invisible_kinematics(*, cartesian: bool, feature_dim: int |
 
 
 def _validation_winrate_enabled(*, compute_winrate: bool, cartesian: bool, feature_dim: int | None = None) -> bool:
-    """Win-rate needs a truth-L2 geometry we can actually build for this feature layout."""
-    return bool(compute_winrate) and _supports_legacy_invisible_kinematics(
-        cartesian=cartesian,
-        feature_dim=feature_dim,
-    )
+    """Validation win-rate is available whenever the extra reference rollout is enabled."""
+    del cartesian, feature_dim
+    return bool(compute_winrate)
 
 
 def _validation_profile_feature_names(*, cartesian: bool) -> tuple[str, ...]:
@@ -3498,6 +3518,7 @@ def train_step(
     out.update(nonfinite_diag)
 
     cartesian = _truth_generation_cartesian()
+    all_plot_feature_names = _generation_monitor_feature_names(cartesian=cartesian)
     if _supports_legacy_invisible_kinematics(
         cartesian=cartesian,
         feature_dim=int(batch["x_invisible"].shape[-1]),
@@ -3527,7 +3548,6 @@ def train_step(
         out["_kin_h_e_k1_t"] = np.histogram(k1_teta, bins=_td_eta_edges)[0].astype(np.float64)
         out["_kin_h_p_k1_p"] = np.histogram(k1_phi, bins=_td_phi_edges)[0].astype(np.float64)
         out["_kin_h_p_k1_t"] = np.histogram(k1_tphi, bins=_td_phi_edges)[0].astype(np.float64)
-        all_plot_feature_names = _generation_monitor_feature_names(cartesian=cartesian)
         if cartesian:
             all_px_p, all_py_p, all_pz_p, all_px_t, all_py_t, all_pz_t = (
                 _val_pred_truth_cartesian_flat_all_candidates(
@@ -3543,17 +3563,17 @@ def train_step(
             out["_kin_all_py_t"] = all_py_t
             out["_kin_all_pz_p"] = all_pz_p
             out["_kin_all_pz_t"] = all_pz_t
-        else:
-            feature_arrays = _val_pred_truth_feature_flat_all_candidates(
-                candidates_phys,
-                batch,
-                feature_names=all_plot_feature_names,
-                device=device,
-            )
-            for key, values in feature_arrays.items():
-                suffix = "p" if key.endswith("_pred") else "t"
-                feature_name = key.rsplit("_", 1)[0]
-                out[f"_kin_all_{feature_name}_{suffix}"] = values
+    if not cartesian:
+        feature_arrays = _val_pred_truth_feature_flat_all_candidates(
+            candidates_phys,
+            batch,
+            feature_names=all_plot_feature_names,
+            device=device,
+        )
+        for key, values in feature_arrays.items():
+            suffix = "p" if key.endswith("_pred") else "t"
+            feature_name = key.rsplit("_", 1)[0]
+            out[f"_kin_all_{feature_name}_{suffix}"] = values
 
     optimizer.scheduler_step()
     return out
@@ -3861,7 +3881,7 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "val/reward/p30": "30th percentile.",
         "val/reward/p70": "70th percentile.",
         "val/reward/p90": "90th percentile.",
-        "val/winrate": "Fraction of valid events where one current-policy sample beats one reference-policy sample on truth L2 distance. NaN if validation_compute_winrate=false.",
+        "val/winrate": "Fraction of valid events where the current policy's reward-best validation candidate beats the reference-policy sample on combined reward. NaN if validation_compute_winrate=false.",
         "val_diagnostics/profile/pt_delta_vs_truth_pt": "Validation profile plot by truth-pT bin: selected-candidate mean delta pT = pT_pred - pT_truth, with the initial pre-DGPO validation profile overlaid after the baseline pass.",
         "val_diagnostics/profile/eta_delta_vs_truth_eta": "Validation profile plot by truth-eta bin: selected-candidate mean eta residual, with the initial pre-DGPO validation profile overlaid after the baseline pass.",
         "val_diagnostics/profile/pt/delta_mean": "Global validation mean pT residual, pT_pred - pT_truth, over selected candidates and valid neutrino slots.",
@@ -3914,7 +3934,7 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.beta": "beta_dgpo: Temperature parameter that scales the event-level gate logit M_e. Higher beta makes the gate more sensitive to the advantage-weighted velocity gap. M_e = (beta / K) * sum_over_candidates(advantage * Delta). Typical range: 0.1 to 1.0. Current value controls how aggressively events are up/down-weighted in the loss.",
         "dgpo.grad_clip_norm": "Global L2 gradient clip for AdamW (torch.nn.utils.clip_grad_norm_). Compare train/grad/global_norm_pre_clip to this value.",
         "dgpo.K": "Number of DDIM candidate samples generated per event **during training** (rollout + DGPO). Each event gets K neutrino reconstructions, and the reward function ranks them. Larger K = more candidates to choose from (better oracle performance) but slower generation. Typical values: 4-16.",
-        "dgpo.validation_K": "Candidates per event during **validation** only (independent of training K). Default **1**: one current-policy DDIM sample per event; with validation_compute_winrate, one additional ref-policy DDIM per event for winrate. Does not advance the training global_step or train-panel x-axis.",
+        "dgpo.validation_K": "Candidates per event during **validation** only (independent of training K). Default **1**: one current-policy DDIM sample per event; with validation_compute_winrate, one additional ref-policy DDIM per event for reward-based winrate. Does not advance the training global_step or train-panel x-axis.",
         "dgpo.rollout_parallel_chains": "How many DDIM chains to batch together per model call during training rollout. Keeps total K the same, but runs up to this many chains in one larger forward pass. Higher can be faster if GPU headroom exists; too high can OOM.",
         "dgpo.validation_rollout_parallel_chains": "Validation-only version of rollout_parallel_chains. If unset, falls back to the training value.",
         "dgpo.num_ddim_steps": "Number of DDIM denoising steps (T_sample) used for online candidate generation during **training** only. More steps = higher-quality samples but slower. Typical values: 20-100.",
@@ -3924,7 +3944,7 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.log_reward_dist_every": "Log reward/dist/overlap every N optimizer steps when wandb is enabled. Defaults to dgpo.diagnostic_plots.plot_every when omitted.",
         "dgpo.validation_every_n_epochs": "Run end-of-epoch DDIM validation when (epoch+1) is divisible by this value (default 1 = every epoch). Epoch -1 baseline at train start is unaffected. Top-K checkpointing runs only on validation epochs.",
         "dgpo.validation_max_batches": "If set (e.g. 20): stop validation after this many batches per epoch (faster validation for debugging). If null: run full validation set. Typical: null for real training, 5-20 for smoke tests.",
-        "dgpo.validation_compute_winrate": "If true: each validation batch generates one extra reference-policy DDIM sample to compute val/winrate. Adds ~50% validation time. If false: skip winrate (logged as NaN). Typical: false (cheaper validation).",
+        "dgpo.validation_compute_winrate": "If true: each validation batch generates one extra reference-policy DDIM sample to compute reward-based val/winrate. Adds ~50% validation time. If false: skip winrate (logged as NaN). Typical: false (cheaper validation).",
         "dgpo.validation_log_batches": "If true: log INFO messages for each validation batch (start time, DDIM wall time). Useful for monitoring long validation runs. Typical: true.",
         "dgpo.validation_tqdm_k_chains": "If true: show a tqdm progress bar over the K DDIM chains per validation batch. Typical: true (helps see validation progress).",
         "dgpo.validation_tqdm_ddim": "If true: show a tqdm progress bar for every DDIM step within each chain (very verbose). Typical: false (too much output).",
@@ -5353,7 +5373,7 @@ def run_validation_epoch(
 
     Validation uses ``val_K`` candidates per event (default **1** in config), independent of training ``K``.
     Typical setup: **one** current-policy DDIM sample per event; if ``compute_winrate``, **one**
-    reference-policy DDIM sample per event (no extra multi-candidate rollout for val).
+    reference-policy DDIM sample per event for reward-based winrate (no extra multi-candidate rollout for val).
 
     Under Ray Train, every rank receives its own validation shard via
     ``ray.train.get_dataset_shard("validation")``.  Each rank iterates its own shard;
@@ -5408,12 +5428,6 @@ def run_validation_epoch(
         cartesian=cartesian,
         feature_dim=len(_invisible_feature_names()) or None,
     )
-    if compute_winrate and not winrate_enabled and is_rank0 and val_log_batches:
-        _log.warning(
-            "[DGPO] val/winrate skipped: truth L2 needs legacy 3D neutrino kinematics, got feature_names=%s cartesian=%s.",
-            _invisible_feature_names(),
-            cartesian,
-        )
     profile_feature_names = tuple(_validation_profile_feature_names(cartesian=cartesian))
     local_pt_delta_event_mean_chunks: list[np.ndarray] = []
     local_profile_chunks: dict[str, list[np.ndarray]] = {
@@ -5577,6 +5591,15 @@ def run_validation_epoch(
             local_pt_delta_event_mean_chunks.append(
                 selected_delta_arrays["pt_delta_event_mean"]
             )
+        if not cartesian:
+            feature_arrays = _val_pred_truth_feature_flat_all_candidates(
+                candidates,
+                batch_d,
+                feature_names=all_plot_feature_names,
+                device=device,
+            )
+            for key, values in feature_arrays.items():
+                local_truth_pred_all_chunks[key].append(values)
 
         if legacy_kinematics:
             ppt, peta, pphi, tpt, teta, tphi = _val_pred_truth_kin_flat(
@@ -5607,15 +5630,6 @@ def run_validation_epoch(
                 local_truth_pred_all_chunks["py_pred"].append(all_py_p)
                 local_truth_pred_all_chunks["pz_truth"].append(all_pz_t)
                 local_truth_pred_all_chunks["pz_pred"].append(all_pz_p)
-            else:
-                feature_arrays = _val_pred_truth_feature_flat_all_candidates(
-                    candidates,
-                    batch_d,
-                    feature_names=all_plot_feature_names,
-                    device=device,
-                )
-                for key, values in feature_arrays.items():
-                    local_truth_pred_all_chunks[key].append(values)
 
             ppx, ppy, ppz, tpx, tpy, tpz = _val_pred_truth_cartesian_flat(
                 candidates,
@@ -5719,13 +5733,10 @@ def run_validation_epoch(
                 h_tm_r += np.histogram(top_r, bins=bin_topmass_edges)[0]
 
         if winrate_enabled:
-            d_cur = compute_truth_l2_distances_kb(
-                candidates, batch_d, cartesian=cartesian, mask=None
-            )[0]
-            d_ref = compute_truth_l2_distances_kb(
-                r_one, batch_d, cartesian=cartesian, mask=None
-            )[0]
-            wins = (d_cur < d_ref) & m_sel & torch.isfinite(d_cur) & torch.isfinite(d_ref)
+            rewards_ref, _ = reward_agg.compute(r_one, batch_d)
+            r_cur = rewards.max(dim=0).values
+            r_ref = rewards_ref[0]
+            wins = (r_cur > r_ref) & m_sel & torch.isfinite(r_cur) & torch.isfinite(r_ref)
             w = wins.float().sum()
             nw = m_sel.sum()
             sum_win += float(w.detach().cpu().item())
@@ -5958,21 +5969,25 @@ def run_validation_epoch(
                         title="Validation 2D correlation: initial vs current event mean delta pT",
                     )
                 )
+        available_truth_pred_features = _available_truth_pred_features(
+            truth_pred_all_merged,
+            all_plot_feature_names,
+        )
+        for feature_name in available_truth_pred_features:
+            truth_key = f"{feature_name}_truth"
+            pred_key = f"{feature_name}_pred"
+            out[f"val_neutrino/all/{feature_name}_truth_vs_pred"] = _truth_pred_matrix_figure(
+                truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
+                truth_pred_all_merged.get(pred_key, np.array([], dtype=np.float64)),
+                xlabel=f"Truth {feature_name}",
+                ylabel=f"Pred {feature_name}",
+                title=(
+                    f"Validation 2D truth vs pred {feature_name} "
+                    f"({val_K} candidate{'s' if val_K != 1 else ''}, all)"
+                ),
+                bin_edges=_generation_special_bin_edges(feature_name),
+            )
         if legacy_kinematics:
-            for feature_name in all_plot_feature_names:
-                truth_key = f"{feature_name}_truth"
-                pred_key = f"{feature_name}_pred"
-                out[f"val_neutrino/all/{feature_name}_truth_vs_pred"] = _truth_pred_matrix_figure(
-                    truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
-                    truth_pred_all_merged.get(pred_key, np.array([], dtype=np.float64)),
-                    xlabel=f"Truth {feature_name}",
-                    ylabel=f"Pred {feature_name}",
-                    title=(
-                        f"Validation 2D truth vs pred {feature_name} "
-                        f"({val_K} candidate{'s' if val_K != 1 else ''}, all)"
-                    ),
-                    bin_edges=_generation_special_bin_edges(feature_name),
-                )
             out["val_neutrino/pt"] = _val_overlay_kin_figure(
                 h_pt_t,
                 h_pt_p,
@@ -6727,13 +6742,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     td_k1_e_t += metrics["_kin_h_e_k1_t"]
                     td_k1_p_p += metrics["_kin_h_p_k1_p"]
                     td_k1_p_t += metrics["_kin_h_p_k1_t"]
-                    for feature_name in td_all_feature_names:
-                        td_all_chunks[f"{feature_name}_truth"].append(
-                            metrics[f"_kin_all_{feature_name}_t"]
-                        )
-                        td_all_chunks[f"{feature_name}_pred"].append(
-                            metrics[f"_kin_all_{feature_name}_p"]
-                        )
+                for feature_name in td_all_feature_names:
+                    truth_key = f"_kin_all_{feature_name}_t"
+                    pred_key = f"_kin_all_{feature_name}_p"
+                    if truth_key not in metrics or pred_key not in metrics:
+                        continue
+                    td_all_chunks[f"{feature_name}_truth"].append(metrics[truth_key])
+                    td_all_chunks[f"{feature_name}_pred"].append(metrics[pred_key])
 
                 if is_rank0 and global_step % log_every == 0:
                     _log.info(
@@ -6771,56 +6786,59 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 ) = [td_merged[i] for i in range(12)]
 
             td_all_merged: dict[str, np.ndarray] = {}
-            if legacy_train_kinematics:
-                td_all_merged = _gather_val_array_dict(
-                    {
-                        key: _concat_np_chunks(chunks)
-                        for key, chunks in td_all_chunks.items()
-                    },
-                    rank=rank,
-                    world_size=world_size,
-                )
+            td_all_merged = _gather_val_array_dict(
+                {
+                    key: _concat_np_chunks(chunks)
+                    for key, chunks in td_all_chunks.items()
+                },
+                rank=rank,
+                world_size=world_size,
+            )
 
-            if legacy_train_kinematics and is_rank0 and wandb_mod is not None:
+            if is_rank0 and wandb_mod is not None:
                 _td_bin_pt = _diagnostic_bin_edges("pt")
                 _td_bin_eta = _diagnostic_bin_edges("eta")
                 _td_bin_phi = _diagnostic_bin_edges("phi")
-                _td_suffix = "train: reward best-of-K vs truth (all batches)"
                 try:
-                    td_log: dict[str, Any] = {
-                        "train_dist/pt": _val_overlay_kin_figure(
-                            td_pt_t, td_pt_p, _td_bin_pt,
-                            f"Neutrino pT [GeV] ({_td_suffix})",
-                            pred_label="Pred (train)", xlabel="pT [GeV]",
-                        ),
-                        "train_dist/eta": _val_overlay_kin_figure(
-                            td_e_t, td_e_p, _td_bin_eta,
-                            f"Neutrino η ({_td_suffix})",
-                            pred_label="Pred (train)", xlabel="η",
-                        ),
-                        "train_dist/phi": _val_overlay_kin_figure(
-                            td_p_t, td_p_p, _td_bin_phi,
-                            f"Neutrino φ ({_td_suffix})",
-                            pred_label="Pred (train)", xlabel="φ [rad]",
-                        ),
-                        "train_dist_k1/pt": _val_overlay_kin_figure(
-                            td_k1_pt_t, td_k1_pt_p, _td_bin_pt,
-                            "Neutrino pT [GeV] (train: candidate 0 / K=1 proxy vs truth, all batches)",
-                            pred_label="Pred (train K=1 proxy)", xlabel="pT [GeV]",
-                        ),
-                        "train_dist_k1/eta": _val_overlay_kin_figure(
-                            td_k1_e_t, td_k1_e_p, _td_bin_eta,
-                            "Neutrino η (train: candidate 0 / K=1 proxy vs truth, all batches)",
-                            pred_label="Pred (train K=1 proxy)", xlabel="η",
-                        ),
-                        "train_dist_k1/phi": _val_overlay_kin_figure(
-                            td_k1_p_t, td_k1_p_p, _td_bin_phi,
-                            "Neutrino φ (train: candidate 0 / K=1 proxy vs truth, all batches)",
-                            pred_label="Pred (train K=1 proxy)", xlabel="φ [rad]",
-                        ),
-                        "epoch": float(epoch),
-                    }
-                    for feature_name in td_all_feature_names:
+                    td_log: dict[str, Any] = {"epoch": float(epoch)}
+                    if legacy_train_kinematics:
+                        _td_suffix = "train: reward best-of-K vs truth (all batches)"
+                        td_log.update({
+                            "train_dist/pt": _val_overlay_kin_figure(
+                                td_pt_t, td_pt_p, _td_bin_pt,
+                                f"Neutrino pT [GeV] ({_td_suffix})",
+                                pred_label="Pred (train)", xlabel="pT [GeV]",
+                            ),
+                            "train_dist/eta": _val_overlay_kin_figure(
+                                td_e_t, td_e_p, _td_bin_eta,
+                                f"Neutrino η ({_td_suffix})",
+                                pred_label="Pred (train)", xlabel="η",
+                            ),
+                            "train_dist/phi": _val_overlay_kin_figure(
+                                td_p_t, td_p_p, _td_bin_phi,
+                                f"Neutrino φ ({_td_suffix})",
+                                pred_label="Pred (train)", xlabel="φ [rad]",
+                            ),
+                            "train_dist_k1/pt": _val_overlay_kin_figure(
+                                td_k1_pt_t, td_k1_pt_p, _td_bin_pt,
+                                "Neutrino pT [GeV] (train: candidate 0 / K=1 proxy vs truth, all batches)",
+                                pred_label="Pred (train K=1 proxy)", xlabel="pT [GeV]",
+                            ),
+                            "train_dist_k1/eta": _val_overlay_kin_figure(
+                                td_k1_e_t, td_k1_e_p, _td_bin_eta,
+                                "Neutrino η (train: candidate 0 / K=1 proxy vs truth, all batches)",
+                                pred_label="Pred (train K=1 proxy)", xlabel="η",
+                            ),
+                            "train_dist_k1/phi": _val_overlay_kin_figure(
+                                td_k1_p_t, td_k1_p_p, _td_bin_phi,
+                                "Neutrino φ (train: candidate 0 / K=1 proxy vs truth, all batches)",
+                                pred_label="Pred (train K=1 proxy)", xlabel="φ [rad]",
+                            ),
+                        })
+                    for feature_name in _available_truth_pred_features(
+                        td_all_merged,
+                        td_all_feature_names,
+                    ):
                         td_log[f"train_dist/all/{feature_name}_truth_vs_pred"] = _truth_pred_matrix_figure(
                             td_all_merged.get(f"{feature_name}_truth", np.array([], dtype=np.float64)),
                             td_all_merged.get(f"{feature_name}_pred", np.array([], dtype=np.float64)),
@@ -6829,11 +6847,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             title=f"Train 2D truth vs pred {feature_name} (all candidates, all batches)",
                             bin_edges=_generation_special_bin_edges(feature_name),
                         )
-                    _wandb_log_with_step(
-                        wandb_mod,
-                        td_log,
-                        step=_wandb_epoch_end_step(global_step),
-                    )
+                    if len(td_log) > 1:
+                        _wandb_log_with_step(
+                            wandb_mod,
+                            td_log,
+                            step=_wandb_epoch_end_step(global_step),
+                        )
                 except Exception as _e:
                     _log.warning("[DGPO] train_dist figures failed at epoch=%s: %s", epoch, _e)
 
