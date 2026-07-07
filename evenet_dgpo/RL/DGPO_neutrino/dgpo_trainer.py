@@ -1370,6 +1370,20 @@ def _reward_feature_names() -> tuple[str, ...] | None:
     return tuple(str(item) for item in raw)
 
 
+def _reward_component_axis_pairs(component_names: tuple[str, ...] | list[str]) -> dict[str, tuple[str, str]]:
+    """Pair ``nu1_*`` and ``nu2_*`` components by feature name."""
+    names = set(str(name) for name in component_names)
+    pairs: dict[str, tuple[str, str]] = {}
+    for name in sorted(names):
+        if not name.startswith("nu1_"):
+            continue
+        feature_name = name[4:]
+        other = f"nu2_{feature_name}"
+        if other in names:
+            pairs[feature_name] = (name, other)
+    return pairs
+
+
 def build_reward_aggregator(
     model: torch.nn.Module,
     device: torch.device,
@@ -1714,11 +1728,7 @@ def _build_reward_extra_metrics(
                 best_k = rewards_v.argmax(dim=0)
                 bv = int(best_k.numel())
                 cols = torch.arange(bv, device=rewards.device, dtype=torch.long)
-                axis_pairs = {
-                    "px": ("nu1_px", "nu2_px"),
-                    "py": ("nu1_py", "nu2_py"),
-                    "pz": ("nu1_pz", "nu2_pz"),
-                }
+                axis_pairs = _reward_component_axis_pairs(tuple(comps.keys()))
                 for axis, (a, b) in axis_pairs.items():
                     axis_reward = -(comps[a] + comps[b])[:, vb]
                     out[f"diagnostics/reward_hacking/all/{axis}/reward_mean"] = float(
@@ -1750,12 +1760,13 @@ def _build_reward_extra_metrics(
                 kin_deltas = src.last_kinematic_deltas()
                 if kin_deltas is not None:
                     rel_pt = kin_deltas.get("rel_pt")
-                    if rel_pt is None:
-                        break
-                    for name in ("pt", "eta", "phi"):
+                    feature_metric_names = tuple(
+                        key
+                        for key in kin_deltas.keys()
+                        if not key.startswith("truth_") and key != "rel_pt"
+                    )
+                    for name in feature_metric_names:
                         tensor = kin_deltas.get(name)
-                        if tensor is None:
-                            continue
                         all_delta = tensor[:, vb]
                         best_delta = all_delta[best_k, cols, :]
                         _log_mean_abs(
@@ -1769,31 +1780,32 @@ def _build_reward_extra_metrics(
                         truth_tensor = kin_deltas.get(f"truth_{name}")
                         if truth_tensor is not None:
                             profile_tensors[name] = (truth_tensor, tensor)
-                    all_rel_pt = rel_pt[:, vb].reshape(-1)
-                    all_rel_pt = all_rel_pt[torch.isfinite(all_rel_pt)]
-                    t_sel = rel_pt[:, vb, :]
-                    best_rel_pt = t_sel[best_k, cols, :].reshape(-1)
-                    best_rel_pt = best_rel_pt[torch.isfinite(best_rel_pt)]
-                    if all_rel_pt.numel() > 0:
-                        out["diagnostics/reward_hacking/all/rel_pt/mean"] = float(
-                            all_rel_pt.mean().detach().cpu()
-                        )
-                        out["diagnostics/reward_hacking/all/rel_pt/abs_mean"] = float(
-                            all_rel_pt.abs().mean().detach().cpu()
-                        )
-                    else:
-                        out["diagnostics/reward_hacking/all/rel_pt/mean"] = float("nan")
-                        out["diagnostics/reward_hacking/all/rel_pt/abs_mean"] = float("nan")
-                    if best_rel_pt.numel() > 0:
-                        out["diagnostics/reward_hacking/best/rel_pt/mean"] = float(
-                            best_rel_pt.mean().detach().cpu()
-                        )
-                        out["diagnostics/reward_hacking/best/rel_pt/abs_mean"] = float(
-                            best_rel_pt.abs().mean().detach().cpu()
-                        )
-                    else:
-                        out["diagnostics/reward_hacking/best/rel_pt/mean"] = float("nan")
-                        out["diagnostics/reward_hacking/best/rel_pt/abs_mean"] = float("nan")
+                    if rel_pt is not None:
+                        all_rel_pt = rel_pt[:, vb].reshape(-1)
+                        all_rel_pt = all_rel_pt[torch.isfinite(all_rel_pt)]
+                        t_sel = rel_pt[:, vb, :]
+                        best_rel_pt = t_sel[best_k, cols, :].reshape(-1)
+                        best_rel_pt = best_rel_pt[torch.isfinite(best_rel_pt)]
+                        if all_rel_pt.numel() > 0:
+                            out["diagnostics/reward_hacking/all/rel_pt/mean"] = float(
+                                all_rel_pt.mean().detach().cpu()
+                            )
+                            out["diagnostics/reward_hacking/all/rel_pt/abs_mean"] = float(
+                                all_rel_pt.abs().mean().detach().cpu()
+                            )
+                        else:
+                            out["diagnostics/reward_hacking/all/rel_pt/mean"] = float("nan")
+                            out["diagnostics/reward_hacking/all/rel_pt/abs_mean"] = float("nan")
+                        if best_rel_pt.numel() > 0:
+                            out["diagnostics/reward_hacking/best/rel_pt/mean"] = float(
+                                best_rel_pt.mean().detach().cpu()
+                            )
+                            out["diagnostics/reward_hacking/best/rel_pt/abs_mean"] = float(
+                                best_rel_pt.abs().mean().detach().cpu()
+                            )
+                        else:
+                            out["diagnostics/reward_hacking/best/rel_pt/mean"] = float("nan")
+                            out["diagnostics/reward_hacking/best/rel_pt/abs_mean"] = float("nan")
                     if log_distribution or collect_profile_accum:
                         try:
                             import wandb  # noqa: F401
@@ -1944,7 +1956,10 @@ def _build_reward_extra_metrics(
                                         oracle_pt_delta.detach().float().cpu().numpy(),
                                         title="Reward selection pT bias vs truth pT",
                                     )
-                            for profile_name in ("eta", "phi", "px", "py", "pz"):
+                            profile_names = tuple(
+                                name for name in profile_tensors.keys() if name != "pt"
+                            )
+                            for profile_name in profile_names:
                                 if not log_distribution or f"{profile_name}_profile" not in plot_names:
                                     continue
                                 tensors = profile_tensors.get(profile_name)
@@ -2004,18 +2019,24 @@ def _build_reward_extra_metrics(
                             pass
             else:
                 nan_f = float("nan")
+                axis_pairs = _reward_component_axis_pairs(tuple(comps.keys()))
+                kin_deltas = src.last_kinematic_deltas() or {}
+                feature_metric_names = tuple(
+                    key for key in kin_deltas.keys() if not key.startswith("truth_") and key != "rel_pt"
+                )
                 for scope in ("all", "best"):
-                    for axis in ("px", "py", "pz"):
+                    for axis in axis_pairs:
                         out[f"diagnostics/reward_hacking/{scope}/{axis}/reward_mean"] = nan_f
                         out[f"diagnostics/reward_hacking/{scope}/{axis}/delta_mean"] = nan_f
                         out[f"diagnostics/reward_hacking/{scope}/{axis}/delta_abs_mean"] = nan_f
-                    for name in ("pt", "eta", "phi"):
+                    for name in feature_metric_names:
                         out[f"diagnostics/reward_hacking/{scope}/{name}/delta_mean"] = nan_f
                         out[f"diagnostics/reward_hacking/{scope}/{name}/delta_abs_mean"] = nan_f
-                out["diagnostics/reward_hacking/all/rel_pt/mean"] = nan_f
-                out["diagnostics/reward_hacking/all/rel_pt/abs_mean"] = nan_f
-                out["diagnostics/reward_hacking/best/rel_pt/mean"] = nan_f
-                out["diagnostics/reward_hacking/best/rel_pt/abs_mean"] = nan_f
+                if kin_deltas.get("rel_pt") is not None:
+                    out["diagnostics/reward_hacking/all/rel_pt/mean"] = nan_f
+                    out["diagnostics/reward_hacking/all/rel_pt/abs_mean"] = nan_f
+                    out["diagnostics/reward_hacking/best/rel_pt/mean"] = nan_f
+                    out["diagnostics/reward_hacking/best/rel_pt/abs_mean"] = nan_f
             break
 
     return out
