@@ -11,9 +11,13 @@ options:
     model_checkpoint_load_path: /path/to/post_training_init_checkpoint.ckpt
     pretrain_model_load_path: null
     model_checkpoint_save_path: /path/to/output/dgpo_post_training/checkpoints
+  Dataset:
+    # DGPO post-training uses a smaller dataset limit to reduce training time.
+    dataset_limit: 0.1
 
 logger:
   wandb:
+    project: Ztautau-DGPO
     run_name: EveNet-DGPO-PostTraining
   local:
     name: EveNet-DGPO-PostTraining
