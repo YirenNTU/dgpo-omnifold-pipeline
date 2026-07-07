@@ -1,6 +1,6 @@
 platform:
   data_parquet_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/evenet-input/train-diffusion
-  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/evenet-input/val-diffusion
+#  data_parquet_val_dir: /pscratch/sd/t/tihsu/database/ZtautauAnalysis/ml_baseline_full_analysis/evenet-input/val-diffusion
   number_of_workers: 16
   resources_per_worker: {
     "CPU": 20,
