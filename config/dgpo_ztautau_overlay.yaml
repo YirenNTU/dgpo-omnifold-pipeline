@@ -1,3 +1,7 @@
+platform:
+  # DGPO policy evaluation multiplies memory use beyond plain diffusion training.
+  batch_size: 512
+
 rl:
   enabled: true
 
@@ -19,6 +23,7 @@ ztautau_domain:
     target_delta_phi_to_pi: 0.0
 
 dgpo:
+  validation_max_batches: 10
   validation_compute_winrate: false
   validation_log_batches: true
   diagnostic_plot_every: 5

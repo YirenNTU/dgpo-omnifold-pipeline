@@ -1,3 +1,8 @@
+platform:
+  # DGPO expands the effective forward size by K and policy-eval timesteps.
+  # Keeping the pretraining batch of 2048 is too large here and tends to OOM.
+  batch_size: 512
+
 options:
   Training:
     # Stage 2: DGPO post-training.
@@ -39,8 +44,11 @@ dgpo:
   K: 8
   num_ddim_steps: 20
   validation_num_ddim_steps: 20
+  # Cap validation work directly; val_dataset_limit under dgpo is not consumed
+  # by the current trainer path.
+  validation_max_batches: 10
   validation_compute_winrate: false
-  rollout_parallel_chains: 2
+  rollout_parallel_chains: 1
   validation_rollout_parallel_chains: 4
   validation_log_batches: true
   diagnostic_plot_every: 5
