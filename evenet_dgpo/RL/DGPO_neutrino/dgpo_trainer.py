@@ -6214,6 +6214,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         return _dgpo_constraint_checkpoint_payload(constraint_state)
 
     try:
+        legacy_train_kinematics = _supports_legacy_invisible_kinematics(
+            cartesian=_truth_generation_cartesian(),
+            feature_dim=len(_invisible_feature_names()) or None,
+        )
 
         for epoch in range(start_epoch, epochs):
             # Each call to ``iter_torch_batches`` produces a fresh streaming generator
@@ -6303,18 +6307,19 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     _append_profile_accum(metrics)
                     _flush_profile_accum(step=global_step)
 
-                td_pt_p += metrics["_kin_h_pt_p"]
-                td_pt_t += metrics["_kin_h_pt_t"]
-                td_e_p += metrics["_kin_h_e_p"]
-                td_e_t += metrics["_kin_h_e_t"]
-                td_p_p += metrics["_kin_h_p_p"]
-                td_p_t += metrics["_kin_h_p_t"]
-                td_k1_pt_p += metrics["_kin_h_pt_k1_p"]
-                td_k1_pt_t += metrics["_kin_h_pt_k1_t"]
-                td_k1_e_p += metrics["_kin_h_e_k1_p"]
-                td_k1_e_t += metrics["_kin_h_e_k1_t"]
-                td_k1_p_p += metrics["_kin_h_p_k1_p"]
-                td_k1_p_t += metrics["_kin_h_p_k1_t"]
+                if legacy_train_kinematics:
+                    td_pt_p += metrics["_kin_h_pt_p"]
+                    td_pt_t += metrics["_kin_h_pt_t"]
+                    td_e_p += metrics["_kin_h_e_p"]
+                    td_e_t += metrics["_kin_h_e_t"]
+                    td_p_p += metrics["_kin_h_p_p"]
+                    td_p_t += metrics["_kin_h_p_t"]
+                    td_k1_pt_p += metrics["_kin_h_pt_k1_p"]
+                    td_k1_pt_t += metrics["_kin_h_pt_k1_t"]
+                    td_k1_e_p += metrics["_kin_h_e_k1_p"]
+                    td_k1_e_t += metrics["_kin_h_e_k1_t"]
+                    td_k1_p_p += metrics["_kin_h_p_k1_p"]
+                    td_k1_p_t += metrics["_kin_h_p_k1_t"]
 
                 if is_rank0 and global_step % log_every == 0:
                     _log.info(
@@ -6338,7 +6343,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             if wandb_mod is not None:
                 _flush_profile_accum(step=max(global_step - 1, 0), force=True)
 
-            if world_size > 1:
+            if legacy_train_kinematics and world_size > 1:
                 td_stack = np.stack([
                     td_pt_p, td_pt_t, td_e_p, td_e_t, td_p_p, td_p_t,
                     td_k1_pt_p, td_k1_pt_t, td_k1_e_p, td_k1_e_t, td_k1_p_p, td_k1_p_t,
@@ -6351,7 +6356,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     td_k1_pt_p, td_k1_pt_t, td_k1_e_p, td_k1_e_t, td_k1_p_p, td_k1_p_t,
                 ) = [td_merged[i] for i in range(12)]
 
-            if is_rank0 and wandb_mod is not None:
+            if legacy_train_kinematics and is_rank0 and wandb_mod is not None:
                 _td_bin_pt = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
                 _td_bin_eta = np.linspace(-4.0, 4.0, _VAL_KIN_NUM_BINS + 1)
                 _td_bin_phi = np.linspace(-3.2, 3.2, _VAL_KIN_NUM_BINS + 1)
