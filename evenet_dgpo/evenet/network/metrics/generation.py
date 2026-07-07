@@ -361,13 +361,16 @@ class GenerationMetrics:
 
         return fig, jsd
 
-    def plot_histogram2d_func(self, histogram2d, x_centers, y_centers, title="2D Histogram"):
+    def plot_histogram2d_func(self, histogram2d, x_centers, y_centers, title="Truth vs Pred 2D"):
         fig, ax = plt.subplots()
         X, Y = np.meshgrid(x_centers, y_centers, indexing="ij")
         pcm = ax.pcolormesh(X, Y, histogram2d, shading='auto', cmap='viridis')
         fig.colorbar(pcm, ax=ax, label="Counts")
         ax.set_xlabel('Predicted')
         ax.set_ylabel('Truth')
+        diag_min = min(x_centers[0], y_centers[0])
+        diag_max = max(x_centers[-1], y_centers[-1])
+        ax.plot([diag_min, diag_max], [diag_min, diag_max], linestyle='--', color='white', linewidth=1)
         ax.set_title(title)
         return fig
 
@@ -393,29 +396,23 @@ class GenerationMetrics:
                 jsd_results[f"{name}-{cls_name}"] = score
 
             for class_name in self.class_names:
-                if class_name not in jsd:
-                    continue
-                if 'neutrino' not in name:
+                if self.pearson_stats[name][class_name]['n'] == 0:
                     continue
 
                 fig = self.plot_histogram2d_func(
                     self.histogram_2d[name][class_name],
                     x_centers=bin_centers,
                     y_centers=bin_centers,
-                    title=f"2D Histogram {name} - {class_name}"
+                    title=f"Truth vs Pred 2D {name} - {class_name}"
                 )
                 figs[f"2D_{name}_{class_name}"] = fig
 
         # Pearson correlation
         pearson_results = dict()
         for name in self.pearson_stats:
-            if 'neutrino' not in name:
-                continue
-
             pearson_results[name] = dict()
             for class_name in self.class_names:
-
-                if class_name not in jsd_results:
+                if self.pearson_stats[name][class_name]['n'] == 0:
                     continue
 
                 stats = self.pearson_stats[name][class_name]
@@ -543,46 +540,44 @@ def shared_epoch_end(
         metrics_train: GenerationMetrics,
         logger,
 ):
+    def resolve_log_target(metric_name: str):
+        base_name = metric_name[3:] if metric_name.startswith("2D_") else metric_name
+        category_map = {
+            "neutrino-": "generation-invisible",
+            "point cloud-": "generation-event",
+            "global-": "generation-global",
+            "num_vectors": "generation-global",
+        }
+        for prefix, category in category_map.items():
+            if base_name.startswith(prefix):
+                tag = base_name[len(prefix):] if base_name != prefix else base_name
+                return category, tag
+        return None, None
+
     metrics_valid.reduce_across_gpus()
     if metrics_train:
         metrics_train.reduce_across_gpus()
 
     if global_rank == 0:
-        category_map = {
-            "neutrino-": "generation-invisible",
-            "point cloud-": "generation-event",
-            "global-": "generation-global"
-        }
         figs, extra, jsd_results = metrics_valid.plot_histogram()
         for name, fig in figs.items():
-
-            for prefix, category in category_map.items():
-                if prefix in name:
-                    tag = name.replace(prefix, "")
-                    logger.log({f"{category}/{tag}": wandb.Image(fig)})
-                    break
+            category, tag = resolve_log_target(name)
+            if category is not None:
+                plot_kind = "truth-vs-pred-2d" if name.startswith("2D_") else "distribution"
+                logger.log({f"{category}/{plot_kind}/{tag}": wandb.Image(fig)})
 
             plt.close(fig)
 
         for name in extra:
             for class_name, value in extra[name].items():
-                # logger.log({f"generation/pearson_{name}_{class_name}": value})
+                category, tag = resolve_log_target(name)
+                if category is not None:
+                    logger.log({f"{category}/pearson/{tag}_{class_name}": value})
 
-                for prefix, category in category_map.items():
-                    if prefix in name:
-                        tag = name.replace(prefix, "")
-                        logger.log({f"{category}/pearson/{tag}_{class_name}": value})
-                        break
-
-        for _ in jsd_results:
-            for jsd_name, jsd_score in jsd_results.items():
-                # logger.log({f"generation/jsd_{jsd_name}": jsd_score})
-
-                for prefix, category in category_map.items():
-                    if prefix in jsd_name:
-                        tag = jsd_name.replace(prefix, "")
-                        logger.log({f"{category}/jsd/{tag}": jsd_score})
-                        break
+        for jsd_name, jsd_score in jsd_results.items():
+            category, tag = resolve_log_target(jsd_name)
+            if category is not None:
+                logger.log({f"{category}/jsd/{tag}": jsd_score})
 
     metrics_valid.reset()
     if metrics_train:
