@@ -56,8 +56,8 @@ dgpo:
   # by the current trainer path.
   validation_max_batches: 10
   validation_compute_winrate: false
-  rollout_parallel_chains: 1
-  validation_rollout_parallel_chains: 1
+  rollout_parallel_chains: 4
+  validation_rollout_parallel_chains: 4
   validation_log_batches: true
   diagnostic_plot_every: 5
   diagnostic_plot_names:
