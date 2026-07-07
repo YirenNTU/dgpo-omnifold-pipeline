@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.spatial.distance import jensenshannon
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -196,6 +197,19 @@ def _next_batch_synced(
 def _truth_generation_cartesian() -> bool:
     tg = global_config.options.Training.Components.TruthGeneration
     return bool(getattr(tg, "cartesian", False))
+
+
+def _histogram_jsd(truth_counts: np.ndarray, pred_counts: np.ndarray) -> float:
+    """Jensen-Shannon distance between two count histograms, or ``nan`` when undefined."""
+    truth = np.asarray(truth_counts, dtype=np.float64)
+    pred = np.asarray(pred_counts, dtype=np.float64)
+    truth_sum = float(truth.sum())
+    pred_sum = float(pred.sum())
+    if not np.isfinite(truth_sum) or not np.isfinite(pred_sum):
+        return float("nan")
+    if truth_sum <= 0.0 or pred_sum <= 0.0:
+        return float("nan")
+    return float(jensenshannon(truth / truth_sum, pred / pred_sum))
 
 
 @torch.no_grad()
@@ -6042,6 +6056,18 @@ def run_validation_epoch(
                 counts_ref=h_z_r,
                 xlabel="p_z [GeV]",
             )
+            out["val_neutrino/jsd/current/pt"] = _histogram_jsd(h_pt_t, h_pt_p)
+            out["val_neutrino/jsd/current/eta"] = _histogram_jsd(h_e_t, h_e_p)
+            out["val_neutrino/jsd/current/phi"] = _histogram_jsd(h_p_t, h_p_p)
+            out["val_neutrino/jsd/current/px"] = _histogram_jsd(h_x_t, h_x_p)
+            out["val_neutrino/jsd/current/py"] = _histogram_jsd(h_y_t, h_y_p)
+            out["val_neutrino/jsd/current/pz"] = _histogram_jsd(h_z_t, h_z_p)
+            out["val_neutrino/jsd/ref/pt"] = _histogram_jsd(h_pt_t, h_pt_r)
+            out["val_neutrino/jsd/ref/eta"] = _histogram_jsd(h_e_t, h_e_r)
+            out["val_neutrino/jsd/ref/phi"] = _histogram_jsd(h_p_t, h_p_r)
+            out["val_neutrino/jsd/ref/px"] = _histogram_jsd(h_x_t, h_x_r)
+            out["val_neutrino/jsd/ref/py"] = _histogram_jsd(h_y_t, h_y_r)
+            out["val_neutrino/jsd/ref/pz"] = _histogram_jsd(h_z_t, h_z_r)
             out["val_mass/w_mass"] = _val_overlay_kin_figure(
                 h_wm_t,
                 h_wm_p,
@@ -6060,6 +6086,10 @@ def run_validation_epoch(
                 counts_ref=h_tm_r,
                 xlabel="Top mass [GeV]",
             )
+            out["val_mass/jsd/current/w_mass"] = _histogram_jsd(h_wm_t, h_wm_p)
+            out["val_mass/jsd/current/top_mass"] = _histogram_jsd(h_tm_t, h_tm_p)
+            out["val_mass/jsd/ref/w_mass"] = _histogram_jsd(h_wm_t, h_wm_r)
+            out["val_mass/jsd/ref/top_mass"] = _histogram_jsd(h_tm_t, h_tm_r)
     return out
 
 

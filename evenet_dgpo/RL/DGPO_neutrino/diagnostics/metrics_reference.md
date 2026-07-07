@@ -80,9 +80,17 @@ Logged per train step for both `all/*` rollout candidates and reward-selected `b
 
 End-of-epoch DDIM validation (`validation_K` candidates). `val/reward/mean` drives top-K checkpoint selection. `val_neutrino/*` overlays truth / current policy / frozen reference for neutrino kinematics (pT, η, φ, and p_x/p_y/p_z in GeV).
 
+Also logged as scalars:
+- `val_neutrino/jsd/current/{pt,eta,phi,px,py,pz}`: JSD between truth and current-policy validation histograms.
+- `val_neutrino/jsd/ref/{pt,eta,phi,px,py,pz}`: JSD between truth and frozen-reference validation histograms.
+
 ## `val_mass/*`
 
 Same validation pass: W and top mass reconstructed from ground-truth `assignments-indices` (b + lepton from point cloud + neutrino). **Truth** histogram uses target neutrinos; **Pred** / **Ref** use DDIM neutrinos (best-of-`validation_K` vs frozen reference, same candidate rule as `val_neutrino/pt`).
+
+Also logged as scalars:
+- `val_mass/jsd/current/{w_mass,top_mass}`: JSD between truth and current-policy mass histograms.
+- `val_mass/jsd/ref/{w_mass,top_mass}`: JSD between truth and frozen-reference mass histograms.
 
 ## Config knobs
 

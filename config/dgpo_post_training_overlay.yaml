@@ -12,7 +12,7 @@ options:
   Dataset:
     # DGPO post-training uses a smaller train subset and caps validation independently.
     dataset_limit: 0.003
-    val_dataset_limit: 20000
+    val_dataset_limit: 200000
   Training:
     # Stage 2: DGPO post-training.
     # Point model_checkpoint_load_path at a supervised diffusion checkpoint for
