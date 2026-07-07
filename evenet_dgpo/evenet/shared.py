@@ -61,7 +61,7 @@ def register_dataset(
         parquet_files: list[str],
         process_event_batch_partial,
         platform_info,
-        dataset_limit: float = 1.0,
+        dataset_limit: float | int = 1.0,
         file_shuffling: bool = False,
 ) -> tuple[Dataset, int]:
     """Registers a Ray dataset, preprocesses it, and returns dataset and event count."""
@@ -75,9 +75,17 @@ def register_dataset(
         shuffle="files" if file_shuffling else None,
     )
 
-    if dataset_limit < 1.0:
-        total_events = ds.count()
-        ds = ds.limit(int(total_events * dataset_limit))
+    total_events = ds.count()
+    limit_value = dataset_limit
+    if isinstance(limit_value, bool):
+        limit_value = int(limit_value)
+    if limit_value is not None:
+        limit_float = float(limit_value)
+        if limit_float > 0.0:
+            if limit_float < 1.0:
+                ds = ds.limit(int(total_events * limit_float))
+            elif limit_float >= 1.0:
+                ds = ds.limit(min(int(limit_float), total_events))
     total_events = ds.count()
 
     ds = ds.map_batches(
@@ -108,6 +116,7 @@ def prepare_datasets(
     val_start_index = int(len(parquet_files) * val_split[0])
     val_end_index = int(len(parquet_files) * val_split[1])
     dataset_limit = global_config.options.Dataset.dataset_limit
+    val_dataset_limit = global_config.options.Dataset.get("val_dataset_limit", None)
     dataset_limit_val = global_config.options.Dataset.get("dataset_limit_apply_to_val_set", False)
 
     if predict:
@@ -152,7 +161,11 @@ def prepare_datasets(
         })
         val_ds, val_count = register_dataset(val_files, **{
             "file_shuffling": False,
-            "dataset_limit": dataset_limit if dataset_limit_val else 1.0,
+            "dataset_limit": (
+                val_dataset_limit
+                if val_dataset_limit is not None
+                else (dataset_limit if dataset_limit_val else 1.0)
+            ),
             **dataset_kwargs
         })
 

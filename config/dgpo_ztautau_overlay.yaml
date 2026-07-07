@@ -2,6 +2,11 @@ platform:
   # DGPO policy evaluation multiplies memory use beyond plain diffusion training.
   batch_size: 512
 
+options:
+  Dataset:
+    # Train keeps the base-config dataset_limit; validation is capped independently.
+    val_dataset_limit: 20000
+
 rl:
   enabled: true
 
