@@ -3,6 +3,7 @@ import math
 import numpy as np
 from pathlib import Path
 from functools import partial
+import pyarrow.parquet as pq
 from ray.data import Dataset
 import ray
 from ray.data.dataset import MaterializedDataset
@@ -23,6 +24,61 @@ from ray.train import Checkpoint
 from evenet.control.global_config import global_config
 from evenet.dataset.preprocess import process_event_batch, unflatten_dict
 import logging
+
+
+def _normalize_dataset_limit(dataset_limit: float | int | None) -> float | int | None:
+    if isinstance(dataset_limit, bool):
+        return int(dataset_limit)
+    return dataset_limit
+
+
+def _parquet_row_counts(parquet_files: list[str]) -> tuple[list[int], int]:
+    row_counts = [int(pq.ParquetFile(path).metadata.num_rows) for path in parquet_files]
+    return row_counts, int(sum(row_counts))
+
+
+def _resolve_dataset_slice(
+        parquet_files: list[str],
+        dataset_limit: float | int = 1.0,
+) -> tuple[list[str], int | None, int]:
+    """
+    Resolve a smaller parquet file list plus an exact row cap before Ray reads data.
+
+    Returns:
+        selected_files, target_rows, total_rows
+
+    ``target_rows`` is the exact row limit to apply after reading ``selected_files``.
+    When it is ``None``, the full selected file set should be consumed.
+    """
+    limit_value = _normalize_dataset_limit(dataset_limit)
+    if not parquet_files:
+        return [], None, 0
+
+    row_counts, total_rows = _parquet_row_counts(parquet_files)
+    if limit_value is None:
+        return parquet_files, None, total_rows
+
+    limit_float = float(limit_value)
+    if limit_float <= 0.0:
+        return parquet_files, None, total_rows
+
+    if limit_float < 1.0:
+        target_rows = int(total_rows * limit_float)
+    else:
+        target_rows = min(int(limit_float), total_rows)
+
+    if target_rows >= total_rows:
+        return parquet_files, None, total_rows
+
+    selected_files: list[str] = []
+    covered_rows = 0
+    for path, row_count in zip(parquet_files, row_counts):
+        selected_files.append(path)
+        covered_rows += row_count
+        if covered_rows >= target_rows:
+            break
+
+    return selected_files, target_rows, total_rows
 
 
 def make_process_fn(base_dir: Path):
@@ -65,9 +121,10 @@ def register_dataset(
         file_shuffling: bool = False,
 ) -> tuple[Dataset, int]:
     """Registers a Ray dataset, preprocesses it, and returns dataset and event count."""
+    selected_files, target_rows, total_rows = _resolve_dataset_slice(parquet_files, dataset_limit)
     ds = ray.data.read_parquet(
-        parquet_files,
-        override_num_blocks=len(parquet_files) * min(platform_info.number_of_workers, 8),
+        selected_files,
+        override_num_blocks=max(1, len(selected_files) * min(platform_info.number_of_workers, 8)),
         ray_remote_args={
             "num_cpus": 0.5,
         },
@@ -75,18 +132,10 @@ def register_dataset(
         shuffle="files" if file_shuffling else None,
     )
 
-    total_events = ds.count()
-    limit_value = dataset_limit
-    if isinstance(limit_value, bool):
-        limit_value = int(limit_value)
-    if limit_value is not None:
-        limit_float = float(limit_value)
-        if limit_float > 0.0:
-            if limit_float < 1.0:
-                ds = ds.limit(int(total_events * limit_float))
-            elif limit_float >= 1.0:
-                ds = ds.limit(min(int(limit_float), total_events))
-    total_events = ds.count()
+    total_events = total_rows
+    if target_rows is not None:
+        ds = ds.limit(target_rows)
+        total_events = target_rows
 
     ds = ds.map_batches(
         process_event_batch_partial,
