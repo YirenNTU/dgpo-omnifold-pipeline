@@ -512,15 +512,16 @@ def _pt_delta_vs_truth_pt_figure(
     truth_pt = truth_pt[keep]
     delta_pt = delta_pt[keep]
 
-    bin_edges = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
+    bin_edges = _diagnostic_bin_edges("pt")
+    num_bins = len(bin_edges) - 1
     centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    means = np.full(_VAL_KIN_NUM_BINS, np.nan, dtype=np.float64)
-    errors = np.full(_VAL_KIN_NUM_BINS, np.nan, dtype=np.float64)
-    counts = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.int64)
+    means = np.full(num_bins, np.nan, dtype=np.float64)
+    errors = np.full(num_bins, np.nan, dtype=np.float64)
+    counts = np.zeros(num_bins, dtype=np.int64)
     if truth_pt.size > 0:
         bin_idx = np.digitize(truth_pt, bin_edges) - 1
-        valid = (bin_idx >= 0) & (bin_idx < _VAL_KIN_NUM_BINS)
-        for i in range(_VAL_KIN_NUM_BINS):
+        valid = (bin_idx >= 0) & (bin_idx < num_bins)
+        for i in range(num_bins):
             vals = delta_pt[valid & (bin_idx == i)]
             counts[i] = int(vals.size)
             if vals.size > 0:
@@ -581,7 +582,7 @@ def _binned_delta_profile(
     delta_value = delta_value[keep]
 
     if bin_edges is None:
-        bin_edges = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
+        bin_edges = _diagnostic_bin_edges("pt")
     centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
     num_bins = len(bin_edges) - 1
     means = np.full(num_bins, np.nan, dtype=np.float64)
@@ -715,12 +716,9 @@ def _pt_delta_selection_profiles_figure(
 
 def _profile_bin_edges(profile_name: str, truth_arrays: list[np.ndarray]) -> np.ndarray:
     """Bin edges for residual profile plots keyed by the profiled truth variable."""
-    if profile_name == "pt":
-        return np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
-    if profile_name == "eta":
-        return np.linspace(-4.0, 4.0, _VAL_KIN_NUM_BINS + 1)
-    if profile_name == "phi":
-        return np.linspace(-3.2, 3.2, _VAL_KIN_NUM_BINS + 1)
+    fixed_edges = _diagnostic_bin_edges(profile_name)
+    if fixed_edges is not None:
+        return fixed_edges
 
     finite_parts = [
         np.asarray(arr, dtype=np.float64).reshape(-1)
@@ -3452,9 +3450,9 @@ def train_step(
         k1_pt, k1_eta, k1_phi, k1_tpt, k1_teta, k1_tphi = _val_pred_truth_kin_flat(
             candidates_phys, batch, k1_sel, cartesian=cartesian, device=device
         )
-        _td_pt_edges = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
-        _td_eta_edges = np.linspace(-4.0, 4.0, _VAL_KIN_NUM_BINS + 1)
-        _td_phi_edges = np.linspace(-3.2, 3.2, _VAL_KIN_NUM_BINS + 1)
+        _td_pt_edges = _diagnostic_bin_edges("pt")
+        _td_eta_edges = _diagnostic_bin_edges("eta")
+        _td_phi_edges = _diagnostic_bin_edges("phi")
         out["_kin_h_pt_p"] = np.histogram(ppt, bins=_td_pt_edges)[0].astype(np.float64)
         out["_kin_h_pt_t"] = np.histogram(tpt, bins=_td_pt_edges)[0].astype(np.float64)
         out["_kin_h_e_p"] = np.histogram(peta, bins=_td_eta_edges)[0].astype(np.float64)
@@ -3997,13 +3995,76 @@ _DEFAULT_DIAGNOSTIC_PLOTS = {
     "pt_profile_accumulated",
     "projection_violation_compare",
 }
+_DEFAULT_DIAGNOSTIC_BIN_RANGES: dict[str, tuple[float, float]] = {
+    "pt": (0.0, 300.0),
+    "eta": (-4.0, 4.0),
+    "phi": (-3.2, 3.2),
+    "px": (-300.0, 300.0),
+    "py": (-300.0, 300.0),
+    "pz": (-800.0, 800.0),
+    "wmass": (50.0, 120.0),
+    "topmass": (100.0, 250.0),
+}
+
+
+def _diagnostic_plot_block(dg_cfg: Any) -> Any | None:
+    """Return ``dgpo.diagnostic_plots`` when present, else ``None``."""
+    return _dgpo_cfg_get(dg_cfg, "diagnostic_plots", None)
+
+
+def _resolve_diagnostic_num_bins(dg_cfg: Any | None = None) -> int:
+    """Resolve W&B diagnostic histogram bin count with legacy-key fallback."""
+    cfg = dg_cfg if dg_cfg is not None else getattr(global_config, "dgpo", None)
+    block = _diagnostic_plot_block(cfg)
+    raw = _dgpo_cfg_get(block, "num_bins", None)
+    if raw is None:
+        raw = _dgpo_cfg_get(cfg, "diagnostic_num_bins", _VAL_KIN_NUM_BINS)
+    return max(2, int(raw))
+
+
+def _resolve_diagnostic_bin_range(name: str, dg_cfg: Any | None = None) -> tuple[float, float] | None:
+    """Resolve per-variable diagnostic plot ranges from config or defaults."""
+    cfg = dg_cfg if dg_cfg is not None else getattr(global_config, "dgpo", None)
+    block = _diagnostic_plot_block(cfg)
+    raw_ranges = _dgpo_cfg_get(block, "bin_ranges", None)
+    if raw_ranges is None:
+        raw_ranges = _dgpo_cfg_get(cfg, "diagnostic_bin_ranges", None)
+    raw = None
+    if isinstance(raw_ranges, Mapping):
+        raw = raw_ranges.get(name, None)
+    if raw is not None:
+        try:
+            lo, hi = [float(x) for x in raw]
+        except (TypeError, ValueError):
+            lo = hi = float("nan")
+        if math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+            return lo, hi
+    return _DEFAULT_DIAGNOSTIC_BIN_RANGES.get(name)
+
+
+def _diagnostic_bin_edges(name: str, dg_cfg: Any | None = None) -> np.ndarray | None:
+    """Fixed diagnostic histogram edges for known/configured variables."""
+    bounds = _resolve_diagnostic_bin_range(name, dg_cfg=dg_cfg)
+    if bounds is None:
+        return None
+    lo, hi = bounds
+    return np.linspace(lo, hi, _resolve_diagnostic_num_bins(dg_cfg=dg_cfg) + 1)
 
 
 def _resolve_diagnostic_plot_settings(dg_cfg: Any) -> tuple[set[str], int]:
     """Resolve W&B media diagnostics from ``dgpo.diagnostic_plots`` (names, plot_every)."""
-    block = _dgpo_cfg_get(dg_cfg, "diagnostic_plots", None)
+    block = _diagnostic_plot_block(dg_cfg)
     if block is None:
-        return set(_DEFAULT_DIAGNOSTIC_PLOTS), 1
+        raw_names = _dgpo_cfg_get(dg_cfg, "diagnostic_plot_names", None)
+        plot_every = max(1, int(_dgpo_cfg_get(dg_cfg, "diagnostic_plot_every", 1)))
+        if raw_names is None:
+            return set(_DEFAULT_DIAGNOSTIC_PLOTS), plot_every
+        if isinstance(raw_names, str):
+            return {raw_names}, plot_every
+        try:
+            return {str(name) for name in raw_names}, plot_every
+        except TypeError:
+            return set(_DEFAULT_DIAGNOSTIC_PLOTS), plot_every
     enabled = _dgpo_cfg_get(block, "enabled", None)
     if enabled is not None and not bool(enabled):
         return set(), 1
@@ -5091,41 +5152,42 @@ def run_validation_epoch(
         for profile_name in profile_feature_names
     })
     # pT in GeV (original physics scale, after expm1 inversion of log1p).
-    bin_pt_edges = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
-    bin_eta_edges = np.linspace(-4.0, 4.0, _VAL_KIN_NUM_BINS + 1)
-    bin_phi_edges = np.linspace(-3.2, 3.2, _VAL_KIN_NUM_BINS + 1)
+    bin_pt_edges = _diagnostic_bin_edges("pt")
+    bin_eta_edges = _diagnostic_bin_edges("eta")
+    bin_phi_edges = _diagnostic_bin_edges("phi")
     # px/py track neutrino pT (rarely beyond a few hundred GeV); pz ~ pt*sinh(eta) has a much
     # wider longitudinal spread, so it needs a larger range or the histogram clips to ~empty.
-    bin_px_edges = np.linspace(-300.0, 300.0, _VAL_KIN_NUM_BINS + 1)
-    bin_py_edges = np.linspace(-300.0, 300.0, _VAL_KIN_NUM_BINS + 1)
-    bin_pz_edges = np.linspace(-800.0, 800.0, _VAL_KIN_NUM_BINS + 1)
-    bin_wmass_edges = np.linspace(50.0, 120.0, _VAL_KIN_NUM_BINS + 1)
-    bin_topmass_edges = np.linspace(100.0, 250.0, _VAL_KIN_NUM_BINS + 1)
+    bin_px_edges = _diagnostic_bin_edges("px")
+    bin_py_edges = _diagnostic_bin_edges("py")
+    bin_pz_edges = _diagnostic_bin_edges("pz")
+    bin_wmass_edges = _diagnostic_bin_edges("wmass")
+    bin_topmass_edges = _diagnostic_bin_edges("topmass")
+    num_diag_bins = len(bin_pt_edges) - 1
     # _p = current policy, _t = truth, _r = frozen reference policy
-    h_pt_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_pt_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_pt_r = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_e_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_e_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_e_r = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_p_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_p_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_p_r = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_x_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_x_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_x_r = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_y_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_y_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_y_r = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_z_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_z_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_z_r = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_wm_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_wm_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_wm_r = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_tm_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_tm_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-    h_tm_r = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
+    h_pt_p = np.zeros(num_diag_bins, dtype=np.float64)
+    h_pt_t = np.zeros(num_diag_bins, dtype=np.float64)
+    h_pt_r = np.zeros(num_diag_bins, dtype=np.float64)
+    h_e_p = np.zeros(num_diag_bins, dtype=np.float64)
+    h_e_t = np.zeros(num_diag_bins, dtype=np.float64)
+    h_e_r = np.zeros(num_diag_bins, dtype=np.float64)
+    h_p_p = np.zeros(num_diag_bins, dtype=np.float64)
+    h_p_t = np.zeros(num_diag_bins, dtype=np.float64)
+    h_p_r = np.zeros(num_diag_bins, dtype=np.float64)
+    h_x_p = np.zeros(num_diag_bins, dtype=np.float64)
+    h_x_t = np.zeros(num_diag_bins, dtype=np.float64)
+    h_x_r = np.zeros(num_diag_bins, dtype=np.float64)
+    h_y_p = np.zeros(num_diag_bins, dtype=np.float64)
+    h_y_t = np.zeros(num_diag_bins, dtype=np.float64)
+    h_y_r = np.zeros(num_diag_bins, dtype=np.float64)
+    h_z_p = np.zeros(num_diag_bins, dtype=np.float64)
+    h_z_t = np.zeros(num_diag_bins, dtype=np.float64)
+    h_z_r = np.zeros(num_diag_bins, dtype=np.float64)
+    h_wm_p = np.zeros(num_diag_bins, dtype=np.float64)
+    h_wm_t = np.zeros(num_diag_bins, dtype=np.float64)
+    h_wm_r = np.zeros(num_diag_bins, dtype=np.float64)
+    h_tm_p = np.zeros(num_diag_bins, dtype=np.float64)
+    h_tm_t = np.zeros(num_diag_bins, dtype=np.float64)
+    h_tm_r = np.zeros(num_diag_bins, dtype=np.float64)
 
     val_iter = iter(val_loader) if val_loader is not None else None
     if val_iter is None:
@@ -6225,20 +6287,21 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             # provides per-shard random shuffling each epoch.
             train_iter = train_shard.iter_torch_batches(**train_loader_cfg)
             train_it = iter(train_iter)
+            num_diag_bins = _resolve_diagnostic_num_bins()
 
             # Epoch-level histogram accumulators for training-distribution plots (all batches).
-            td_pt_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_pt_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_e_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_e_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_p_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_p_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_k1_pt_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_k1_pt_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_k1_e_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_k1_e_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_k1_p_p = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
-            td_k1_p_t = np.zeros(_VAL_KIN_NUM_BINS, dtype=np.float64)
+            td_pt_p = np.zeros(num_diag_bins, dtype=np.float64)
+            td_pt_t = np.zeros(num_diag_bins, dtype=np.float64)
+            td_e_p = np.zeros(num_diag_bins, dtype=np.float64)
+            td_e_t = np.zeros(num_diag_bins, dtype=np.float64)
+            td_p_p = np.zeros(num_diag_bins, dtype=np.float64)
+            td_p_t = np.zeros(num_diag_bins, dtype=np.float64)
+            td_k1_pt_p = np.zeros(num_diag_bins, dtype=np.float64)
+            td_k1_pt_t = np.zeros(num_diag_bins, dtype=np.float64)
+            td_k1_e_p = np.zeros(num_diag_bins, dtype=np.float64)
+            td_k1_e_t = np.zeros(num_diag_bins, dtype=np.float64)
+            td_k1_p_p = np.zeros(num_diag_bins, dtype=np.float64)
+            td_k1_p_t = np.zeros(num_diag_bins, dtype=np.float64)
             stop_epoch = False
             while True:
                 if max_steps is not None and global_step >= max_steps:
@@ -6357,9 +6420,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 ) = [td_merged[i] for i in range(12)]
 
             if legacy_train_kinematics and is_rank0 and wandb_mod is not None:
-                _td_bin_pt = np.linspace(0.0, 300.0, _VAL_KIN_NUM_BINS + 1)
-                _td_bin_eta = np.linspace(-4.0, 4.0, _VAL_KIN_NUM_BINS + 1)
-                _td_bin_phi = np.linspace(-3.2, 3.2, _VAL_KIN_NUM_BINS + 1)
+                _td_bin_pt = _diagnostic_bin_edges("pt")
+                _td_bin_eta = _diagnostic_bin_edges("eta")
+                _td_bin_phi = _diagnostic_bin_edges("phi")
                 _td_suffix = "train: reward best-of-K vs truth (all batches)"
                 try:
                     td_log: dict[str, Any] = {

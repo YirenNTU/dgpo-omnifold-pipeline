@@ -62,3 +62,6 @@ dgpo:
   diagnostic_plot_every: 5
   diagnostic_plot_names:
     - ztautau_back_to_back
+  diagnostic_bin_ranges:
+    theta: [-0.5, 0.5]
+    phi: [-0.5, 0.5]
