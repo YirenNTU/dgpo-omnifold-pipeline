@@ -48,6 +48,29 @@ class TestLogPtEtaPhiToCartesian(unittest.TestCase):
 
 
 class TestComponentNormalizedTruthDistanceReward(unittest.TestCase):
+    def test_reward_uses_root_sum_squared_distance(self):
+        truth = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+        batch = {
+            "x_invisible": truth,
+            "x_invisible_mask": torch.ones(1, 2),
+        }
+        candidates = truth.unsqueeze(0).clone()
+        candidates[0, 0, 0, 0] = 3.0
+        candidates[0, 0, 1, 1] = 4.0
+
+        reward = ComponentNormalizedTruthDistanceReward(
+            {
+                "nu1_theta": 1.0,
+                "nu1_phi": 1.0,
+                "nu2_theta": 1.0,
+                "nu2_phi": 1.0,
+            },
+            feature_names=("theta", "phi"),
+        )
+        value = reward.compute(candidates, batch)
+
+        self.assertAlmostEqual(float(value[0, 0]), -5.0, places=5)
+
     def test_exact_match_highest_reward(self):
         B, K, F = 2, 4, 7
         truth = _random_invisible(B, 2, F)

@@ -7,6 +7,7 @@ Run from repo root:
 
 from __future__ import annotations
 
+import ast
 import numpy as np
 import os
 import sys
@@ -41,6 +42,32 @@ from RL.DGPO_neutrino.dgpo_utils import (
     predict_x0_normalized_from_velocity_diffusion,
     repeat_batch_for_candidates,
 )
+
+
+def _load_generate_neutrino_candidates():
+    trainer_path = os.path.join(_REPO_ROOT, "RL", "DGPO_neutrino", "dgpo_trainer.py")
+    with open(trainer_path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    module = ast.parse(source, filename=trainer_path)
+    func_node = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "generate_neutrino_candidates"
+    )
+    fn_module = ast.Module(body=[func_node], type_ignores=[])
+    code = compile(fn_module, trainer_path, "exec")
+    namespace = {
+        "Any": object,
+        "DDIMSampler": object,
+        "Tensor": torch.Tensor,
+        "partial": __import__("functools").partial,
+        "repeat_batch_for_candidates": repeat_batch_for_candidates,
+        "torch": torch,
+    }
+    exec(code, namespace)
+    return namespace["generate_neutrino_candidates"]
+
+
+generate_neutrino_candidates = _load_generate_neutrino_candidates()
 
 
 class TestPerEventAdvantage(unittest.TestCase):
@@ -171,6 +198,77 @@ class TestBuildDGPOLoss(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertIsNotNone(L.grad)
+
+
+class TestGenerateNeutrinoCandidates(unittest.TestCase):
+    def test_parallel_chains_batches_sampler_calls(self):
+        class FakeNormalizer:
+            def denormalize(self, x, noise_mask, remove_padding=False):
+                return x
+
+        class FakeModel:
+            invisible_input_dim = 3
+            invisible_normalizer = FakeNormalizer()
+
+            def __init__(self):
+                self.call_batch_sizes = []
+
+            def predict_diffusion_vector(self, noise_x, cond_x, time, mode, noise_mask=None):
+                self.call_batch_sizes.append((noise_x.shape[0], cond_x["x"].shape[0], noise_mask.shape[0]))
+                return torch.zeros_like(noise_x)
+
+        class FakeSampler:
+            def __init__(self):
+                self.data_shapes = []
+
+            def sample(
+                self,
+                data_shape,
+                pred_fn,
+                normalize_fn=None,
+                num_steps=20,
+                eta=1.0,
+                noise_mask=None,
+                use_tqdm=False,
+                process_name="Sampling",
+                remove_padding=False,
+            ):
+                self.data_shapes.append(data_shape)
+                pred_fn(
+                    noise_x=torch.zeros(data_shape, dtype=torch.float32),
+                    time=torch.zeros((data_shape[0],), dtype=torch.float32),
+                )
+                out = torch.arange(int(np.prod(data_shape)), dtype=torch.float32).reshape(data_shape)
+                if normalize_fn is not None:
+                    out = normalize_fn.denormalize(out, noise_mask, remove_padding=remove_padding)
+                return out
+
+        B, N_nu, F, K = 3, 2, 3, 5
+        batch = {
+            "x": torch.randn(B, 4, 6),
+            "x_mask": torch.ones(B, 4),
+            "conditions": torch.randn(B, 2),
+            "conditions_mask": torch.ones(B),
+            "classification": torch.zeros(B, dtype=torch.long),
+            "x_invisible": torch.randn(B, N_nu, F),
+            "x_invisible_mask": torch.ones(B, N_nu),
+        }
+        model = FakeModel()
+        sampler = FakeSampler()
+
+        out = generate_neutrino_candidates(
+            model,
+            batch,
+            sampler,
+            K=K,
+            num_ddim_steps=4,
+            device=torch.device("cpu"),
+            parallel_chains=2,
+        )
+
+        self.assertEqual(out.shape, (K, B, N_nu, F))
+        self.assertEqual(sampler.data_shapes, [(2 * B, N_nu, F), (2 * B, N_nu, F), (B, N_nu, F)])
+        self.assertEqual(model.call_batch_sizes, [(2 * B, 2 * B, 2 * B), (2 * B, 2 * B, 2 * B), (B, B, B)])
 
 
 if __name__ == "__main__":

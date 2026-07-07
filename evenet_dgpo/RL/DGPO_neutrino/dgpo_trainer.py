@@ -1432,6 +1432,7 @@ def generate_neutrino_candidates(
     K: int,
     num_ddim_steps: int,
     device: torch.device,
+    parallel_chains: int = 1,
     tqdm_k_chains: bool = False,
     use_tqdm_ddim: bool = False,
     chain_progress_desc: str = "DGPO DDIM chains",
@@ -1449,40 +1450,56 @@ def generate_neutrino_candidates(
     inv_dim = int(getattr(model, "invisible_input_dim", batch["x_invisible"].shape[-1]))
     data_shape = (B, N_nu, inv_dim)
     candidates: list[Tensor] = []
+    parallel_chains = max(1, min(int(parallel_chains), int(K)))
     noise_mask = batch["x_invisible_mask"].unsqueeze(-1)
-    pred_partial = partial(
-        model.predict_diffusion_vector,
-        mode="neutrino",
-        cond_x=batch,
-        noise_mask=noise_mask,
-    )
-    k_iter: Any = range(K)
+    k_iter: Any = range(0, K, parallel_chains)
     if tqdm_k_chains:
         try:
             from tqdm.auto import tqdm
 
             k_iter = tqdm(
-                range(K),
+                range(0, K, parallel_chains),
                 desc=chain_progress_desc,
                 leave=False,
-                unit="chain",
+                unit="group",
             )
         except ImportError:
-            k_iter = range(K)
+            k_iter = range(0, K, parallel_chains)
 
     inner_name = f"{chain_progress_desc} steps"
-    for _ in k_iter:
+    for chain_start in k_iter:
+        chain_count = min(parallel_chains, K - chain_start)
+        if chain_count == 1:
+            batch_group = batch
+            noise_mask_group = noise_mask
+            data_shape_group = data_shape
+        else:
+            batch_group = repeat_batch_for_candidates(batch, chain_count)
+            noise_mask_group = repeat_batch_for_candidates(
+                {"x_invisible_mask": noise_mask},
+                chain_count,
+            )["x_invisible_mask"]
+            data_shape_group = (chain_count * B, N_nu, inv_dim)
+        pred_partial = partial(
+            model.predict_diffusion_vector,
+            mode="neutrino",
+            cond_x=batch_group,
+            noise_mask=noise_mask_group,
+        )
         gen = sampler.sample(
-            data_shape=data_shape,
+            data_shape=data_shape_group,
             pred_fn=pred_partial,
             num_steps=num_ddim_steps,
             normalize_fn=model.invisible_normalizer,
             remove_padding=True,
-            noise_mask=noise_mask,
+            noise_mask=noise_mask_group,
             use_tqdm=use_tqdm_ddim,
             process_name=inner_name,
         )
-        candidates.append(gen)
+        if chain_count == 1:
+            candidates.append(gen)
+        else:
+            candidates.extend(gen.reshape(chain_count, B, N_nu, gen.shape[-1]).unbind(dim=0))
     return torch.stack(candidates, dim=0)
 
 
@@ -3183,6 +3200,7 @@ def train_step(
     beta: float,
     K: int,
     num_ddim_steps: int,
+    rollout_parallel_chains: int = 1,
     global_step: int,
     epoch: int,
     device: torch.device,
@@ -3232,6 +3250,7 @@ def train_step(
                 K=K,
                 num_ddim_steps=num_ddim_steps,
                 device=device,
+                parallel_chains=rollout_parallel_chains,
             )
     finally:
         if buf:
@@ -3477,6 +3496,20 @@ def train_step(
         out["_kin_h_e_k1_t"] = np.histogram(k1_teta, bins=_td_eta_edges)[0].astype(np.float64)
         out["_kin_h_p_k1_p"] = np.histogram(k1_phi, bins=_td_phi_edges)[0].astype(np.float64)
         out["_kin_h_p_k1_t"] = np.histogram(k1_tphi, bins=_td_phi_edges)[0].astype(np.float64)
+        all_pt_p, all_eta_p, all_phi_p, all_pt_t, all_eta_t, all_phi_t = (
+            _val_pred_truth_kin_flat_all_candidates(
+                candidates_phys,
+                batch,
+                cartesian=cartesian,
+                device=device,
+            )
+        )
+        out["_kin_all_pt_p"] = all_pt_p
+        out["_kin_all_pt_t"] = all_pt_t
+        out["_kin_all_eta_p"] = all_eta_p
+        out["_kin_all_eta_t"] = all_eta_t
+        out["_kin_all_phi_p"] = all_phi_p
+        out["_kin_all_phi_t"] = all_phi_t
 
     optimizer.scheduler_step()
     return out
@@ -3806,6 +3839,9 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "val_neutrino/pt": "1D density overlay: truth vs current-policy vs frozen-reference prediction for pT [GeV] (original scale, expm1 of log1p(pT)) (wandb.Image); x-axis **epoch**. Current-policy histogram uses the same per-event candidate index rule as train_dist/* (combined-reward argmax).",
         "val_neutrino/eta": "Same three-way overlay for η; same candidate selection as val_neutrino/pt.",
         "val_neutrino/phi": "Same three-way overlay for φ [rad]; same candidate selection as val_neutrino/pt.",
+        "val_neutrino/all/pt_truth_vs_pred": "2D density matrix of truth pT vs current-policy predicted pT for all validation candidates and valid neutrino slots (wandb.Image); x-axis epoch.",
+        "val_neutrino/all/eta_truth_vs_pred": "2D density matrix of truth η vs current-policy predicted η for all validation candidates and valid neutrino slots (wandb.Image); x-axis epoch.",
+        "val_neutrino/all/phi_truth_vs_pred": "2D density matrix of truth φ vs current-policy predicted φ for all validation candidates and valid neutrino slots (wandb.Image); x-axis epoch.",
         "val_neutrino/px": "Same three-way overlay for neutrino p_x [GeV]; truth is denormalized invisible target, pred/ref from DDIM output.",
         "val_neutrino/py": "Same three-way overlay for neutrino p_y [GeV].",
         "val_neutrino/pz": "Same three-way overlay for neutrino p_z [GeV].",
@@ -3815,6 +3851,9 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "train_dist/pt": "1D density overlay: truth vs best-of-K training prediction for pT [GeV] (original scale), accumulated over all training batches in the epoch (wandb.Image). x-axis **epoch**. \"Best\" = combined-reward argmax among K candidates.",
         "train_dist/eta": "Same overlay for η (training); same candidate selection as train_dist/pt.",
         "train_dist/phi": "Same overlay for φ [rad] (training); same candidate selection as train_dist/pt.",
+        "train_dist/all/pt_truth_vs_pred": "2D density matrix of truth pT vs predicted pT for all training candidates and valid neutrino slots accumulated over the epoch (wandb.Image).",
+        "train_dist/all/eta_truth_vs_pred": "2D density matrix of truth η vs predicted η for all training candidates and valid neutrino slots accumulated over the epoch (wandb.Image).",
+        "train_dist/all/phi_truth_vs_pred": "2D density matrix of truth φ vs predicted φ for all training candidates and valid neutrino slots accumulated over the epoch (wandb.Image).",
         "train_dist_k1/pt": "1D density overlay: truth vs candidate-0 training rollout prediction for pT [GeV], accumulated over all training batches in the epoch. This is a K=1 / single-sample proxy on the train rollout pool, separate from reward-best train_dist/*.",
         "train_dist_k1/eta": "Same overlay for η using candidate 0 as the train K=1 proxy.",
         "train_dist_k1/phi": "Same overlay for φ using candidate 0 as the train K=1 proxy.",
@@ -3832,6 +3871,8 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.grad_clip_norm": "Global L2 gradient clip for AdamW (torch.nn.utils.clip_grad_norm_). Compare train/grad/global_norm_pre_clip to this value.",
         "dgpo.K": "Number of DDIM candidate samples generated per event **during training** (rollout + DGPO). Each event gets K neutrino reconstructions, and the reward function ranks them. Larger K = more candidates to choose from (better oracle performance) but slower generation. Typical values: 4-16.",
         "dgpo.validation_K": "Candidates per event during **validation** only (independent of training K). Default **1**: one current-policy DDIM sample per event; with validation_compute_winrate, one additional ref-policy DDIM per event for winrate. Does not advance the training global_step or train-panel x-axis.",
+        "dgpo.rollout_parallel_chains": "How many DDIM chains to batch together per model call during training rollout. Keeps total K the same, but runs up to this many chains in one larger forward pass. Higher can be faster if GPU headroom exists; too high can OOM.",
+        "dgpo.validation_rollout_parallel_chains": "Validation-only version of rollout_parallel_chains. If unset, falls back to the training value.",
         "dgpo.num_ddim_steps": "Number of DDIM denoising steps (T_sample) used for online candidate generation during **training** only. More steps = higher-quality samples but slower. Typical values: 20-100.",
         "dgpo.validation_num_ddim_steps": "Number of DDIM denoising steps used for candidate generation during **validation** only (independent of training num_ddim_steps). If null, falls back to num_ddim_steps. Lets you validate at higher fidelity than the training rollout without slowing training.",
         "dgpo.diagnostic_profile_accumulate_steps": "Number of train batches to concatenate before logging accumulated diagnostics/reward_hacking/profile/*_delta_vs_truth_* images. Larger values stabilize sparse bins but update the W&B images less often.",
@@ -4467,6 +4508,49 @@ def _val_pred_truth_kin_flat(
 
 
 @torch.no_grad()
+def _val_pred_truth_kin_flat_all_candidates(
+    candidates: Tensor,
+    batch_d: dict[str, Any],
+    *,
+    cartesian: bool,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Masked flattened ``pt``/``eta``/``phi`` for all candidates vs repeated truth slots."""
+    K = int(candidates.shape[0])
+    B = int(batch_d["x"].shape[0])
+    N_nu = int(candidates.shape[2])
+    xm = batch_d["x_invisible_mask"]
+    if xm.dim() == 3 and xm.shape[-1] == 1:
+        mask = xm.squeeze(-1).to(device=device, dtype=candidates.dtype)
+    else:
+        mask = xm.to(device=device, dtype=candidates.dtype)
+    mask = (mask > 0).reshape(B, N_nu)
+    mask_k = mask.unsqueeze(0).expand(K, -1, -1)
+    if cartesian:
+        truth = batch_d["x_invisible_cartesian"]
+        plp, peta, pphi = cartesian_to_log_pt_eta_phi(
+            candidates[..., 0], candidates[..., 1], candidates[..., 2]
+        )
+        tlp, teta, tphi = cartesian_to_log_pt_eta_phi(
+            truth[..., 0], truth[..., 1], truth[..., 2]
+        )
+    else:
+        truth = batch_d["x_invisible"]
+        plp, peta, pphi = candidates[..., 0], candidates[..., 1], candidates[..., 2]
+        tlp, teta, tphi = truth[..., 0], truth[..., 1], truth[..., 2]
+    tlp = tlp.unsqueeze(0).expand(K, -1, -1)
+    teta = teta.unsqueeze(0).expand(K, -1, -1)
+    tphi = tphi.unsqueeze(0).expand(K, -1, -1)
+    ppt = np.expm1(plp[mask_k].detach().float().cpu().numpy())
+    peta = peta[mask_k].detach().float().cpu().numpy()
+    pphi = pphi[mask_k].detach().float().cpu().numpy()
+    tpt = np.expm1(tlp[mask_k].detach().float().cpu().numpy())
+    teta = teta[mask_k].detach().float().cpu().numpy()
+    tphi = tphi[mask_k].detach().float().cpu().numpy()
+    return ppt, peta, pphi, tpt, teta, tphi
+
+
+@torch.no_grad()
 def _truth_invisible_kin_phys(
     batch_d: dict[str, Any],
     *,
@@ -5074,6 +5158,51 @@ def _response_matrix_figure(
     return img
 
 
+def _truth_pred_matrix_figure(
+    truth: np.ndarray,
+    pred: np.ndarray,
+    *,
+    xlabel: str,
+    ylabel: str,
+    title: str,
+) -> Any:
+    """2D density matrix for truth-vs-pred comparisons."""
+    import wandb
+
+    x = np.asarray(truth, dtype=np.float64).reshape(-1)
+    y = np.asarray(pred, dtype=np.float64).reshape(-1)
+    n = min(x.size, y.size)
+    x = x[:n]
+    y = y[:n]
+    keep = np.isfinite(x) & np.isfinite(y)
+    x = x[keep]
+    y = y[keep]
+    if x.size == 0:
+        x = np.array([0.0], dtype=np.float64)
+        y = np.array([0.0], dtype=np.float64)
+
+    stacked = np.concatenate([x, y], axis=0)
+    lo, hi = [float(v) for v in np.nanpercentile(stacked, [1.0, 99.0])]
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        center = float(np.nanmean(stacked)) if stacked.size > 0 else 0.0
+        lo, hi = center - 1.0, center + 1.0
+    pad = max(0.05 * (hi - lo), 1e-6)
+    lo -= pad
+    hi += pad
+
+    fig, ax = plt.subplots(figsize=(5.4, 4.8))
+    hist = ax.hist2d(x, y, bins=50, range=[[lo, hi], [lo, hi]], cmap="viridis")
+    fig.colorbar(hist[3], ax=ax, label="Samples")
+    ax.plot([lo, hi], [lo, hi], color="white", linestyle="--", linewidth=1.0, alpha=0.85)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    fig.tight_layout()
+    img = wandb.Image(fig)
+    plt.close(fig)
+    return img
+
+
 def _dgpo_should_run_validation_epoch(epoch: int, every_n_epochs: int) -> bool:
     """True when end-of-epoch validation should run (matches EveNet ``eval_metrics_every_n_epochs``)."""
     n = max(1, int(every_n_epochs))
@@ -5098,6 +5227,7 @@ def run_validation_epoch(
     epoch: int | None = None,
     est_total_batches: int | None = None,
     val_log_batches: bool = True,
+    val_rollout_parallel_chains: int = 1,
     val_tqdm_k_chains: bool = True,
     val_tqdm_ddim: bool = False,
     max_batches: int | None = None,
@@ -5169,6 +5299,14 @@ def run_validation_epoch(
         f"{profile_name}_delta": []
         for profile_name in profile_feature_names
     })
+    local_truth_pred_all_chunks: dict[str, list[np.ndarray]] = {
+        "pt_truth": [],
+        "pt_pred": [],
+        "eta_truth": [],
+        "eta_pred": [],
+        "phi_truth": [],
+        "phi_pred": [],
+    }
     # pT in GeV (original physics scale, after expm1 inversion of log1p).
     bin_pt_edges = _diagnostic_bin_edges("pt")
     bin_eta_edges = _diagnostic_bin_edges("eta")
@@ -5263,6 +5401,7 @@ def run_validation_epoch(
                 K=val_K,
                 num_ddim_steps=num_ddim_steps,
                 device=device,
+                parallel_chains=val_rollout_parallel_chains,
                 tqdm_k_chains=val_tqdm_k_chains and is_rank0,
                 use_tqdm_ddim=val_tqdm_ddim and is_rank0,
                 chain_progress_desc=chain_desc,
@@ -5330,6 +5469,20 @@ def run_validation_epoch(
             h_e_t += np.histogram(teta, bins=bin_eta_edges)[0]
             h_p_p += np.histogram(pphi, bins=bin_phi_edges)[0]
             h_p_t += np.histogram(tphi, bins=bin_phi_edges)[0]
+            all_pt_p, all_eta_p, all_phi_p, all_pt_t, all_eta_t, all_phi_t = (
+                _val_pred_truth_kin_flat_all_candidates(
+                    candidates,
+                    batch_d,
+                    cartesian=cartesian,
+                    device=device,
+                )
+            )
+            local_truth_pred_all_chunks["pt_truth"].append(all_pt_t)
+            local_truth_pred_all_chunks["pt_pred"].append(all_pt_p)
+            local_truth_pred_all_chunks["eta_truth"].append(all_eta_t)
+            local_truth_pred_all_chunks["eta_pred"].append(all_eta_p)
+            local_truth_pred_all_chunks["phi_truth"].append(all_phi_t)
+            local_truth_pred_all_chunks["phi_pred"].append(all_phi_p)
 
             ppx, ppy, ppz, tpx, tpy, tpz = _val_pred_truth_cartesian_flat(
                 candidates,
@@ -5386,6 +5539,7 @@ def run_validation_epoch(
             K=1,
             num_ddim_steps=num_ddim_steps,
             device=device,
+            parallel_chains=1,
             tqdm_k_chains=False,
             use_tqdm_ddim=val_tqdm_ddim and is_rank0,
             chain_progress_desc=f"val ref DDIM ({ep_str})",
@@ -5602,6 +5756,14 @@ def run_validation_epoch(
             rank=rank,
             world_size=world_size,
         )
+    truth_pred_all_merged = _gather_val_array_dict(
+        {
+            key: _concat_np_chunks(chunks)
+            for key, chunks in local_truth_pred_all_chunks.items()
+        },
+        rank=rank,
+        world_size=world_size,
+    )
 
     out: dict[str, Any] = {
         "val/reward/mean": _mean(sum_r, cnt_r),
@@ -5664,6 +5826,27 @@ def run_validation_epoch(
                     )
                 )
         if legacy_kinematics:
+            out["val_neutrino/all/pt_truth_vs_pred"] = _truth_pred_matrix_figure(
+                truth_pred_all_merged.get("pt_truth", np.array([], dtype=np.float64)),
+                truth_pred_all_merged.get("pt_pred", np.array([], dtype=np.float64)),
+                xlabel="Truth pT [GeV]",
+                ylabel="Pred pT [GeV]",
+                title=f"Validation 2D truth vs pred pT ({val_K} candidate{'s' if val_K != 1 else ''}, all)",
+            )
+            out["val_neutrino/all/eta_truth_vs_pred"] = _truth_pred_matrix_figure(
+                truth_pred_all_merged.get("eta_truth", np.array([], dtype=np.float64)),
+                truth_pred_all_merged.get("eta_pred", np.array([], dtype=np.float64)),
+                xlabel="Truth η",
+                ylabel="Pred η",
+                title=f"Validation 2D truth vs pred η ({val_K} candidate{'s' if val_K != 1 else ''}, all)",
+            )
+            out["val_neutrino/all/phi_truth_vs_pred"] = _truth_pred_matrix_figure(
+                truth_pred_all_merged.get("phi_truth", np.array([], dtype=np.float64)),
+                truth_pred_all_merged.get("phi_pred", np.array([], dtype=np.float64)),
+                xlabel="Truth φ [rad]",
+                ylabel="Pred φ [rad]",
+                title=f"Validation 2D truth vs pred φ ({val_K} candidate{'s' if val_K != 1 else ''}, all)",
+            )
             out["val_neutrino/pt"] = _val_overlay_kin_figure(
                 h_pt_t,
                 h_pt_p,
@@ -5897,6 +6080,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             val_max_batches = None
     K = int(_dgpo_cfg_get(dg, "K", 1))
     val_K = max(1, int(dg.get("validation_K", 1)))
+    rollout_parallel_chains = max(1, int(dg.get("rollout_parallel_chains", 1)))
+    val_rollout_parallel_chains = max(
+        1,
+        int(dg.get("validation_rollout_parallel_chains", rollout_parallel_chains)),
+    )
     validation_every_n_epochs = max(1, int(dg.get("validation_every_n_epochs", 1)))
     beta = float(_dgpo_cfg_get(dg, "beta", 1.0))
     # Training and validation use independent DDIM rollout-step budgets: training uses
@@ -5907,9 +6095,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     num_ddim_val = int(_val_steps_raw) if _val_steps_raw is not None else num_ddim
     if is_rank0:
         _log.info(
-            "[DGPO] DDIM rollout steps: training=%s, validation=%s.",
+            "[DGPO] DDIM rollout steps: training=%s, validation=%s. Parallel chains: training=%s, validation=%s.",
             num_ddim,
             num_ddim_val,
+            rollout_parallel_chains,
+            val_rollout_parallel_chains,
         )
     log_every = max(1, int(dg.get("log_every", 1)))
     diagnostic_plot_names, diagnostic_plot_every = _resolve_diagnostic_plot_settings(dg)
@@ -6248,6 +6438,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             epoch=-1,
             est_total_batches=est_val_batches,
             val_log_batches=bool(dg.get("validation_log_batches", True)),
+            val_rollout_parallel_chains=val_rollout_parallel_chains,
             val_tqdm_k_chains=bool(dg.get("validation_tqdm_k_chains", True)),
             val_tqdm_ddim=bool(dg.get("validation_tqdm_ddim", False)),
             max_batches=val_max_batches,
@@ -6320,6 +6511,14 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             td_k1_e_t = np.zeros(num_diag_bins, dtype=np.float64)
             td_k1_p_p = np.zeros(num_diag_bins, dtype=np.float64)
             td_k1_p_t = np.zeros(num_diag_bins, dtype=np.float64)
+            td_all_chunks: dict[str, list[np.ndarray]] = {
+                "pt_truth": [],
+                "pt_pred": [],
+                "eta_truth": [],
+                "eta_pred": [],
+                "phi_truth": [],
+                "phi_pred": [],
+            }
             stop_epoch = False
             while True:
                 if max_steps is not None and global_step >= max_steps:
@@ -6364,6 +6563,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     beta=beta,
                     K=K,
                     num_ddim_steps=num_ddim,
+                    rollout_parallel_chains=rollout_parallel_chains,
                     global_step=global_step,
                     epoch=epoch,
                     device=device,
@@ -6401,6 +6601,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     td_k1_e_t += metrics["_kin_h_e_k1_t"]
                     td_k1_p_p += metrics["_kin_h_p_k1_p"]
                     td_k1_p_t += metrics["_kin_h_p_k1_t"]
+                    td_all_chunks["pt_truth"].append(metrics["_kin_all_pt_t"])
+                    td_all_chunks["pt_pred"].append(metrics["_kin_all_pt_p"])
+                    td_all_chunks["eta_truth"].append(metrics["_kin_all_eta_t"])
+                    td_all_chunks["eta_pred"].append(metrics["_kin_all_eta_p"])
+                    td_all_chunks["phi_truth"].append(metrics["_kin_all_phi_t"])
+                    td_all_chunks["phi_pred"].append(metrics["_kin_all_phi_p"])
 
                 if is_rank0 and global_step % log_every == 0:
                     _log.info(
@@ -6436,6 +6642,17 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     td_pt_p, td_pt_t, td_e_p, td_e_t, td_p_p, td_p_t,
                     td_k1_pt_p, td_k1_pt_t, td_k1_e_p, td_k1_e_t, td_k1_p_p, td_k1_p_t,
                 ) = [td_merged[i] for i in range(12)]
+
+            td_all_merged: dict[str, np.ndarray] = {}
+            if legacy_train_kinematics:
+                td_all_merged = _gather_val_array_dict(
+                    {
+                        key: _concat_np_chunks(chunks)
+                        for key, chunks in td_all_chunks.items()
+                    },
+                    rank=rank,
+                    world_size=world_size,
+                )
 
             if legacy_train_kinematics and is_rank0 and wandb_mod is not None:
                 _td_bin_pt = _diagnostic_bin_edges("pt")
@@ -6473,6 +6690,27 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             td_k1_p_t, td_k1_p_p, _td_bin_phi,
                             "Neutrino φ (train: candidate 0 / K=1 proxy vs truth, all batches)",
                             pred_label="Pred (train K=1 proxy)", xlabel="φ [rad]",
+                        ),
+                        "train_dist/all/pt_truth_vs_pred": _truth_pred_matrix_figure(
+                            td_all_merged.get("pt_truth", np.array([], dtype=np.float64)),
+                            td_all_merged.get("pt_pred", np.array([], dtype=np.float64)),
+                            xlabel="Truth pT [GeV]",
+                            ylabel="Pred pT [GeV]",
+                            title="Train 2D truth vs pred pT (all candidates, all batches)",
+                        ),
+                        "train_dist/all/eta_truth_vs_pred": _truth_pred_matrix_figure(
+                            td_all_merged.get("eta_truth", np.array([], dtype=np.float64)),
+                            td_all_merged.get("eta_pred", np.array([], dtype=np.float64)),
+                            xlabel="Truth η",
+                            ylabel="Pred η",
+                            title="Train 2D truth vs pred η (all candidates, all batches)",
+                        ),
+                        "train_dist/all/phi_truth_vs_pred": _truth_pred_matrix_figure(
+                            td_all_merged.get("phi_truth", np.array([], dtype=np.float64)),
+                            td_all_merged.get("phi_pred", np.array([], dtype=np.float64)),
+                            xlabel="Truth φ [rad]",
+                            ylabel="Pred φ [rad]",
+                            title="Train 2D truth vs pred φ (all candidates, all batches)",
                         ),
                         "epoch": float(epoch),
                     }
@@ -6521,6 +6759,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     epoch=epoch,
                     est_total_batches=est_val_batches,
                     val_log_batches=bool(dg.get("validation_log_batches", True)),
+                    val_rollout_parallel_chains=val_rollout_parallel_chains,
                     val_tqdm_k_chains=bool(dg.get("validation_tqdm_k_chains", True)),
                     val_tqdm_ddim=bool(dg.get("validation_tqdm_ddim", False)),
                     max_batches=val_max_batches,

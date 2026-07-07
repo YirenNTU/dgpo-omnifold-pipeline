@@ -97,7 +97,7 @@ class BaseReward(ABC):
 
 
 class ComponentNormalizedTruthDistanceReward(BaseReward):
-    """Negative sum of per-component normalized squared errors over (nu1, nu2) × (px, py, pz)."""
+    """Negative root-sum of per-component normalized squared errors."""
 
     COMPONENT_ORDER: tuple[str, ...] = (
         "nu1_px", "nu1_py", "nu1_pz",
@@ -202,7 +202,7 @@ class ComponentNormalizedTruthDistanceReward(BaseReward):
         scales = torch.tensor(self._scales, device=candidates.device, dtype=candidates.dtype)
         denom = scales.pow(2) + self._eps
         err_components = diff_flat.pow(2) / denom
-        reward = -err_components.sum(dim=-1)
+        reward = -torch.sqrt(err_components.sum(dim=-1) + self._eps)
         reward = apply_event_valid_to_rewards(reward, batch)
 
         valid_kb = get_event_valid_mask(batch, B, reward.device, reward.dtype).unsqueeze(0)
