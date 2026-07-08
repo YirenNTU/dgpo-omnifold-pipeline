@@ -51,7 +51,7 @@ ztautau_domain:
 dgpo:
   variance_regularization:
     enabled: true
-    weight: 1.0e-3
+    weight: 1.0e-2
     features: null
   projection_constraint:
     type: none

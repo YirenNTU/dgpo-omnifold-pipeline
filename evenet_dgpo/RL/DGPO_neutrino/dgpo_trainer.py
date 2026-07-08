@@ -984,7 +984,7 @@ def _variance_matching_penalty(
     feature_names: tuple[str, ...],
     selected_features: tuple[str, ...],
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Small anti-shrink penalty: ``mean(relu(std_truth - std_pred)^2)`` over selected features."""
+    """Small anti-shrink penalty using relative shrinkage vs truth std."""
     zero = pred_phys.new_zeros(())
     diag: dict[str, Tensor] = {
         "train/regularization/variance/active": pred_phys.new_tensor(0.0, dtype=torch.float64),
@@ -1018,18 +1018,22 @@ def _variance_matching_penalty(
         if pred_feature is None or truth_feature is None or valid_count < 2.0:
             diag[f"{prefix}/std_truth"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
             diag[f"{prefix}/std_pred"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
+            diag[f"{prefix}/std_delta_ratio"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
             diag[f"{prefix}/std_gap"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
             diag[f"{prefix}/penalty"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
             continue
         std_truth = _masked_batch_std(truth_feature.detach(), mask)
         std_pred = _masked_batch_std(pred_feature, mask)
-        std_gap = torch.relu(std_truth - std_pred)
+        std_scale = std_truth.detach().clamp(min=1.0e-8)
+        std_delta_ratio = (std_pred - std_truth) / std_scale
+        std_gap = torch.relu(-std_delta_ratio)
         penalty_feature = std_gap.pow(2)
         penalties.append(penalty_feature)
         active_features += 1
         diag[f"{prefix}/active"] = pred_phys.new_tensor(1.0, dtype=torch.float64)
         diag[f"{prefix}/std_truth"] = std_truth.detach().to(dtype=torch.float64)
         diag[f"{prefix}/std_pred"] = std_pred.detach().to(dtype=torch.float64)
+        diag[f"{prefix}/std_delta_ratio"] = std_delta_ratio.detach().to(dtype=torch.float64)
         diag[f"{prefix}/std_gap"] = std_gap.detach().to(dtype=torch.float64)
         diag[f"{prefix}/penalty"] = penalty_feature.detach().to(dtype=torch.float64)
 
@@ -4089,14 +4093,15 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "train/loss/L_ref": "Mean velocity MSE for the frozen reference policy. Lower is better.",
         "train/loss/delta": "mean(|L_cur - L_ref|): average absolute gap between current and reference velocity MSE. Shows how far the policy has moved from frozen ref_model (not rollout EMA).",
         "train/loss/velocity": "Detached velocity objective slice: pure DGPO main term used for backward.",
-        "train/loss/variance_regularization": "Weighted anti-shrink soft penalty added to backward: lambda_var * mean(relu(std_truth - std_pred)^2) over the selected event_info-driven angular features.",
+        "train/loss/variance_regularization": "Weighted anti-shrink soft penalty added to backward: lambda_var * mean(relu((std_truth - std_pred) / std_truth)^2) over the selected event_info-driven angular features.",
         "train/regularization/variance/active": "1 when batch-level variance anti-shrink regularization found at least one selected feature in the current feature layout.",
         "train/regularization/variance/active_features": "How many selected features contributed to the anti-shrink regularizer on this batch.",
         "train/regularization/variance/raw": "Unweighted anti-shrink penalty before multiplying by dgpo.variance_regularization.weight.",
         "train/regularization/variance/*/std_truth": "Per-feature truth std over valid batch slots for the anti-shrink monitor.",
         "train/regularization/variance/*/std_pred": "Per-feature prediction std over valid batch slots for the anti-shrink monitor.",
-        "train/regularization/variance/*/std_gap": "Per-feature positive std gap max(std_truth - std_pred, 0). Non-zero means the prediction is narrower than truth.",
-        "train/regularization/variance/*/penalty": "Per-feature raw anti-shrink penalty relu(std_truth - std_pred)^2.",
+        "train/regularization/variance/*/std_delta_ratio": "Signed relative std shift (std_pred - std_truth) / std_truth. Negative means the prediction is narrower than truth; positive means wider.",
+        "train/regularization/variance/*/std_gap": "Per-feature positive relative shrinkage max((std_truth - std_pred) / std_truth, 0). Non-zero means the prediction is narrower than truth.",
+        "train/regularization/variance/*/penalty": "Per-feature raw anti-shrink penalty relu((std_truth - std_pred) / std_truth)^2.",
         # --- projection (W&B panel: five CPO repair scalars only) ---
         "projection/v_linear": "Linear post-Adam violation estimate: C_adam_pred - epsilon. Drives lambda when positive.",
         "projection/C_adam_pred": "First-order Taylor prediction C_old + b^T delta0 at theta_adam (linear constraint after AdamW step).",
