@@ -2,16 +2,16 @@ platform:
   # DGPO expands the effective forward size by K and policy-eval timesteps.
   # Keeping the pretraining batch of 2048 is too large here and tends to OOM.
   batch_size: 256
-  number_of_workers: 4
+  number_of_workers: 16
   resources_per_worker: {
-    "CPU": 10,
+    "CPU": 15,
     "GPU": 1,
   }
 
 options:
   Dataset:
     # DGPO post-training uses a smaller train subset and caps validation independently.
-    dataset_limit: 0.01
+    dataset_limit: 0.1
     val_dataset_limit: 50000
   Training:
     # Stage 2: DGPO post-training.
@@ -51,14 +51,14 @@ ztautau_domain:
 dgpo:
   projection_constraint:
     type: none
-  K: 4
+  K: 5
   num_ddim_steps: 20
   validation_num_ddim_steps: 20
   # Cap validation work directly; val_dataset_limit under dgpo is not consumed
   # by the current trainer path.
   validation_compute_winrate: true
-  rollout_parallel_chains: 4
-  validation_rollout_parallel_chains: 4
+  rollout_parallel_chains: 5
+  validation_rollout_parallel_chains: 5
   validation_log_batches: true
   diagnostic_plot_every: 5
   diagnostic_plot_names:
