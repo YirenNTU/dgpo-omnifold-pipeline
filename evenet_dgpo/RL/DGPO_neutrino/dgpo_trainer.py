@@ -245,6 +245,69 @@ def _array_histogram_jsd(
     return _histogram_jsd(truth_counts, pred_counts)
 
 
+def _truth_pred_scalar_metrics(
+    truth_values: np.ndarray,
+    pred_values: np.ndarray,
+) -> dict[str, float]:
+    """Scalar summaries for truth-vs-pred arrays used by 2D monitoring panels."""
+    truth = np.asarray(truth_values, dtype=np.float64).reshape(-1)
+    pred = np.asarray(pred_values, dtype=np.float64).reshape(-1)
+    n = min(truth.size, pred.size)
+    if n == 0:
+        return {
+            "count": 0.0,
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "bias": float("nan"),
+            "pearson_r": float("nan"),
+            "slope": float("nan"),
+            "intercept": float("nan"),
+        }
+    truth = truth[:n]
+    pred = pred[:n]
+    keep = np.isfinite(truth) & np.isfinite(pred)
+    truth = truth[keep]
+    pred = pred[keep]
+    if truth.size == 0:
+        return {
+            "count": 0.0,
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "bias": float("nan"),
+            "pearson_r": float("nan"),
+            "slope": float("nan"),
+            "intercept": float("nan"),
+        }
+
+    delta = pred - truth
+    mae = float(np.mean(np.abs(delta)))
+    rmse = float(np.sqrt(np.mean(delta * delta)))
+    bias = float(np.mean(delta))
+    if truth.size >= 2:
+        truth_mean = float(np.mean(truth))
+        pred_mean = float(np.mean(pred))
+        truth_centered = truth - truth_mean
+        pred_centered = pred - pred_mean
+        denom = float(np.sqrt(np.sum(truth_centered * truth_centered) * np.sum(pred_centered * pred_centered)))
+        pearson_r = float(np.sum(truth_centered * pred_centered) / denom) if denom > 0.0 else float("nan")
+        truth_var = float(np.sum(truth_centered * truth_centered))
+        slope = float(np.sum(truth_centered * pred_centered) / truth_var) if truth_var > 0.0 else float("nan")
+        intercept = pred_mean - slope * truth_mean if math.isfinite(slope) else float("nan")
+    else:
+        pearson_r = float("nan")
+        slope = float("nan")
+        intercept = float("nan")
+    return {
+        "count": float(truth.size),
+        "mae": mae,
+        "rmse": rmse,
+        "bias": bias,
+        "pearson_r": pearson_r,
+        "slope": slope,
+        "intercept": intercept,
+    }
+
+
 @torch.no_grad()
 def _kin_hist_candidate_indices_per_event(
     rewards_kb: Tensor,
@@ -3960,11 +4023,12 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "val_neutrino/all/pt_truth_vs_pred": "Example 2D truth-vs-pred key. Actual validation 2D keys follow event_info.invisible_feature_names as val_neutrino/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "val_neutrino/all/eta_truth_vs_pred": "Example 2D truth-vs-pred key. Actual validation 2D keys follow event_info.invisible_feature_names as val_neutrino/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "val_neutrino/all/phi_truth_vs_pred": "Example 2D truth-vs-pred key. Actual validation 2D keys follow event_info.invisible_feature_names as val_neutrino/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
+        "val_neutrino/all_metrics/*/*": "Scalar summaries for validation truth-vs-pred 2D monitors over all candidates: count, mae, rmse, bias=mean(pred-truth), pearson_r, slope, intercept.",
         "val_neutrino/px": "Same three-way overlay for neutrino p_x [GeV]; truth is denormalized invisible target, pred/ref from DDIM output.",
         "val_neutrino/py": "Same three-way overlay for neutrino p_y [GeV].",
         "val_neutrino/pz": "Same three-way overlay for neutrino p_z [GeV].",
-        "val_neutrino/jsd/current/*": "Histogram Jensen-Shannon distance between truth and current-policy validation distributions for the named kinematic. Lower is better.",
-        "val_neutrino/jsd/ref/*": "Histogram Jensen-Shannon distance between truth and frozen-reference validation distributions for the named kinematic. Lower is better.",
+        "val_neutrino/jsd/current/*": "Histogram Jensen-Shannon distance between truth and current-policy validation distributions for the named kinematic. Feature names follow event_info.yaml invisible_feature_names (or px/py/pz in cartesian mode). Lower is better.",
+        "val_neutrino/jsd/ref/*": "Histogram Jensen-Shannon distance between truth and frozen-reference validation distributions for the named kinematic. Feature names follow event_info.yaml invisible_feature_names (or px/py/pz in cartesian mode). Lower is better.",
         "val_mass/w_mass": "W-boson mass reconstruction (assigned lepton + neutrino) vs truth-neutrino resonance mass, truth vs current policy vs frozen reference (wandb.Image); x-axis **epoch**.",
         "val_mass/top_mass": "Top mass reconstruction (assigned b + W) vs truth-neutrino resonance mass; same three-way overlay as val_mass/w_mass.",
         "val_mass/jsd/current/*": "Histogram Jensen-Shannon distance between truth and current-policy validation mass distributions. Lower is better.",
@@ -3977,6 +4041,7 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "train_dist/all/pt_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "train_dist/all/eta_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "train_dist/all/phi_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
+        "train_dist/all_metrics/*/*": "Scalar summaries for train truth-vs-pred 2D monitors over all candidates: count, mae, rmse, bias=mean(pred-truth), pearson_r, slope, intercept.",
         "train_dist_k1/pt": "1D density overlay: truth vs candidate-0 training rollout prediction for pT [GeV], accumulated over all training batches in the epoch. This is a K=1 / single-sample proxy on the train rollout pool, separate from reward-best train_dist/*.",
         "train_dist_k1/eta": "Same overlay for η using candidate 0 as the train K=1 proxy.",
         "train_dist_k1/phi": "Same overlay for φ using candidate 0 as the train K=1 proxy.",
@@ -5501,7 +5566,7 @@ def run_validation_epoch(
     local_truth_pred_all_chunks: dict[str, list[np.ndarray]] = {
         f"{feature_name}_{suffix}": []
         for feature_name in all_plot_feature_names
-        for suffix in ("truth", "pred")
+        for suffix in ("truth", "pred", "ref")
     }
     # pT in GeV (original physics scale, after expm1 inversion of log1p).
     bin_pt_edges = _diagnostic_bin_edges("pt")
@@ -5791,6 +5856,26 @@ def run_validation_epoch(
             if top_r.size:
                 h_tm_r += np.histogram(top_r, bins=bin_topmass_edges)[0]
 
+        if not cartesian:
+            ref_feature_arrays = _val_pred_truth_feature_flat_all_candidates(
+                r_one,
+                batch_d,
+                feature_names=all_plot_feature_names,
+                device=device,
+            )
+            for key, values in ref_feature_arrays.items():
+                local_truth_pred_all_chunks[key.replace("_pred", "_ref")].append(values)
+        elif legacy_kinematics:
+            all_px_r, all_py_r, all_pz_r, _, _, _ = _val_pred_truth_cartesian_flat_all_candidates(
+                r_one,
+                batch_d,
+                device=device,
+                dtype=dtype,
+            )
+            local_truth_pred_all_chunks["px_ref"].append(all_px_r)
+            local_truth_pred_all_chunks["py_ref"].append(all_py_r)
+            local_truth_pred_all_chunks["pz_ref"].append(all_pz_r)
+
         if winrate_enabled:
             rewards_ref, _ = reward_agg.compute(r_one, batch_d)
             r_cur = rewards.max(dim=0).values
@@ -6045,6 +6130,22 @@ def run_validation_epoch(
                     f"({val_K} candidate{'s' if val_K != 1 else ''}, all)"
                 ),
                 bin_edges=_generation_special_bin_edges(feature_name),
+            )
+            for metric_name, metric_value in _truth_pred_scalar_metrics(
+                truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
+                truth_pred_all_merged.get(pred_key, np.array([], dtype=np.float64)),
+            ).items():
+                out[f"val_neutrino/all_metrics/{feature_name}/{metric_name}"] = metric_value
+            bin_edges = _generation_special_bin_edges(feature_name)
+            out[f"val_neutrino/jsd/current/{feature_name}"] = _array_histogram_jsd(
+                truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
+                truth_pred_all_merged.get(pred_key, np.array([], dtype=np.float64)),
+                bin_edges=bin_edges,
+            )
+            out[f"val_neutrino/jsd/ref/{feature_name}"] = _array_histogram_jsd(
+                truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
+                truth_pred_all_merged.get(f"{feature_name}_ref", np.array([], dtype=np.float64)),
+                bin_edges=bin_edges,
             )
         if legacy_kinematics:
             out["val_neutrino/pt"] = _val_overlay_kin_figure(
@@ -6942,6 +7043,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             title=f"Train 2D truth vs pred {feature_name} (all candidates, all batches)",
                             bin_edges=_generation_special_bin_edges(feature_name),
                         )
+                        for metric_name, metric_value in _truth_pred_scalar_metrics(
+                            td_all_merged.get(f"{feature_name}_truth", np.array([], dtype=np.float64)),
+                            td_all_merged.get(f"{feature_name}_pred", np.array([], dtype=np.float64)),
+                        ).items():
+                            td_log[f"train_dist/all_metrics/{feature_name}/{metric_name}"] = metric_value
                     if len(td_log) > 1:
                         _wandb_log_with_step(
                             wandb_mod,
