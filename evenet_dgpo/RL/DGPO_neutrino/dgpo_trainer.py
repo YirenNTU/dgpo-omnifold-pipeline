@@ -3654,7 +3654,7 @@ def train_step(
             _ref_v,
             noise_mask_rep,
             x_t,
-            _target_v,
+            target_v,
             t_rep,
             batch_rep,
             _eps_rep,
@@ -3679,6 +3679,13 @@ def train_step(
             beta_dgpo,
             K,
         )
+        beta_kl = max(0.0, float(_dgpo_cfg_get(global_config.dgpo, "beta_kl", 0.0)))
+        kl_loss = per_row_velocity_mse(
+            model_v,
+            target_v,
+            noise_mask_rep,
+            invisible_padding=0,
+        ).mean()
 
         variance_loss = x_t.new_zeros(())
         variance_diag: dict[str, Tensor] = {
@@ -3710,14 +3717,22 @@ def train_step(
                 selected_features=variance_reg_features,
             )
 
-        # Backward uses pure DGPO plus the optional anti-shrink soft regularizer.
+        # Backward uses DGPO plus an optional supervised diffusion anchor and soft regularizers.
         # The latent-SWD constraint, when enabled, is still enforced post-AdamW by CPO repair.
-        loss_backward = loss_vel + float(variance_reg_weight) * variance_loss
+        loss_backward = (
+            loss_vel
+            + beta_kl * kl_loss
+            + float(variance_reg_weight) * variance_loss
+        )
         dlast["loss_velocity_training"] = loss_vel.detach()
+        dlast["train/loss/kl"] = (beta_kl * kl_loss.detach()).to(dtype=torch.float64)
         dlast["train/loss/variance_regularization"] = (
             float(variance_reg_weight) * variance_loss.detach()
         ).to(dtype=torch.float64)
         dlast["loss_total"] = loss_backward.detach()
+        dlast["kl_weight_mean"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
+        dlast["kl_weight_min"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
+        dlast["kl_weight_max"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
         dlast["projection/active"] = torch.tensor(
             1.0 if projection_active else 0.0,
             device=device,
@@ -4101,12 +4116,13 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "projection/active": "1 when projection_constraint repair runs after AdamW on this step.",
         "projection/pure_dgpo_backward": "1 when the main policy objective stays DGPO-style in backward. Optional soft regularizers may be added, while any latent-SWD CPO repair still happens only post-AdamW.",
         # --- train/loss ---
-        "train/loss/total": "Scalar passed to backward(): DGPO main term plus any enabled soft regularizers (for example batch-level variance anti-shrink). Post-step latent-SWD CPO repair is after AdamW only.",
+        "train/loss/total": "Scalar passed to backward(): DGPO main term plus any enabled supervised diffusion anchor and soft regularizers. Post-step latent-SWD CPO repair is after AdamW only.",
         "train/loss/dgpo": "DGPO main term (detached gate × advantage × L_cur). Lower is better.",
         "train/loss/L_cur": "Mean velocity MSE for the trainable policy (DDIM target). Lower is better.",
         "train/loss/L_ref": "Mean velocity MSE for the frozen reference policy. Lower is better.",
         "train/loss/delta": "mean(|L_cur - L_ref|): average absolute gap between current and reference velocity MSE. Shows how far the policy has moved from frozen ref_model (not rollout EMA).",
         "train/loss/velocity": "Detached velocity objective slice: pure DGPO main term used for backward.",
+        "train/loss/kl": "Weighted supervised diffusion anchor beta_kl * mean_row |v_pred - v_truth|^2 on the same noisy inputs. Keeps the original diffusion preference toward the denoising target while DGPO adds physics steering.",
         "train/loss/variance_regularization": "Weighted anti-shrink soft penalty added to backward: lambda_var * mean(relu((std_truth - std_pred) / std_truth)^2) over the selected event_info-driven angular features.",
         "train/regularization/variance/active": "1 when batch-level variance anti-shrink regularization found at least one selected feature in the current feature layout.",
         "train/regularization/variance/active_features": "How many selected features contributed to the anti-shrink regularizer on this batch.",

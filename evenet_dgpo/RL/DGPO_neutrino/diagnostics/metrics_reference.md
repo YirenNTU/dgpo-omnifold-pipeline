@@ -22,9 +22,9 @@ Logged every optimizer step: `reward/monitor/best_of_k`, `median`, `mean_gap`, `
 
 | Key | Description |
 |-----|-------------|
-| `train/loss/total` | Scalar passed to `backward()`: pure DGPO main term (`beta_kl=0`). CPO repair runs after AdamW. |
+| `train/loss/total` | Scalar passed to `backward()`: DGPO main term plus any enabled supervised diffusion anchor and auxiliary regularizers. CPO repair runs after AdamW. |
 | `train/loss/dgpo` | DGPO main: detached gate × advantage × `L_cur`. |
-| `train/loss/kl` | Always 0 in backward (velocity KL disabled). |
+| `train/loss/kl` | Weighted supervised diffusion anchor `beta_kl * mean_row |v_pred - v_truth|^2` on the same noisy inputs. |
 | `train/loss/L_cur` / `L_ref` / `delta` | Current vs reference velocity MSE diagnostics. |
 
 ## `train/grad/`

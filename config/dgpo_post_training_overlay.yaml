@@ -50,6 +50,7 @@ ztautau_domain:
     target_delta_phi_to_pi: 0.0
 
 dgpo:
+  beta_kl: 1.0e-2
   variance_regularization:
     enabled: false
     weight: 0.0

@@ -241,6 +241,7 @@ dgpo:
   policy_eval_t_max: 0.7
   ema_rollout_decay_max: 0.3
   ema_rollout_decay_ramp: 0.001
+  beta_kl: 0.0
   log_every: 1
   log_reward_dist_every: 5
   diagnostic_plot_every: 5
