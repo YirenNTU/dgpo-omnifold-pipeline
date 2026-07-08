@@ -2491,6 +2491,7 @@ def _build_train_metrics(
                 diag_last, "loss_velocity_training"
             ),
             "train/loss/dgpo": float(diag_last["loss_main"].cpu()),
+            "train/loss/kl": _diag_scalar_float(diag_last, "train/loss/kl"),
             "train/loss/L_cur": float(diag_last["L_cur_mean"].cpu()),
             "train/loss/L_ref": float(diag_last["L_ref_mean"].cpu()),
             "train/loss/delta": float(diag_last["delta_abs_mean"].cpu()),
@@ -2533,6 +2534,7 @@ def _build_train_metrics(
         "train/loss/total": float(diag_last["loss_total"].cpu()),
         "train/loss/velocity": lv,
         "train/loss/dgpo": float(diag_last["loss_main"].cpu()),
+        "train/loss/kl": _diag_scalar_float(diag_last, "train/loss/kl"),
         "train/loss/L_cur": float(diag_last["L_cur_mean"].cpu()),
         "train/loss/L_ref": float(diag_last["L_ref_mean"].cpu()),
         "train/loss/delta": float(diag_last["delta_abs_mean"].cpu()),
