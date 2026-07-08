@@ -53,6 +53,7 @@ from RL.DGPO_neutrino.dgpo_utils import (
     _dgpo_cfg_get,
     build_dgpo_loss,
     compute_per_event_advantage,
+    predict_x0_normalized_from_velocity_diffusion,
     repeat_batch_for_candidates,
 )
 from RL.DGPO_neutrino.model_utils import (
@@ -893,6 +894,154 @@ def _generation_monitor_feature_names(*, cartesian: bool) -> tuple[str, ...]:
     if cartesian:
         return ("px", "py", "pz")
     return _invisible_feature_names()
+
+
+def _variance_regularization_config(dg_cfg: Any | None = None) -> Any | None:
+    """Optional anti-shrink regularization block under ``dgpo.variance_regularization``."""
+    cfg = dg_cfg if dg_cfg is not None else getattr(global_config, "dgpo", None)
+    return _dgpo_cfg_get(cfg, "variance_regularization", None)
+
+
+def _variance_regularization_enabled(dg_cfg: Any | None = None) -> bool:
+    """Whether batch-level std matching regularization is enabled."""
+    block = _variance_regularization_config(dg_cfg)
+    return bool(_dgpo_cfg_get(block, "enabled", False))
+
+
+def _variance_regularization_weight(dg_cfg: Any | None = None) -> float:
+    """Scalar weight for the anti-shrink regularizer."""
+    block = _variance_regularization_config(dg_cfg)
+    return max(0.0, float(_dgpo_cfg_get(block, "weight", 0.0)))
+
+
+def _variance_regularization_feature_names(dg_cfg: Any | None = None) -> tuple[str, ...]:
+    """Target features for anti-shrink regularization.
+
+    Default: inspect ``event_info.yaml`` via ``event_info.invisible_feature_names`` and keep
+    the angular-like entries we actually care about. This makes ``eta/phi`` and ``theta/phi``
+    layouts both work without hard-coding one schema.
+    """
+    block = _variance_regularization_config(dg_cfg)
+    raw = _dgpo_cfg_get(block, "features", None)
+    if raw:
+        return tuple(str(name) for name in raw)
+    event_features = _invisible_feature_names()
+    preferred = tuple(
+        str(name) for name in event_features
+        if str(name) in {"eta", "theta", "phi"}
+    )
+    return preferred if preferred else event_features
+
+
+def _named_invisible_feature_tensors(
+    kin: Tensor,
+    *,
+    cartesian: bool,
+    feature_names: tuple[str, ...],
+) -> dict[str, Tensor]:
+    """Expose invisible kinematics as named tensors in the current feature space."""
+    if int(kin.shape[-1]) <= 0:
+        return {}
+    if cartesian:
+        if int(kin.shape[-1]) < 3:
+            return {}
+        log_pt, eta, phi = cartesian_to_log_pt_eta_phi(
+            kin[..., 0],
+            kin[..., 1],
+            kin[..., 2],
+        )
+        return {
+            "log_pt": log_pt,
+            "pt": torch.expm1(log_pt),
+            "eta": eta,
+            "phi": phi,
+            "px": kin[..., 0],
+            "py": kin[..., 1],
+            "pz": kin[..., 2],
+        }
+    out: dict[str, Tensor] = {}
+    max_features = min(len(feature_names), int(kin.shape[-1]))
+    for index, name in enumerate(feature_names[:max_features]):
+        out[str(name)] = kin[..., index]
+    return out
+
+
+def _masked_batch_std(values: Tensor, mask: Tensor, eps: float = 1.0e-8) -> Tensor:
+    """Population std over valid batch slots; ``mask`` is 0/1 with the same broadcast shape."""
+    weights = mask.to(device=values.device, dtype=values.dtype)
+    count = weights.sum().clamp(min=1.0)
+    mean = (values * weights).sum() / count
+    var = ((values - mean).pow(2) * weights).sum() / count
+    return torch.sqrt(var.clamp(min=0.0) + float(eps))
+
+
+def _variance_matching_penalty(
+    pred_phys: Tensor,
+    truth_phys: Tensor,
+    valid_mask: Tensor,
+    *,
+    cartesian: bool,
+    feature_names: tuple[str, ...],
+    selected_features: tuple[str, ...],
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Small anti-shrink penalty: ``mean(relu(std_truth - std_pred)^2)`` over selected features."""
+    zero = pred_phys.new_zeros(())
+    diag: dict[str, Tensor] = {
+        "train/regularization/variance/active": pred_phys.new_tensor(0.0, dtype=torch.float64),
+        "train/regularization/variance/active_features": pred_phys.new_tensor(0.0, dtype=torch.float64),
+        "train/regularization/variance/raw": zero.detach(),
+    }
+    if not selected_features:
+        return zero, diag
+
+    pred_named = _named_invisible_feature_tensors(
+        pred_phys,
+        cartesian=cartesian,
+        feature_names=feature_names,
+    )
+    truth_named = _named_invisible_feature_tensors(
+        truth_phys,
+        cartesian=cartesian,
+        feature_names=feature_names,
+    )
+    mask = valid_mask.squeeze(-1) if int(valid_mask.dim()) == int(pred_phys.dim()) else valid_mask
+    penalties: list[Tensor] = []
+    active_features = 0
+    valid_count = float(mask.sum().detach().cpu())
+
+    for feature_name in selected_features:
+        prefix = f"train/regularization/variance/{feature_name}"
+        pred_feature = pred_named.get(feature_name)
+        truth_feature = truth_named.get(feature_name)
+        diag[f"{prefix}/active"] = pred_phys.new_tensor(0.0, dtype=torch.float64)
+        diag[f"{prefix}/count"] = pred_phys.new_tensor(valid_count, dtype=torch.float64)
+        if pred_feature is None or truth_feature is None or valid_count < 2.0:
+            diag[f"{prefix}/std_truth"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
+            diag[f"{prefix}/std_pred"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
+            diag[f"{prefix}/std_gap"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
+            diag[f"{prefix}/penalty"] = pred_phys.new_tensor(float("nan"), dtype=torch.float64)
+            continue
+        std_truth = _masked_batch_std(truth_feature.detach(), mask)
+        std_pred = _masked_batch_std(pred_feature, mask)
+        std_gap = torch.relu(std_truth - std_pred)
+        penalty_feature = std_gap.pow(2)
+        penalties.append(penalty_feature)
+        active_features += 1
+        diag[f"{prefix}/active"] = pred_phys.new_tensor(1.0, dtype=torch.float64)
+        diag[f"{prefix}/std_truth"] = std_truth.detach().to(dtype=torch.float64)
+        diag[f"{prefix}/std_pred"] = std_pred.detach().to(dtype=torch.float64)
+        diag[f"{prefix}/std_gap"] = std_gap.detach().to(dtype=torch.float64)
+        diag[f"{prefix}/penalty"] = penalty_feature.detach().to(dtype=torch.float64)
+
+    if penalties:
+        raw = torch.stack(penalties).mean()
+        diag["train/regularization/variance/active"] = pred_phys.new_tensor(1.0, dtype=torch.float64)
+        diag["train/regularization/variance/active_features"] = pred_phys.new_tensor(
+            float(active_features), dtype=torch.float64
+        )
+        diag["train/regularization/variance/raw"] = raw.detach().to(dtype=torch.float64)
+        return raw, diag
+    return zero, diag
 
 
 def _generation_special_bin_edges(feature_name: str) -> np.ndarray | None:
@@ -2341,8 +2490,9 @@ def _build_train_metrics(
             base["train/loss/velocity"] = float(diag_last["loss_total"].cpu())
         base.update(param)
         for dk, dv in diag_last.items():
-            if isinstance(dk, str) and dk.startswith(
-                ("projection/", "latent_constraint/")
+            if isinstance(dk, str) and (
+                dk.startswith(("projection/", "latent_constraint/", "train/regularization/"))
+                or dk == "train/loss/variance_regularization"
             ):
                 base[dk] = float(dv.detach().float().cpu())
         return base
@@ -2380,8 +2530,9 @@ def _build_train_metrics(
     }
     out.update(param)
     for dk, dv in diag_last.items():
-        if isinstance(dk, str) and dk.startswith(
-            ("projection/", "latent_constraint/")
+        if isinstance(dk, str) and (
+            dk.startswith(("projection/", "latent_constraint/", "train/regularization/"))
+            or dk == "train/loss/variance_regularization"
         ):
             out[dk] = float(dv.detach().float().cpu())
     return out
@@ -3392,6 +3543,9 @@ def train_step(
     freeze_reference_model(ref_model)
     proj_cfg = resolve_projection_constraint_config(global_config.dgpo)
     projection_active = bool(proj_cfg.active and constraint_state is not None)
+    variance_reg_active = _variance_regularization_enabled(global_config.dgpo)
+    variance_reg_weight = _variance_regularization_weight(global_config.dgpo)
+    variance_reg_features = _variance_regularization_feature_names(global_config.dgpo)
 
     core = _unwrap_core_evenet(model)
     B = int(batch["x"].shape[0])
@@ -3455,6 +3609,13 @@ def train_step(
             _log.info(
                 "[DGPO] pure DGPO mode: backward and optimizer step run without projection/CPO repair."
             )
+        if variance_reg_active and variance_reg_weight > 0.0:
+            _log.info(
+                "[DGPO] anti-shrink variance regularization enabled: weight=%.4g, features=%s "
+                "(defaults come from event_info.yaml unless overridden).",
+                variance_reg_weight,
+                ",".join(variance_reg_features) if variance_reg_features else "<none>",
+            )
 
     candidate_weights_kb: Tensor | None = None
     if projection_active and proj_cfg.active_apply_to == "best_candidate":
@@ -3471,13 +3632,13 @@ def train_step(
             L_cur,
             L_ref,
             _,
-            _model_v,
+            model_v,
             _ref_v,
-            _noise_mask_rep,
-            _x_t,
+            noise_mask_rep,
+            x_t,
             _target_v,
-            _t_rep,
-            _batch_rep,
+            t_rep,
+            batch_rep,
             _eps_rep,
         ) = policy_evaluation_step(
             model,
@@ -3501,10 +3662,43 @@ def train_step(
             K,
         )
 
-        # Backward uses the pure DGPO main term; the latent-SWD constraint is
-        # enforced post-AdamW by the CPO projection repair.
-        loss_backward = loss_vel
+        variance_loss = x_t.new_zeros(())
+        variance_diag: dict[str, Tensor] = {
+            "train/regularization/variance/active": x_t.new_tensor(0.0, dtype=torch.float64),
+            "train/regularization/variance/active_features": x_t.new_tensor(0.0, dtype=torch.float64),
+            "train/regularization/variance/raw": x_t.new_tensor(0.0, dtype=torch.float64),
+        }
+        if variance_reg_active and variance_reg_weight > 0.0 and variance_reg_features:
+            pred_x0_norm, _, _ = predict_x0_normalized_from_velocity_diffusion(
+                x_t,
+                model_v,
+                t_rep,
+            )
+            pred_phys = core.invisible_normalizer.denormalize_grad(
+                pred_x0_norm,
+                mask=noise_mask_rep,
+                remove_padding=True,
+            )
+            truth_phys = batch_rep["x_invisible"][..., :pred_phys.shape[-1]].to(
+                device=pred_phys.device,
+                dtype=pred_phys.dtype,
+            )
+            variance_loss, variance_diag = _variance_matching_penalty(
+                pred_phys,
+                truth_phys,
+                noise_mask_rep,
+                cartesian=_truth_generation_cartesian(),
+                feature_names=_invisible_feature_names(),
+                selected_features=variance_reg_features,
+            )
+
+        # Backward uses pure DGPO plus the optional anti-shrink soft regularizer.
+        # The latent-SWD constraint, when enabled, is still enforced post-AdamW by CPO repair.
+        loss_backward = loss_vel + float(variance_reg_weight) * variance_loss
         dlast["loss_velocity_training"] = loss_vel.detach()
+        dlast["train/loss/variance_regularization"] = (
+            float(variance_reg_weight) * variance_loss.detach()
+        ).to(dtype=torch.float64)
         dlast["loss_total"] = loss_backward.detach()
         dlast["projection/active"] = torch.tensor(
             1.0 if projection_active else 0.0,
@@ -3516,6 +3710,7 @@ def train_step(
             device=device,
             dtype=torch.float64,
         )
+        dlast.update(variance_diag)
         return loss_backward, dlast
 
     # Accumulate the sub-step gradients into ONE AdamW update per batch, then run
@@ -3886,14 +4081,22 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "reward/sources/*/selection_gap": "selected_by_total_mean - mean. Large shifts show how combined reward selection biases that source.",
         # --- dgpo (train scalars) ---
         "projection/active": "1 when projection_constraint repair runs after AdamW on this step.",
-        "projection/pure_dgpo_backward": "1 when backward uses pure DGPO main term (always; the constraint is enforced post-AdamW).",
+        "projection/pure_dgpo_backward": "1 when the main policy objective stays DGPO-style in backward. Optional soft regularizers may be added, while any latent-SWD CPO repair still happens only post-AdamW.",
         # --- train/loss ---
-        "train/loss/total": "Scalar passed to backward(): pure DGPO main term. Post-step latent-SWD CPO repair is after AdamW only.",
+        "train/loss/total": "Scalar passed to backward(): DGPO main term plus any enabled soft regularizers (for example batch-level variance anti-shrink). Post-step latent-SWD CPO repair is after AdamW only.",
         "train/loss/dgpo": "DGPO main term (detached gate × advantage × L_cur). Lower is better.",
         "train/loss/L_cur": "Mean velocity MSE for the trainable policy (DDIM target). Lower is better.",
         "train/loss/L_ref": "Mean velocity MSE for the frozen reference policy. Lower is better.",
         "train/loss/delta": "mean(|L_cur - L_ref|): average absolute gap between current and reference velocity MSE. Shows how far the policy has moved from frozen ref_model (not rollout EMA).",
         "train/loss/velocity": "Detached velocity objective slice: pure DGPO main term used for backward.",
+        "train/loss/variance_regularization": "Weighted anti-shrink soft penalty added to backward: lambda_var * mean(relu(std_truth - std_pred)^2) over the selected event_info-driven angular features.",
+        "train/regularization/variance/active": "1 when batch-level variance anti-shrink regularization found at least one selected feature in the current feature layout.",
+        "train/regularization/variance/active_features": "How many selected features contributed to the anti-shrink regularizer on this batch.",
+        "train/regularization/variance/raw": "Unweighted anti-shrink penalty before multiplying by dgpo.variance_regularization.weight.",
+        "train/regularization/variance/*/std_truth": "Per-feature truth std over valid batch slots for the anti-shrink monitor.",
+        "train/regularization/variance/*/std_pred": "Per-feature prediction std over valid batch slots for the anti-shrink monitor.",
+        "train/regularization/variance/*/std_gap": "Per-feature positive std gap max(std_truth - std_pred, 0). Non-zero means the prediction is narrower than truth.",
+        "train/regularization/variance/*/penalty": "Per-feature raw anti-shrink penalty relu(std_truth - std_pred)^2.",
         # --- projection (W&B panel: five CPO repair scalars only) ---
         "projection/v_linear": "Linear post-Adam violation estimate: C_adam_pred - epsilon. Drives lambda when positive.",
         "projection/C_adam_pred": "First-order Taylor prediction C_old + b^T delta0 at theta_adam (linear constraint after AdamW step).",

@@ -250,6 +250,12 @@ dgpo:
   validation_log_batches: true
   validation_tqdm_k_chains: true
   validation_tqdm_ddim: false
+  variance_regularization:
+    enabled: false
+    weight: 1.0e-3
+    # Default: inspect event_info.invisible_feature_names and keep angular-like features
+    # (eta/theta/phi). Override with an explicit list if you want different targets.
+    features: null
   projection_constraint:
     # Set ``type: none`` for pure DGPO, or ``latent_swd`` to enable the optional
     # post-AdamW CPO repair with a frozen latent encoder.

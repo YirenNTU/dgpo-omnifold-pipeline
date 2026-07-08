@@ -49,6 +49,10 @@ ztautau_domain:
     target_delta_phi_to_pi: 0.0
 
 dgpo:
+  variance_regularization:
+    enabled: true
+    weight: 1.0e-3
+    features: null
   projection_constraint:
     type: none
   K: 5
