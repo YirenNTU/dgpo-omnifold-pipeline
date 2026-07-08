@@ -32,6 +32,7 @@ rl:
   enabled: true
 
 reward_config:
+  type: calibration_magnitude
   weight: 1.0
   feature_names: [theta, phi]
   component_normalized:
@@ -50,8 +51,8 @@ ztautau_domain:
 
 dgpo:
   variance_regularization:
-    enabled: true
-    weight: 1.0e-2
+    enabled: false
+    weight: 0.0
     features: null
   projection_constraint:
     type: none

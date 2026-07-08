@@ -9,6 +9,8 @@ import torch
 from torch import Tensor
 
 from RL.DGPO_neutrino.domains.ztautau import (
+    DEFAULT_FEATURE_NAMES as ZTAUTAU_FEATURE_NAMES,
+    tau_calibration_magnitude_metrics,
     tau_back_to_back_metrics,
     wrapped_delta_phi,
 )
@@ -94,6 +96,21 @@ class BaseReward(ABC):
         mask: Tensor | None = None,
     ) -> Tensor:
         """Return rewards of shape ``(K, B)`` for candidates ``(K, B, num_nu, F)``."""
+
+    def last_topology_metrics(self) -> dict[str, Tensor] | None:
+        return None
+
+    def last_component_errors(self) -> dict[str, Tensor] | None:
+        return None
+
+    def last_component_deltas(self) -> dict[str, Tensor] | None:
+        return None
+
+    def last_component_truths(self) -> dict[str, Tensor] | None:
+        return None
+
+    def last_kinematic_deltas(self) -> dict[str, Tensor] | None:
+        return None
 
 
 class ComponentNormalizedTruthDistanceReward(BaseReward):
@@ -380,6 +397,55 @@ class ComponentNormalizedTruthDistanceReward(BaseReward):
         return reward
 
 
+class CalibrationMagnitudeReward(BaseReward):
+    """Physics-consistency reward: smaller post-calibration direction shift is better."""
+
+    def __init__(
+        self,
+        *,
+        feature_names: tuple[str, ...] | None = None,
+    ) -> None:
+        names = tuple(feature_names) if feature_names else ZTAUTAU_FEATURE_NAMES
+        if tuple(names) != ZTAUTAU_FEATURE_NAMES:
+            raise ValueError(
+                f"CalibrationMagnitudeReward expects feature_names={ZTAUTAU_FEATURE_NAMES!r}, got {names!r}"
+            )
+        self._feature_names = names
+        self._last_topology_metrics: dict[str, Tensor] | None = None
+
+    @property
+    def name(self) -> str:
+        return "calibration_magnitude"
+
+    def last_topology_metrics(self) -> dict[str, Tensor] | None:
+        return self._last_topology_metrics
+
+    def compute(
+        self,
+        candidates: Tensor,
+        batch: dict[str, Any],
+        mask: Tensor | None = None,
+    ) -> Tensor:
+        _K, B, N_nu, _F = candidates.shape
+        if N_nu < 2:
+            raise ValueError(
+                f"CalibrationMagnitudeReward needs N_nu >= 2 (nu1, nu2), got {N_nu}"
+            )
+        metrics = tau_calibration_magnitude_metrics(
+            candidates,
+            batch,
+            feature_names=self._feature_names,
+        )
+        reward = -metrics["calibration_deltaR_sum"]
+        reward = apply_event_valid_to_rewards(reward, batch)
+        valid_kb = get_event_valid_mask(batch, B, reward.device, reward.dtype).unsqueeze(0)
+        self._last_topology_metrics = {
+            name: (values * valid_kb).detach().contiguous()
+            for name, values in metrics.items()
+        }
+        return reward
+
+
 def compute_truth_l2_distances_kb(
     candidates: Tensor,
     batch: dict[str, Any],
@@ -470,6 +536,7 @@ class RewardAggregator:
 
 __all__ = [
     "BaseReward",
+    "CalibrationMagnitudeReward",
     "ComponentNormalizedTruthDistanceReward",
     "RewardAggregator",
     "apply_event_valid_to_rewards",

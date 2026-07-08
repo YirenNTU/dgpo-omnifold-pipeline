@@ -12,6 +12,7 @@ _REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 sys.path.insert(0, _REPO_ROOT)
 
 from RL.DGPO_neutrino.rewards import (
+    CalibrationMagnitudeReward,
     ComponentNormalizedTruthDistanceReward,
     RewardAggregator,
     cartesian_to_log_pt_eta_phi,
@@ -140,6 +141,35 @@ class TestGetEventValidMask(unittest.TestCase):
         m = get_event_valid_mask(batch, 2, torch.device("cpu"), torch.float32)
         self.assertEqual(float(m[0]), 1.0)
         self.assertEqual(float(m[1]), 0.0)
+
+
+class TestCalibrationMagnitudeReward(unittest.TestCase):
+    def test_back_to_back_candidate_has_higher_reward(self):
+        truth = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+        batch = {
+            "x_invisible": truth,
+            "x_invisible_mask": torch.ones(1, 2),
+            "lead_a_visible_px": torch.tensor([1.0]),
+            "lead_a_visible_py": torch.tensor([0.0]),
+            "lead_a_visible_pz": torch.tensor([0.0]),
+            "lead_b_visible_px": torch.tensor([-1.0]),
+            "lead_b_visible_py": torch.tensor([0.0]),
+            "lead_b_visible_pz": torch.tensor([0.0]),
+        }
+        candidates = torch.tensor(
+            [
+                [[[0.0, 0.0], [0.0, 0.0]]],
+                [[[0.0, 0.4], [0.0, -0.6]]],
+            ],
+            dtype=torch.float32,
+        )
+        reward = CalibrationMagnitudeReward(feature_names=("theta", "phi"))
+        values = reward.compute(candidates, batch)
+        self.assertGreater(float(values[0, 0]), float(values[1, 0]))
+        topology = reward.last_topology_metrics()
+        self.assertIsNotNone(topology)
+        assert topology is not None
+        self.assertAlmostEqual(float(topology["calibration_deltaR_sum"][0, 0]), 0.0, places=5)
 
 
 class TestRewardAggregator(unittest.TestCase):

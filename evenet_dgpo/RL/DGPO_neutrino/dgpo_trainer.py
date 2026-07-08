@@ -90,6 +90,7 @@ from RL.DGPO_neutrino.projection_cpo import (
     trainable_params_all_finite,
 )
 from RL.DGPO_neutrino.rewards import (
+    CalibrationMagnitudeReward,
     ComponentNormalizedTruthDistanceReward,
     RewardAggregator,
     cartesian_to_log_pt_eta_phi,
@@ -1701,12 +1702,25 @@ def build_reward_aggregator(
     device: torch.device,
     normalization_dict: dict[str, Any] | None = None,
 ) -> RewardAggregator:
-    """Construct ``ComponentNormalizedTruthDistanceReward`` from ``reward_config``."""
+    """Construct the configured DGPO reward from ``reward_config``."""
     rc = global_config.reward_config
+    reward_type = str(getattr(rc, "type", "component_normalized_truth_distance")).strip().lower()
     cn = getattr(rc, "component_normalized", None)
     eps = float(getattr(cn, "eps", 1e-8)) if cn is not None else 1e-8
     weight = float(getattr(rc, "weight", 1.0))
     feature_names = _reward_feature_names()
+    agg = RewardAggregator()
+    if reward_type in {"calibration_magnitude", "physics_consistency", "ztautau_calibration_magnitude"}:
+        _log.info(
+            "[DGPO/reward] using calibration_magnitude reward for feature_names=%s.",
+            feature_names,
+        )
+        agg.add(
+            CalibrationMagnitudeReward(feature_names=feature_names),
+            weight,
+        )
+        return agg
+
     if feature_names is not None:
         scales = build_feature_space_scales(
             normalization_dict,
@@ -1724,7 +1738,6 @@ def build_reward_aggregator(
             "invisible_cartesian_std [px, py, pz]: %s",
             {k: round(v, 4) for k, v in scales.items()},
         )
-    agg = RewardAggregator()
     agg.add(
         ComponentNormalizedTruthDistanceReward(
             scales,
@@ -2046,6 +2059,18 @@ def _build_reward_extra_metrics(
     out.update(_build_reward_source_metrics(rewards, valid_b, reward_agg, reward_breakdown))
 
     for src, _w in reward_agg.sources:
+        if vb.sum() > 0:
+            rewards_v = rewards[:, vb]
+            best_k = rewards_v.argmax(dim=0)
+            bv = int(best_k.numel())
+            cols = torch.arange(bv, device=rewards.device, dtype=torch.long)
+            topology = src.last_topology_metrics()
+            if topology is not None:
+                for name, values in topology.items():
+                    all_values = values[:, vb]
+                    best_values = all_values[best_k, cols]
+                    _log_mean(f"diagnostics/ztautau_back_to_back/all/{name}", all_values)
+                    _log_mean(f"diagnostics/ztautau_back_to_back/best/{name}", best_values)
         if isinstance(src, ComponentNormalizedTruthDistanceReward):
             comps = src.last_component_errors()
             if comps is None:
@@ -2058,10 +2083,6 @@ def _build_reward_extra_metrics(
                 # Negate so the sign matches ``reward/raw/*`` (per-component reward, not error).
                 out[f"components/{cname}/mean"] = float((-cv).mean().detach().cpu())
             if vb.sum() > 0:
-                rewards_v = rewards[:, vb]
-                best_k = rewards_v.argmax(dim=0)
-                bv = int(best_k.numel())
-                cols = torch.arange(bv, device=rewards.device, dtype=torch.long)
                 axis_pairs = _reward_component_axis_pairs(tuple(comps.keys()))
                 for axis, (a, b) in axis_pairs.items():
                     axis_reward = -(comps[a] + comps[b])[:, vb]
@@ -2091,13 +2112,6 @@ def _build_reward_extra_metrics(
                             truth_axis = torch.stack((truths[a], truths[b]), dim=-1)
                             delta_axis = torch.stack((deltas[a], deltas[b]), dim=-1)
                             profile_tensors[axis] = (truth_axis, delta_axis)
-                topology = src.last_topology_metrics()
-                if topology is not None:
-                    for name, values in topology.items():
-                        all_values = values[:, vb]
-                        best_values = all_values[best_k, cols]
-                        _log_mean(f"diagnostics/ztautau_back_to_back/all/{name}", all_values)
-                        _log_mean(f"diagnostics/ztautau_back_to_back/best/{name}", best_values)
                 kin_deltas = src.last_kinematic_deltas()
                 if kin_deltas is not None:
                     rel_pt = kin_deltas.get("rel_pt")
@@ -4158,6 +4172,12 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "diagnostics/ztautau_back_to_back/best/delta_phi_to_pi": "Same azimuthal back-to-back metric on reward-best candidates.",
         "diagnostics/ztautau_back_to_back/all/back_to_back_loss": "Mean (cos_opening + 1)^2 + (|Delta phi| - pi)^2 over all valid rollout candidates.",
         "diagnostics/ztautau_back_to_back/best/back_to_back_loss": "Same combined back-to-back loss on reward-best candidates.",
+        "diagnostics/ztautau_back_to_back/all/calibration_deltaR_a": "Mean post-calibration direction change DeltaR for tau-a over all valid rollout candidates. Smaller is more physics-consistent.",
+        "diagnostics/ztautau_back_to_back/best/calibration_deltaR_a": "Same tau-a post-calibration DeltaR on reward-best candidates.",
+        "diagnostics/ztautau_back_to_back/all/calibration_deltaR_b": "Mean post-calibration direction change DeltaR for tau-b over all valid rollout candidates.",
+        "diagnostics/ztautau_back_to_back/best/calibration_deltaR_b": "Same tau-b post-calibration DeltaR on reward-best candidates.",
+        "diagnostics/ztautau_back_to_back/all/calibration_deltaR_sum": "Mean calibration magnitude DeltaR_a + DeltaR_b over all valid rollout candidates. This is the physics-consistency reward when reward_config.type=calibration_magnitude.",
+        "diagnostics/ztautau_back_to_back/best/calibration_deltaR_sum": "Same calibration magnitude on reward-best candidates.",
         "diagnostics/reward_hacking/all/rel_pt/mean": "Mean pT_pred / pT_truth - 1 over all valid rollout candidates and both ν slots. Negative values indicate pT shrink.",
         "diagnostics/reward_hacking/all/rel_pt/abs_mean": "Mean abs(pT_pred / pT_truth - 1) over all valid rollout candidates and both ν slots.",
         "diagnostics/reward_hacking/best/rel_pt/mean": "Mean pT_pred / pT_truth - 1 after selecting the combined-reward argmax candidate per valid event. Compare to all/rel_pt/mean to spot reward-driven pT shrink.",
@@ -4280,9 +4300,10 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.validation_log_batches": "If true: log INFO messages for each validation batch (start time, DDIM wall time). Useful for monitoring long validation runs. Typical: true.",
         "dgpo.validation_tqdm_k_chains": "If true: show a tqdm progress bar over the K DDIM chains per validation batch. Typical: true (helps see validation progress).",
         "dgpo.validation_tqdm_ddim": "If true: show a tqdm progress bar for every DDIM step within each chain (very verbose). Typical: false (too much output).",
-        # --- reward_config: component-normalized truth distance ---
-        "reward_config.weight": "Global multiplier on ComponentNormalizedTruthDistanceReward before summing into the combined DGPO reward. Typical: 1.0.",
-        "reward_config.component_normalized.eps": "Numerical stability added to per-component scale denominators in the truth-distance reward.",
+        # --- reward_config ---
+        "reward_config.type": "Reward backend. 'component_normalized_truth_distance' uses truth-matching squared error; 'calibration_magnitude' uses post-calibration tau direction-change magnitude (smaller is better) as the physics-consistency reward.",
+        "reward_config.weight": "Global multiplier on the configured reward source before summing into the combined DGPO reward. Typical: 1.0.",
+        "reward_config.component_normalized.eps": "Numerical stability added to per-component scale denominators in the truth-distance reward. Unused by calibration_magnitude.",
     }
 
 

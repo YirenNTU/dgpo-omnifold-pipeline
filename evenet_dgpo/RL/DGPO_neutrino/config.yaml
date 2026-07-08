@@ -290,6 +290,7 @@ dgpo:
                                  # estimate; cost is a cheap (KB x 1024) projection of 32-D vectors.
 
 reward_config:
+  type: component_normalized_truth_distance
   weight: 1.0
   component_normalized:
     eps: 1.0e-8
