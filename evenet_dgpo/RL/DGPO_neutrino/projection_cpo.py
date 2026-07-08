@@ -24,6 +24,7 @@ from RL.DGPO_neutrino.latent_constraint.dgpo_constraint import (
 
 _MULTI_SAMPLE_T_STRATIFIED_FIXED = "stratified_fixed"
 
+CONSTRAINT_NONE = "none"
 # The only constraint backend producing the CPO scalar ``C``.
 CONSTRAINT_LATENT_SWD = "latent_swd"
 
@@ -44,12 +45,18 @@ class ProjectionConstraintConfig:
     use_adam_preconditioner: bool
     damping: float
     multi_sample_count: int
-    latent_swd: LatentSWDConfig
-    type: str = CONSTRAINT_LATENT_SWD
+    latent_swd: LatentSWDConfig | None
+    type: str = CONSTRAINT_NONE
+
+    @property
+    def active(self) -> bool:
+        return self.type == CONSTRAINT_LATENT_SWD and self.latent_swd is not None
 
     @property
     def active_apply_to(self) -> str:
         """``apply_to`` selector for the latent-SWD constraint."""
+        if self.latent_swd is None:
+            return "all_candidates"
         return self.latent_swd.apply_to
 
 
@@ -57,9 +64,8 @@ def resolve_projection_constraint_config(dg_cfg: Any | None) -> ProjectionConstr
     """Parse ``dgpo.projection_constraint`` from the DGPO config namespace."""
     block = _dgpo_cfg_get(dg_cfg, "projection_constraint", None) if dg_cfg is not None else None
     if block is None:
-        latent_swd = resolve_latent_swd_config(None)
         return ProjectionConstraintConfig(
-            epsilon=float(latent_swd.margin),
+            epsilon=0.0,
             min_b_norm2=1e-12,
             max_lambda=None,
             trust_region_ratio=1.0,
@@ -67,13 +73,27 @@ def resolve_projection_constraint_config(dg_cfg: Any | None) -> ProjectionConstr
             use_adam_preconditioner=True,
             damping=0.0,
             multi_sample_count=8,
-            latent_swd=latent_swd,
+            latent_swd=None,
+            type=CONSTRAINT_NONE,
         )
-    constraint_type = str(_dgpo_cfg_get(block, "type", CONSTRAINT_LATENT_SWD)).strip()
+    constraint_type = str(_dgpo_cfg_get(block, "type", CONSTRAINT_NONE)).strip().lower()
+    if constraint_type in {"", CONSTRAINT_NONE, "off", "disabled", "false"}:
+        return ProjectionConstraintConfig(
+            epsilon=0.0,
+            min_b_norm2=1e-12,
+            max_lambda=None,
+            trust_region_ratio=1.0,
+            log_diagnostics=False,
+            use_adam_preconditioner=True,
+            damping=0.0,
+            multi_sample_count=1,
+            latent_swd=None,
+            type=CONSTRAINT_NONE,
+        )
     if constraint_type != CONSTRAINT_LATENT_SWD:
         raise ValueError(
-            "dgpo.projection_constraint.type must be 'latent_swd' (the only supported "
-            f"constraint backend), got {constraint_type!r}"
+            "dgpo.projection_constraint.type must be 'none' or 'latent_swd', "
+            f"got {constraint_type!r}"
         )
     latent_swd = resolve_latent_swd_config(_dgpo_cfg_get(block, "latent_swd", None))
     # epsilon (= CPO activation margin) defaults to the constraint's margin.

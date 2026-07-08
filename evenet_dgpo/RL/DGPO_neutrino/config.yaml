@@ -1,5 +1,5 @@
 # TT2L EveNet training layout (aligned with reasoning_module/train_TT2L.yaml) plus DGPO-neutrino RL add-on.
-# Single RL method: DGPO + CPO + frozen latent-SWD constraint (``rl.enabled`` switch only).
+# Single RL trainer: pure DGPO by default; optional latent-SWD post-AdamW CPO repair via config.
 # default: paths are relative to this file's directory (RL/DGPO_neutrino/).
 
 platform:
@@ -212,7 +212,7 @@ logger:
   name: "nu2flow_RL"
 
 # ---------------------------------------------------------------------------
-# RL add-on: DGPO + CPO + frozen latent-SWD constraint (``rl.enabled`` switch).
+# RL add-on: pure DGPO by default; optional latent-SWD CPO repair via ``dgpo.projection_constraint``.
 #
 # Lifecycle:
 #   - Load frozen encoder from latent_swd.checkpoint_file at startup on every rank;
@@ -251,10 +251,12 @@ dgpo:
   validation_tqdm_k_chains: true
   validation_tqdm_ddim: false
   projection_constraint:
+    # Set ``type: none`` for pure DGPO, or ``latent_swd`` to enable the optional
+    # post-AdamW CPO repair with a frozen latent encoder.
+    type: none
     # The frozen latent-SWD encoder is the only constraint backend; enforcement is
     # post-AdamW CPO trust-region projection repair (lambda = v/(b.p) puts the
     # constraint gradient b in the DENOMINATOR -> coordinate-invariant, phi-safe).
-    type: latent_swd
     epsilon: 0.1
     min_b_norm2: 1.0e-12
     trust_region_ratio: 1.0

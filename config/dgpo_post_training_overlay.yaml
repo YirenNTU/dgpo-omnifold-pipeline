@@ -49,6 +49,8 @@ ztautau_domain:
     target_delta_phi_to_pi: 0.0
 
 dgpo:
+  projection_constraint:
+    type: none
   K: 4
   num_ddim_steps: 20
   validation_num_ddim_steps: 20

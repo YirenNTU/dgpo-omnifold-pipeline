@@ -178,7 +178,7 @@ def build_ad_runtime_config(
 def build_dgpo_runtime_overlay(
     *,
     augmented_root: Path,
-    latent_checkpoint: Path,
+    latent_checkpoint: Path | None,
     diffusion_config: dict[str, Any],
     stage_root: Path,
     dgpo_init_checkpoint: Path | None,
@@ -209,7 +209,11 @@ def build_dgpo_runtime_overlay(
         "dgpo": {
             "projection_constraint": {
                 "latent_swd": {
-                    "checkpoint_file": str(latent_checkpoint.resolve()),
+                    "checkpoint_file": (
+                        str(latent_checkpoint.resolve())
+                        if latent_checkpoint is not None
+                        else ""
+                    ),
                     "normalization_file": diffusion_config["options"]["Dataset"]["normalization_file"],
                 }
             }
@@ -338,12 +342,17 @@ def run_diffusion_stage(
         raise FileNotFoundError(
             f"Augmented AD parquet not found under {augmented_root}. Run the AD stage first or pass the matching --stage-root."
         )
-    resolved_latent_checkpoint = (
-        resolve_checkpoint(latent_checkpoint)
-        if latent_checkpoint is not None
-        else resolve_checkpoint(stage_root / "latent_constraint" / "checkpoints")
-    )
     diffusion_config_dict = merged_config(diffusion_base_config, diffusion_overlay_config)
+    proj_block = diffusion_config_dict.get("dgpo", {}).get("projection_constraint", {})
+    proj_type = str(proj_block.get("type", "none")).strip().lower()
+    constraint_active = proj_type not in {"", "none", "off", "disabled", "false"}
+    resolved_latent_checkpoint = None
+    if constraint_active:
+        resolved_latent_checkpoint = (
+            resolve_checkpoint(latent_checkpoint)
+            if latent_checkpoint is not None
+            else resolve_checkpoint(stage_root / "latent_constraint" / "checkpoints")
+        )
     dgpo_overlay = build_dgpo_runtime_overlay(
         augmented_root=augmented_root,
         latent_checkpoint=resolved_latent_checkpoint,

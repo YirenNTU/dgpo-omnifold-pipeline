@@ -212,6 +212,39 @@ def _histogram_jsd(truth_counts: np.ndarray, pred_counts: np.ndarray) -> float:
     return float(jensenshannon(truth / truth_sum, pred / pred_sum))
 
 
+def _array_histogram_jsd(
+    truth_values: np.ndarray,
+    pred_values: np.ndarray,
+    *,
+    bin_edges: np.ndarray | None = None,
+    num_bins: int = 40,
+) -> float:
+    """Histogram JSD from raw truth/pred arrays using explicit or data-driven bin edges."""
+    truth = np.asarray(truth_values, dtype=np.float64).reshape(-1)
+    pred = np.asarray(pred_values, dtype=np.float64).reshape(-1)
+    truth = truth[np.isfinite(truth)]
+    pred = pred[np.isfinite(pred)]
+    if truth.size == 0 or pred.size == 0:
+        return float("nan")
+
+    edges = None if bin_edges is None else np.asarray(bin_edges, dtype=np.float64).reshape(-1)
+    if edges is None or edges.size < 2 or not np.all(np.isfinite(edges)) or not np.all(np.diff(edges) > 0):
+        merged = np.concatenate((truth, pred), axis=0)
+        lo, hi = [float(x) for x in np.nanpercentile(merged, [0.5, 99.5])]
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            return float("nan")
+        if hi <= lo:
+            center = float(np.nanmean(merged))
+            span = max(abs(center) * 0.1, 1.0)
+            lo, hi = center - span, center + span
+        pad = max(0.05 * (hi - lo), 1e-6)
+        edges = np.linspace(lo - pad, hi + pad, max(2, int(num_bins)) + 1)
+
+    truth_counts, _ = np.histogram(truth, bins=edges)
+    pred_counts, _ = np.histogram(pred, bins=edges)
+    return _histogram_jsd(truth_counts, pred_counts)
+
+
 @torch.no_grad()
 def _kin_hist_candidate_indices_per_event(
     rewards_kb: Tensor,
@@ -3294,9 +3327,8 @@ def train_step(
     model.train()
     ref_model.eval()
     freeze_reference_model(ref_model)
-
-    if constraint_state is None:
-        raise ValueError("constraint_state is required for DGPO projection training")
+    proj_cfg = resolve_projection_constraint_config(global_config.dgpo)
+    projection_active = bool(proj_cfg.active and constraint_state is not None)
 
     core = _unwrap_core_evenet(model)
     B = int(batch["x"].shape[0])
@@ -3347,18 +3379,22 @@ def train_step(
         advantages = torch.clamp(advantages, -float(adv_clip_max), float(adv_clip_max))
 
     beta_dgpo = float(beta)
-    proj_cfg = resolve_projection_constraint_config(global_config.dgpo)
     if int(global_step) == 0:
-        _log.info(
-            "[DGPO] projection_constraint active (latent_swd, frozen encoder): backward "
-            "uses pure DGPO main term only. Post-step AdamW-metric CPO on normalized "
-            "C_norm = (SWD(z_pred,z_truth) - swd_tt) / (swd_tt + eps) with epsilon=%.4g. "
-            "W&B: swd/* panel + projection/* CPO repair (x-axis global_step).",
-            float(proj_cfg.epsilon),
-        )
+        if projection_active:
+            _log.info(
+                "[DGPO] projection_constraint active (latent_swd, frozen encoder): backward "
+                "uses pure DGPO main term only. Post-step AdamW-metric CPO on normalized "
+                "C_norm = (SWD(z_pred,z_truth) - swd_tt) / (swd_tt + eps) with epsilon=%.4g. "
+                "W&B: swd/* panel + projection/* CPO repair (x-axis global_step).",
+                float(proj_cfg.epsilon),
+            )
+        else:
+            _log.info(
+                "[DGPO] pure DGPO mode: backward and optimizer step run without projection/CPO repair."
+            )
 
     candidate_weights_kb: Tensor | None = None
-    if proj_cfg.active_apply_to == "best_candidate":
+    if projection_active and proj_cfg.active_apply_to == "best_candidate":
         best_k = rewards.detach().argmax(dim=0)
         cols = torch.arange(B, device=device, dtype=torch.long)
         candidate_weights_kb = torch.zeros_like(rewards, dtype=torch.bool)
@@ -3407,7 +3443,11 @@ def train_step(
         loss_backward = loss_vel
         dlast["loss_velocity_training"] = loss_vel.detach()
         dlast["loss_total"] = loss_backward.detach()
-        dlast["projection/active"] = torch.tensor(1.0, device=device, dtype=torch.float64)
+        dlast["projection/active"] = torch.tensor(
+            1.0 if projection_active else 0.0,
+            device=device,
+            dtype=torch.float64,
+        )
         dlast["projection/pure_dgpo_backward"] = torch.tensor(
             1.0,
             device=device,
@@ -3457,7 +3497,7 @@ def train_step(
         optimizer.step()
         optimizer_ran = True
     diag_last = _mean_diag_dict(diags)
-    if optimizer_ran and theta_old_snap is not None:
+    if optimizer_ran and theta_old_snap is not None and projection_active:
         _dgpo_projection_repair_after_adamw(
             model=model,
             ref_model=ref_model,
@@ -3524,7 +3564,7 @@ def train_step(
     )
     out["train/grad/global_norm_pre_clip"] = float(grad_norm_pre_clip_max)
     out["train/grad/clip_active"] = 1.0 if grad_clip_active_any else 0.0
-    out["projection/active"] = 1.0
+    out["projection/active"] = 1.0 if projection_active else 0.0
     out["projection/pure_dgpo_backward"] = 1.0
     _append_projection_summary_metrics(out)
     _append_projection_constraint_panel_metrics(out)
@@ -3923,12 +3963,17 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "val_neutrino/px": "Same three-way overlay for neutrino p_x [GeV]; truth is denormalized invisible target, pred/ref from DDIM output.",
         "val_neutrino/py": "Same three-way overlay for neutrino p_y [GeV].",
         "val_neutrino/pz": "Same three-way overlay for neutrino p_z [GeV].",
+        "val_neutrino/jsd/current/*": "Histogram Jensen-Shannon distance between truth and current-policy validation distributions for the named kinematic. Lower is better.",
+        "val_neutrino/jsd/ref/*": "Histogram Jensen-Shannon distance between truth and frozen-reference validation distributions for the named kinematic. Lower is better.",
         "val_mass/w_mass": "W-boson mass reconstruction (assigned lepton + neutrino) vs truth-neutrino resonance mass, truth vs current policy vs frozen reference (wandb.Image); x-axis **epoch**.",
         "val_mass/top_mass": "Top mass reconstruction (assigned b + W) vs truth-neutrino resonance mass; same three-way overlay as val_mass/w_mass.",
+        "val_mass/jsd/current/*": "Histogram Jensen-Shannon distance between truth and current-policy validation mass distributions. Lower is better.",
+        "val_mass/jsd/ref/*": "Histogram Jensen-Shannon distance between truth and frozen-reference validation mass distributions. Lower is better.",
         # --- train_dist (epoch end, accumulated over all training batches; own wandb panel) ---
         "train_dist/pt": "1D density overlay: truth vs best-of-K training prediction for pT [GeV] (original scale), accumulated over all training batches in the epoch (wandb.Image). x-axis **epoch**. \"Best\" = combined-reward argmax among K candidates.",
         "train_dist/eta": "Same overlay for η (training); same candidate selection as train_dist/pt.",
         "train_dist/phi": "Same overlay for φ [rad] (training); same candidate selection as train_dist/pt.",
+        "train_dist/jsd/current/*": "Histogram Jensen-Shannon distance between truth and reward-best train rollout distributions, accumulated over the epoch. Feature names follow event_info.yaml invisible_feature_names (or px/py/pz in cartesian mode). Lower is better.",
         "train_dist/all/pt_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "train_dist/all/eta_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "train_dist/all/phi_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
@@ -6291,7 +6336,6 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     # no PPO clip or velocity KL anchor.
 
     proj_cfg_startup = resolve_projection_constraint_config(dg)
-    # The projection constraint is the frozen pre-trained latent-SWD encoder.
     constraint_ckpt_blob = (
         (
             ckpt_dict.get(_DGPO_CONSTRAINT_CKPT_KEY)
@@ -6300,72 +6344,76 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         if ckpt_dict is not None
         else None
     )
-    _validate_dgpo_constraint_resume(constraint_ckpt_blob, expected_type="latent_swd")
-    latent_cfg = proj_cfg_startup.latent_swd
-    if latent_cfg is None or not latent_cfg.checkpoint_file:
-        raise ValueError(
-            "dgpo.projection_constraint.latent_swd.checkpoint_file is required "
-            "(frozen encoder checkpoint)."
-        )
-    ckpt_file = Path(latent_cfg.checkpoint_file).expanduser()
-    if not ckpt_file.is_file():
-        raise FileNotFoundError(
-            f"latent_swd.checkpoint_file not found: {ckpt_file} "
-            "(frozen latent-constraint encoder)"
-        )
-    policy_norm = Path(
-        str(global_config.options.Dataset.normalization_file)
-    ).expanduser()
-    latent_norm_raw = latent_cfg.normalization_file.strip()
-    if latent_norm_raw:
-        latent_norm = Path(latent_norm_raw).expanduser()
-        if policy_norm.resolve() != latent_norm.resolve() and is_rank0:
-            _log.warning(
-                "[DGPO] latent_swd.normalization_file (%s) differs from policy "
-                "Dataset.normalization_file (%s); latent/policy neutrino spaces may "
-                "diverge.",
-                latent_norm,
-                policy_norm,
+    constraint_state: ProjectionConstraintState | None = None
+    if proj_cfg_startup.active:
+        _validate_dgpo_constraint_resume(constraint_ckpt_blob, expected_type="latent_swd")
+        latent_cfg = proj_cfg_startup.latent_swd
+        if latent_cfg is None or not latent_cfg.checkpoint_file:
+            raise ValueError(
+                "dgpo.projection_constraint.latent_swd.checkpoint_file is required "
+                "(frozen encoder checkpoint)."
             )
-    constraint_state = init_latent_swd_state(
-        latent_cfg,
-        device=device,
-        resume_payload=constraint_ckpt_blob,
-    )
-    broadcast_latent_swd_state(
-        constraint_state,
-        rank=rank,
-        world_size=world_size,
-        device=device,
-    )
-    if is_rank0:
-        enc = constraint_state.model
-        policy_norm_res = policy_norm.resolve()
-        latent_norm_cfg = latent_cfg.normalization_file.strip()
-        _log.info(
-            "[DGPO] DGPO + CPO + latent-SWD (frozen): checkpoint=%s margin=%.4g "
-            "num_projections=%s apply_to=%s world_size=%s latent_dim=%s d_model=%s "
-            "encoder_params=%.3fM policy_norm=%s latent_swd_norm=%s. "
-            "Encoder broadcast from rank 0; no on-policy retrain/finetune.",
-            str(ckpt_file),
-            float(latent_cfg.margin),
-            int(latent_cfg.num_projections),
-            latent_cfg.apply_to,
-            world_size,
-            enc.latent_dim,
-            enc.d_model,
-            sum(p.numel() for p in enc.parameters()) / 1e6,
-            policy_norm_res,
-            latent_norm_cfg or "(from checkpoint payload)",
+        ckpt_file = Path(latent_cfg.checkpoint_file).expanduser()
+        if not ckpt_file.is_file():
+            raise FileNotFoundError(
+                f"latent_swd.checkpoint_file not found: {ckpt_file} "
+                "(frozen latent-constraint encoder)"
+            )
+        policy_norm = Path(
+            str(global_config.options.Dataset.normalization_file)
+        ).expanduser()
+        latent_norm_raw = latent_cfg.normalization_file.strip()
+        if latent_norm_raw:
+            latent_norm = Path(latent_norm_raw).expanduser()
+            if policy_norm.resolve() != latent_norm.resolve() and is_rank0:
+                _log.warning(
+                    "[DGPO] latent_swd.normalization_file (%s) differs from policy "
+                    "Dataset.normalization_file (%s); latent/policy neutrino spaces may "
+                    "diverge.",
+                    latent_norm,
+                    policy_norm,
+                )
+        constraint_state = init_latent_swd_state(
+            latent_cfg,
+            device=device,
+            resume_payload=constraint_ckpt_blob,
         )
-        if constraint_ckpt_blob is not None:
+        broadcast_latent_swd_state(
+            constraint_state,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
+        if is_rank0:
+            enc = constraint_state.model
+            policy_norm_res = policy_norm.resolve()
+            latent_norm_cfg = latent_cfg.normalization_file.strip()
             _log.info(
-                "[DGPO] latent-SWD resume metadata from DGPO checkpoint: %s",
-                {
-                    k: constraint_ckpt_blob.get(k)
-                    for k in ("constraint_type", "checkpoint_file", "normalization_file")
-                },
+                "[DGPO] DGPO + CPO + latent-SWD (frozen): checkpoint=%s margin=%.4g "
+                "num_projections=%s apply_to=%s world_size=%s latent_dim=%s d_model=%s "
+                "encoder_params=%.3fM policy_norm=%s latent_swd_norm=%s. "
+                "Encoder broadcast from rank 0; no on-policy retrain/finetune.",
+                str(ckpt_file),
+                float(latent_cfg.margin),
+                int(latent_cfg.num_projections),
+                latent_cfg.apply_to,
+                world_size,
+                enc.latent_dim,
+                enc.d_model,
+                sum(p.numel() for p in enc.parameters()) / 1e6,
+                policy_norm_res,
+                latent_norm_cfg or "(from checkpoint payload)",
             )
+            if constraint_ckpt_blob is not None:
+                _log.info(
+                    "[DGPO] latent-SWD resume metadata from DGPO checkpoint: %s",
+                    {
+                        k: constraint_ckpt_blob.get(k)
+                        for k in ("constraint_type", "checkpoint_file", "normalization_file")
+                    },
+                )
+    elif is_rank0:
+        _log.info("[DGPO] projection_constraint.type=none -> pure DGPO (no CPO / latent-SWD repair).")
     if world_size > 1 and dist.is_initialized():
         dist.barrier()
 
@@ -6865,6 +6913,23 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                                 pred_label="Pred (train K=1 proxy)", xlabel="φ [rad]",
                             ),
                         })
+                    available_td_jsd_features = _available_truth_pred_features(
+                        td_all_merged,
+                        td_all_feature_names,
+                    )
+                    for feature_name in available_td_jsd_features:
+                        bin_edges = _generation_special_bin_edges(feature_name)
+                        td_log[f"train_dist/jsd/current/{feature_name}"] = _array_histogram_jsd(
+                            td_all_merged.get(
+                                f"{feature_name}_truth",
+                                np.array([], dtype=np.float64),
+                            ),
+                            td_all_merged.get(
+                                f"{feature_name}_pred",
+                                np.array([], dtype=np.float64),
+                            ),
+                            bin_edges=bin_edges,
+                        )
                     for feature_name in _available_truth_pred_features(
                         td_all_merged,
                         td_all_feature_names,
