@@ -19,9 +19,9 @@ import torch.multiprocessing as mp
 import vector
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-ML_PIPELINE_ROOT = REPO_ROOT / "ml_pipeline"
-EVENET_ROOT = ML_PIPELINE_ROOT / "EveNet-Full"
+ML_PIPELINE_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = ML_PIPELINE_ROOT.parent
+EVENET_ROOT = ML_PIPELINE_ROOT / "evenet_dgpo"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

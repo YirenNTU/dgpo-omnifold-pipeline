@@ -49,6 +49,10 @@ def _resolve_dataset_slice(
 
     ``target_rows`` is the exact row limit to apply after reading ``selected_files``.
     When it is ``None``, the full selected file set should be consumed.
+
+    Values in ``(0, 1]`` are fractions of the dataset; values greater than
+    ``1`` are absolute row caps.  In particular, ``1.0`` means 100% of the
+    dataset, matching the original EveNet configuration semantics.
     """
     limit_value = _normalize_dataset_limit(dataset_limit)
     if not parquet_files:
@@ -62,7 +66,7 @@ def _resolve_dataset_slice(
     if limit_float <= 0.0:
         return parquet_files, None, total_rows
 
-    if limit_float < 1.0:
+    if limit_float <= 1.0:
         target_rows = int(total_rows * limit_float)
     else:
         target_rows = min(int(limit_float), total_rows)

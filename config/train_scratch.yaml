@@ -23,7 +23,7 @@ logger:
     version: "v1"
 
 options:
-  default: /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/EveNet-Full/share/options/options.yaml
+  default: evenet_defaults/options.yaml
   Training:
     total_epochs: 1500
     epochs: 1500
@@ -169,7 +169,7 @@ options:
         "66": "n"
 
 network:
-  default: /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/EveNet-Full/share/network/network-20M.yaml
+  default: evenet_defaults/network-20M.yaml
 
   Body:
     GroupedSequentialEmbedding:
@@ -183,7 +183,7 @@ network:
     feature_drop: 0.0
 
 event_info:
-  default:  /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/config/generated_event_info.yaml
+  default: generated_event_info.yaml
 
 resonance:
-  default:  /global/homes/t/tihsu/lep_tree_ana/ml_pipeline/config/resonance.yaml
+  default: resonance.yaml

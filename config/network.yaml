@@ -1,4 +1,4 @@
-default: ../EveNet-Full/share/network/network-20M.yaml
+default: evenet_defaults/network-20M.yaml
 
 Body:
   GroupedSequentialEmbedding:

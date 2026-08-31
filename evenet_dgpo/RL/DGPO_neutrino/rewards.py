@@ -112,6 +112,10 @@ class BaseReward(ABC):
     def last_kinematic_deltas(self) -> dict[str, Tensor] | None:
         return None
 
+    def checkpoint_metadata(self) -> dict[str, Any] | None:
+        """Immutable reward identity saved in DGPO checkpoints when required."""
+        return None
+
 
 class ComponentNormalizedTruthDistanceReward(BaseReward):
     """Negative root-sum of per-component normalized squared errors."""
@@ -247,15 +251,24 @@ class ComponentNormalizedTruthDistanceReward(BaseReward):
         self._last_kinematic_deltas = kin_deltas
         self._last_topology_metrics = None
         if feature_names == ("theta", "phi"):
-            topology = tau_back_to_back_metrics(
-                candidates,
-                batch,
-                feature_names=feature_names,
+            visible_fields = (
+                "lead_a_visible_px",
+                "lead_a_visible_py",
+                "lead_a_visible_pz",
+                "lead_b_visible_px",
+                "lead_b_visible_py",
+                "lead_b_visible_pz",
             )
-            self._last_topology_metrics = {
-                name: (values * valid_kb).detach().contiguous()
-                for name, values in topology.items()
-            }
+            if all(field in batch for field in visible_fields):
+                topology = tau_back_to_back_metrics(
+                    candidates,
+                    batch,
+                    feature_names=feature_names,
+                )
+                self._last_topology_metrics = {
+                    name: (values * valid_kb).detach().contiguous()
+                    for name, values in topology.items()
+                }
         return reward
 
     def compute(
@@ -532,6 +545,30 @@ class RewardAggregator:
         if not isinstance(total, Tensor):
             raise RuntimeError("Aggregator produced non-tensor total.")
         return total, breakdown
+
+    def checkpoint_metadata(self) -> dict[str, Any] | None:
+        rows: list[dict[str, Any]] = []
+        has_immutable_source = False
+        for reward, weight in self.sources:
+            metadata = reward.checkpoint_metadata()
+            has_immutable_source = has_immutable_source or metadata is not None
+            rows.append(
+                {
+                    "name": reward.name,
+                    "weight": float(weight),
+                    "metadata": metadata,
+                }
+            )
+        if not has_immutable_source:
+            return None
+        return {"schema_version": 1, "sources": rows}
+
+    @property
+    def omnifold_source(self) -> BaseReward | None:
+        for reward, _weight in self.sources:
+            if reward.name == "omnifold":
+                return reward
+        return None
 
 
 __all__ = [

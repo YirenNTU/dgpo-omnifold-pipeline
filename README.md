@@ -1,810 +1,373 @@
-# ML Pipeline
+# Ztautau ML Pipeline
 
-This repository contains the Ztautau EveNet workflow used to convert central
-baseline parquet files into trained EveNet models, predictions, and
-QI/unfolding-ready inputs.
+This repository contains the self-contained Ztautau EveNet workflow:
 
-The complete workflow is:
+1. supervised diffusion training
+2. one-candidate-per-event OmniFold fitting
+3. OmniFold-guided DGPO with `K` diffusion candidates per event
 
-1. generate the EveNet event schema
-2. build EveNet input shards
-3. preprocess the shards into train, validation, test, and data splits
-4. train classification and invisible-particle generation models
-5. run prediction
-6. export predictions to the central QI layout
-7. run the central QI and forward-folding processors
+Run commands from the `ml_pipeline` root unless stated otherwise.
 
-## Repository Structure
-
-`ml_pipeline` is a submodule of `lep_tree_ana`. It also contains two nested
-submodules:
+## Repository layout
 
 ```text
-lep_tree_ana
-└── ml_pipeline                          github.com/tihsu99/ml_pipeline
-    └── EveNet-Full                      branch: tautau
-        └── evenet                       github.com/tihsu99/Core
-                                         branch: tautau
+ml_pipeline/
+├── NERSC/                         interactive multi-node Ray helpers
+├── config/                        diffusion, OmniFold, and DGPO YAMLs
+│   └── evenet_defaults/           vendored EveNet options/network defaults
+├── evenet_dgpo/
+│   ├── evenet/                    EveNet training implementation
+│   └── RL/DGPO_neutrino/          sampling, OmniFold, rewards, and DGPO
+├── preprocessing/                 EveNet preprocessing helpers
+├── scripts/
+│   ├── run_omnifold_stage.py
+│   └── train_neutrino_backend.py
+└── generate_event_info_yaml.py
 ```
 
-This repository also vendors a local DGPO compatibility layer under
-`ml_pipeline/evenet_dgpo/` so the neutrino-generation backend can be switched
-without changing the current prediction and export scripts.
+The active workflow does not require a separate EveNet-Full or EveNet-private
+checkout. Data, checkpoints, and generated training outputs remain on CFS or
+pscratch and are not stored in Git.
 
-The commands in this README assume that the current working directory is the
-top-level `lep_tree_ana` directory:
+## Current NERSC campaign paths
+
+| Item | Path |
+| --- | --- |
+| Full supervised training data | `/global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/train-diffusion` |
+| DGPO/OmniFold 40% training subset | `/pscratch/sd/y/yiren/Ztautau/dgpo_post_training_40pct/train` |
+| Validation data | `/global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/val-diffusion` |
+| Normalization | `/global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/normalization.pt` |
+| Shape metadata | `/global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/shape_metadata.json` |
+| Diffusion checkpoints | `/pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints` |
+| OmniFold output | `/pscratch/sd/y/yiren/Ztautau/omnifold_ztautau_v1` |
+| DGPO output | `/pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fresh_residual_v2` |
+
+The active configurations are:
+
+- `config/train_diffusion_nersc.yaml`: cold-start supervised diffusion
+- `config/train_diffusion_resume_nersc.yaml`: exact Lightning resume
+- `config/omnifold_ztautau.yaml`: standalone `K=1` OmniFold stage
+- `config/dgpo_omnifold_ztautau.yaml`: single-control `K=8` OmniFold-guided DGPO
+
+## Upload from a Mac
+
+Run this command on the Mac, not on Perlmutter. The trailing slashes copy the
+contents into the existing remote `ml_pipeline` directory. Do not add
+`--delete`; NERSC-only files such as generated event info may exist remotely.
 
 ```bash
-cd /path/to/lep_tree_ana
+rsync -avz --progress --partial \
+  --exclude='.git/' \
+  --exclude='.venv/' \
+  --exclude='__pycache__/' \
+  --exclude='*.pyc' \
+  --exclude='.pytest_cache/' \
+  --exclude='.mypy_cache/' \
+  --exclude='.ruff_cache/' \
+  --exclude='.ipynb_checkpoints/' \
+  --exclude='wandb/' \
+  --exclude='.DS_Store' \
+  /Users/yirenwu/Ztautau/ml_pipeline/ \
+  yiren@perlmutter.nersc.gov:/global/homes/y/yiren/ml_pipeline/
 ```
 
-Do not run the examples from inside `ml_pipeline` unless the command explicitly
-says otherwise.
-
-## Quick Start
-
-Initialize the ML submodule chain:
+## NERSC environment setup
 
 ```bash
-git submodule update --init --recursive ml_pipeline
+ssh yiren@perlmutter.nersc.gov
+cd /global/homes/y/yiren/ml_pipeline
+
+export PYTHONPATH="$PWD/evenet_dgpo:$PWD:${PYTHONPATH:-}"
+export TORCH_NCCL_TIMEOUT=180
+export WANDB_API_KEY=<YOUR_WANDB_API_KEY>
+
+source NERSC/start_interactive_ray.sh
 ```
 
-Create a Python 3.12 environment and install EveNet:
+Do not store the W&B key in YAML, README, or shell scripts.
+
+Generate the event schema after each relevant analysis/schema change:
 
 ```bash
-python3.12 -m venv .venv-ml
-source .venv-ml/bin/activate
-
-python3 -m pip install --upgrade pip
-python3 -m pip install -r ml_pipeline/EveNet-Full/requirements.txt
-python3 -m pip install -e ml_pipeline/EveNet-Full
-python3 -m pip install -r ml_pipeline/evenet_dgpo/requirements.txt
+shifter python3 generate_event_info_yaml.py \
+  --analysis-config config/analysis.yaml \
+  --evenet-config config/evenet_schema.yaml \
+  --output config/generated_event_info.yaml
 ```
 
-Expose the local pipeline modules:
+The generated file is intentionally NERSC-local and may be regenerated after
+each rsync.
+
+## Interactive 4-node × 4-GPU Ray cluster
+
+The training YAMLs use 16 Ray Train workers with one GPU per worker. Therefore
+the allocation and Ray status must expose four nodes and sixteen GPUs.
+
+### Option A: allocate and source Ray manually
+
+On a Perlmutter login node:
 
 ```bash
-export PYTHONPATH="$PWD/ml_pipeline:$PWD/ml_pipeline/EveNet-Full:$PYTHONPATH"
+salloc --nodes 4 --qos interactive --time 04:00:00 \
+  --constraint gpu --gpus-per-node=4 --account m5019_g \
+  --image=registry.nersc.gov/m2616/avencast/evenet:1.3
 ```
 
-Verify the installation:
+Check the allocation:
 
 ```bash
-python3 -c "import evenet, awkward, torch; print(torch.__version__)"
-evenet-train --help
-git submodule status --recursive ml_pipeline
+scontrol show job "$SLURM_JOB_ID" | grep -E 'TRES|NumNodes'
 ```
 
-The submodule status should list commits for all three repositories:
+From the shell holding that allocation:
+
+```bash
+cd /global/homes/y/yiren/ml_pipeline
+export PYTHONPATH="$PWD/evenet_dgpo:$PWD:${PYTHONPATH:-}"
+export TORCH_NCCL_TIMEOUT=180
+
+source NERSC/start_interactive_ray.sh
+```
+
+`source` is required so `head_node`, `head_node_ip`, `port`, and `RAY_ADDRESS`
+remain in the current shell. The shorter compatibility command is also valid:
+
+```bash
+source NERSC/interactive.sh
+```
+
+Verify the cluster before training:
+
+```bash
+shifter ray status --address="$RAY_ADDRESS"
+```
+
+Expected result: four active Ray nodes and `16.0 GPU` total.
+
+### Option B: allocate and start Ray with one command
+
+From a login node:
+
+```bash
+cd /global/homes/y/yiren/ml_pipeline
+export WANDB_API_KEY="<your-current-key>"
+bash NERSC/salloc_4node_16gpu_ray.sh
+```
+
+This opens an interactive compute-node shell, starts Ray, and exports
+`RAY_ADDRESS`. Exit that shell to release the allocation.
+
+Leave `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES` unset for normal training.
+Ray then assigns exactly one visible GPU to each worker.
+
+## Stage 1: supervised diffusion
+
+### Start or continue the cold-start configuration
+
+```bash
+shifter python3 evenet_dgpo/evenet/train.py \
+  config/train_diffusion_nersc.yaml \
+  --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/ray_results
+```
+
+### Resume an interrupted run
+
+The resume YAML restores `last.ckpt`, including live weights, optimizer state,
+epoch/global step, and the separately saved EMA state. It continues toward the
+same configured total epoch horizon.
+
+```bash
+shifter python3 evenet_dgpo/evenet/train.py \
+  config/train_diffusion_resume_nersc.yaml \
+  --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/ray_results_resume
+```
+
+Before the next stage, confirm:
+
+```bash
+test -f /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
+```
+
+## Optional standalone OmniFold diagnostic
+
+This standalone path remains useful for inspecting fixed K=1 pools, but it is
+not a prerequisite for the active DGPO launch. The active DGPO trainer now
+generates its own K=1 population, trains frozen-backbone OmniFold PEFT banks,
+and installs the resulting reward before its first policy update.
+
+Check paths and checkpoint compatibility:
+
+```bash
+shifter python3 scripts/run_omnifold_stage.py \
+  --train-config config/train_diffusion_nersc.yaml \
+  --omnifold-config config/omnifold_ztautau.yaml \
+  --stage check \
+  --device cuda
+```
+
+Build the fixed train/validation pools and fit the reward:
+
+```bash
+shifter python3 scripts/run_omnifold_stage.py \
+  --train-config config/train_diffusion_nersc.yaml \
+  --omnifold-config config/omnifold_ztautau.yaml \
+  --stage all \
+  --device cuda
+```
+
+Expected outputs:
 
 ```text
-ml_pipeline
-ml_pipeline/EveNet-Full
-ml_pipeline/EveNet-Full/evenet
+/pscratch/sd/y/yiren/Ztautau/omnifold_ztautau_v1/
+├── train_k1_pool.pt
+├── validation_k1_pool.pt
+└── omnifold_reward.pt
 ```
 
-Before running a campaign:
+Use `--stage pool` or `--stage fit` to run only one part. Add
+`--rebuild-pools` if the supervised checkpoint, input data, or sampler settings
+changed.
 
-1. edit `ml_pipeline/config/analysis.yaml`
-2. generate `ml_pipeline/config/generated_event_info.yaml`
-3. update all machine-specific paths in the selected training configs
-4. set `WANDB_API_KEY`
+## Stage 3: OmniFold-guided DGPO
 
-## Requirements
-
-- Python 3.12
-- Git with submodule support
-- CUDA-capable GPUs for normal training and inference
-- access to the central selected and raw parquet files
-- a writable campaign output directory
-- a Weights & Biases API key for the current EveNet training entry point
-
-Set the Weights & Biases key before training:
+Start DGPO from the same shell where Ray was sourced:
 
 ```bash
-export WANDB_API_KEY="<your-key>"
+shifter python3 evenet_dgpo/RL/DGPO_neutrino/dgpo_trainer.py \
+  config/dgpo_omnifold_ztautau.yaml \
+  --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fresh_residual_v2/ray_results
 ```
 
-The pinned Python dependencies are listed in
-`ml_pipeline/EveNet-Full/requirements.txt`.
+Like EveNet-private, DGPO is controlled by one complete YAML. The diffusion
+pretraining config is not merged at launch time.
 
-## Updating Submodules
+The active setup uses:
 
-Update only the ML submodule chain:
+- 16 distributed workers, one GPU each
+- 150 DGPO epochs (independent of the base diffusion YAML's 1500 epochs)
+- `1e-4` projector/head and `1e-5` body learning rates
+- `dgpo.K: 8` candidates per event
+- 1024 DGPO events per GPU/update, evaluated as four sequential gradient-bearing
+  256-event microbatches; rollout evaluates all K=8 chains together under no-grad
+- OmniFold/audit effective training batch 8192 rows per class/GPU, accumulated
+  from 2048-row gradient microbatches before one optimizer step
+- the EveNet-private shared-noise round-reference trust term (`coefficient: 1`)
+- live-policy DDIM sampling; EMA is still updated every step and checkpointed
+- an in-process, fail-closed K=1 OmniFold bootstrap before round 1
+- adaptive staleness probes and training-time OmniFold refits
+- live rank-0 console/W&B OmniFold fit metrics during classifier fitting
+- a recovery `last.ckpt` immediately after bootstrap and every 25 optimizer steps
+- TARP diagnostics and targeted one-dimensional physics distributions
+- W&B project `nu2flow-RL`
+
+For each OmniFold residual iteration, the frozen-backbone PEFT classifier must
+reach saturation before its weights are stored as a reward snapshot. The next
+iteration trains against the newly reweighted Gen population. The final closure
+classifier is logged but deliberately not stored in the reward.
+
+After a refit, installation no longer compares the candidate with a separately
+audited incumbent. The candidate is installed when its fresh held-out weighted
+balanced accuracy is strictly below `0.51` and both the residual fits and audit
+have reached their configured saturation condition.
+
+During each residual reward fit, acceptance audit, and staleness audit, rank 0
+logs `omnifold_live/*` periodically. Each classifier epoch now consumes the
+entire fit split exactly once, including a short final batch.
+
+The adaptive fresh audit runs every 10 DGPO logical epochs. Its retraining
+margin is a configurable hyperparameter, currently set to a 1 percentage-point
+AUC gap. The active trigger is
+`current_weighted_gap > installed_baseline_gap + 0.01`. This is the complete
+retraining rule; there is no statistical uncertainty guard or absolute floor.
+The single weighted audit judge checks its early-stop split after every complete
+epoch. If its AUC gap crosses the threshold, training stops and the untouched
+final split must confirm the crossing. Otherwise training continues until ten
+complete epochs in a row show no validation-loss improvement. Candidate
+installation always uses the saturated path; the old separate raw audit has
+been removed. The fresh PEFT audit logs separation and precision:
+
+- `staleness/judge_auc_weighted` and `staleness/weighted_auc_gap` test closure
+  after the installed OmniFold weights.
+- `staleness/audit_power_at_retrain_margin`,
+  `staleness/audit_minimum_detectable_auc_gap`, and
+  `staleness/audit_power_sufficient` report whether the held-out population
+  can resolve the configured `0.01` retraining margin. These are monitoring
+  metrics, not a hidden retraining gate.
+
+The active routine-audit cap is 600k events; its untouched 20% audit split gives
+about 120k examples per class. At ideal weight ESS this provides more than 85%
+power for a two-sided `|AUC-0.5|=0.01` test at `alpha=0.05`. W&B recomputes the
+actual power using the observed weight ESS. Ordinary K=16 validation remains
+capped near 53k events by `dgpo.validation_max_batches: 13`.
+
+Alternatively, this script starts Ray and launches the same DGPO command:
 
 ```bash
-git submodule sync --recursive ml_pipeline
-git submodule update --init --recursive ml_pipeline
+bash evenet_dgpo/RL/DGPO_neutrino/run-dgpo-4nodes-interactive.sh
 ```
 
-Specifying `ml_pipeline` avoids initializing unrelated top-level submodules.
+If Ray is already running in the current shell:
 
-The parent repository records exact commits. The configured branches are useful
-when deliberately updating the nested repositories, but a normal checkout uses
-the recorded commits for reproducibility.
+```bash
+DGPO_SKIP_RAY_START=1 \
+  bash evenet_dgpo/RL/DGPO_neutrino/run-dgpo-4nodes-interactive.sh
+```
 
-## Directory Layout
+## DGPO resume
 
-| Path | Purpose |
+DGPO checkpoints are written to:
+
+```text
+/pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fresh_residual_v2/checkpoints
+```
+
+To resume, change `options.Training.model_checkpoint_load_path` in
+`config/dgpo_omnifold_ztautau.yaml` from the supervised checkpoint to:
+
+```text
+/pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fresh_residual_v2/checkpoints/last.ckpt
+```
+
+Then run the same Stage 3 command. The checkpoint carries optimizer/EMA state,
+DGPO counters, active adaptive OmniFold reward stack, controller state, and the
+paired policy reference.
+
+## Validation
+
+Run the active Ztautau/OmniFold/DGPO tests locally:
+
+```bash
+PYTHONPATH="$PWD/evenet_dgpo:${PYTHONPATH:-}" python3 -m pytest -q \
+  evenet_dgpo/RL/DGPO_neutrino/test_dgpo_utils.py \
+  evenet_dgpo/RL/DGPO_neutrino/test_model_utils.py \
+  evenet_dgpo/RL/DGPO_neutrino/test_normalizer_denormalize_grad_parity.py \
+  evenet_dgpo/RL/DGPO_neutrino/test_rewards.py \
+  evenet_dgpo/RL/DGPO_neutrino/diagnostics/test_ztautau_validation.py \
+  evenet_dgpo/RL/DGPO_neutrino/omnifold_ztautau/test_adaptive.py \
+  evenet_dgpo/RL/DGPO_neutrino/omnifold_ztautau/test_ztautau_omnifold.py
+```
+
+## Common pitfalls
+
+| Symptom | Fix |
 | --- | --- |
-| `ml_pipeline/config/analysis.yaml` | Samples, input paths, luminosity, labels, regions, and feature layout. |
-| `ml_pipeline/config/evenet_schema.yaml` | Process and generation schema used to generate EveNet event information. |
-| `ml_pipeline/config/preprocess_config.yaml` | EveNet preprocessing configuration. |
-| `ml_pipeline/config/train_*_cls.yaml` | Classification training configurations. |
-| `ml_pipeline/config/train_pretrain.yaml` | Pretrained diffusion/generation configuration. |
-| `ml_pipeline/config/train_scratch.yaml` | Scratch diffusion/generation configuration. |
-| `ml_pipeline/config/ad_stage_overlay.yaml` | Stage-specific overlay for supervised AD/foundation training with its own checkpoint lineage. |
-| `ml_pipeline/config/dgpo_ztautau_overlay.yaml` | Ztautau-specific overlay that enables the DGPO backend. |
-| `ml_pipeline/config/dgpo_post_training_overlay.yaml` | Stage-specific overlay for DGPO post-training with its own checkpoint lineage. |
-| `ml_pipeline/build_evenet_input_from_parquet.py` | Convert central selected parquets into EveNet input shards. |
-| `ml_pipeline/generate_event_info_yaml.py` | Generate the EveNet event schema and JSON summary. |
-| `ml_pipeline/preprocess_evenet_parquet.py` | Create training splits and normalization metadata. |
-| `ml_pipeline/predict_evenet.py` | Run classification and invisible-particle inference. |
-| `ml_pipeline/export_evenet_qi_inputs.py` | Export predictions to the central QI/unfolding layout. |
-| `ml_pipeline/scripts/train_neutrino_backend.py` | Shared launcher for pure EveNet or DGPO-EveNet neutrino training. |
-| `ml_pipeline/scripts/run_ad_stage.py` | Stage 1 wrapper: freeze a classification backbone, export `event_token`/`object_token`, and train the latent constraint autoencoder. |
-| `ml_pipeline/scripts/run_dgpo_stage.py` | Stage 2 wrapper: launch DGPO/diffusion post-training on the AD-augmented parquet. |
-| `ml_pipeline/evenet_dgpo/` | Vendored EveNet + DGPO stack, including RL and latent-SWD constraint tooling. |
-| `ml_pipeline/monitor_input.py` | Produce optional input monitoring plots. |
-| `ml_pipeline/plot_channel_purity_side_by_side.py` | Compare channel yield, purity, and significance. |
-| `ml_pipeline/extract_qi_calibration_magnitude.py` | Summarize post-calibration shifts. |
-| `ml_pipeline/extract_qi_final_measurements.py` | Parse and plot final QI measurements. |
-| `ml_pipeline/extract_response_matrix_summary.py` | Summarize central response matrices. |
-| `ml_pipeline/util/` | Additional validation, debugging, and legacy-compatible utilities. |
+| `ModuleNotFoundError: evenet` | Export `PYTHONPATH="$PWD/evenet_dgpo:$PWD:${PYTHONPATH:-}"` from `ml_pipeline`. |
+| Included options/network YAML is missing | Re-rsync `config/evenet_defaults`; EveNet-Full is not required. |
+| `generated_event_info.yaml` is missing | Run the generator command in the NERSC setup section. |
+| `AF_UNIX path length cannot exceed 107 bytes` | Use the default short `/tmp/r${UID}_${SLURM_JOB_ID}` Ray directory. |
+| Ray cannot find a running instance | Source `NERSC/start_interactive_ray.sh` in the same shell used for training. |
+| Ray reports fewer than 16 GPUs | Reallocate with four nodes and `--gpus-per-node=4`; do not start training. |
+| Training waits for workers | Ensure `platform.number_of_workers: 16` and Ray exposes 16 GPUs. |
+| `omnifold_reward.pt` is missing | Complete Stage 2 before DGPO. |
+| `shifter: command not found` | Run on a Perlmutter host shell, not from inside an already-entered container shell. |
 
-## Configure a Campaign
+## Cleanup
 
-### Analysis Configuration
-
-Edit `ml_pipeline/config/analysis.yaml` before starting a new production.
-
-Check these fields:
-
-- `Samples.<sample>.input_files`: selected central parquet files, usually
-  `filtered___baseline.parquet`
-- `Samples.<sample>.raw_files`: raw central parquet files, usually
-  `filtered___raw.parquet`
-- `Samples.<sample>.is_data` and `is_signal`: sample behavior and target setup
-- `Samples.<sample>.lumi`: data luminosity in pb
-- `Samples.<sample>.norm_factor`: MC cross section or normalization factor in pb
-- `Inputs.Part` and `Inputs.Global`: EveNet input features
-- `Subcategories`: signal channel labels
-- `NeutrinoPrediction`: channels used for invisible-particle training and
-  prediction
-
-### Training Configuration
-
-Choose the appropriate configuration:
-
-| Goal | Configuration |
-| --- | --- |
-| Pretrained classification | `ml_pipeline/config/train_pretrain_cls.yaml` |
-| Scratch classification | `ml_pipeline/config/train_scratch_cls.yaml` |
-| Pretrained generation | `ml_pipeline/config/train_pretrain.yaml` |
-| Scratch generation | `ml_pipeline/config/train_scratch.yaml` |
-
-Every selected training config must be reviewed for machine-specific paths.
-At minimum, check:
-
-- `platform.data_parquet_dir`
-- `platform.data_parquet_val_dir`
-- `logger.wandb.entity`
-- `logger.local.save_dir`
-- `options.default`
-- `options.Training.model_checkpoint_save_path`
-- `options.Training.model_checkpoint_load_path`
-- `options.Training.pretrain_model_load_path`
-- `options.Dataset.normalization_file`
-- `network.default`
-- `event_info.default`
-- `resonance.default`
-
-Some committed configs contain example paths from previous NERSC campaigns.
-Replace every `/global/...` and `/pscratch/...` path before training.
-
-Relative `default` paths are resolved relative to the training config file.
-For example:
-
-```yaml
-options:
-  default: ../EveNet-Full/share/options/options.yaml
-
-network:
-  default: ../EveNet-Full/share/network/network-20M.yaml
-
-event_info:
-  default: generated_event_info.yaml
-
-resonance:
-  default: resonance.yaml
-```
-
-## Campaign Paths
-
-The examples below use one campaign directory:
+Exit the interactive shell or cancel the allocation:
 
 ```bash
-export CAMPAIGN_DIR=/path/to/campaign
-export INPUT_DIR="$CAMPAIGN_DIR/evenet-input-shards"
-export PREPROCESS_DIR="$CAMPAIGN_DIR/evenet-input"
-export PRED_DIR="$CAMPAIGN_DIR/evenet-prediction"
-export QI_DIR="$CAMPAIGN_DIR/qi-study"
-
-mkdir -p "$CAMPAIGN_DIR"
+scancel "$SLURM_JOB_ID"
 ```
 
-## Two-Stage AD + DGPO
-
-The wrapped DGPO workflow is intentionally split into two commands:
-
-1. `AD`: use a frozen classification backbone to export `event_token` and
-   `object_token`, then train the latent constraint autoencoder
-2. `DGPO`: run diffusion/DGPO post-training on the augmented parquet from
-   stage 1
-
-Minimal example:
-
-```bash
-python3 ml_pipeline/scripts/run_ad_stage.py \
-  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
-  --ad-backbone-checkpoint /path/to/ad_backbone.ckpt
-
-python3 ml_pipeline/scripts/run_dgpo_stage.py \
-  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
-  --dgpo-init-checkpoint /path/to/diffusion_init.ckpt
-```
-
-Those are only the smallest useful invocations. In practice, both wrappers also
-inherit a lot of behavior from their base config and overlay config files, so
-you usually need to know which defaults you are accepting.
-
-Stage 1 `run_ad_stage.py` defaults:
-
-- `--ad-base-config ml_pipeline/config/train_pretrain_cls.yaml`
-- `--ad-overlay-config ml_pipeline/config/ad_stage_overlay.yaml`
-- `--augmented-dirname ad_augmented`
-- `--token-batch-size 1024`
-- `--token-devices auto`
-- if `--ad-backbone-checkpoint` is omitted, the script falls back to
-  `options.Training.model_checkpoint_load_path` or
-  `options.Training.pretrain_model_load_path` from the AD config
-- if `--latent-checkpoint` is omitted, the script trains a new latent
-  constraint model and writes it under
-  `<stage-root>/latent_constraint/checkpoints`
-
-Stage 2 `run_dgpo_stage.py` defaults:
-
-- `--diffusion-base-config ml_pipeline/config/train_pretrain.yaml`
-- `--diffusion-overlay-config ml_pipeline/config/dgpo_post_training_overlay.yaml`
-- `--augmented-dirname ad_augmented`
-- if `--latent-checkpoint` is omitted, the script expects stage 1 to have
-  already produced `<stage-root>/latent_constraint/checkpoints/last.ckpt`
-- if `--dgpo-init-checkpoint` is omitted, the diffusion init checkpoint comes
-  from `options.Training.model_checkpoint_load_path` in the DGPO config / overlay
-
-Important prerequisites:
-
-- the AD base config must point to a split root in the form
-  `platform.data_parquet_dir=<root>/train` and
-  `platform.data_parquet_val_dir=<root>/val`; the wrapper validates this and
-  exports tokens for both splits together
-- the diffusion stage expects the augmented parquet from stage 1 to exist under
-  `<stage-root>/<augmented-dirname>/train` and
-  `<stage-root>/<augmented-dirname>/val`
-- the normalization file, Ray worker count, GPU usage, and most dataset /
-  training settings are not passed on the CLI here; they are inherited from the
-  selected base config plus overlay config
-
-Recommended explicit invocation:
-
-```bash
-python3 ml_pipeline/scripts/run_ad_stage.py \
-  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
-  --ad-base-config ml_pipeline/config/train_pretrain_cls.yaml \
-  --ad-overlay-config ml_pipeline/config/ad_stage_overlay.yaml \
-  --ad-backbone-checkpoint /path/to/ad_backbone.ckpt \
-  --token-batch-size 1024 \
-  --token-devices auto
-
-python3 ml_pipeline/scripts/run_dgpo_stage.py \
-  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
-  --diffusion-base-config ml_pipeline/config/train_pretrain.yaml \
-  --diffusion-overlay-config ml_pipeline/config/dgpo_post_training_overlay.yaml \
-  --latent-checkpoint "$CAMPAIGN_DIR/dgpo_run/latent_constraint/checkpoints/last.ckpt" \
-  --dgpo-init-checkpoint /path/to/diffusion_init.ckpt
-```
-
-Useful variants:
-
-- reuse precomputed token parquet and skip frozen token export:
-
-```bash
-python3 ml_pipeline/scripts/run_ad_stage.py \
-  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
-  --skip-export
-```
-
-- reuse an existing latent constraint checkpoint instead of retraining it:
-
-```bash
-python3 ml_pipeline/scripts/run_ad_stage.py \
-  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
-  --ad-backbone-checkpoint /path/to/ad_backbone.ckpt \
-  --latent-checkpoint /path/to/existing_latent.ckpt
-```
-
-- point stage 2 at a latent checkpoint stored somewhere else:
-
-```bash
-python3 ml_pipeline/scripts/run_dgpo_stage.py \
-  --stage-root "$CAMPAIGN_DIR/dgpo_run" \
-  --latent-checkpoint /path/to/existing_latent.ckpt \
-  --dgpo-init-checkpoint /path/to/diffusion_init.ckpt
-```
-
-What each stage writes:
-
-- stage 1 token export writes augmented parquet under
-  `<stage-root>/<augmented-dirname>/train` and
-  `<stage-root>/<augmented-dirname>/val`
-- stage 1 latent training writes runtime YAML under
-  `<stage-root>/runtime_configs/` and checkpoints / logs under
-  `<stage-root>/latent_constraint/`
-- stage 2 writes a generated DGPO overlay under
-  `<stage-root>/runtime_configs/` and DGPO checkpoints under
-  `<stage-root>/diffusion/checkpoints`
-
-Notes:
-
-- `--ad-backbone-checkpoint` and `--dgpo-init-checkpoint` are intentionally
-  separate, so AD and DGPO can start from different checkpoints
-- `run_ad_stage.py` does not fine-tune the backbone; it only uses the frozen
-  checkpoint to export tokens for the AD stack
-- both commands share the same `--stage-root`; stage 1 writes the augmented
-  parquet and latent checkpoint there, and stage 2 reads them back
-
-## End-to-End Workflow
-
-### 1. Generate EveNet Event Information
-
-Regenerate the event schema after changing sample labels, feature definitions,
-subcategories, neutrino-prediction channels, or the EveNet schema.
-
-```bash
-python3 ml_pipeline/generate_event_info_yaml.py \
-  --analysis-config ml_pipeline/config/analysis.yaml \
-  --evenet-config ml_pipeline/config/evenet_schema.yaml \
-  --output ml_pipeline/config/generated_event_info.yaml
-```
-
-Outputs:
-
-- `ml_pipeline/config/generated_event_info.yaml`
-- `ml_pipeline/config/generated_event_info.summary.json`
-
-The generated class order must match the class order used to build input shards
-and train EveNet.
-
-### 2. Build EveNet Input Shards
-
-Convert selected central parquet files into EveNet-ready shards:
-
-```bash
-python3 ml_pipeline/build_evenet_input_from_parquet.py \
-  --analysis-config ml_pipeline/config/analysis.yaml \
-  --output-dir "$INPUT_DIR" \
-  --batch-size 50000 \
-  --rows-per-shard 100000 \
-  --num-workers 4
-```
-
-Run only a subset of samples when testing:
-
-```bash
-python3 ml_pipeline/build_evenet_input_from_parquet.py \
-  --analysis-config ml_pipeline/config/analysis.yaml \
-  --output-dir "$INPUT_DIR" \
-  --samples Ztautau Zll Zqq \
-  --num-workers 4
-```
-
-Outputs:
-
-- `$INPUT_DIR/shards/<sample>/*.parquet`
-- `$INPUT_DIR/monitoring/<sample>/*.png`
-- `$INPUT_DIR/monitoring/comparison/*.png`
-- `$INPUT_DIR/manifest.json`
-
-Important behavior:
-
-- data events receive unit event weight
-- MC weights use `lumi * norm_factor / sum(initial_total_num_events)`
-- signal events receive truth invisible targets and truth angular observables
-- data events receive classification index `-1`
-- `$INPUT_DIR/manifest.json` is the input to preprocessing
-
-Success check:
-
-```bash
-test -f "$INPUT_DIR/manifest.json"
-```
-
-### 3. Preprocess for EveNet
-
-Create train, validation, test, diffusion, and data splits. The default split is
-`0.4,0.1,0.5`.
-
-```bash
-python3 ml_pipeline/preprocess_evenet_parquet.py \
-  --manifest "$INPUT_DIR/manifest.json" \
-  --config ml_pipeline/config/preprocess_config.yaml \
-  --store-dir "$PREPROCESS_DIR" \
-  --split-ratio 0.4,0.1,0.5 \
-  --num-workers 4 \
-  --verbose
-```
-
-Outputs:
-
-- `$PREPROCESS_DIR/train/*.parquet`
-- `$PREPROCESS_DIR/val/*.parquet`
-- `$PREPROCESS_DIR/test/*.parquet`
-- `$PREPROCESS_DIR/train-diffusion/*.parquet`
-- `$PREPROCESS_DIR/val-diffusion/*.parquet`
-- `$PREPROCESS_DIR/test-diffusion/*.parquet`
-- `$PREPROCESS_DIR/data/*.parquet`
-- `$PREPROCESS_DIR/shape_metadata.json`
-- `$PREPROCESS_DIR/normalization.pt`
-- `$PREPROCESS_DIR/preprocess_manifest.json`
-
-Use `train`, `val`, and `test` for classification. Use `train-diffusion`,
-`val-diffusion`, and `test-diffusion` for invisible-particle generation. The
-diffusion splits contain only events with valid invisible targets.
-
-Success check:
-
-```bash
-test -f "$PREPROCESS_DIR/normalization.pt"
-test -f "$PREPROCESS_DIR/shape_metadata.json"
-```
-
-### 4. Train EveNet Models
-
-Before training, update the selected config so that:
-
-- classification configs use `$PREPROCESS_DIR/train` and `$PREPROCESS_DIR/val`
-- generation configs use `$PREPROCESS_DIR/train-diffusion` and
-  `$PREPROCESS_DIR/val-diffusion`
-- `options.Dataset.normalization_file` points to
-  `$PREPROCESS_DIR/normalization.pt`
-- checkpoint paths point to writable campaign directories
-- all included config paths exist on the current machine
-
-Classification:
-
-```bash
-evenet-train ml_pipeline/config/train_pretrain_cls.yaml \
-  --ray_dir "$CAMPAIGN_DIR/ray/pretrain-cls"
-
-evenet-train ml_pipeline/config/train_scratch_cls.yaml \
-  --ray_dir "$CAMPAIGN_DIR/ray/scratch-cls"
-```
-
-Invisible-particle generation:
-
-```bash
-evenet-train ml_pipeline/config/train_pretrain.yaml \
-  --ray_dir "$CAMPAIGN_DIR/ray/pretrain-diffusion"
-
-evenet-train ml_pipeline/config/train_scratch.yaml \
-  --ray_dir "$CAMPAIGN_DIR/ray/scratch-diffusion"
-```
-
-The best checkpoints are written below
-`options.Training.model_checkpoint_save_path`.
-
-### 4b. Fine-Tune the Neutrino Backend with DGPO
-
-The DGPO path reuses the same base training YAML, then overlays RL-specific
-settings at launch time.
-
-Before running DGPO, make sure:
-
-- `config/train_pretrain.yaml` points to the diffusion train/val parquet and the
-  correct `normalization.pt`
-- `options.Training.model_checkpoint_load_path` points to the supervised
-  diffusion checkpoint you want to fine-tune
-- the DGPO parquet carries `event_token` and `object_token`
-- `config/dgpo_ztautau_overlay.yaml` is adjusted for the current campaign,
-  especially the latent-SWD checkpoint inputs if you enable the frozen
-  constraint
-
-Launch the original foundation trainer through the shared wrapper:
-
-```bash
-python3 ml_pipeline/scripts/train_neutrino_backend.py \
-  --backend pure-evenet \
-  --base-config ml_pipeline/config/train_pretrain.yaml \
-  --overlay-config ml_pipeline/config/ad_stage_overlay.yaml
-```
-
-Launch DGPO fine-tuning from the same base config:
-
-```bash
-python3 ml_pipeline/scripts/train_neutrino_backend.py \
-  --backend dgpo-evenet \
-  --base-config ml_pipeline/config/train_pretrain.yaml \
-  --overlay-config ml_pipeline/config/dgpo_post_training_overlay.yaml
-```
-
-Pass extra trainer arguments after `--`, for example:
-
-```bash
-python3 ml_pipeline/scripts/train_neutrino_backend.py \
-  --backend dgpo-evenet \
-  --base-config ml_pipeline/config/train_pretrain.yaml \
-  -- --ray_dir "$CAMPAIGN_DIR/ray/dgpo-diffusion"
-```
-
-The launcher writes a temporary merged runtime YAML, sets `PYTHONPATH` so the
-vendored `evenet_dgpo` package is importable, and then dispatches to either
-`evenet_dgpo/evenet/train.py` or
-`evenet_dgpo/RL/DGPO_neutrino/dgpo_trainer.py`.
-
-Recommended stage split:
-
-- `config/ad_stage_overlay.yaml`: use a dedicated `pretrain_model_load_path`
-  and output directory for the supervised AD/foundation stage.
-- `config/dgpo_post_training_overlay.yaml`: use a dedicated
-  `model_checkpoint_load_path` and output directory for DGPO post-training.
-- `config/dgpo_ztautau_overlay.yaml`: keep as the minimal domain/RL overlay
-  when you only want to switch the base config into DGPO mode without defining
-  a separate stage lineage.
-
-### 5. Run EveNet Prediction
-
-Run MC prediction on the converted test split:
-
-```bash
-python3 predict_evenet.py \
-  --analysis-config config/analysis.yaml \
-  --train-config config/train_pretrain.yaml \
-  --evenet-config config/evenet_schema.yaml \
-  --classification-checkpoint /path/to/classification/best.ckpt \
-  --diffusion-checkpoint /path/to/diffusion/best.ckpt \
-  --converted-parquet "$PREPROCESS_DIR/test" \
-  --shape-metadata "$PREPROCESS_DIR/shape_metadata.json" \
-  --output-dir "$PRED_DIR/mc" \
-  --converted-split-fraction 0.5 \
-  --batch-size 8192 \
-  --num-gpus 4 \
-  --num-steps [NUM STEP] \
-```
-
-Run data prediction separately:
-
-```bash
-python3 predict_evenet.py \
-  --analysis-config config/analysis.yaml \
-  --train-config config/train_pretrain.yaml \
-  --evenet-config config/evenet_schema.yaml \
-  --classification-checkpoint /path/to/classification/best.ckpt \
-  --diffusion-checkpoint /path/to/diffusion/best.ckpt \
-  --converted-parquet "$PREPROCESS_DIR/data" \
-  --shape-metadata "$PREPROCESS_DIR/shape_metadata.json" \
-  --output-dir "$PRED_DIR/data" \
-  --batch-size 8192 \
-  --num-gpus 4 \
-  --num-steps [NUM STEP] \
-
-```
-
-Useful options:
-
-- `--task-num-shards` and `--task-shard-index`: distribute prediction across
-  independent scheduler jobs
-- `--skip-merge`: keep `*.part*.parquet` outputs
-- `--merge-only`: merge existing parts without rerunning inference
-- `--delete-merged-parts`: remove parts after a successful merge
-- `--use-truth-classification`: skip classification inference and use stored
-  truth classes
-
-Prediction outputs:
-
-- `<input_stem>__evenet_pred.parquet`
-- optional `<input_stem>__evenet_pred.partNNN.parquet`
-
-`--converted-split-fraction 0.5` rescales MC weights because the test split
-contains half of the original MC events. Do not use it for data.
-
-### 6. Export Predictions to QI Inputs
-
-Export prediction parquets to the central processed-parquet layout:
-
-```bash
-python3 ml_pipeline/export_evenet_qi_inputs.py \
-  --analysis-config ml_pipeline/config/analysis.yaml \
-  --prediction-parquet \
-    "$PRED_DIR/mc/*__evenet_pred.parquet" \
-    "$PRED_DIR/data/*__evenet_pred.parquet" \
-  --base-dir "$QI_DIR" \
-  --methods evenet \
-  --num-workers 4 \
-  --batch-size 50000
-```
-
-The exporter expands quoted glob patterns internally.
-
-Use `--mc-split-fraction` only when the prediction step did not already apply
-the split correction. Never apply both `--converted-split-fraction` and
-`--mc-split-fraction` to the same MC prediction files.
-
-Outputs:
-
-- `$QI_DIR/evenet/processed/<sample>/filtered___raw.parquet`
-- `$QI_DIR/evenet/processed/<sample>/filtered___<region>.parquet`
-- `$QI_DIR/evenet/processed/<sample>/cutflow_<sample>.json`
-- `$QI_DIR/evenet/config_evenet.yaml`
-- `$QI_DIR/export_summary.json`
-
-### 7. Run Central QI and Forward Folding
-
-Run from the top-level central analysis environment:
-
-```bash
-python3 bin/tree_ana \
-  -c "$QI_DIR/evenet/config_evenet.yaml"
-```
-
-The central workflow writes QI and response-matrix outputs under the `run`
-directory configured by `config_evenet.yaml`.
-
-## Common Validation Commands
-
-### Monitor EveNet Inputs
-
-```bash
-python3 ml_pipeline/monitor_input.py \
-  --data-dir "$INPUT_DIR/shards/data94" \
-  --mc-dir \
-    "$INPUT_DIR/shards/Ztautau" \
-    "$INPUT_DIR/shards/Zll" \
-    "$INPUT_DIR/shards/Zqq" \
-  --config ml_pipeline/config/analysis.yaml \
-  --output-dir "$CAMPAIGN_DIR/monitor-input" \
-  --num-workers 4
-```
-
-### Compare Exported Channel Purity
-
-```bash
-python3 ml_pipeline/plot_channel_purity_side_by_side.py \
-  --method EveNet:"$QI_DIR/evenet" \
-  --baseline-xlsx data/baseline_yield.xlsx \
-  --output "$CAMPAIGN_DIR/channel_purity_side_by_side.png"
-```
-
-Add `--unblind` only when data/MC panels should be shown.
-
-### Summarize Calibration Magnitude
-
-```bash
-python3 ml_pipeline/extract_qi_calibration_magnitude.py \
-  --method EveNet:"$QI_DIR/evenet" \
-  --output-prefix "$CAMPAIGN_DIR/calibration_magnitude"
-```
-
-### Extract Final QI Measurements
-
-```bash
-python3 ml_pipeline/extract_qi_final_measurements.py \
-  --method EveNet:"$QI_DIR/evenet/run/QI_analysis/results.txt" \
-  --output-prefix "$CAMPAIGN_DIR/qi-results/evenet"
-```
-
-Compare multiple methods:
-
-```bash
-python3 ml_pipeline/extract_qi_final_measurements.py \
-  --method Baseline:/path/to/baseline/results.txt \
-  --method EveNet:"$QI_DIR/evenet/run/QI_analysis/results.txt" \
-  --output-prefix "$CAMPAIGN_DIR/qi-results/baseline-vs-evenet"
-```
-
-### Summarize Response Matrices
-
-```bash
-python3 ml_pipeline/extract_response_matrix_summary.py \
-  --method EveNet:"$QI_DIR/evenet/run/ForwardFoldingProcessor/response_matrices" \
-  --output-prefix "$CAMPAIGN_DIR/response-matrix/evenet"
-```
-
-## Troubleshooting
-
-### Nested Submodule Is Missing
-
-```bash
-git submodule sync --recursive ml_pipeline
-git submodule update --init --recursive ml_pipeline
-git submodule status --recursive ml_pipeline
-```
-
-### `ModuleNotFoundError: evenet`
-
-Verify that the nested Core repository exists:
-
-```bash
-test -f ml_pipeline/EveNet-Full/evenet/__init__.py
-```
-
-Then reinstall EveNet and set `PYTHONPATH`:
-
-```bash
-python3 -m pip install -e ml_pipeline/EveNet-Full
-export PYTHONPATH="$PWD/ml_pipeline:$PWD/ml_pipeline/EveNet-Full:$PYTHONPATH"
-```
-
-### `evenet-train: command not found`
-
-```bash
-python3 -m pip install -e ml_pipeline/EveNet-Full
-```
-
-Confirm that the active environment is the expected one:
-
-```bash
-command -v python3
-command -v evenet-train
-```
-
-### Included Config File Does Not Exist
-
-Inspect every `default:` entry in the selected training config:
-
-```bash
-grep -n "default:" ml_pipeline/config/train_pretrain.yaml
-```
-
-Replace stale absolute paths with valid absolute paths or paths relative to
-`ml_pipeline/config`.
-
-### Class Labels Do Not Match
-
-Regenerate the event information:
-
-```bash
-python3 ml_pipeline/generate_event_info_yaml.py \
-  --analysis-config ml_pipeline/config/analysis.yaml \
-  --evenet-config ml_pipeline/config/evenet_schema.yaml \
-  --output ml_pipeline/config/generated_event_info.yaml
-```
-
-Then rebuild input shards and rerun preprocessing.
-
-### Prediction Weights Are Too Small or Too Large
-
-Apply the MC split correction exactly once:
-
-- prediction: `--converted-split-fraction 0.5`
-- export: `--mc-split-fraction 0.5`
-
-Do not apply either option to data.
-
-### Export Cannot Find Raw Complement Events
-
-Check that every sample in `ml_pipeline/config/analysis.yaml` has valid
-`raw_files`. Export uses these files to rebuild the raw complement outside the
-selected baseline rows.
-
-## Updating the ML Repositories
-
-Normal users should use the commits recorded by the parent repositories.
-Maintainers updating a nested repository must commit and push from the inside
-out:
-
-1. commit and push `ml_pipeline/EveNet-Full/evenet`
-2. update, commit, and push `ml_pipeline/EveNet-Full`
-3. update, commit, and push `ml_pipeline`
-4. update and commit the `ml_pipeline` pointer in `lep_tree_ana`
-
-Each parent repository stores the exact commit of its child submodule.
+Ray logs for the head process are written to
+`/tmp/ray_head_${USER}_${SLURM_JOB_ID}.log` on the allocation.

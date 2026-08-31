@@ -1,0 +1,20 @@
+# Materialize a reproducible row-level 40% subset of the full Ztautau
+# train-diffusion population for standalone OmniFold fitting, DGPO training,
+# and adaptive OmniFold refits. Validation remains the independent full
+# val-diffusion split.
+
+source:
+  data_parquet_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/train-diffusion
+
+output:
+  train_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_post_training_40pct/train
+  val_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_post_training_40pct/_val_unused
+  copy_sidecars: true
+
+subset:
+  fraction: 0.4
+  # Keep all sampled rows in the training output. Validation comes from the
+  # separate val-diffusion directory.
+  val_split: [1.0, 1.0]
+  seed: 42
+  shuffle: true

@@ -1,7 +1,7 @@
 #!/bin/bash
 # DGPO neutrino on 4 Perlmutter GPU nodes.
-# Submit from the EveNet repo root:
-#   cd /path/to/EveNet-private && sbatch RL/DGPO_neutrino/submit-dgpo-4nodes.sbatch
+# Submit from the ml_pipeline repo root:
+#   sbatch evenet_dgpo/RL/DGPO_neutrino/submit-dgpo-4nodes.sbatch
 
 #SBATCH -C gpu
 #SBATCH --time=12:00:00
@@ -17,11 +17,12 @@
 #SBATCH --output=dgpo_4nodes_%j.out   # stdout+stderr → dgpo_4nodes_<jobid>.out
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-REPO_ROOT="/global/homes/y/yiren/EveNet-private"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 NERSC_SCRIPTS="${REPO_ROOT}/NERSC"
 
 # ── WandB ──────────────────────────────────────────────────────────────────
-export WANDB_API_KEY="2a0d7e3df0ce2abff1442fc210a5da54c19ea850"
+: "${WANDB_API_KEY:?Set WANDB_API_KEY before submitting DGPO}"
 
 # ── Ray cluster setup ──────────────────────────────────────────────────────
 head_node=$(hostname)
@@ -50,7 +51,7 @@ sleep 5
 
 # ── Environment ────────────────────────────────────────────────────────────
 cd "$REPO_ROOT" || exit 1
-export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+export PYTHONPATH="$REPO_ROOT/evenet_dgpo:$REPO_ROOT:${PYTHONPATH:-}"
 
 # NCCL settings for multi-node GPU communication
 export TORCH_NCCL_TIMEOUT=180
@@ -64,6 +65,11 @@ echo "Starting DGPO training on $SLURM_JOB_NUM_NODES nodes"
 echo "Repo: $REPO_ROOT"
 echo "=========================================="
 
-shifter python3 RL/DGPO_neutrino/dgpo_trainer.py RL/DGPO_neutrino/config.yaml
+shifter python3 scripts/train_neutrino_backend.py \
+  --backend dgpo-evenet \
+  --base-config config/train_diffusion_nersc.yaml \
+  --overlay-config config/dgpo_omnifold_overlay.yaml \
+  -- \
+  --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_v1/ray_results
 
 exit

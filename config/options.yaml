@@ -1,4 +1,4 @@
-default: ../EveNet-Full/share/options/options.yaml
+default: evenet_defaults/options.yaml
 
 Training:
   total_epochs: 100

@@ -57,7 +57,9 @@ class TestComponentNormalizedTruthDistanceReward(unittest.TestCase):
         }
         candidates = truth.unsqueeze(0).clone()
         candidates[0, 0, 0, 0] = 3.0
-        candidates[0, 0, 1, 1] = 4.0
+        # Keep the 3-4-5 check on non-periodic theta components. A 4-rad phi
+        # residual is correctly wrapped into [-pi, pi] by the reward.
+        candidates[0, 0, 1, 0] = 4.0
 
         reward = ComponentNormalizedTruthDistanceReward(
             {

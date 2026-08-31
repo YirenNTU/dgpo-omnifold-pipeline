@@ -3,6 +3,33 @@ import torch
 import torch.nn as nn
 
 
+def resolve_ema_update_every_n_steps(config) -> int:
+    """Return the configured EMA update interval.
+
+    ``update_every_n_steps`` is the canonical YAML key.  ``update_step`` is
+    retained as a fallback for checkpoints or configs written before the key
+    was standardized.
+    """
+
+    raw_interval = config.get(
+        "update_every_n_steps",
+        config.get("update_step", 1),
+    )
+    if isinstance(raw_interval, bool):
+        raise ValueError("EMA update_every_n_steps must be a positive integer")
+    try:
+        interval = int(raw_interval)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "EMA update_every_n_steps must be a positive integer"
+        ) from exc
+    if interval < 1 or (
+        isinstance(raw_interval, float) and not raw_interval.is_integer()
+    ):
+        raise ValueError("EMA update_every_n_steps must be a positive integer")
+    return interval
+
+
 class EMA:
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay

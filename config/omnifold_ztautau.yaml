@@ -1,0 +1,50 @@
+# Standalone OmniFold stage between supervised diffusion and DGPO for the
+# current NERSC Ztautau campaign.
+omnifold:
+  # Current OmniFold deliberately fits on one unbiased diffusion draw per event.
+  # DGPO's group size remains a separate dgpo.K setting.
+  candidates_per_event: 1
+  # Use the same seed-42 40% population as DGPO and adaptive refits.
+  train_parquet_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_post_training_40pct/train
+  validation_parquet_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/val-diffusion
+  shape_metadata: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/shape_metadata.json
+  policy_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
+  # Frozen EveNet body used by the candidate-aware ratio classifier. It may be
+  # the same checkpoint as policy_checkpoint when no separate backbone is used.
+  backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
+  output_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_ztautau_v1
+
+  pool_batch_size: 256
+  num_ddim_steps: 20
+  max_train_events: null
+  max_validation_events: null
+
+  min_iterations: 2
+  max_iterations: 12
+  stop_balanced_accuracy: 0.55
+  tempering: 1.0
+  seed: 20260819
+
+  adapter_bottleneck: 16
+  # Share one frozen EveNet body and train only the classifier PEFT bank.
+  train_layernorm: false
+  train_encoder: false
+  train_backbone: false
+  decoder_hidden_dim: 256
+  decoder_layers: 2
+  decoder_heads: 8
+  head_dropout: 0.1
+
+  fit:
+    batch_size: 8192
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    sampling: independent_epoch_shuffle
+    safety_max_epochs: 300
+    min_epochs: 1
+    validation_interval_epochs: 0.2
+    validation_patience_epochs: 5.0
+    validation_min_delta: 5.0e-4
+    validation_batch_size: 8192
+    restore_best: true
+    require_saturation: true

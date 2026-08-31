@@ -14,11 +14,8 @@ import numpy as np
 import yaml
 from matplotlib.colors import LinearSegmentedColormap
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-ML_PIPELINE_ROOT = REPO_ROOT / "ml_pipeline"
-EVENET_ROOT = ML_PIPELINE_ROOT / "EveNet-Full"
-if str(EVENET_ROOT) not in sys.path:
-    sys.path.insert(0, str(EVENET_ROOT))
+ML_PIPELINE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = ML_PIPELINE_ROOT.parent
 
 from build_evenet_input_from_parquet import merge_evenet_config, parse_config, read_yaml
 from ml_pipeline_config import parse_evenet_config

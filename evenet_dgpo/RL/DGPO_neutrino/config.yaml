@@ -186,7 +186,7 @@ resonance:
   # overwrites
   # ...
 wandb:
-  project: "Ztautau-RL"
+  project: "nu2flow-RL"
   entity: "ytchou97-university-of-washington"
   name: "Ztautau-RL-DGPO-evetoken"
   run_name: "Ztautau-RL-DGPO-evetoken"

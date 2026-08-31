@@ -1,0 +1,207 @@
+# OmniFold-guided DGPO overlay for the Ztautau angular-delta diffusion model.
+# The initial frozen-backbone PEFT OmniFold stack is fitted inside DGPO from the
+# same supervised policy checkpoint used to cold-start the policy.
+
+platform:
+  batch_size: 256
+  # Pre-materialized, seed-42 row-level 40% subset of train-diffusion.
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_post_training_40pct/train
+  data_parquet_val_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/val-diffusion
+
+options:
+  Dataset:
+    # The directory is already the desired 40%; do not limit it a second time.
+    dataset_limit: 1.0
+    # Keep enough held-out identities for ~80% power at |AUC-0.5|=0.005.
+    # Ordinary K=16 validation is capped separately below.
+    val_dataset_limit: 300000
+  Training:
+    # DGPO has its own optimization horizon; do not inherit the supervised
+    # diffusion run's 1500-epoch schedule through the base-config merge.
+    total_epochs: 150
+    epochs: 150
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
+    pretrain_model_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_v1/checkpoints
+    # Match the EveNet-private DGPO fine-tuning scale instead of inheriting the
+    # supervised diffusion optimizer (2e-4 for every effective group).
+    learning_rate: 1.0e-4
+    learning_rate_body: 1.0e-5
+    Components:
+      InvisibleInputProjector:
+        optimizer_group: projector
+        learning_rate: 1.0e-4
+      GroupedSequentialEmbedding:
+        optimizer_group: projector
+        learning_rate: 1.0e-4
+      GlobalEmbedding:
+        optimizer_group: body
+        learning_rate: 1.0e-5
+      PET:
+        optimizer_group: body
+        learning_rate: 1.0e-5
+      ObjectEncoder:
+        optimizer_group: object_encoder
+        learning_rate: 1.0e-5
+      TruthGeneration:
+        optimizer_group: truth_generation
+        learning_rate: 1.0e-4
+    EMA:
+      # Keep the save/eval EMA, but do not allocate a separate rollout EMA:
+      # DGPO rollouts use the live policy so OmniFold denominator snapshots align.
+      use_for_generation: false
+
+logger:
+  wandb:
+    # Same W&B project/entity as EveNet-private DGPO; keep a distinct run.
+    project: nu2flow-RL
+    entity: ytchou97-university-of-washington
+    run_name: Ztautau-OmniFold-Guided-DGPO
+    tags: [NERSC, Ztautau, DGPO, OmniFoldReward, TARP, TargetedPhysics]
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_v1/logs
+    name: EveNet-OmniFold-Guided-DGPO
+    version: v1
+
+rl:
+  enabled: true
+
+reward_config:
+  type: omnifold
+  weight: 1.0
+  omnifold:
+    # DGPO itself generates K=1 populations, fits each frozen-backbone PEFT
+    # classifier to saturation, stores its bank snapshot, and installs the
+    # stack before the first policy optimizer step. No prefit reward is needed.
+    bootstrap_in_dgpo: true
+    bundle_file: null
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
+    # Match EveNet-private: share one frozen EveNet body and train only the
+    # classifier PEFT bank (PET adapters, position encoder, decoder, output head).
+    require_full_finetune: false
+
+ztautau_domain:
+  enabled: true
+  feature_names: [theta, phi]
+
+dgpo:
+  # EveNet-private's density-ratio arm uses this estimator. Z-score is rejected
+  # for OmniFold because it removes the learned reward scale.
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  beta: 1.0
+  # Match EveNet-private: trust the policy snapshot paired with the installed
+  # OmniFold denominator. Disable the older truth-denoising beta_kl anchor.
+  beta_kl: 0.0
+  reference_trust:
+    enabled: true
+    coefficient: 1.0
+  num_ddim_steps: 20
+  # TARP needs a posterior pool. OmniFold fit/refit remains K=1 independently.
+  validation_K: 16
+  validation_num_ddim_steps: 20
+  rollout_parallel_chains: 8
+  validation_rollout_parallel_chains: 8
+  # Match the EveNet-private DGPO optimizer estimator and recovery cadence.
+  num_train_timesteps: 8
+  # Keep one (t, eps) draw per current/reference forward on 40 GiB GPUs.
+  # T=2 made the effective policy-evaluation batch 2*8*256=4096 and OOMed.
+  policy_eval_parallel_timesteps: 1
+  checkpoint_every_n_steps: 25
+  adv_clip_max: null
+  grad_clip_norm: 1.0
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  ema_rollout_decay_max: 0.3
+  ema_rollout_decay_ramp: 0.001
+  log_every: 1
+  log_reward_dist_every: 5
+  validation_every_n_epochs: 5
+  validation_compute_winrate: true
+  validation_log_batches: true
+  # 13 batches/rank x 256 x 16 ranks ~= 53k events for ordinary validation.
+  validation_max_batches: 13
+  diagnostic_plot_every: 5
+  ztautau_metrics:
+    enabled: true
+    # Candidate zero is always used for 1D truth/current/reference overlays.
+    candidate_index: 0
+    bins: 60
+    log_images: true
+  tarp:
+    enabled: true
+    # Conditional calibration bins use visible tau-pair acoplanarity, which is
+    # an observed input and is independent of truth and generated candidates.
+    profile: visible_acoplanarity
+    n_bins: 4
+    min_events: 500
+    arms: [full, rank_copula]
+    n_null_assignments: 399
+    n_reference_trials: 8
+    seed: 20260820
+    alpha: 0.05
+    pooled_panel: true
+  adaptive_omnifold:
+    enabled: true
+    log_only: false
+    # The in-process epoch -1 bootstrap installs the first stack and its
+    # independent fresh-audit baseline.
+    baseline_probe_on_start: true
+    # Run the fresh frozen-backbone PEFT separability/closure audit every epoch.
+    staleness_every_n_epochs: 1
+    trigger:
+      # Sole retraining threshold: deterioration beyond the installed baseline.
+      retrain_auc_margin: 0.005
+      required_consecutive_epochs: 1
+      require_audit_saturation: true
+      power_alpha: 0.05
+      power_target: 0.80
+      probe_seed: 20260818
+      # 20% is reserved for the untouched audit: 300k -> about 60k/class,
+      # giving ~85% ideal-ESS power for a 0.005 two-sided AUC gap at alpha=.05.
+      probe_max_events: 300000
+    recalibration:
+      # Always K=1 for the population fit; dgpo.K above stays 8.
+      candidates_per_event: 1
+      bootstrap_on_start: true
+      bootstrap_fail_closed: true
+      # Global K=1 event cap across all ranks. Each classifier sees 400k truth
+      # rows and 400k current-policy rows (800k balanced examples total).
+      pool_events: 400000
+      # Select the same 400k identities for bootstrap and every adaptive refit.
+      # Policy candidates are regenerated for those identities at each round.
+      pool_selection_seed: 42
+      min_iterations: 2
+      max_iterations: 12
+      acceptance_max_balanced_accuracy: 0.51
+      tempering: 1.0
+      seed: 20260819
+      # PET scoring is bounded by events*candidates, not just event count.
+      score_row_budget: 512
+      adapter_bottleneck: 16
+      # Freeze the classifier's EveNet body. These flags do not freeze the live
+      # DGPO policy, whose backbone remains trainable through Training.Components.
+      train_layernorm: false
+      train_encoder: false
+      train_backbone: false
+      decoder_hidden_dim: 256
+      decoder_layers: 2
+      decoder_heads: 8
+      head_dropout: 0.1
+      fit:
+        batch_size: 8192
+        learning_rate: 3.0e-4
+        weight_decay: 1.0e-4
+        sampling: independent_epoch_shuffle
+        safety_max_epochs: 300
+        min_epochs: 1
+        validation_interval_epochs: 0.2
+        validation_patience_epochs: 5.0
+        validation_min_delta: 5.0e-4
+        validation_batch_size: 8192
+        # Live console/W&B scalars; independent of validation and early stop.
+        progress_every_n_steps: 10
+        restore_best: true
+        require_saturation: true
+  projection_constraint:
+    type: none

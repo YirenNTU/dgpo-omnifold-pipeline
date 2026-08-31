@@ -30,7 +30,7 @@ from evenet.network.metrics.object_tag_embedding import ObjectTagEmbeddingLogger
 from evenet.network.metrics.segmentation import SegmentationMetrics
 from evenet.network.metrics.segmentation import shared_step as seg_step, shared_epoch_end as seg_end
 from evenet.network.loss.famo import FAMO
-from evenet.utilities.ema import EMA
+from evenet.utilities.ema import EMA, resolve_ema_update_every_n_steps
 
 from evenet.utilities.debug_tool import time_decorator, log_function_stats
 from evenet.utilities.task_scheduler import ProgressiveTaskScheduler
@@ -677,7 +677,8 @@ class EveNetEngine(L.LightningModule):
         # === Update EMA ===
         if self.ema_model is not None:
             update_epoch = self.current_epoch >= self.ema_cfg.get("start_epoch", 0)
-            update_step = self.current_step % self.ema_cfg.get("update_step", 1) == 0
+            update_every_n_steps = resolve_ema_update_every_n_steps(self.ema_cfg)
+            should_update_step = self.current_step % update_every_n_steps == 0
 
             current_parameters = self.task_scheduler.get_current_parameters(
                 epoch=self.current_epoch,
@@ -686,7 +687,7 @@ class EveNetEngine(L.LightningModule):
             )
 
             train_parameters = current_parameters["train_parameters"]
-            if update_epoch and update_step:
+            if update_epoch and should_update_step:
                 self.ema_model.update(self.model, decay_=train_parameters.get("ema_decay", None))
 
         # -------------------------------------

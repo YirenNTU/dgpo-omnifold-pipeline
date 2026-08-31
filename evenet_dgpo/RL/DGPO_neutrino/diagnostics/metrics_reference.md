@@ -22,10 +22,18 @@ Logged every optimizer step: `reward/monitor/best_of_k`, `median`, `mean_gap`, `
 
 | Key | Description |
 |-----|-------------|
-| `train/loss/total` | Scalar passed to `backward()`: DGPO main term plus any enabled supervised diffusion anchor and auxiliary regularizers. CPO repair runs after AdamW. |
+| `train/loss/total` | Scalar passed to `backward()`: DGPO main term plus the configured round-reference trust, optional supervised anchor, and auxiliary regularizers. CPO repair runs after AdamW. |
 | `train/loss/dgpo` | DGPO main: detached gate × advantage × `L_cur`. |
-| `train/loss/kl` | Weighted supervised diffusion anchor `beta_kl * mean_row |v_pred - v_truth|^2` on the same noisy inputs. |
+| `train/loss/kl` | Legacy supervised diffusion anchor. It is zero in the active OmniFold overlay (`beta_kl: 0`). |
 | `train/loss/L_cur` / `L_ref` / `delta` | Current vs reference velocity MSE diagnostics. |
+
+## `reference_trust/` — paired round-reference anchor
+
+| Key | Description |
+|-----|-------------|
+| `reference_trust/loss` | `0.5 * masked_mean((v_policy-v_round_ref)^2)` on the same `(t, eps)` draw as the DGPO loss. |
+| `reference_trust/velocity_mse_ratio` | Trust velocity MSE divided by the round reference's own velocity loss. |
+| `reference_trust/coefficient` | Configured trust multiplier; `1.0` in the active Ztautau overlay. |
 
 ## `train/grad/`
 
@@ -69,6 +77,8 @@ Also logged: `projection/multi_sample/C_mean` (mean C_norm over multi-sample dra
 ## `train_dist/*` — training kinematics (epoch end)
 
 `train_dist/{pt,eta,phi}`: best-of-K reward argmax vs truth, accumulated over the epoch.
+When `dgpo.train_dist_enabled: false`, this path is fully cold: no per-step truth/pred
+arrays, histogram buffers, cross-rank gathers, figures, or W&B uploads are produced.
 
 ## `diagnostics/ztautau_back_to_back/*`
 
@@ -81,8 +91,15 @@ Logged per train step for both `all/*` rollout candidates and reward-selected `b
 End-of-epoch DDIM validation (`validation_K` candidates). `val/reward/mean` drives top-K checkpoint selection. `val_neutrino/*` overlays truth / current policy / frozen reference for neutrino kinematics (pT, η, φ, and p_x/p_y/p_z in GeV).
 
 Also logged as scalars:
+
 - `val_neutrino/jsd/current/{pt,eta,phi,px,py,pz}`: JSD between truth and current-policy validation histograms.
 - `val_neutrino/jsd/ref/{pt,eta,phi,px,py,pz}`: JSD between truth and frozen-reference validation histograms.
+- `val_neutrino/all_metrics/{feature}/{count,mae,rmse,bias,pearson_r,slope,intercept}`: pooled truth-vs-pred response summaries.
+- `val_neutrino/by_process/{process}/metrics/{feature}/*`: the same response summaries split by EVENT process; the corresponding `*_truth_vs_pred` keys are 2D response panels.
+
+`val/response/*` compares the fixed pre-DGPO validation baseline with the current
+policy. It includes pooled reward and event-mean pT-delta panels/metrics plus
+`val/response/by_process/{process}/*` reward response panels and metrics.
 
 ## `val_mass/*`
 
@@ -92,10 +109,71 @@ Also logged as scalars:
 - `val_mass/jsd/current/{w_mass,top_mass}`: JSD between truth and current-policy mass histograms.
 - `val_mass/jsd/ref/{w_mass,top_mass}`: JSD between truth and frozen-reference mass histograms.
 
+## `val_ztautau/*` — targeted Ztautau physics
+
+Enabled by `ztautau_domain.enabled` with `feature_names: [theta, phi]`. These
+truth/current/reference 1D density overlays always use candidate zero for the
+current policy and candidate zero for the frozen reference. They never use the
+reward-best member of the validation group.
+
+- `val_ztautau/target/*`: the four diffusion targets
+  (`tau_{a,b}_delta_{theta,phi}`).
+- `val_ztautau/reco/*`: reconstructed tau-a/tau-b theta and phi after the
+  shared direction reconstruction.
+- `val_ztautau/topology/*`: `cos_opening`, `delta_phi_to_pi`,
+  `back_to_back_loss`, and the shared physics-calibration direction changes
+  `calibration_deltaR_{a,b,sum}`.
+- `val_ztautau/jsd/{current,ref}/*`: histogram Jensen-Shannon distance to
+  truth; lower is better.
+- `val_ztautau/residual/{current,ref}/*/{mean,abs_mean}`: paired candidate-zero
+  residual summaries. Phi residuals are periodic.
+
+## `val_tarp/*` — posterior calibration
+
+TARP uses all `dgpo.validation_K` candidates for each event; it is therefore
+separate from the candidate-zero 1D panels. The conditional decision panel
+bins events by visible tau-pair acoplanarity, which is observed input and does
+not use target truth or generated candidates.
+
+- `val_tarp/tarp_binned_min_holm_pvalue`: family-wise Holm-adjusted minimum
+  p-value across acoplanarity bins and configured joint arms. Values below
+  `dgpo.tarp.alpha` reject calibration.
+- `val_tarp/bin*/{full,rank_copula}_{pvalue,holm_pvalue,max_gap}`: per-bin
+  diagnostics and coverage gaps.
+- `val_tarp/geometry/{events,candidates,holm_power_floor}`: effective test
+  geometry and the attainable family-wise p-value floor.
+- `val_tarp/coverage`: binned coverage curves. `val_tarp/pooled_*` is an
+  orientation-only pooled panel; use the binned Holm value for decisions.
+
+The OmniFold population fit and adaptive refits are independent K=1 draws.
+`dgpo.validation_K: 16` does not change the OmniFold fitting population or
+`dgpo.K` used by training.
+
+## Live OmniFold fitting
+
+The active Ztautau config publishes periodic rank-0 classifier progress.
+`omnifold_live/meta/{fit_step,iteration,dgpo_epoch,global_step}` identifies the
+fit position. Every classifier epoch traverses its complete fit split exactly
+once. The phase-specific namespaces are:
+
+- `omnifold_live/residual_reward/*`
+- `omnifold_live/acceptance_audit/*`
+- `omnifold_live/staleness_audit/*`
+
+Each phase reports training loss and balanced accuracy. Once a validation has
+run, it also reports validation loss, validation balanced accuracy, validation
+AUC/AUC gap when available, best validation loss, threshold-crossing state, and
+saturation state. The W&B chart step is
+`omnifold_live/log_index`; the physical classifier step remains
+`omnifold_live/meta/fit_step`.
+
 ## Config knobs
 
 See `rl.enabled` and numeric fields in `RL/DGPO_neutrino/config.yaml`. Notable:
 
 - `dgpo.K`, `dgpo.num_train_timesteps`, `dgpo.beta`, `dgpo.adv_clip_max`
+- `dgpo.reference_trust.enabled`, `dgpo.reference_trust.coefficient`
+- `dgpo.validation_K`, `dgpo.ztautau_metrics.*`, `dgpo.tarp.*`
+- `dgpo.adaptive_omnifold.recalibration.fit.progress_every_n_steps`
 - `dgpo.projection_constraint.epsilon`, `multi_sample.samples`, `trust_region_ratio`
 - `dgpo.projection_constraint.latent_swd.checkpoint_file`, `margin`, `num_projections`, `min_samples`, `apply_to`

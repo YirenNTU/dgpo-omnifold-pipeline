@@ -9,6 +9,7 @@ from evenet.network.layers.transformer import TransformerBlockModule
 from evenet.network.layers.utils import RandomDrop
 import torch
 from evenet.network.body.adapter import Adapter
+from torch.utils.checkpoint import checkpoint
 
 class EmbeddingStack(nn.Module):
     def __init__(self, linear_block_type: str,
@@ -263,7 +264,8 @@ class PETBody(nn.Module):
     def __init__(
             self, num_feat, num_keep, feature_drop, projection_dim, local, K, num_local,
             num_layers, num_heads, drop_probability, talking_head, layer_scale,
-            layer_scale_init, dropout, mode, use_adapter: bool = False
+            layer_scale_init, dropout, mode, use_adapter: bool = False,
+            adapter_bottleneck: int = 16
     ):
         super().__init__()
         self.num_keep = num_keep
@@ -277,6 +279,9 @@ class PETBody(nn.Module):
         self.layer_scale_init = layer_scale_init
         self.dropout = dropout
         self.mode = mode
+        # DGPO may enable block-wise non-reentrant checkpointing at runtime.
+        # It remains off for ordinary EveNet training and inference.
+        self.gradient_checkpointing = False
 
         self.random_drop = RandomDrop(feature_drop if 'all' in self.mode else 0.0, num_keep)
         self.feature_embedding = nn.Sequential(
@@ -303,7 +308,7 @@ class PETBody(nn.Module):
         self.use_adapter = use_adapter
         if self.use_adapter:
             self.adapters = nn.ModuleList([
-                Adapter(projection_dim, bottleneck=16, dropout=dropout)
+                Adapter(projection_dim, bottleneck=adapter_bottleneck, dropout=dropout)
                 for _ in range(num_layers)
             ])
 
@@ -314,7 +319,8 @@ class PETBody(nn.Module):
                 mask: Tensor,
                 time: Tensor,
                 attn_mask: Optional[Tensor]=None,
-                time_masking: Optional[Tensor]=None) -> Tensor:
+                time_masking: Optional[Tensor]=None,
+                adapters: Optional[nn.ModuleList]=None) -> Tensor:
         """
 
         :param input_features: input features (batch_size, num_objects, num_features)
@@ -350,14 +356,41 @@ class PETBody(nn.Module):
             encoded = local_features + encoded  # Combine with original features
 
         skip_connection = encoded
-        for itransformer, transformer_block in enumerate(self.transformer_blocks):
-            encoded = transformer_block(
-                x=encoded,
-                mask=mask,
-                attn_mask=attn_mask
+        adapter_stack = adapters
+        if adapter_stack is None and self.use_adapter:
+            adapter_stack = self.adapters
+        if adapter_stack is not None and len(adapter_stack) != len(self.transformer_blocks):
+            raise ValueError(
+                "PET adapter count must match transformer depth, "
+                f"got {len(adapter_stack)} vs {len(self.transformer_blocks)}"
             )
-            if self.use_adapter:
-                encoded = self.adapters[itransformer](encoded)
+        for itransformer, transformer_block in enumerate(self.transformer_blocks):
+            checkpoint_block = bool(
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+                and any(
+                    parameter.requires_grad
+                    for parameter in transformer_block.parameters()
+                )
+            )
+            if checkpoint_block:
+                encoded = checkpoint(
+                    transformer_block,
+                    encoded,
+                    mask,
+                    attn_mask,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                encoded = transformer_block(
+                    x=encoded,
+                    mask=mask,
+                    attn_mask=attn_mask
+                )
+            if adapter_stack is not None:
+                encoded = adapter_stack[itransformer](encoded)
                 encoded = encoded * mask.float()
 
 
@@ -440,4 +473,3 @@ class PointCloudPositionalEmbedding(nn.Module):
         x = (x + position_token) * x_mask.float()
 
         return x  # (B, N, D)
-

@@ -174,6 +174,8 @@ class EveNetModel(nn.Module):
             layer_scale_init=pet_config.layer_scale_init,
             dropout=pet_config.dropout,
             mode=pet_config.mode,
+            use_adapter=pet_config.get("use_adapter", False),
+            adapter_bottleneck=pet_config.get("adapter_bottleneck", 16),
         )
 
         # [2] Classification + Regression + Assignment Body

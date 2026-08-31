@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -77,10 +79,12 @@ def resolve_checkpoint_path(
     config: Config,
     checkpoint_path: str | Path | None,
 ) -> Path | None:
-    """Prefer explicit path; else YAML paths in EveNet order (resume ckpt before pretrain-only)."""
+    """Prefer explicit path; fail if a configured checkpoint does not exist."""
     if checkpoint_path is not None:
         p = Path(checkpoint_path).expanduser().resolve()
-        return p if p.is_file() else None
+        if not p.is_file():
+            raise FileNotFoundError(f"configured DGPO checkpoint does not exist: {p}")
+        return p
     tr = config.options.Training
     for key in ("model_checkpoint_load_path", "pretrain_model_load_path"):
         raw = getattr(tr, key, None)
@@ -89,7 +93,69 @@ def resolve_checkpoint_path(
         p = Path(str(raw)).expanduser().resolve()
         if p.is_file():
             return p
+        raise FileNotFoundError(
+            f"options.Training.{key} does not exist or is not a file: {p}"
+        )
     return None
+
+
+def select_dgpo_training_state(
+    checkpoint: dict[str, Any] | None,
+    *,
+    load_mode: str,
+) -> dict[str, Any] | None:
+    """Select whether a loaded checkpoint also restores DGPO training state.
+
+    ``weights_only`` keeps the policy weights already loaded by
+    :func:`load_evenet_model_for_dgpo`, but presents no checkpoint state to the
+    reference/EMA/optimizer/controller builders.  This creates a true fresh
+    DGPO run initialized from an existing policy.
+    """
+    mode = str(load_mode).strip().lower()
+    if mode == "resume":
+        return checkpoint
+    if mode == "weights_only":
+        return None
+    raise ValueError(
+        "dgpo.checkpoint_load_mode must be 'resume' or 'weights_only', "
+        f"got {load_mode!r}"
+    )
+
+
+def dgpo_snapshot_checkpoint_name(
+    *,
+    last_completed_epoch: int,
+    dgpo_next_epoch: int,
+    global_step: int,
+) -> str:
+    """Stable filename for an unpruned DGPO recovery snapshot."""
+    return (
+        f"dgpo-epoch={int(last_completed_epoch)}-"
+        f"next_ep={int(dgpo_next_epoch)}-step={int(global_step)}.ckpt"
+    )
+
+
+def update_last_checkpoint_pointer(snapshot_path: Path | str) -> Path:
+    """Atomically point ``last.ckpt`` at a saved snapshot without losing legacy last."""
+    snapshot = Path(snapshot_path).expanduser().resolve()
+    if not snapshot.is_file():
+        raise FileNotFoundError(f"DGPO snapshot does not exist: {snapshot}")
+    last = snapshot.parent / "last.ckpt"
+    preserved = snapshot.parent / "dgpo-preserved-last-before-snapshot-mode.ckpt"
+    if last.exists() and not last.is_symlink() and not preserved.exists():
+        os.replace(last, preserved)
+        _log.info("[DGPO/model] Preserved previous regular last.ckpt as %s", preserved)
+    temporary = snapshot.parent / f".last.ckpt.tmp-{os.getpid()}"
+    try:
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+        temporary.symlink_to(snapshot.name)
+        os.replace(temporary, last)
+    finally:
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+    _log.info("[DGPO/model] Updated last.ckpt → %s", snapshot.name)
+    return last
 
 
 def load_weights_like_configure_model(
@@ -127,6 +193,33 @@ def freeze_reference_model(model: nn.Module) -> None:
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
+
+
+def unwrap_for_state_dict(model: nn.Module) -> nn.Module:
+    """Return the repository-native EveNet module behind DDP/trainer wrappers."""
+    current = model
+    if isinstance(current, nn.parallel.DistributedDataParallel):
+        current = current.module
+    inner = getattr(current, "eve_net", None)
+    if isinstance(inner, nn.Module):
+        current = inner
+    if hasattr(current, "_orig_mod"):
+        current = current._orig_mod
+    return current
+
+
+def state_dict_sha256(model: nn.Module) -> str:
+    """Stable digest of model tensor names, dtypes, shapes, and bytes."""
+    digest = hashlib.sha256()
+    state = unwrap_for_state_dict(model).state_dict()
+    for name in sorted(state):
+        tensor = state[name].detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(tensor.dtype).encode())
+        digest.update(repr(tuple(tensor.shape)).encode())
+        byte_view = tensor.reshape(1) if tensor.ndim == 0 else tensor
+        digest.update(byte_view.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _debug_verify_component_freeze(
@@ -320,6 +413,26 @@ def make_reference_model(
     return model_ref
 
 
+def make_round_reference_model(
+    fallback_reference: EveNetModel,
+    config: Config,
+    normalization_dict: dict[str, Any],
+    device: torch.device,
+    checkpoint: dict[str, Any] | None = None,
+) -> EveNetModel:
+    """Frozen policy paired with the currently installed adaptive ratio reward."""
+    model_ref = build_evenet_on_device(config, normalization_dict, device)
+    if checkpoint is not None and "dgpo_round_ref_state_dict" in checkpoint:
+        safe_load_state(model_ref, checkpoint["dgpo_round_ref_state_dict"])
+        _log.info("[DGPO/model] Restored adaptive OmniFold round reference.")
+    else:
+        model_ref.load_state_dict(unwrap_for_state_dict(fallback_reference).state_dict())
+        _log.info("[DGPO/model] Initialized round reference from the fixed reference.")
+    freeze_reference_model(model_ref)
+    assert_reference_model_frozen(model_ref, where="make_round_reference_model")
+    return model_ref
+
+
 def make_ema(
     model: EveNetModel,
     config: Config,
@@ -346,17 +459,24 @@ def make_ema_rollout(
     checkpoint: dict[str, Any] | None = None,
     device: torch.device | None = None,
 ) -> EMA | None:
-    """Build a second EMA used only for Phase-1 rollout; decay is set each step via ``update(..., decay_=...)``.
+    """Build the optional EMA used only for Phase-1 rollout.
 
-    Decay is overridden per step via :meth:`EMA.update`; the constructor value is unused.
+    Live-policy generation (``EMA.use_for_generation: false``) returns ``None`` so
+    no unused rollout shadow is allocated, updated, restored, or checkpointed.
+    When enabled, decay is overridden per step via :meth:`EMA.update`; the
+    constructor value is unused.
     On resume, the smoothed rollout shadow is restored from ``dgpo_ema_rollout_state_dict`` when
     present so the Phase-1 rollout policy is continuous across sessions (avoids the transient
     constraint fluctuation caused by re-seeding from raw trainable weights). Falls back to the
     current trainable weights when the key is absent (first run or pre-this-change checkpoints).
-    Returns ``None`` when ``options.Training.EMA.enable`` is false.
+    Returns ``None`` when EMA is disabled or generation explicitly uses the live policy.
     """
     ema_cfg = config.options.Training.get("EMA", None) or {}
-    if not bool(ema_cfg.get("enable", False)):
+    if not generation_uses_ema_shadow(ema_cfg):
+        if bool(ema_cfg.get("enable", False)):
+            _log.info(
+                "[DGPO/model] Live-policy generation selected; rollout EMA shadow disabled."
+            )
         return None
     ema = EMA(model, decay=0.0)
     if checkpoint is not None and "dgpo_ema_rollout_state_dict" in checkpoint:
@@ -419,8 +539,13 @@ def save_lightning_compatible_checkpoint(
     global_step: int,
     optimizer: Optimizer | None = None,
     ref_model: nn.Module | None = None,
+    round_ref_model: nn.Module | None = None,
+    reward_round_id: int = 0,
     ema_rollout: EMA | None = None,
     dgpo_projection_constraint_state: dict[str, Any] | None = None,
+    dgpo_omnifold_reward_metadata: dict[str, Any] | None = None,
+    dgpo_adaptive_omnifold_state: dict[str, Any] | None = None,
+    dgpo_omnifold_reward_stack: dict[str, Any] | None = None,
 ) -> None:
     """Write a ``.ckpt`` file using the same tensor layout as Lightning + EveNetEngine.
 
@@ -446,21 +571,35 @@ def save_lightning_compatible_checkpoint(
     if optimizer is not None:
         payload["dgpo_optimizer_state_dict"] = optimizer.state_dict()
     if ref_model is not None:
-        orig_ref = ref_model
-        if isinstance(orig_ref, nn.parallel.DistributedDataParallel):
-            orig_ref = orig_ref.module
-        _ir = getattr(orig_ref, "eve_net", None)
-        if isinstance(_ir, nn.Module):
-            orig_ref = _ir
-        if hasattr(orig_ref, "_orig_mod"):
-            orig_ref = orig_ref._orig_mod
+        orig_ref = unwrap_for_state_dict(ref_model)
         payload["dgpo_ref_state_dict"] = {
             f"model.{k}": v for k, v in orig_ref.state_dict().items()
         }
+    if round_ref_model is not None:
+        orig_round_ref = unwrap_for_state_dict(round_ref_model)
+        payload["dgpo_round_ref_state_dict"] = {
+            f"model.{k}": v for k, v in orig_round_ref.state_dict().items()
+        }
+        payload["dgpo_reward_round_id"] = int(reward_round_id)
+        payload["dgpo_round_ref_sha256"] = state_dict_sha256(round_ref_model)
     if dgpo_projection_constraint_state is not None:
         payload["dgpo_projection_constraint_state"] = dgpo_projection_constraint_state
+    if dgpo_omnifold_reward_metadata is not None:
+        payload["dgpo_omnifold_reward_metadata"] = dgpo_omnifold_reward_metadata
+    if dgpo_adaptive_omnifold_state is not None:
+        payload["dgpo_adaptive_omnifold_state"] = dgpo_adaptive_omnifold_state
+    if dgpo_omnifold_reward_stack is not None:
+        payload["dgpo_omnifold_reward_stack"] = dgpo_omnifold_reward_stack
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, out_path)
+    # The adaptive stack makes checkpoints large. Preserve the previous resume
+    # point if a wall-time kill interrupts serialization.
+    tmp_path = out_path.with_name(out_path.name + f".tmp.{os.getpid()}")
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     _log.info(
         "[DGPO/model] Wrote checkpoint %s (next_epoch=%s step=%s)",
         out_path,
@@ -505,3 +644,18 @@ def parse_dgpo_resume_from_checkpoint(checkpoint: dict[str, Any] | None) -> tupl
         return int(checkpoint["dgpo_next_epoch"]), gs
     ep = int(checkpoint.get("epoch", -1))
     return ep + 1, gs
+
+
+def generation_uses_ema_shadow(ema_cfg: Mapping[str, Any] | None) -> bool:
+    """Whether train/validation DDIM should temporarily install EMA weights.
+
+    EMA remains updated and checkpointed independently.  An explicit
+    ``use_for_generation: false`` keeps candidate generation on the live policy,
+    matching the policy snapshot paired with adaptive OmniFold rewards.
+    """
+    cfg = dict(ema_cfg or {})
+    if not bool(cfg.get("enable", False)):
+        return False
+    if "use_for_generation" in cfg:
+        return bool(cfg["use_for_generation"])
+    return True

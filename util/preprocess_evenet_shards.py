@@ -20,8 +20,9 @@ from numpy.lib import format as npy_format
 
 REPO_DIR = Path(__file__).resolve().parents[2]
 ML_PIPELINE_DIR = Path(__file__).resolve().parents[1]
-EVENET_DIR = ML_PIPELINE_DIR / "EveNet-Full"
+EVENET_DIR = ML_PIPELINE_DIR / "evenet_dgpo"
 sys.path.insert(0, str(EVENET_DIR))
+sys.path.insert(0, str(ML_PIPELINE_DIR))
 
 from evenet.control.global_config import global_config  # noqa: E402
 from preprocessing.helper import (  # noqa: E402

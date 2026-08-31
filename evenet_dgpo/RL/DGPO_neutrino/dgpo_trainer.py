@@ -19,7 +19,6 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from functools import partial
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -50,8 +49,11 @@ from evenet.utilities.diffusion_sampler import (
 )
 
 from RL.DGPO_neutrino.dgpo_utils import (
+    ADVANTAGE_ESTIMATOR_ZSCORE,
+    VALID_ADVANTAGE_ESTIMATORS,
     _dgpo_cfg_get,
     build_dgpo_loss,
+    build_reference_trust_loss,
     compute_per_event_advantage,
     predict_x0_normalized_from_velocity_diffusion,
     repeat_batch_for_candidates,
@@ -59,13 +61,27 @@ from RL.DGPO_neutrino.dgpo_utils import (
 from RL.DGPO_neutrino.model_utils import (
     apply_component_freezes,
     freeze_reference_model,
+    generation_uses_ema_shadow,
     load_evenet_model_for_dgpo,
     make_ema,
     make_ema_rollout,
     make_reference_model,
+    make_round_reference_model,
     parse_dgpo_resume_from_checkpoint,
     save_lightning_compatible_checkpoint,
+    select_dgpo_training_state,
+    dgpo_snapshot_checkpoint_name,
+    update_last_checkpoint_pointer,
+    unwrap_for_state_dict,
 )
+from RL.DGPO_neutrino.monitoring import (
+    append_reference_prediction_arrays,
+    paired_finite_truth_pred,
+    scheduled_epoch,
+    select_truth_pred_by_class,
+    validation_schedule_tier,
+)
+from RL.DGPO_neutrino.sampling import generate_neutrino_candidates
 from RL.DGPO_neutrino.latent_constraint.dgpo_constraint import (
     LatentSWDState,
     broadcast_latent_swd_state,
@@ -98,6 +114,10 @@ from RL.DGPO_neutrino.rewards import (
     log_pt_eta_phi_to_cartesian,
 )
 from RL.DGPO_neutrino.domains.ztautau import build_feature_space_scales
+from RL.DGPO_neutrino.diagnostics.ztautau_validation import (
+    build_ztautau_validation_metrics,
+    collect_ztautau_validation_arrays,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -105,6 +125,19 @@ _log = logging.getLogger(__name__)
 # Epoch-end panels (val, train_dist) reuse the last training step of the epoch
 # but chart x-axis is ``epoch`` via ``wandb.define_metric``.
 _wandb_committed_step: int = -1
+# Live OmniFold fits happen between DGPO optimizer steps.  Reserve monotonically
+# increasing internal W&B rows for them while keeping ``global_step`` as the
+# scientific x-axis for policy metrics.
+_wandb_step_offset: int = 0
+
+# Single source of truth for live classifier phases.  W&B registration and the
+# runtime logger must stay in lock-step; otherwise a valid long-running fit can
+# fail merely when it emits its first progress row.
+_OMNIFOLD_LIVE_PHASE_IDS = {
+    "residual_reward": 0,
+    "acceptance_audit": 1,
+    "staleness_audit": 2,
+}
 
 _GRAD_CLIP_NORM = 1.0
 # Projection-constraint payload key in DGPO checkpoints. The legacy key (from the
@@ -164,6 +197,67 @@ def _unwrap_core_evenet(model: nn.Module) -> nn.Module:
     if hasattr(m, "eve_net") and isinstance(getattr(m, "eve_net"), nn.Module):
         return m.eve_net
     return m
+
+
+def _set_dgpo_activation_checkpointing(
+    model: nn.Module, *, enabled: bool
+) -> int:
+    """Toggle block-wise checkpointing on PET bodies; return modules changed."""
+
+    count = 0
+    for module in _unwrap_core_evenet(model).modules():
+        if hasattr(module, "gradient_checkpointing"):
+            module.gradient_checkpointing = bool(enabled)
+            count += 1
+    return count
+
+
+_DGPO_POLICY_BATCH_TENSOR_KEYS = frozenset(
+    {
+        "x",
+        "x_mask",
+        "conditions",
+        "conditions_mask",
+        "classification",
+        "x_invisible",
+        "x_invisible_mask",
+    }
+)
+
+
+def _dgpo_policy_conditioning_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    """View containing only tensors consumed by neutrino policy forwards."""
+
+    required = {"x", "x_mask", "conditions", "conditions_mask", "x_invisible_mask"}
+    missing = sorted(required - set(batch))
+    if missing:
+        raise KeyError(f"DGPO policy batch is missing required tensors: {missing}")
+    return {
+        key: value
+        for key, value in batch.items()
+        if not isinstance(value, Tensor) or key in _DGPO_POLICY_BATCH_TENSOR_KEYS
+    }
+
+
+def _slice_event_batch(
+    batch: dict[str, Any],
+    start: int,
+    stop: int,
+    *,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Slice tensors whose leading dimension is the event dimension."""
+
+    return {
+        key: (
+            value[start:stop]
+            if isinstance(value, Tensor)
+            and value.ndim > 0
+            and int(value.shape[0]) == int(batch_size)
+            else value
+        )
+        for key, value in batch.items()
+    }
 
 
 def _next_batch_synced(
@@ -252,24 +346,11 @@ def _truth_pred_scalar_metrics(
     pred_values: np.ndarray,
 ) -> dict[str, float]:
     """Scalar summaries for truth-vs-pred arrays used by 2D monitoring panels."""
-    truth = np.asarray(truth_values, dtype=np.float64).reshape(-1)
-    pred = np.asarray(pred_values, dtype=np.float64).reshape(-1)
-    n = min(truth.size, pred.size)
-    if n == 0:
-        return {
-            "count": 0.0,
-            "mae": float("nan"),
-            "rmse": float("nan"),
-            "bias": float("nan"),
-            "pearson_r": float("nan"),
-            "slope": float("nan"),
-            "intercept": float("nan"),
-        }
-    truth = truth[:n]
-    pred = pred[:n]
-    keep = np.isfinite(truth) & np.isfinite(pred)
-    truth = truth[keep]
-    pred = pred[keep]
+    truth, pred = paired_finite_truth_pred(
+        truth_values,
+        pred_values,
+        context="truth/pred monitoring",
+    )
     if truth.size == 0:
         return {
             "count": 0.0,
@@ -280,7 +361,6 @@ def _truth_pred_scalar_metrics(
             "slope": float("nan"),
             "intercept": float("nan"),
         }
-
     delta = pred - truth
     mae = float(np.mean(np.abs(delta)))
     rmse = float(np.sqrt(np.mean(delta * delta)))
@@ -895,6 +975,18 @@ def _generation_monitor_feature_names(*, cartesian: bool) -> tuple[str, ...]:
     if cartesian:
         return ("px", "py", "pz")
     return _invisible_feature_names()
+
+
+def _event_signal_class_names() -> tuple[str, ...]:
+    """Ordered EVENT/signal names matching integer ``classification`` IDs."""
+    event_info = getattr(global_config, "event_info", None)
+    class_label = getattr(event_info, "class_label", {}) or {}
+    event_labels = _dgpo_cfg_get(class_label, "EVENT", {}) or {}
+    raw = _dgpo_cfg_get(event_labels, "signal", []) or []
+    raw_values = list(raw)
+    if raw_values and not isinstance(raw_values[0], str):
+        raw_values = list(raw_values[0])
+    return tuple(str(name) for name in raw_values)
 
 
 def _variance_regularization_config(dg_cfg: Any | None = None) -> Any | None:
@@ -1641,6 +1733,20 @@ def _save_trainable_weights(model: torch.nn.Module) -> dict[str, Tensor]:
     return {n: p.data.clone() for n, p in core.named_parameters() if p.requires_grad}
 
 
+def _maybe_install_ema_for_generation(
+    ema: Any | None,
+    model: torch.nn.Module,
+    core: Any,
+) -> dict[str, Tensor]:
+    """Install an EMA shadow only when requested by ``EMA.use_for_generation``."""
+    ema_cfg = global_config.options.Training.get("EMA", None) or {}
+    if ema is None or not generation_uses_ema_shadow(ema_cfg):
+        return {}
+    buffer = _save_trainable_weights(model)
+    ema.copy_to(core)
+    return buffer
+
+
 def _restore_trainable_weights(model: torch.nn.Module, buf: dict[str, Tensor]) -> None:
     core = _unwrap_core_evenet(model)
     for n, p in core.named_parameters():
@@ -1710,6 +1816,79 @@ def build_reward_aggregator(
     weight = float(getattr(rc, "weight", 1.0))
     feature_names = _reward_feature_names()
     agg = RewardAggregator()
+    if reward_type in {"omnifold", "omnifold_guided", "ztautau_omnifold"}:
+        from RL.DGPO_neutrino.omnifold_ztautau.dgpo_reward import (
+            build_uninstalled_ztautau_omnifold_reward,
+            load_ztautau_omnifold_reward,
+        )
+
+        block = _dgpo_cfg_get(rc, "omnifold", None)
+        bundle_file = _dgpo_cfg_get(block, "bundle_file", None)
+        backbone_checkpoint = _dgpo_cfg_get(block, "backbone_checkpoint", None)
+        bootstrap_in_dgpo = bool(
+            _dgpo_cfg_get(block, "bootstrap_in_dgpo", False)
+        )
+        if not backbone_checkpoint or (not bootstrap_in_dgpo and not bundle_file):
+            raise ValueError(
+                "reward_config.type=omnifold requires omnifold.backbone_checkpoint "
+                "and either bootstrap_in_dgpo=true or omnifold.bundle_file"
+            )
+        if normalization_dict is None:
+            raise ValueError("OmniFold reward requires the EveNet normalization dictionary")
+        if bootstrap_in_dgpo:
+            adaptive_block = _dgpo_cfg_get(global_config.dgpo, "adaptive_omnifold", None)
+            recal = _dgpo_cfg_get(adaptive_block, "recalibration", None)
+            classifier_defaults = {
+                "adapter_bottleneck": 16,
+                "train_layernorm": False,
+                "train_encoder": False,
+                "train_backbone": False,
+                "head_dropout": 0.1,
+                "decoder_hidden_dim": 256,
+                "decoder_layers": 2,
+                "decoder_heads": 8,
+            }
+            classifier_config = {
+                key: _dgpo_cfg_get(recal, key, default)
+                for key, default in classifier_defaults.items()
+            }
+            reward = build_uninstalled_ztautau_omnifold_reward(
+                backbone_checkpoint=backbone_checkpoint,
+                training_config=global_config,
+                normalization_dict=normalization_dict,
+                device=device,
+                classifier_config=classifier_config,
+            )
+            _log.info(
+                "[DGPO/reward] OmniFold will fit and install its initial K=1 "
+                "residual stack inside DGPO before the first policy update "
+                "(classifier=%s).",
+                "frozen-backbone PEFT bank",
+            )
+            agg.add(reward, weight)
+            return agg
+        expected_iterations = _dgpo_cfg_get(block, "expected_iterations", None)
+        reward = load_ztautau_omnifold_reward(
+            bundle_file=bundle_file,
+            backbone_checkpoint=backbone_checkpoint,
+            training_config=global_config,
+            normalization_dict=normalization_dict,
+            device=device,
+            expected_iterations=(
+                None if expected_iterations is None else int(expected_iterations)
+            ),
+        )
+        _log.info(
+            "[DGPO/reward] using frozen Ztautau OmniFold reward: iterations=%s "
+            "fit_K=1 train_K=%s reference=%s bundle=%s weight=%.4g",
+            reward.iterations,
+            int(_dgpo_cfg_get(global_config.dgpo, "K", 1)),
+            reward.policy_reference_sha256[:12],
+            reward.artifact_path,
+            weight,
+        )
+        agg.add(reward, weight)
+        return agg
     if reward_type in {"calibration_magnitude", "physics_consistency", "ztautau_calibration_magnitude"}:
         _log.info(
             "[DGPO/reward] using calibration_magnitude reward for feature_names=%s.",
@@ -1750,86 +1929,6 @@ def build_reward_aggregator(
     return agg
 
 
-@torch.no_grad()
-def generate_neutrino_candidates(
-    model: torch.nn.Module,
-    batch: dict[str, Any],
-    sampler: DDIMSampler,
-    *,
-    K: int,
-    num_ddim_steps: int,
-    device: torch.device,
-    parallel_chains: int = 1,
-    tqdm_k_chains: bool = False,
-    use_tqdm_ddim: bool = False,
-    chain_progress_desc: str = "DGPO DDIM chains",
-) -> Tensor:
-    """DDIM rollouts in physical invisible space, shape ``(K, B, N_nu, F)``.
-
-    ``data_shape`` for the DDIM prior must match what ``predict_diffusion_vector``
-    receives as ``noise_x``:  ``(B, N_nu, invisible_input_dim)``.  When
-    ``TruthGeneration.cartesian: true`` that is 3 (px, py, pz), not the full
-    7-D ``x_invisible`` from the parquet.
-    """
-    if "x_invisible" not in batch:
-        raise KeyError("batch missing x_invisible for DDIM data_shape.")
-    B, N_nu = batch["x_invisible"].shape[:2]
-    inv_dim = int(getattr(model, "invisible_input_dim", batch["x_invisible"].shape[-1]))
-    data_shape = (B, N_nu, inv_dim)
-    candidates: list[Tensor] = []
-    parallel_chains = max(1, min(int(parallel_chains), int(K)))
-    noise_mask = batch["x_invisible_mask"].unsqueeze(-1)
-    k_iter: Any = range(0, K, parallel_chains)
-    if tqdm_k_chains:
-        try:
-            from tqdm.auto import tqdm
-
-            k_iter = tqdm(
-                range(0, K, parallel_chains),
-                desc=chain_progress_desc,
-                leave=False,
-                unit="group",
-            )
-        except ImportError:
-            k_iter = range(0, K, parallel_chains)
-
-    inner_name = f"{chain_progress_desc} steps"
-    for chain_start in k_iter:
-        chain_count = min(parallel_chains, K - chain_start)
-        if chain_count == 1:
-            batch_group = batch
-            noise_mask_group = noise_mask
-            data_shape_group = data_shape
-        else:
-            batch_group = repeat_batch_for_candidates(batch, chain_count)
-            noise_mask_group = repeat_batch_for_candidates(
-                {"x_invisible_mask": noise_mask},
-                chain_count,
-            )["x_invisible_mask"]
-            data_shape_group = (chain_count * B, N_nu, inv_dim)
-        pred_partial = partial(
-            model.predict_diffusion_vector,
-            mode="neutrino",
-            cond_x=batch_group,
-            noise_mask=noise_mask_group,
-        )
-        gen = sampler.sample(
-            data_shape=data_shape_group,
-            pred_fn=pred_partial,
-            num_steps=num_ddim_steps,
-            normalize_fn=model.invisible_normalizer,
-            remove_padding=True,
-            noise_mask=noise_mask_group,
-            use_tqdm=use_tqdm_ddim,
-            process_name=inner_name,
-        )
-        if chain_count == 1:
-            candidates.append(gen)
-        else:
-            candidates.extend(gen.reshape(chain_count, B, N_nu, gen.shape[-1]).unbind(dim=0))
-    return torch.stack(candidates, dim=0)
-
-
 def _normalize_candidates_for_policy(
     model: torch.nn.Module,
     c_phys: Tensor,
@@ -1853,6 +1952,93 @@ def _normalize_candidates_for_policy(
     full_norm = model.invisible_normalizer(x=x, mask=m)
     inv_in = int(getattr(model, "invisible_input_dim", full_norm.shape[-1]))
     return full_norm[..., :inv_in]
+
+
+@dataclass(frozen=True)
+class _PolicyEvaluationInputs:
+    """Batch tensors that stay constant across a batch's policy-eval draws."""
+
+    batch_size: int
+    num_candidates: int
+    num_timesteps: int
+    candidates_norm: Tensor
+    batch_rep: dict[str, Any]
+    noise_mask_rep: Tensor
+
+
+def _prepare_policy_evaluation_inputs(
+    model: torch.nn.Module,
+    batch: dict[str, Any],
+    candidates_phys: Tensor,
+    *,
+    K: int,
+    batch_rep: dict[str, Any] | None = None,
+) -> _PolicyEvaluationInputs:
+    """Normalize candidates and tile conditioning tensors once per rollout batch."""
+    B = int(batch["x"].shape[0])
+    if int(candidates_phys.shape[0]) != int(K) or int(candidates_phys.shape[1]) != B:
+        raise ValueError(
+            "candidates_phys must start with (K, B); "
+            f"expected ({K}, {B}, ...), got {tuple(candidates_phys.shape)}"
+        )
+
+    if batch_rep is None:
+        batch_rep = repeat_batch_for_candidates(
+            batch,
+            K,
+            tensor_keys=_DGPO_POLICY_BATCH_TENSOR_KEYS,
+        )
+    elif (
+        "x" not in batch_rep
+        or int(batch_rep["x"].shape[0]) != int(K) * B
+    ):
+        raise ValueError(
+            "pre-expanded policy batch must have K*B rows; "
+            f"expected {int(K) * B}"
+        )
+    inv_kb = batch_rep["x_invisible_mask"]
+    c_flat = candidates_phys.reshape(K * B, *candidates_phys.shape[2:])
+    eve = _unwrap_core_evenet(model)
+    candidates_norm = _normalize_candidates_for_policy(eve, c_flat, inv_kb)
+    noise_mask_rep = inv_kb.unsqueeze(-1)
+    return _PolicyEvaluationInputs(
+        batch_size=B,
+        num_candidates=int(K),
+        num_timesteps=1,
+        candidates_norm=candidates_norm,
+        batch_rep=batch_rep,
+        noise_mask_rep=noise_mask_rep,
+    )
+
+
+def _prepare_parallel_policy_evaluation_inputs(
+    base: _PolicyEvaluationInputs,
+    num_timesteps: int,
+) -> _PolicyEvaluationInputs:
+    """Expand fixed K-candidate inputs across parallel policy-eval timesteps."""
+    count = int(num_timesteps)
+    if count < 1:
+        raise ValueError(f"num_timesteps must be positive, got {count}")
+    if count == 1:
+        return base
+    if base.num_timesteps != 1:
+        raise ValueError("parallel policy inputs must be expanded from a one-timestep base")
+    candidates_norm = (
+        base.candidates_norm.unsqueeze(0)
+        .expand(count, *base.candidates_norm.shape)
+        .reshape(count * base.candidates_norm.shape[0], *base.candidates_norm.shape[1:])
+        .contiguous()
+    )
+    batch_rep = repeat_batch_for_candidates(base.batch_rep, count)
+    noise_mask_rep = batch_rep["x_invisible_mask"].unsqueeze(-1)
+    return _PolicyEvaluationInputs(
+        batch_size=base.batch_size,
+        num_candidates=base.num_candidates,
+        num_timesteps=count,
+        candidates_norm=candidates_norm,
+        batch_rep=batch_rep,
+        noise_mask_rep=noise_mask_rep,
+    )
 
 
 def per_row_velocity_mse(
@@ -1937,6 +2123,31 @@ def _mean_diag_dict(diags: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     return out
 
 
+def _weighted_mean_diag_dict(
+    diags: list[dict[str, Tensor]],
+    weights: list[float],
+) -> dict[str, Tensor]:
+    """Event-weighted diagnostic mean for uneven policy-eval microbatches."""
+
+    if len(diags) != len(weights):
+        raise ValueError("diagnostic values and weights must have equal length")
+    if not diags:
+        return {}
+    all_keys: set[str] = set()
+    for diag in diags:
+        all_keys.update(diag.keys())
+    out: dict[str, Tensor] = {}
+    for key in sorted(all_keys):
+        present = [(diag[key].detach(), float(weight)) for diag, weight in zip(diags, weights) if key in diag]
+        if not present:
+            continue
+        denominator = sum(weight for _, weight in present)
+        if denominator <= 0.0:
+            continue
+        out[key] = sum(value * weight for value, weight in present) / denominator
+    return out
+
+
 def _finite_mean_float(values: Tensor) -> float:
     """Mean over finite tensor entries, or NaN if none are finite."""
     flat = values.reshape(-1)
@@ -2013,6 +2224,7 @@ def _build_reward_extra_metrics(
     log_distribution: bool = False,
     collect_profile_accum: bool = False,
     diagnostic_plot_names: set[str] | None = None,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Light extras for W&B: ``reward/raw/{mean,std}`` and per-component contributions.
 
@@ -2055,6 +2267,9 @@ def _build_reward_extra_metrics(
     else:
         out["reward/raw/mean"] = float("nan")
         out["reward/raw/std"] = float("nan")
+
+    if compact:
+        return out
 
     out.update(_build_reward_source_metrics(rewards, valid_b, reward_agg, reward_breakdown))
 
@@ -2510,7 +2725,7 @@ def _build_train_metrics(
         base.update(param)
         for dk, dv in diag_last.items():
             if isinstance(dk, str) and (
-                dk.startswith(("projection/", "latent_constraint/", "train/regularization/"))
+                dk.startswith(("projection/", "latent_constraint/", "train/regularization/", "reference_trust/"))
                 or dk == "train/loss/variance_regularization"
             ):
                 base[dk] = float(dv.detach().float().cpu())
@@ -2551,7 +2766,7 @@ def _build_train_metrics(
     out.update(param)
     for dk, dv in diag_last.items():
         if isinstance(dk, str) and (
-            dk.startswith(("projection/", "latent_constraint/", "train/regularization/"))
+            dk.startswith(("projection/", "latent_constraint/", "train/regularization/", "reference_trust/"))
             or dk == "train/loss/variance_regularization"
         ):
             out[dk] = float(dv.detach().float().cpu())
@@ -2572,6 +2787,8 @@ def policy_evaluation_step(
     eps_rep: Tensor | None = None,
     t_min: float = 0.0,
     t_max: float = 1.0,
+    num_timesteps: int = 1,
+    prepared_inputs: _PolicyEvaluationInputs | None = None,
 ) -> tuple[
     Tensor,
     Tensor,
@@ -2585,33 +2802,79 @@ def policy_evaluation_step(
     dict[str, Any],
     Tensor,
 ]:
-    """Shared ``eps`` per event (when ``shared_noise``).
+    """Evaluate one or more independent ``(t, eps)`` draws in one model forward.
 
-    Returns:
-        ``L_cur``, ``L_ref`` each ``(K, B)``, ``t`` ``(B,)``, ``model_v``, ``ref_v`` each
-        ``(K*B, N_nu, F)``, ``noise_mask_rep`` ``(K*B, N_nu, 1)`` for KL anchor MSE,
-        ``x_t``, ``target_v``, ``t_rep``, ``batch_rep``, and ``eps_rep`` ``(K*B, N_nu, F)``.
+    With ``num_timesteps=1`` the legacy shapes are preserved. For ``T>1``,
+    ``L_cur``/``L_ref`` are ``(T,K,B)``, ``t`` is ``(T,B)``, and flattened
+    model tensors use ``T*K*B`` rows ordered by timestep, candidate, event.
     """
-    B = batch["x"].shape[0]
-    inv_mask = batch["x_invisible_mask"]
-    c_flat = candidates_phys.reshape(K * B, *candidates_phys.shape[2:])
-    # Row order matches ``(K, B, ...)`` reshape: all events for k=0, then k=1, ...
-    inv_kb = inv_mask.unsqueeze(0).expand(K, -1, -1).reshape(K * B, *inv_mask.shape[1:])
-    eve = _unwrap_core_evenet(model)
-    c_norm = _normalize_candidates_for_policy(eve, c_flat, inv_kb)
+    B = int(batch["x"].shape[0])
+    T = max(1, int(num_timesteps))
+    if prepared_inputs is None:
+        base_inputs = _prepare_policy_evaluation_inputs(
+            model,
+            batch,
+            candidates_phys,
+            K=K,
+        )
+        prepared_inputs = _prepare_parallel_policy_evaluation_inputs(base_inputs, T)
+    elif (
+        prepared_inputs.batch_size != B
+        or prepared_inputs.num_candidates != int(K)
+        or prepared_inputs.num_timesteps != T
+    ):
+        raise ValueError(
+            "prepared policy-evaluation inputs do not match the requested (T, K, B): "
+            f"prepared=({prepared_inputs.num_timesteps}, "
+            f"{prepared_inputs.num_candidates}, {prepared_inputs.batch_size}), "
+            f"requested=({T}, {K}, {B})"
+        )
+    c_norm = prepared_inputs.candidates_norm
+    batch_rep = prepared_inputs.batch_rep
+    noise_mask_rep = prepared_inputs.noise_mask_rep
 
     if t is None:
-        t = torch.rand(B, device=device, dtype=torch.float32) * (t_max - t_min) + t_min
-    _, alpha, sigma = get_logsnr_alpha_sigma(t, shape=(B, 1, 1))
-    alpha_rep = alpha.unsqueeze(0).expand(K, -1, -1, -1).reshape(K * B, 1, 1).to(dtype)
-    sigma_rep = sigma.unsqueeze(0).expand(K, -1, -1, -1).reshape(K * B, 1, 1).to(dtype)
+        t_pb = (
+            torch.rand(T, B, device=device, dtype=torch.float32)
+            * (t_max - t_min)
+            + t_min
+        )
+    else:
+        t_pb = t.reshape(1, B) if T == 1 and t.ndim == 1 else t
+        if tuple(t_pb.shape) != (T, B):
+            raise ValueError(
+                f"policy_evaluation_step t must have shape {(T, B)}, "
+                f"got {tuple(t_pb.shape)}"
+            )
+    _, alpha, sigma = get_logsnr_alpha_sigma(
+        t_pb.reshape(T * B),
+        shape=(T * B, 1, 1),
+    )
+    alpha_rep = (
+        alpha.reshape(T, B, 1, 1)
+        .unsqueeze(1)
+        .expand(T, K, B, 1, 1)
+        .reshape(T * K * B, 1, 1)
+        .to(dtype)
+    )
+    sigma_rep = (
+        sigma.reshape(T, B, 1, 1)
+        .unsqueeze(1)
+        .expand(T, K, B, 1, 1)
+        .reshape(T * K * B, 1, 1)
+        .to(dtype)
+    )
 
     N_nu, F_eff = c_norm.shape[1], c_norm.shape[2]
-    expected_eps_shape = (K * B, N_nu, F_eff)
+    expected_eps_shape = (T * K * B, N_nu, F_eff)
     if eps_rep is None:
         if shared_noise:
-            eps = torch.randn(B, N_nu, F_eff, device=device, dtype=dtype)
-            eps_rep = eps.unsqueeze(0).expand(K, -1, -1, -1).reshape(*expected_eps_shape)
+            eps = torch.randn(T, B, N_nu, F_eff, device=device, dtype=dtype)
+            eps_rep = (
+                eps.unsqueeze(1)
+                .expand(T, K, B, N_nu, F_eff)
+                .reshape(*expected_eps_shape)
+            )
         else:
             eps_rep = torch.randn(*expected_eps_shape, device=device, dtype=dtype)
     else:
@@ -2625,10 +2888,7 @@ def policy_evaluation_step(
     x_t = alpha_rep * c_norm + sigma_rep * eps_rep
     target_v = alpha_rep * eps_rep - sigma_rep * c_norm
 
-    t_rep = t.unsqueeze(0).expand(K, -1).reshape(K * B)
-    batch_rep = repeat_batch_for_candidates(batch, K)
-    noise_mask_rep = batch_rep["x_invisible_mask"].unsqueeze(-1)
-
+    t_rep = t_pb.unsqueeze(1).expand(T, K, B).reshape(T * K * B)
     if isinstance(model, DDP):
         model_v = model(x_t, batch_rep, t_rep, noise_mask_rep)
     else:
@@ -2653,10 +2913,17 @@ def policy_evaluation_step(
         )
         L_ref = per_row_velocity_mse(ref_v, target_v, noise_mask_rep, invisible_padding=0)
 
+    L_cur_out = L_cur.reshape(T, K, B)
+    L_ref_out = L_ref.reshape(T, K, B)
+    t_out = t_pb
+    if T == 1:
+        L_cur_out = L_cur_out[0]
+        L_ref_out = L_ref_out[0]
+        t_out = t_out[0]
     return (
-        L_cur.reshape(K, B),
-        L_ref.reshape(K, B),
-        t,
+        L_cur_out,
+        L_ref_out,
+        t_out,
         model_v,
         ref_v,
         noise_mask_rep,
@@ -3531,17 +3798,22 @@ def train_step(
     *,
     beta: float,
     K: int,
+    advantage_estimator: str = ADVANTAGE_ESTIMATOR_ZSCORE,
     num_ddim_steps: int,
     rollout_parallel_chains: int = 1,
     global_step: int,
     epoch: int,
     device: torch.device,
     dtype: torch.dtype,
+    reference_trust_coefficient: float = 0.0,
     log_reward_dist: bool = False,
     log_diagnostic_dist: bool = False,
+    collect_train_dist: bool = True,
     diagnostic_plot_names: set[str] | None = None,
     diagnostic_plot_every: int = 1,
     num_train_timesteps: int = 1,
+    policy_eval_parallel_timesteps: int = 1,
+    policy_eval_event_microbatch_size: int | None = None,
     adv_clip_max: float | None = None,
     grad_clip_norm: float = _GRAD_CLIP_NORM,
     policy_eval_t_min: float = 0.0,
@@ -3552,8 +3824,8 @@ def train_step(
     """Rollout once, accumulate the sub-step gradients, then one AdamW update + CPO repair.
 
     Frozen method: EMA-rollout candidate generation (when the rollout EMA exists),
-    shared noise across the K candidates, z-score advantages, pure DGPO backward,
-    post-AdamW latent-SWD CPO projection repair.
+    shared noise across the K candidates, configured per-event advantages, pure
+    DGPO backward, and post-AdamW latent-SWD CPO projection repair.
     """
     # Frozen method constant: all K candidates share the diffusion timestep t and
     # noise eps during policy evaluation (only the DDIM chain index varies).
@@ -3569,26 +3841,58 @@ def train_step(
 
     core = _unwrap_core_evenet(model)
     B = int(batch["x"].shape[0])
+    if policy_eval_event_microbatch_size is None:
+        policy_event_microbatch_size = B
+    else:
+        policy_event_microbatch_size = int(policy_eval_event_microbatch_size)
+        if policy_event_microbatch_size < 1:
+            raise ValueError("policy_eval_event_microbatch_size must be positive or null")
+        policy_event_microbatch_size = min(B, policy_event_microbatch_size)
+    if policy_event_microbatch_size < B and variance_reg_active:
+        raise ValueError(
+            "policy-evaluation event microbatching is incompatible with the "
+            "batch-coupled variance regularizer; disable variance_regularization "
+            "or leave policy_eval_event_microbatch_size null"
+        )
+    policy_event_ranges = [
+        (start, min(B, start + policy_event_microbatch_size))
+        for start in range(0, B, policy_event_microbatch_size)
+    ]
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
-    # Candidate rollout uses the fast rollout-EMA shadow when available.
-    buf: dict[str, Tensor] = {}
-    if ema_rollout is not None:
-        buf = _save_trainable_weights(model)
-        ema_rollout.copy_to(core)
+    # Fully parallel rollout needs one K-fold conditioning batch. It is released
+    # immediately afterward; gradient-bearing policy evaluation builds B-sized
+    # event chunks instead.
+    policy_batch = _dgpo_policy_conditioning_batch(batch)
+    rollout_batch_rep = None
+    if int(K) > 1 and int(rollout_parallel_chains) >= int(K):
+        rollout_batch_rep = repeat_batch_for_candidates(
+            policy_batch,
+            K,
+            tensor_keys=_DGPO_POLICY_BATCH_TENSOR_KEYS,
+        )
+
+    # Keep the rollout on the live policy unless YAML explicitly asks for EMA.
+    buf = _maybe_install_ema_for_generation(ema_rollout, model, core)
     try:
-        with torch.no_grad():
-            candidates_phys = generate_neutrino_candidates(
-                core,
-                batch,
-                sampler,
-                K=K,
-                num_ddim_steps=num_ddim_steps,
-                device=device,
-                parallel_chains=rollout_parallel_chains,
-            )
+        candidates_phys = generate_neutrino_candidates(
+            core,
+            policy_batch,
+            sampler,
+            K=K,
+            num_ddim_steps=num_ddim_steps,
+            device=device,
+            parallel_chains=rollout_parallel_chains,
+            expanded_batch=rollout_batch_rep,
+        )
     finally:
         if buf:
             _restore_trainable_weights(model, buf)
+    # Rollout is no-grad. Its K-fold conditioning buffer is not needed by the
+    # event-microbatched, gradient-bearing policy evaluation below.
+    rollout_batch_rep = None
+    del policy_batch
 
     nonfinite_diag: dict[str, float] = {}
     cand_frac = _dgpo_nonfinite_fraction(candidates_phys)
@@ -3609,7 +3913,10 @@ def train_step(
     )
     nonfinite_diag.update(rew_nonfinite_diag)
     valid_b = get_event_valid_mask(batch, B, device, dtype)
-    advantages, _ = compute_per_event_advantage(rewards)
+    advantages, _ = compute_per_event_advantage(
+        rewards,
+        estimator=advantage_estimator,
+    )
     advantages = _dgpo_zero_nonfinite(advantages)
 
     if adv_clip_max is not None:
@@ -3645,26 +3952,48 @@ def train_step(
         candidate_weights_kb[best_k, cols] = True
 
     acc_steps = max(1, int(num_train_timesteps))
+    parallel_eval_steps = min(
+        acc_steps,
+        max(1, int(policy_eval_parallel_timesteps)),
+    )
+    beta_kl = max(
+        0.0,
+        float(_dgpo_cfg_get(global_config.dgpo, "beta_kl", 0.0)),
+    )
     optimizer_ran = False
+    chunk_sizes = {parallel_eval_steps}
+    remainder = acc_steps % parallel_eval_steps
+    if remainder:
+        chunk_sizes.add(remainder)
 
-    def _dgpo_substep() -> tuple[Tensor, dict[str, Tensor]]:
+    def _dgpo_substeps(
+        count: int,
+        *,
+        eval_batch: dict[str, Any],
+        eval_candidates: Tensor,
+        eval_advantages: Tensor,
+        eval_rewards: Tensor,
+        prepared_inputs: _PolicyEvaluationInputs,
+        trust_weight_correction: Tensor,
+    ) -> list[tuple[Tensor, dict[str, Tensor]]]:
+        local_B = int(eval_batch["x"].shape[0])
         (
-            L_cur,
-            L_ref,
+            L_cur_all,
+            L_ref_all,
             _,
-            model_v,
-            _ref_v,
-            noise_mask_rep,
-            x_t,
-            target_v,
-            t_rep,
-            batch_rep,
+            model_v_all,
+            ref_v_all,
+            noise_mask_all,
+            x_t_all,
+            _target_v,
+            t_rep_all,
+            batch_rep_all,
             _eps_rep,
         ) = policy_evaluation_step(
             model,
             ref_model,
-            batch,
-            candidates_phys,
+            eval_batch,
+            eval_candidates,
             K=K,
             shared_noise=shared_noise,
             device=device,
@@ -3672,81 +4001,154 @@ def train_step(
             t=None,
             t_min=policy_eval_t_min,
             t_max=policy_eval_t_max,
+            num_timesteps=count,
+            prepared_inputs=prepared_inputs,
         )
-        _dgpo_assert_train_step_invariants(L_ref, advantages, rewards)
-        loss_vel, dlast = build_dgpo_loss(
-            L_cur,
-            L_ref,
-            advantages,
-            beta_dgpo,
-            K,
+        if count == 1:
+            L_cur_all = L_cur_all.unsqueeze(0)
+            L_ref_all = L_ref_all.unsqueeze(0)
+        rows_per_timestep = int(K) * local_B
+        model_v_all = model_v_all.reshape(count, rows_per_timestep, *model_v_all.shape[1:])
+        ref_v_all = ref_v_all.reshape(count, rows_per_timestep, *ref_v_all.shape[1:])
+        noise_mask_all = noise_mask_all.reshape(
+            count,
+            rows_per_timestep,
+            *noise_mask_all.shape[1:],
         )
-        beta_kl = max(0.0, float(_dgpo_cfg_get(global_config.dgpo, "beta_kl", 0.0)))
-        kl_loss = per_row_velocity_mse(
-            model_v,
-            target_v,
-            noise_mask_rep,
-            invisible_padding=0,
-        ).mean()
+        x_t_all = x_t_all.reshape(count, rows_per_timestep, *x_t_all.shape[1:])
+        t_rep_all = t_rep_all.reshape(count, rows_per_timestep)
 
-        variance_loss = x_t.new_zeros(())
-        variance_diag: dict[str, Tensor] = {
-            "train/regularization/variance/active": x_t.new_tensor(0.0, dtype=torch.float64),
-            "train/regularization/variance/active_features": x_t.new_tensor(0.0, dtype=torch.float64),
-            "train/regularization/variance/raw": x_t.new_tensor(0.0, dtype=torch.float64),
-        }
-        if variance_reg_active and variance_reg_weight > 0.0 and variance_reg_features:
-            pred_x0_norm, _, _ = predict_x0_normalized_from_velocity_diffusion(
-                x_t,
-                model_v,
-                t_rep,
-            )
-            pred_phys = core.invisible_normalizer.denormalize_grad(
-                pred_x0_norm,
-                mask=noise_mask_rep,
-                remove_padding=True,
-            )
-            truth_phys = batch_rep["x_invisible"][..., :pred_phys.shape[-1]].to(
-                device=pred_phys.device,
-                dtype=pred_phys.dtype,
-            )
-            variance_loss, variance_diag = _variance_matching_penalty(
-                pred_phys,
-                truth_phys,
-                noise_mask_rep,
-                cartesian=_truth_generation_cartesian(),
-                feature_names=_invisible_feature_names(),
-                selected_features=variance_reg_features,
-            )
+        outcomes: list[tuple[Tensor, dict[str, Tensor]]] = []
+        for timestep_index in range(count):
+            L_cur = L_cur_all[timestep_index]
+            L_ref = L_ref_all[timestep_index]
+            model_v = model_v_all[timestep_index]
+            ref_v = ref_v_all[timestep_index]
+            noise_mask_rep = noise_mask_all[timestep_index]
+            x_t = x_t_all[timestep_index]
+            t_rep = t_rep_all[timestep_index]
+            row_start = timestep_index * rows_per_timestep
+            row_stop = row_start + rows_per_timestep
+            batch_rep = {
+                key: (
+                    value[row_start:row_stop]
+                    if isinstance(value, Tensor)
+                    and value.ndim > 0
+                    and int(value.shape[0]) == count * rows_per_timestep
+                    else value
+                )
+                for key, value in batch_rep_all.items()
+            }
 
-        # Backward uses DGPO plus an optional supervised diffusion anchor and soft regularizers.
-        # The latent-SWD constraint, when enabled, is still enforced post-AdamW by CPO repair.
-        loss_backward = (
-            loss_vel
-            + beta_kl * kl_loss
-            + float(variance_reg_weight) * variance_loss
-        )
-        dlast["loss_velocity_training"] = loss_vel.detach()
-        dlast["train/loss/kl"] = (beta_kl * kl_loss.detach()).to(dtype=torch.float64)
-        dlast["train/loss/variance_regularization"] = (
-            float(variance_reg_weight) * variance_loss.detach()
-        ).to(dtype=torch.float64)
-        dlast["loss_total"] = loss_backward.detach()
-        dlast["kl_weight_mean"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
-        dlast["kl_weight_min"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
-        dlast["kl_weight_max"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
-        dlast["projection/active"] = torch.tensor(
-            1.0 if projection_active else 0.0,
-            device=device,
-            dtype=torch.float64,
-        )
-        dlast["projection/pure_dgpo_backward"] = torch.tensor(
-            1.0,
-            device=device,
-            dtype=torch.float64,
-        )
-        dlast.update(variance_diag)
-        return loss_backward, dlast
+            _dgpo_assert_train_step_invariants(
+                L_ref,
+                eval_advantages,
+                eval_rewards,
+            )
+            loss_vel, dlast = build_dgpo_loss(
+                L_cur,
+                L_ref,
+                eval_advantages,
+                beta_dgpo,
+                K,
+            )
+            # ``L_cur`` is this exact per-row velocity MSE, already carrying the
+            # required gradient graph. Reuse it instead of recomputing the tensor.
+            kl_loss = L_cur.mean()
+
+            variance_loss = x_t.new_zeros(())
+            variance_diag: dict[str, Tensor] = {
+                "train/regularization/variance/active": x_t.new_tensor(
+                    0.0, dtype=torch.float64
+                ),
+                "train/regularization/variance/active_features": x_t.new_tensor(
+                    0.0, dtype=torch.float64
+                ),
+                "train/regularization/variance/raw": x_t.new_tensor(
+                    0.0, dtype=torch.float64
+                ),
+            }
+            if variance_reg_active and variance_reg_weight > 0.0 and variance_reg_features:
+                pred_x0_norm, _, _ = predict_x0_normalized_from_velocity_diffusion(
+                    x_t,
+                    model_v,
+                    t_rep,
+                )
+                pred_phys = core.invisible_normalizer.denormalize_grad(
+                    pred_x0_norm,
+                    mask=noise_mask_rep,
+                    remove_padding=True,
+                )
+                truth_phys = batch_rep["x_invisible"][..., :pred_phys.shape[-1]].to(
+                    device=pred_phys.device,
+                    dtype=pred_phys.dtype,
+                )
+                variance_loss, variance_diag = _variance_matching_penalty(
+                    pred_phys,
+                    truth_phys,
+                    noise_mask_rep,
+                    cartesian=_truth_generation_cartesian(),
+                    feature_names=_invisible_feature_names(),
+                    selected_features=variance_reg_features,
+                )
+
+            # Backward uses DGPO plus optional policy anchors and soft regularizers.
+            # The reference trust term shares this exact (t, eps) draw with L_cur/L_ref.
+            loss_backward = (
+                loss_vel
+                + beta_kl * kl_loss
+                + float(variance_reg_weight) * variance_loss
+            )
+            if reference_trust_coefficient > 0.0:
+                trust_loss, trust_diagnostics = build_reference_trust_loss(
+                    model_v,
+                    ref_v,
+                    noise_mask_rep,
+                    L_ref_2d=L_ref,
+                )
+                loss_backward = (
+                    loss_backward
+                    + float(reference_trust_coefficient)
+                    * trust_weight_correction
+                    * trust_loss
+                )
+                for trust_key in (
+                    "reference_trust/loss",
+                    "reference_trust/velocity_mse",
+                ):
+                    trust_diagnostics[trust_key] = (
+                        trust_diagnostics[trust_key] * trust_weight_correction
+                    )
+                dlast.update(trust_diagnostics)
+            dlast["reference_trust/coefficient"] = torch.tensor(
+                float(reference_trust_coefficient),
+                device=device,
+                dtype=torch.float64,
+            )
+            dlast["loss_velocity_training"] = loss_vel.detach()
+            dlast["train/loss/kl"] = (beta_kl * kl_loss.detach()).to(
+                dtype=torch.float64
+            )
+            dlast["train/loss/variance_regularization"] = (
+                float(variance_reg_weight) * variance_loss.detach()
+            ).to(dtype=torch.float64)
+            dlast["loss_total"] = loss_backward.detach()
+            dlast["kl_weight_mean"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
+            dlast["kl_weight_min"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
+            dlast["kl_weight_max"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
+            dlast["projection/active"] = torch.tensor(
+                1.0 if projection_active else 0.0,
+                device=device,
+                dtype=torch.float64,
+            )
+            dlast["projection/pure_dgpo_backward"] = torch.tensor(
+                1.0,
+                device=device,
+                dtype=torch.float64,
+            )
+            dlast.update(variance_diag)
+            outcomes.append((loss_backward, dlast))
+        return outcomes
 
     # Accumulate the sub-step gradients into ONE AdamW update per batch, then run
     # the post-AdamW CPO projection repair.
@@ -3755,30 +4157,108 @@ def train_step(
     diag_last: dict[str, Tensor] = {}
     skipped_substeps = 0
     diags: list[dict[str, Tensor]] = []
+    diag_weights: list[float] = []
     optimizer.zero_grad(set_to_none=True)
     theta_old_snap: dict[str, Tensor] | None = None
-    for sub in range(1, acc_steps + 1):
-        is_last = sub == acc_steps
-        loss, dlast = _dgpo_substep()
-        diags.append(dlast)
-        if not torch.isfinite(loss):
-            skipped_substeps += 1
-            _log.warning(
-                "[DGPO] non-finite substep loss (%s); skipping backward "
-                "(step=%s sub=%s/%s).",
-                float(loss.detach().float().cpu()),
-                global_step, sub, acc_steps,
+    total_backward_units = acc_steps * len(policy_event_ranges)
+    full_trust_mask_mass = batch["x_invisible_mask"].detach().float().sum()
+    for event_chunk_index, (event_start, event_stop) in enumerate(policy_event_ranges):
+        eval_batch = _slice_event_batch(
+            batch,
+            event_start,
+            event_stop,
+            batch_size=B,
+        )
+        eval_candidates = candidates_phys[:, event_start:event_stop]
+        eval_advantages = advantages[:, event_start:event_stop]
+        eval_rewards = rewards[:, event_start:event_stop]
+        local_B = event_stop - event_start
+        event_weight = float(local_B) / float(B)
+        trust_weight_correction = full_trust_mask_mass.new_ones(())
+        if reference_trust_coefficient > 0.0 and full_trust_mask_mass > 0.0:
+            local_trust_mask_mass = (
+                eval_batch["x_invisible_mask"].detach().float().sum()
             )
-            continue
-        ctx = model.no_sync() if isinstance(model, DDP) and not is_last else nullcontext()
-        with ctx:
-            (loss / float(acc_steps)).backward()
+            # Reference trust is normalized by valid invisible elements, while
+            # DGPO/KL are normalized by events. Correct its local loss so the
+            # outer event weight reconstructs the exact full-batch denominator.
+            trust_weight_correction = (
+                local_trust_mask_mass / full_trust_mask_mass / event_weight
+            )
+
+        # Candidate normalization and K-fold conditioning expansion are constant
+        # across this event chunk's sampled (t, eps) draws. Reuse them for all
+        # accumulated timesteps, then release them before the next event chunk.
+        base_policy_inputs = _prepare_policy_evaluation_inputs(
+            model,
+            eval_batch,
+            eval_candidates,
+            K=K,
+        )
+        parallel_input_cache = {
+            count: _prepare_parallel_policy_evaluation_inputs(
+                base_policy_inputs,
+                count,
+            )
+            for count in chunk_sizes
+        }
+        del base_policy_inputs
+
+        completed_substeps = 0
+        while completed_substeps < acc_steps:
+            chunk_size = min(parallel_eval_steps, acc_steps - completed_substeps)
+            is_last_backward = (
+                event_chunk_index + 1 == len(policy_event_ranges)
+                and completed_substeps + chunk_size == acc_steps
+            )
+            ctx = (
+                model.no_sync()
+                if isinstance(model, DDP) and not is_last_backward
+                else nullcontext()
+            )
+            with ctx:
+                chunk_outcomes = _dgpo_substeps(
+                    chunk_size,
+                    eval_batch=eval_batch,
+                    eval_candidates=eval_candidates,
+                    eval_advantages=eval_advantages,
+                    eval_rewards=eval_rewards,
+                    prepared_inputs=parallel_input_cache[chunk_size],
+                    trust_weight_correction=trust_weight_correction,
+                )
+                finite_losses: list[Tensor] = []
+                for chunk_offset, (loss, dlast) in enumerate(chunk_outcomes):
+                    sub = completed_substeps + chunk_offset + 1
+                    diags.append(dlast)
+                    diag_weights.append(event_weight)
+                    if not torch.isfinite(loss):
+                        skipped_substeps += 1
+                        _log.warning(
+                            "[DGPO] non-finite substep loss (%s); skipping backward "
+                            "(step=%s events=%s:%s sub=%s/%s).",
+                            float(loss.detach().float().cpu()),
+                            global_step,
+                            event_start,
+                            event_stop,
+                            sub,
+                            acc_steps,
+                        )
+                        continue
+                    finite_losses.append(loss)
+                if finite_losses:
+                    (
+                        torch.stack(finite_losses).sum()
+                        * event_weight
+                        / float(acc_steps)
+                    ).backward()
+            completed_substeps += chunk_size
+        del parallel_input_cache
     gn, clip_on = _grad_norm_pre_clip_and_clip_active(
         model, float(grad_clip_norm)
     )
     grad_norm_pre_clip_max = gn
     grad_clip_active_any = clip_on > 0.5
-    if skipped_substeps == acc_steps or not math.isfinite(gn):
+    if skipped_substeps == total_backward_units or not math.isfinite(gn):
         _log.warning(
             "[DGPO] all substeps non-finite or grad-norm non-finite (%s); "
             "skipping optimizer.step at global_step=%s.",
@@ -3786,10 +4266,13 @@ def train_step(
         )
         optimizer.zero_grad(set_to_none=True)
     else:
-        theta_old_snap = snapshot_params(model)
+        # A full trainable-parameter clone is only needed by the optional CPO
+        # repair.  The normal DGPO path (projection type: none) otherwise paid
+        # this GPU-memory bandwidth and allocation cost on every optimizer step.
+        theta_old_snap = snapshot_params(model) if projection_active else None
         optimizer.step()
         optimizer_ran = True
-    diag_last = _mean_diag_dict(diags)
+    diag_last = _weighted_mean_diag_dict(diags, diag_weights)
     if optimizer_ran and theta_old_snap is not None and projection_active:
         _dgpo_projection_repair_after_adamw(
             model=model,
@@ -3826,6 +4309,22 @@ def train_step(
         valid_b,
         advantages=advantages,
     )
+    out["train/policy_eval/parallel_timesteps"] = float(parallel_eval_steps)
+    out["train/policy_eval/event_microbatch_size"] = float(
+        policy_event_microbatch_size
+    )
+    out["train/policy_eval/event_microbatches"] = float(len(policy_event_ranges))
+    if device.type == "cuda":
+        gib = float(1024**3)
+        out["train/memory/peak_allocated_gib"] = (
+            float(torch.cuda.max_memory_allocated(device)) / gib
+        )
+        out["train/memory/peak_reserved_gib"] = (
+            float(torch.cuda.max_memory_reserved(device)) / gib
+        )
+        out["train/memory/device_total_gib"] = (
+            float(torch.cuda.get_device_properties(device).total_memory) / gib
+        )
 
     if log_reward_dist:
         out.update(build_reward_distribution_histograms(rewards, valid_b))
@@ -3835,6 +4334,7 @@ def train_step(
         int(global_step) % plot_every == 0
     )
     collect_profile_accum = log_diag_images and ("pt_profile_accumulated" in plot_names)
+    compact_wandb = _wandb_simplified_enabled()
     out.update(
         _build_reward_extra_metrics(
             rewards,
@@ -3844,17 +4344,19 @@ def train_step(
             log_distribution=log_diag_images,
             collect_profile_accum=collect_profile_accum,
             diagnostic_plot_names=plot_names,
+            compact=compact_wandb,
         )
     )
-    out.update(
-        _build_reference_bias_metrics(
-            candidates_phys,
-            batch,
-            cartesian=_truth_generation_cartesian(),
-            log_distribution=log_diag_images,
-            diagnostic_plot_names=plot_names,
+    if not compact_wandb:
+        out.update(
+            _build_reference_bias_metrics(
+                candidates_phys,
+                batch,
+                cartesian=_truth_generation_cartesian(),
+                log_distribution=log_diag_images,
+                diagnostic_plot_names=plot_names,
+            )
         )
-    )
     out["train/grad/global_norm_pre_clip"] = float(grad_norm_pre_clip_max)
     out["train/grad/clip_active"] = 1.0 if grad_clip_active_any else 0.0
     out["projection/active"] = 1.0 if projection_active else 0.0
@@ -3864,9 +4366,15 @@ def train_step(
     _append_swd_panel_metrics(out)
     out.update(nonfinite_diag)
 
-    cartesian = _truth_generation_cartesian()
-    all_plot_feature_names = _generation_monitor_feature_names(cartesian=cartesian)
-    if _supports_legacy_invisible_kinematics(
+    # Training-distribution monitoring duplicates validation's truth/pred arrays.
+    # Keep the entire path cold when disabled: no feature resolution, tensor-to-CPU
+    # copies, NumPy arrays, histograms, or class-index expansion.
+    if collect_train_dist:
+        cartesian = _truth_generation_cartesian()
+        all_plot_feature_names = _generation_monitor_feature_names(
+            cartesian=cartesian
+        )
+    if collect_train_dist and _supports_legacy_invisible_kinematics(
         cartesian=cartesian,
         feature_dim=int(batch["x_invisible"].shape[-1]),
     ):
@@ -3910,7 +4418,7 @@ def train_step(
             out["_kin_all_py_t"] = all_py_t
             out["_kin_all_pz_p"] = all_pz_p
             out["_kin_all_pz_t"] = all_pz_t
-    if not cartesian:
+    if collect_train_dist and not cartesian:
         feature_arrays = _val_pred_truth_feature_flat_all_candidates(
             candidates_phys,
             batch,
@@ -3921,6 +4429,11 @@ def train_step(
             suffix = "p" if key.endswith("_pred") else "t"
             feature_name = key.rsplit("_", 1)[0]
             out[f"_kin_all_{feature_name}_{suffix}"] = values
+        out["_kin_all_class_index"] = _val_class_index_flat_all_candidates(
+            candidates_phys,
+            batch,
+            device=device,
+        )
 
     optimizer.scheduler_step()
     return out
@@ -4125,6 +4638,9 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "train/loss/delta": "mean(|L_cur - L_ref|): average absolute gap between current and reference velocity MSE. Shows how far the policy has moved from frozen ref_model (not rollout EMA).",
         "train/loss/velocity": "Detached velocity objective slice: pure DGPO main term used for backward.",
         "train/loss/kl": "Weighted supervised diffusion anchor beta_kl * mean_row |v_pred - v_truth|^2 on the same noisy inputs. Keeps the original diffusion preference toward the denoising target while DGPO adds physics steering.",
+        "reference_trust/loss": "Shared-noise velocity-MSE trust loss against the policy snapshot paired with the installed OmniFold reward round.",
+        "reference_trust/velocity_mse_ratio": "Round-reference trust velocity MSE divided by the frozen reference policy's own velocity loss.",
+        "reference_trust/coefficient": "Configured multiplier for the paired round-reference trust loss.",
         "train/loss/variance_regularization": "Weighted anti-shrink soft penalty added to backward: lambda_var * mean(relu((std_truth - std_pred) / std_truth)^2) over the selected event_info-driven angular features.",
         "train/regularization/variance/active": "1 when batch-level variance anti-shrink regularization found at least one selected feature in the current feature layout.",
         "train/regularization/variance/active_features": "How many selected features contributed to the anti-shrink regularizer on this batch.",
@@ -4279,6 +4795,36 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "val_mass/top_mass": "Top mass reconstruction (assigned b + W) vs truth-neutrino resonance mass; same three-way overlay as val_mass/w_mass.",
         "val_mass/jsd/current/*": "Histogram Jensen-Shannon distance between truth and current-policy validation mass distributions. Lower is better.",
         "val_mass/jsd/ref/*": "Histogram Jensen-Shannon distance between truth and frozen-reference validation mass distributions. Lower is better.",
+        "val_tarp/tarp_binned_min_holm_pvalue": "Family-wise Holm-adjusted TARP decision p-value over visible-acoplanarity bins and the configured joint arms. TARP uses all validation_K candidates; higher is better and values below alpha indicate rejected calibration.",
+        "val_tarp/coverage": "Binned TARP coverage curves for the full four-dimensional tau-direction target and rank-copula arms (wandb.Image).",
+        "val_tarp/pooled_coverage": "Pooled TARP coverage shown for orientation only; conditional decisions must use the binned Holm-adjusted value.",
+        "staleness/judge_auc_weighted": "Held-out AUC of the single freshly reset classifier trained after applying the installed OmniFold weights. Values near 0.5 indicate weighted closure and this judge drives the staleness controller.",
+        "staleness/audit_threshold_reached": "1 when the routine judge's early-stop validation |AUC-0.5| crossed the installed baseline + retrain margin. This permits an early stale decision only when the untouched final split also exceeds that threshold.",
+        "staleness/audit_weighted_auc_gap_pvalue_approx": "Two-sided normal-approximation p-value for weighted held-out |AUC-0.5| using weight ESS for effective Gen sample size.",
+        "staleness/audit_power_at_retrain_margin": "Approximate power to detect adaptive_omnifold.trigger.retrain_auc_margin with the actual held-out event count and weight ESS.",
+        "staleness/audit_minimum_detectable_auc_gap": "Smallest |AUC-0.5| detectable at the configured target power under the null-Mann-Whitney approximation. Lower is better.",
+        "staleness/audit_power_sufficient": "1 when audit_power_at_retrain_margin reaches the configured target power; monitoring only, not a retraining gate.",
+        "staleness/weighted_auc_gap": "Fresh classifier held-out |weighted AUC-0.5|. A threshold crossing may trigger early after final-split confirmation; a non-crossing healthy decision requires saturation.",
+        "staleness/trigger_threshold": "Fixed installed-round threshold: baseline_auc_gap + retrain_auc_margin.",
+        "staleness/previous_audit_auc_gap": "Weighted |AUC-0.5| from the immediately preceding routine audit. Diagnostic only; it is not the trigger anchor.",
+        "staleness/next_trigger_threshold": "Current installed-baseline threshold; it remains fixed until a new reward round is installed.",
+        "staleness/baseline_auc_gap": "Weighted held-out |AUC-0.5| that certified the currently installed OmniFold reward round and remains the trigger anchor until a better candidate is installed.",
+        "staleness/auc_gap_delta_from_baseline": "Current weighted AUC gap minus the fixed installed-round baseline gap.",
+        "staleness/required_auc_gap_increase": "Configured retrain_auc_margin required above the installed baseline.",
+        "staleness/decision": "Adaptive controller decision: audit_unsaturated, healthy, threshold_exceeded, recalibrate, or a recalibration outcome.",
+        "omnifold/bootstrap_on_start": "1 when the initial K=1 OmniFold population fit was performed inside DGPO before any policy optimizer step.",
+        "omnifold/classifier_fits_total": "Number of classifier fits attempted in the residual sequence, including the final closure classifier. Trainable scope follows the active OmniFold classifier config.",
+        "omnifold/iterations_fitted": "Number of saturated discriminating classifier snapshots stored in the cumulative reward; excludes the final closure-only classifier.",
+        "omnifold/candidate/audit_balanced_accuracy": "Fresh held-out weighted balanced accuracy used by the candidate installation gate; it must be strictly below acceptance_max_balanced_accuracy.",
+        "omnifold/acceptance_max_balanced_accuracy": "Configured strict upper bound for the candidate's fresh held-out weighted balanced accuracy.",
+        "omnifold/fit/iter*/saturated": "1 when that residual classifier fit reached its configured validation saturation/early-stop condition.",
+        "omnifold/fit/iter*/stored_in_reward": "1 when that saturated classifier snapshot was stored as a cumulative log-ratio increment; 0 for the final closure-only classifier.",
+        "omnifold/fit/iter*/validation_balanced_accuracy": "Held-out balanced accuracy for this residual fit. The next iteration begins only after saturation; closure is assessed against the configured chance band.",
+        "val_ztautau/target/*": "Truth/current/reference 1D density overlays for the four diffusion targets. Current and reference use candidate 0, never reward-best selection.",
+        "val_ztautau/reco/*": "Truth/current/reference 1D density overlays for reconstructed tau theta/phi directions, using the shared Ztautau direction reconstruction.",
+        "val_ztautau/topology/*": "Truth/current/reference 1D density overlays for tau-pair opening, acoplanarity, back-to-back loss, and post-calibration direction-change magnitudes.",
+        "val_ztautau/jsd/current/*": "Jensen-Shannon distance between truth and unbiased candidate-0 current-policy physics distributions. Lower is better.",
+        "val_ztautau/jsd/ref/*": "Jensen-Shannon distance between truth and frozen-reference candidate-0 physics distributions. Lower is better.",
         # --- train_dist (epoch end, accumulated over all training batches; own wandb panel) ---
         "train_dist/pt": "1D density overlay: truth vs best-of-K training prediction for pT [GeV] (original scale), accumulated over all training batches in the epoch (wandb.Image). x-axis **epoch**. \"Best\" = combined-reward argmax among K candidates.",
         "train_dist/eta": "Same overlay for η (training); same candidate selection as train_dist/pt.",
@@ -4288,6 +4834,8 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "train_dist/all/eta_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "train_dist/all/phi_truth_vs_pred": "Example 2D truth-vs-pred key. Actual train epoch-end 2D keys follow event_info.invisible_feature_names as train_dist/all/{feature}_truth_vs_pred and use Generation-Binning neutrino-{feature} when configured.",
         "train_dist/all_metrics/*/*": "Scalar summaries for train truth-vs-pred 2D monitors over all candidates: count, mae, rmse, bias=mean(pred-truth), pearson_r, slope, intercept.",
+        "train_dist/by_class/*/*_truth_vs_pred": "Representative EVENT/signal class-specific train truth-vs-pred matrices over all K candidates. The selected classes and cadence are configured under dgpo.train_dist_representative_classes and train_dist_by_class_every_n_epochs.",
+        "train_dist/by_class_metrics/*/*/*": "Count, MAE, RMSE, bias, Pearson r, slope, and intercept for each representative class/feature matrix.",
         "train_dist_k1/pt": "1D density overlay: truth vs candidate-0 training rollout prediction for pT [GeV], accumulated over all training batches in the epoch. This is a K=1 / single-sample proxy on the train rollout pool, separate from reward-best train_dist/*.",
         "train_dist_k1/eta": "Same overlay for η using candidate 0 as the train K=1 proxy.",
         "train_dist_k1/phi": "Same overlay for φ using candidate 0 as the train K=1 proxy.",
@@ -4302,25 +4850,58 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
     return {
         # --- dgpo: core RL hyperparameters ---
         "dgpo.beta": "beta_dgpo: Temperature parameter that scales the event-level gate logit M_e. Higher beta makes the gate more sensitive to the advantage-weighted velocity gap. M_e = (beta / K) * sum_over_candidates(advantage * Delta). Typical range: 0.1 to 1.0. Current value controls how aggressively events are up/down-weighted in the loss.",
+        "dgpo.float32_matmul_precision": "PyTorch float32 matrix-multiplication precision. 'medium' allows faster reduced-internal-precision tensor-core algorithms while keeping float32 inputs/outputs; 'high' preserves the previous DGPO default.",
+        "dgpo.advantage_estimator": "Per-event candidate baseline. OmniFold requires 'leave_one_out_unscaled' so the learned log-density-ratio scale is retained; legacy rewards default to 'zscore'.",
         "dgpo.grad_clip_norm": "Global L2 gradient clip for AdamW (torch.nn.utils.clip_grad_norm_). Compare train/grad/global_norm_pre_clip to this value.",
         "dgpo.K": "Number of DDIM candidate samples generated per event **during training** (rollout + DGPO). Each event gets K neutrino reconstructions, and the reward function ranks them. Larger K = more candidates to choose from (better oracle performance) but slower generation. Typical values: 4-16.",
         "dgpo.validation_K": "Candidates per event during **validation** only (independent of training K). Default **1**: one current-policy DDIM sample per event; with validation_compute_winrate, one additional ref-policy DDIM per event for reward-based winrate. Does not advance the training global_step or train-panel x-axis.",
+        "dgpo.validation_cheap_K": "Current-policy candidates per event for the cheap scalar-only validation tier. This tier skips reference DDIM, images, per-event gathers, Ztautau panels, and TARP.",
+        "dgpo.validation_batch_size": "Per-worker validation event batch, independent of platform.batch_size. Keeping this fixed allows a larger DGPO training batch without changing validation event count, response alignment, or DDIM peak memory.",
         "dgpo.rollout_parallel_chains": "How many DDIM chains to batch together per model call during training rollout. Keeps total K the same, but runs up to this many chains in one larger forward pass. Higher can be faster if GPU headroom exists; too high can OOM.",
         "dgpo.validation_rollout_parallel_chains": "Validation-only version of rollout_parallel_chains. If unset, falls back to the training value.",
         "dgpo.num_ddim_steps": "Number of DDIM denoising steps (T_sample) used for online candidate generation during **training** only. More steps = higher-quality samples but slower. Typical values: 20-100.",
         "dgpo.validation_num_ddim_steps": "Number of DDIM denoising steps used for candidate generation during **validation** only (independent of training num_ddim_steps). If null, falls back to num_ddim_steps. Lets you validate at higher fidelity than the training rollout without slowing training.",
+        "dgpo.policy_eval_parallel_timesteps": "Independent policy-evaluation (t, eps) draws batched into one current/reference forward. Keeps dgpo.num_train_timesteps and the one-AdamW-step objective unchanged; higher values reduce launches but increase activation memory roughly proportionally.",
+        "dgpo.policy_eval_event_microbatch_size": "Event rows per gradient-bearing current/reference policy-evaluation forward. Gradients are weighted and accumulated into the same one-AdamW-step full-batch objective, preserving K and num_train_timesteps while reducing activation memory. Null uses the full DGPO batch.",
+        "dgpo.activation_checkpointing": "Recompute trainable PET transformer blocks during backward instead of retaining their intermediate activations. Reduces current-policy K*B peak memory while preserving FP32 parameters and loss computation.",
         "dgpo.diagnostic_profile_accumulate_steps": "Number of train batches to concatenate before logging accumulated diagnostics/reward_hacking/profile/*_delta_vs_truth_* images. Larger values stabilize sparse bins but update the W&B images less often.",
         "dgpo.log_every": "Log Python INFO messages (loss, reward, etc.) to the console every N optimizer steps. Does not affect wandb logging frequency (wandb logs every step when enabled). Typical: 1-10.",
         "dgpo.log_reward_dist_every": "Log reward/dist/overlap every N optimizer steps when wandb is enabled. Defaults to dgpo.diagnostic_plots.plot_every when omitted.",
-        "dgpo.validation_every_n_epochs": "Run end-of-epoch DDIM validation when (epoch+1) is divisible by this value (default 1 = every epoch). Epoch -1 baseline at train start is unaffected. Top-K checkpointing runs only on validation epochs.",
+        "dgpo.train_dist_enabled": "Enable duplicate train-rollout truth/pred arrays, cross-rank gathers, and epoch media. False is recommended when full validation already monitors the same distributions.",
+        "dgpo.train_dist_representative_classes": "EVENT/signal class names that receive separate train_dist/by_class truth-vs-pred 2D matrices in addition to the pooled train_dist/all panels.",
+        "dgpo.train_dist_by_class_every_n_epochs": "Cadence for representative per-class train_dist matrices. Epoch 0 is always logged; later panels follow this logical-epoch cadence to bound W&B/Matplotlib overhead.",
+        "dgpo.train_dist_every_n_epochs": "Cadence for collecting, cross-rank gathering, and plotting pooled train_dist arrays. Epoch 0 is included. Outside this cadence, train_step does not materialize the large CPU truth/pred arrays.",
+        "dgpo.steps_per_epoch": "Optional positive optimizer-step budget for one logical DGPO epoch. When set, the Ray training iterator remains open across epoch boundaries and is restarted only after the shard is exhausted, so short logical epochs do not repeatedly consume the start of the dataset. When omitted, one epoch is one complete dataset pass.",
+        "dgpo.validation_every_n_epochs": "Cadence for the cheap scalar-only validation tier. Epoch -1 baseline remains a full validation; a coincident full validation replaces rather than duplicates the cheap pass.",
+        "dgpo.validation_full_every_n_epochs": "Cadence for full validation_K monitoring with reference rollout, response/profile arrays, 2D panels, Ztautau metrics, TARP, and top-K checkpoint selection. A coincident full validation replaces the cheap tier.",
+        "dgpo.validation_cheap_max_batches": "Per-rank batch cap for the scalar-only cheap validation tier. Separate from validation_max_batches used by full monitoring.",
         "dgpo.validation_max_batches": "If set (e.g. 20): stop validation after this many batches per epoch (faster validation for debugging). If null: run full validation set. Typical: null for real training, 5-20 for smoke tests.",
-        "dgpo.validation_compute_winrate": "If true: each validation batch generates one extra reference-policy DDIM sample to compute reward-based val/winrate. Adds ~50% validation time. If false: skip winrate (logged as NaN). Typical: false (cheaper validation).",
+        "dgpo.validation_compute_winrate": "Full-validation-only switch: generate one extra reference-policy DDIM sample for reward-based val/winrate. Cheap validation never runs the reference policy.",
+        "dgpo.checkpoint_every_n_steps": "Periodic last-checkpoint cadence, evaluated only at logical-epoch boundaries. Adaptive audit/refit boundaries and the final epoch are also saved. This replaces duplicate in-step plus every-epoch writes.",
         "dgpo.validation_log_batches": "If true: log INFO messages for each validation batch (start time, DDIM wall time). Useful for monitoring long validation runs. Typical: true.",
+        "dgpo.validation_cheap_log_batches": "If true, emit per-batch logs for cheap validation. False keeps the frequent two-batch probe quiet.",
         "dgpo.validation_tqdm_k_chains": "If true: show a tqdm progress bar over the K DDIM chains per validation batch. Typical: true (helps see validation progress).",
         "dgpo.validation_tqdm_ddim": "If true: show a tqdm progress bar for every DDIM step within each chain (very verbose). Typical: false (too much output).",
+        "dgpo.adaptive_omnifold.enabled": "Run K=1 fresh EveNet audits during DGPO and refit/install a new ratio stack plus its paired round-reference policy when stale.",
+        "dgpo.adaptive_omnifold.staleness_every_n_epochs": "Independent cadence for the fresh K=1 audit; it does not change validation_K or dgpo.K.",
+        "dgpo.adaptive_omnifold.pool_generation_batch_size": "Per-worker Ray batch used only to generate no-grad K=1 live-policy populations for OmniFold fit, stale probes, and acceptance audits. Independent of platform.batch_size and classifier fit.batch_size.",
+        "dgpo.adaptive_omnifold.audit_fit.train_microbatch_size_per_rank": "Per-GPU gradient-bearing audit classifier rows per class and forward. Multiple microbatches reconstruct one configured global optimizer batch without retaining their activation graphs.",
+        "dgpo.adaptive_omnifold.trigger.probe_max_events": "Event cap for the frequent K=1 staleness audit. This may be smaller than recalibration.score_pool_events; it does not reduce the final refit/acceptance population.",
+        "dgpo.adaptive_omnifold.trigger.retrain_auc_margin": "Sole retraining threshold hyperparameter. Refit when weighted |AUC-0.5| is strictly greater than installed baseline_auc_gap plus this margin.",
+        "dgpo.adaptive_omnifold.trigger.require_audit_saturation": "If true, an unsaturated audit is diagnostic only: it resets the exceedance streak and cannot trigger retraining.",
+        "dgpo.adaptive_omnifold.recalibration.pool_events": "Global event count in the fixed current-policy K=1 fit population. When set, the driver creates one seeded subset and bootstrap/refits reuse the same identities; null drains the ordinary train shards.",
+        "dgpo.adaptive_omnifold.recalibration.score_pool_events": "Held-out K=1 population used for residual gating and the candidate balanced-accuracy acceptance audit. Kept separate from the routine staleness probe.",
+        "dgpo.adaptive_omnifold.recalibration.fit.train_microbatch_size_per_rank": "Per-GPU gradient-bearing residual-classifier rows per class and forward. Gradients accumulate across these chunks before one optimizer step and one distributed gradient average.",
+        "dgpo.adaptive_omnifold.recalibration.residual_min_auc_gain": "The sole outer-iteration usefulness gate: a residual classifier is stored only when held-out AUC is strictly greater than 0.5 plus this value. Held-out BCE remains diagnostic. Larger values widen the closure band and stop residual iterations earlier.",
+        "dgpo.adaptive_omnifold.recalibration.acceptance_max_balanced_accuracy": "Install a saturated refit candidate only when its fresh held-out weighted balanced accuracy is strictly below this value.",
+        "dgpo.adaptive_omnifold.recalibration.pool_selection_seed": "Seed used once by the driver to choose the fixed global OmniFold fit identities. It does not control K=1 DDIM noise or classifier optimization.",
         # --- reward_config ---
-        "reward_config.type": "Reward backend. 'component_normalized_truth_distance' uses truth-matching squared error; 'calibration_magnitude' uses post-calibration tau direction-change magnitude (smaller is better) as the physics-consistency reward.",
+        "reward_config.type": "Reward backend. 'omnifold' uses the frozen truth-free conditional log-density-ratio bundle; 'component_normalized_truth_distance' uses truth matching; 'calibration_magnitude' uses tau direction-change magnitude.",
         "reward_config.weight": "Global multiplier on the configured reward source before summing into the combined DGPO reward. Typical: 1.0.",
+        "reward_config.omnifold.bundle_file": "Path to omnifold_reward.pt produced from the fixed K=1 train/validation populations.",
+        "reward_config.omnifold.backbone_checkpoint": "Supervised EveNet checkpoint used to initialize the OmniFold classifier body inside DGPO. In frozen-backbone mode, classifier fits share that body and train independent PEFT banks.",
+        "reward_config.omnifold.bootstrap_in_dgpo": "When true, DGPO fits and installs the initial K=1 residual ratio stack before any policy optimizer step; no prefit reward bundle is required.",
+        "dgpo.adaptive_omnifold.recalibration.bootstrap_on_start": "Run the fail-closed initial residual sequence inside DGPO. Every classifier fit must saturate before a discriminating snapshot is stored.",
         "reward_config.component_normalized.eps": "Numerical stability added to per-component scale denominators in the truth-distance reward. Unused by calibration_magnitude.",
     }
 
@@ -4334,6 +4915,14 @@ def _dgpo_wandb_publish_metric_docs() -> None:
 
     run = wandb.run
     if run is None:
+        return
+    if _wandb_simplified_enabled():
+        # The compact profile deliberately keeps W&B Config and Artifacts free
+        # of a second, very large copy of documentation already tracked in git.
+        try:
+            run.summary["dgpo_logging_profile"] = "simplified"
+        except Exception as e:
+            _log.warning("[DGPO] wandb simplified-profile summary failed: %s", e)
         return
     defs = _dgpo_wandb_metric_definition_map()
     param_defs = _dgpo_wandb_hyperparameter_definitions()
@@ -4351,7 +4940,7 @@ def _dgpo_wandb_publish_metric_docs() -> None:
                     "components/*, diagnostics/reward_hacking/* (including all/ vs best/), "
                     "diagnostics/reference_bias/*; projection/* + swd/* (latent-SWD CPO repair, x-axis global_step); "
                     "train_dist/*, train_dist_k1/*; val/reward/*, val/winrate, "
-                    "val_diagnostics/*, val_neutrino/*."
+                    "val_diagnostics/*, val_neutrino/*, val_ztautau/*, val_tarp/*."
                 ),
             },
             allow_val_change=True,
@@ -4395,6 +4984,142 @@ def _wandb_is_media_value(v: Any) -> bool:
         "Video",
         "Html",
     )
+
+
+def _wandb_simplified_enabled() -> bool:
+    """Whether the configured W&B run uses the compact, decision-focused profile."""
+
+    section, _ = _dgpo_wandb_yaml_section()
+    return bool(_dgpo_cfg_get(section, "simplified", False))
+
+
+_WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
+    {
+        "epoch",
+        "global_step",
+        "omnifold_live/log_index",
+        "train/loss/total",
+        "train/loss/dgpo",
+        "train/loss/L_cur",
+        "train/loss/L_ref",
+        "train/loss/delta",
+        "train/grad/global_norm_pre_clip",
+        "train/grad/clip_active",
+        "train/memory/peak_allocated_gib",
+        "train/memory/peak_reserved_gib",
+        "reward/raw/mean",
+        "reward/raw/std",
+        "reward/monitor/best_of_k",
+        "reward/monitor/median",
+        "reward/monitor/last_place",
+        "reward/monitor/mean_gap",
+        "parameter/w_e/mean",
+        "parameter/w_e/std",
+        "reference_trust/loss",
+        "reference_trust/velocity_mse_ratio",
+        "val/reward/mean",
+        "val/reward/median",
+        "val/reward/p10",
+        "val/reward/p90",
+        "val/winrate",
+        "val_cheap/reward/mean",
+        "val_cheap/reward/median",
+        "val_cheap/reward/p10",
+        "val_cheap/reward/p90",
+        "omnifold/accepted",
+        "omnifold/iterations_fitted",
+        "omnifold/all_fits_saturated",
+        "omnifold/bootstrap_on_start",
+        "omnifold/candidate/audit_balanced_accuracy",
+        "omnifold/reward_round_id",
+        "omnifold/recalibration_count",
+        "staleness/weighted_auc_gap",
+        "staleness/audit_saturated",
+        "staleness/audit_threshold_reached",
+        "staleness/trigger_threshold",
+        "staleness/trigger_recalibration",
+        "staleness/reward_round_id",
+    }
+)
+
+
+def _wandb_simplified_keep(key: str, value: Any) -> bool:
+    """Keep only non-redundant metrics used to judge training or acceptance."""
+
+    if key in _WANDB_SIMPLIFIED_EXACT_KEYS:
+        return True
+    if "nonfinite" in key:
+        return True
+    if key in _PROJECTION_WANDB_SCALAR_KEYS or key in _SWD_WANDB_SCALAR_KEYS:
+        return True
+    if key.startswith(_PROJECTION_CONSTRAINT_WANDB_SCALAR_PREFIX):
+        return True
+    if key.startswith("omnifold_live/meta/"):
+        return key.rsplit("/", 1)[-1] in {
+            "fit_step",
+            "iteration",
+            "crossfit_fold",
+            "dgpo_epoch",
+            "global_step",
+        }
+    if key.startswith("omnifold_live/"):
+        return key.rsplit("/", 1)[-1] in {
+            "validation_auc",
+            "validation_balanced_accuracy",
+            "accepted",
+            "saturated",
+            "threshold_reached",
+        }
+    if key.startswith("omnifold/fit/iter"):
+        return key.rsplit("/", 1)[-1] in {
+            "saturated",
+            "stored_in_reward",
+            "validation_auc",
+            "validation_balanced_accuracy",
+        }
+    if key.startswith("omnifold/candidate/"):
+        return key.rsplit("/", 1)[-1] in {
+            "weighted_auc_gap",
+            "audit_validation_auc",
+            "audit_balanced_accuracy",
+            "audit_saturated",
+        }
+    if key.startswith("val_diagnostics/profile/"):
+        return key.rsplit("/", 1)[-1] in {
+            "delta_mean",
+            "slope",
+            "zero_delta_truth",
+        }
+    if key.startswith("val_neutrino/jsd/current/"):
+        return True
+    if key.startswith("val_neutrino/all_metrics/"):
+        return True
+    if key.startswith("val_neutrino/all/") and key.endswith("_truth_vs_pred"):
+        return True
+    if key.startswith("val_neutrino/by_process/"):
+        return True
+    if key.startswith("val/response/"):
+        return True
+    # Ztautau observables and both TARP arms (full + rank-copula) are primary
+    # scientific diagnostics, not generic validation clutter. Preserve their
+    # scalars and media in the compact profile.
+    if key.startswith("val_ztautau/"):
+        return True
+    if key.startswith("val_tarp/"):
+        return True
+    return False
+
+
+def _wandb_apply_simplified_profile(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply the compact W&B allowlist when ``logger.wandb.simplified`` is true."""
+
+    if not _wandb_simplified_enabled():
+        return dict(data)
+    return {
+        str(key): value
+        for key, value in data.items()
+        if _wandb_simplified_keep(str(key), value)
+    }
 
 
 _PROJECTION_WANDB_SCALAR_KEYS = frozenset({
@@ -4611,13 +5336,14 @@ def _wandb_sanitize_log_dict(data: dict[str, Any]) -> dict[str, Any]:
 
 def _wandb_reset_step_tracker() -> None:
     """Reset monotonic W&B step tracking (call once after ``wandb.init``)."""
-    global _wandb_committed_step
+    global _wandb_committed_step, _wandb_step_offset
     _wandb_committed_step = -1
+    _wandb_step_offset = 0
 
 
 def _wandb_train_step(global_step: int) -> int:
-    """W&B ``step`` for DGPO training metrics — identical to ``global_step``."""
-    return int(global_step)
+    """Internal W&B row for DGPO metrics after auxiliary fit rows."""
+    return int(global_step) + int(_wandb_step_offset)
 
 
 def _wandb_epoch_end_step(global_step: int) -> int:
@@ -4628,7 +5354,7 @@ def _wandb_epoch_end_step(global_step: int) -> int:
 def _wandb_log_with_step(wandb_mod: Any, payload: dict[str, Any], *, step: int) -> None:
     """``wandb.log`` with an explicit monotonic ``step=`` (required for all DGPO logging)."""
     global _wandb_committed_step
-    clean = _wandb_sanitize_log_dict(payload)
+    clean = _wandb_sanitize_log_dict(_wandb_apply_simplified_profile(payload))
     if not clean:
         return
     s = int(step)
@@ -4649,6 +5375,25 @@ def _wandb_log_with_step(wandb_mod: Any, payload: dict[str, Any], *, step: int) 
 def _wandb_log_step(wandb_mod: Any, payload: dict[str, Any], *, step: int) -> None:
     """Training / projection metrics: W&B Step axis tracks ``global_step`` (LinearPostAdam style)."""
     _wandb_log_with_step(wandb_mod, payload, step=_wandb_train_step(step))
+
+
+def _wandb_log_auxiliary(
+    wandb_mod: Any,
+    payload: dict[str, Any],
+    *,
+    current_global_step: int,
+) -> None:
+    """Commit one live fit row without regressing later DGPO W&B steps."""
+    global _wandb_step_offset
+    internal_step = max(
+        _wandb_train_step(current_global_step),
+        int(_wandb_committed_step) + 1,
+    )
+    _wandb_log_with_step(wandb_mod, payload, step=internal_step)
+    _wandb_step_offset = max(
+        int(_wandb_step_offset),
+        int(internal_step) + 1 - int(current_global_step),
+    )
 
 
 def _wandb_log_validation(
@@ -4732,11 +5477,23 @@ def _start_wandb_run(*, disable: bool = False) -> bool:
         wandb.define_metric("epoch")
         wandb.define_metric("global_step", hidden=True)
         wandb.define_metric("val/*", step_metric="epoch")
+        wandb.define_metric("val_cheap/*", step_metric="epoch")
         wandb.define_metric("val_diagnostics/*", step_metric="epoch")
         wandb.define_metric("val_neutrino/*", step_metric="epoch")
         wandb.define_metric("val_mass/*", step_metric="epoch")
+        wandb.define_metric("val_ztautau/*", step_metric="epoch")
+        wandb.define_metric("val_tarp/*", step_metric="epoch")
         wandb.define_metric("train_dist/*", step_metric="epoch")
         wandb.define_metric("train_dist_k1/*", step_metric="epoch")
+        wandb.define_metric("omnifold_live/log_index")
+        wandb.define_metric(
+            "omnifold_live/meta/*", step_metric="omnifold_live/log_index"
+        )
+        for phase_name in _OMNIFOLD_LIVE_PHASE_IDS:
+            wandb.define_metric(
+                f"omnifold_live/{phase_name}/*",
+                step_metric="omnifold_live/log_index",
+            )
         wandb.define_metric("projection/*", step_metric="global_step")
         wandb.define_metric("swd/*", step_metric="global_step")
     except Exception as e:
@@ -4779,12 +5536,17 @@ def _dgpo_save_last_ckpt(
     dgpo_next_epoch: int,
     global_step: int,
     ema_rollout: Any | None = None,
+    round_ref_model: torch.nn.Module | None = None,
+    reward_round_id: int = 0,
     dgpo_projection_constraint_state: dict[str, Any] | None = None,
+    dgpo_omnifold_reward_metadata: dict[str, Any] | None = None,
+    dgpo_adaptive_omnifold_state: dict[str, Any] | None = None,
+    dgpo_omnifold_reward_stack: dict[str, Any] | None = None,
 ) -> None:
-    """Write ``last.ckpt`` with live trainable weights in ``state_dict`` plus optional ``ema_state_dict``.
+    """Write an unpruned snapshot and repoint ``last.ckpt`` to it.
 
-    Refuses to overwrite ``last.ckpt`` when any trainable parameter is non-finite, so a single
-    bad batch cannot poison the resume state of a long-running DGPO job.
+    Refuses to save when any trainable parameter is non-finite, so a single bad
+    batch cannot poison the resume state of a long-running DGPO job.
     """
     save_dir = global_config.options.Training.get("model_checkpoint_save_path", None)
     if not save_dir:
@@ -4794,12 +5556,17 @@ def _dgpo_save_last_ckpt(
     bad = [n for n, p in core_for_check.named_parameters() if not torch.isfinite(p).all()]
     if bad:
         _log.warning(
-            "[DGPO] last.ckpt save SKIPPED at epoch=%s step=%s: %s non-finite trainable params "
-            "(first: %s). Existing last.ckpt is preserved.",
+            "[DGPO] checkpoint save SKIPPED at epoch=%s step=%s: %s non-finite "
+            "trainable params (first: %s). Existing snapshots are preserved.",
             last_completed_epoch, global_step, len(bad), bad[:3],
         )
         return
-    path = Path(str(save_dir)).expanduser().resolve() / "last.ckpt"
+    save_root = Path(str(save_dir)).expanduser().resolve()
+    path = save_root / dgpo_snapshot_checkpoint_name(
+        last_completed_epoch=last_completed_epoch,
+        dgpo_next_epoch=dgpo_next_epoch,
+        global_step=global_step,
+    )
     save_lightning_compatible_checkpoint(
         path,
         model,
@@ -4810,24 +5577,43 @@ def _dgpo_save_last_ckpt(
         global_step=global_step,
         optimizer=optimizer,
         ref_model=ref_model,
+        round_ref_model=round_ref_model,
+        reward_round_id=reward_round_id,
         ema_rollout=ema_rollout,
         dgpo_projection_constraint_state=dgpo_projection_constraint_state,
+        dgpo_omnifold_reward_metadata=dgpo_omnifold_reward_metadata,
+        dgpo_adaptive_omnifold_state=dgpo_adaptive_omnifold_state,
+        dgpo_omnifold_reward_stack=dgpo_omnifold_reward_stack,
     )
+    update_last_checkpoint_pointer(path)
 
 
 class _DgpoCheckpointTopK:
-    """Keep the best ``val/reward/mean`` checkpoints (higher is better) under ``model_checkpoint_save_path``."""
+    """Keep top-k checkpoints for one configured scalar metric."""
 
-    def __init__(self, save_dir: Path, top_k: int) -> None:
+    def __init__(
+        self,
+        save_dir: Path,
+        top_k: int,
+        *,
+        metric_name: str,
+        mode: str,
+    ) -> None:
         self._save_dir = save_dir
         self._top_k = max(0, int(top_k))
-        # (val_reward_mean, path_str) smallest reward first for easy pop
-        self._worst_heap: list[tuple[float, str]] = []
+        self._metric_name = str(metric_name)
+        self._metric_slug = self._metric_name.replace("/", "_")
+        self._mode = str(mode).lower()
+        if self._mode not in {"min", "max"}:
+            raise ValueError("model_checkpoint_top_k_mode must be 'min' or 'max'")
+        # Heap root is always the worst retained item. For min-mode, negate the
+        # raw score so the largest accuracy becomes the smallest priority.
+        self._worst_heap: list[tuple[float, str, float]] = []
 
     def maybe_save(
         self,
         *,
-        val_reward_mean: float,
+        score: float,
         last_completed_epoch: int,
         dgpo_next_epoch: int,
         global_step: int,
@@ -4836,17 +5622,26 @@ class _DgpoCheckpointTopK:
         optimizer: torch.optim.Optimizer,
         ref_model: torch.nn.Module,
         ema_rollout: Any | None = None,
+        round_ref_model: torch.nn.Module | None = None,
+        reward_round_id: int = 0,
         dgpo_projection_constraint_state: dict[str, Any] | None = None,
+        dgpo_omnifold_reward_metadata: dict[str, Any] | None = None,
+        dgpo_adaptive_omnifold_state: dict[str, Any] | None = None,
+        dgpo_omnifold_reward_stack: dict[str, Any] | None = None,
     ) -> None:
         if self._top_k <= 0:
             return
-        if not math.isfinite(val_reward_mean):
-            _log.warning("[DGPO] val/reward/mean is non-finite; skipping top-k checkpoint.")
+        raw_score = float(score)
+        if not math.isfinite(raw_score):
+            _log.warning(
+                "[DGPO] %s is non-finite; skipping top-k checkpoint.",
+                self._metric_name,
+            )
             return
 
         self._save_dir.mkdir(parents=True, exist_ok=True)
         fname = (
-            f"dgpo-top-val_reward_mean={val_reward_mean:.6f}-"
+            f"dgpo-top-{self._metric_slug}={raw_score:.6f}-"
             f"next_ep={dgpo_next_epoch}-step={global_step}.ckpt"
         )
         path = self._save_dir / fname
@@ -4860,38 +5655,52 @@ class _DgpoCheckpointTopK:
             global_step=global_step,
             optimizer=optimizer,
             ref_model=ref_model,
+            round_ref_model=round_ref_model,
+            reward_round_id=reward_round_id,
             ema_rollout=ema_rollout,
             dgpo_projection_constraint_state=dgpo_projection_constraint_state,
+            dgpo_omnifold_reward_metadata=dgpo_omnifold_reward_metadata,
+            dgpo_adaptive_omnifold_state=dgpo_adaptive_omnifold_state,
+            dgpo_omnifold_reward_stack=dgpo_omnifold_reward_stack,
         )
 
-        heapq.heappush(self._worst_heap, (val_reward_mean, str(path)))
+        priority = raw_score if self._mode == "max" else -raw_score
+        heapq.heappush(self._worst_heap, (priority, str(path), raw_score))
 
-        # Keep ``best.ckpt`` symlink pointing to the highest val/reward/mean seen so far.
-        best_score, best_path_str = max(self._worst_heap, key=lambda x: x[0])
+        # Highest priority is the best item for either mode.
+        _best_priority, best_path_str, best_score = max(
+            self._worst_heap,
+            key=lambda x: x[0],
+        )
         best_link = self._save_dir / "best.ckpt"
         try:
             if best_link.is_symlink() or best_link.exists():
                 best_link.unlink()
             best_link.symlink_to(Path(best_path_str).name)
             _log.info(
-                "[DGPO] best.ckpt → %s (val/reward/mean=%.6f)",
+                "[DGPO] best.ckpt → %s (%s=%.6f, mode=%s)",
                 Path(best_path_str).name,
+                self._metric_name,
                 best_score,
+                self._mode,
             )
         except OSError as e:
             _log.warning("[DGPO] Could not update best.ckpt symlink: %s", e)
 
         while len(self._worst_heap) > self._top_k:
-            _worst_score, worst_path = heapq.heappop(self._worst_heap)
+            _worst_priority, worst_path, worst_score = heapq.heappop(
+                self._worst_heap
+            )
             wp = Path(worst_path)
             if wp.is_file():
                 try:
                     wp.unlink()
                     _log.info(
-                        "[DGPO] Removed checkpoint outside top-%s: %s (val/reward/mean=%.6f)",
+                        "[DGPO] Removed checkpoint outside top-%s: %s (%s=%.6f)",
                         self._top_k,
                         wp.name,
-                        _worst_score,
+                        self._metric_name,
+                        worst_score,
                     )
                 except OSError as e:
                     _log.warning("[DGPO] Failed to remove old checkpoint %s: %s", wp, e)
@@ -5014,6 +5823,40 @@ def _val_pred_truth_feature_flat_all_candidates(
         out[f"{feature_name}_pred"] = pred
         out[f"{feature_name}_truth"] = target
     return out
+
+
+@torch.no_grad()
+def _val_class_index_flat_all_candidates(
+    candidates: Tensor,
+    batch_d: dict[str, Any],
+    *,
+    device: torch.device,
+) -> np.ndarray:
+    """Class ID aligned with the masked ``K x B x N`` feature flattening."""
+    class_index = batch_d.get("classification")
+    if not isinstance(class_index, Tensor):
+        return np.array([], dtype=np.int64)
+    K = int(candidates.shape[0])
+    B = int(batch_d["x"].shape[0])
+    N_nu = int(candidates.shape[2])
+    if int(class_index.shape[0]) != B or int(class_index.numel()) != B:
+        raise ValueError(
+            "classification must contain one integer class ID per event; "
+            f"got shape={tuple(class_index.shape)} for batch={B}"
+        )
+    xm = batch_d["x_invisible_mask"]
+    if xm.dim() == 3 and xm.shape[-1] == 1:
+        mask = xm.squeeze(-1).to(device=device)
+    else:
+        mask = xm.to(device=device)
+    mask_k = (mask > 0).reshape(B, N_nu).unsqueeze(0).expand(K, -1, -1)
+    class_k = (
+        class_index.reshape(B)
+        .to(device=device, dtype=torch.long)
+        .reshape(1, B, 1)
+        .expand(K, B, N_nu)
+    )
+    return class_k[mask_k].detach().cpu().numpy().astype(np.int64, copy=False)
 
 
 @torch.no_grad()
@@ -5425,6 +6268,36 @@ def _gather_val_array_dict(
     return {}
 
 
+def _gather_val_ndarray_dict(
+    local_arrays: dict[str, np.ndarray],
+    *,
+    rank: int,
+    world_size: int,
+) -> dict[str, np.ndarray]:
+    """Gather validation arrays to rank 0 while preserving non-event dimensions."""
+    if world_size <= 1:
+        return {key: np.asarray(value) for key, value in local_arrays.items()}
+    if rank == 0:
+        gathered: list[Any] = [None] * world_size
+        dist.gather_object(local_arrays, object_gather_list=gathered, dst=0)
+        keys: set[str] = set()
+        for part in gathered:
+            if isinstance(part, dict):
+                keys.update(part)
+        merged: dict[str, np.ndarray] = {}
+        for key in keys:
+            chunks = [
+                np.asarray(part[key])
+                for part in gathered
+                if isinstance(part, dict) and key in part and np.asarray(part[key]).size > 0
+            ]
+            if chunks:
+                merged[key] = np.concatenate(chunks, axis=0)
+        return merged
+    dist.gather_object(local_arrays, dst=0)
+    return {}
+
+
 def _profile_fit_metrics(
     profile_name: str,
     truth_value: np.ndarray,
@@ -5668,14 +6541,11 @@ def _truth_pred_matrix_figure(
     """2D density matrix for truth-vs-pred comparisons."""
     import wandb
 
-    x = np.asarray(truth, dtype=np.float64).reshape(-1)
-    y = np.asarray(pred, dtype=np.float64).reshape(-1)
-    n = min(x.size, y.size)
-    x = x[:n]
-    y = y[:n]
-    keep = np.isfinite(x) & np.isfinite(y)
-    x = x[keep]
-    y = y[keep]
+    x, y = paired_finite_truth_pred(
+        truth,
+        pred,
+        context="truth/pred matrix",
+    )
     if x.size == 0:
         x = np.array([0.0], dtype=np.float64)
         y = np.array([0.0], dtype=np.float64)
@@ -5708,10 +6578,167 @@ def _truth_pred_matrix_figure(
     return img
 
 
-def _dgpo_should_run_validation_epoch(epoch: int, every_n_epochs: int) -> bool:
-    """True when end-of-epoch validation should run (matches EveNet ``eval_metrics_every_n_epochs``)."""
-    n = max(1, int(every_n_epochs))
-    return (int(epoch) + 1) % n == 0
+def _snapshot_policy_state_dict(model: torch.nn.Module) -> dict[str, Tensor]:
+    """CPU policy snapshot paired with a newly materialized K=1 denominator."""
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in unwrap_for_state_dict(model).state_dict().items()
+    }
+
+
+@torch.no_grad()
+def _materialize_adaptive_omnifold_pool(
+    data_shard: Any,
+    loader_config: dict[str, Any],
+    *,
+    model: torch.nn.Module,
+    sampler: DDIMSampler,
+    device: torch.device,
+    world_size: int,
+    rank: int,
+    quota_events: int | None,
+    num_ddim_steps: int,
+    seed: int,
+) -> Any:
+    """Generate and all-gather a truth/visible-event/current-policy K=1 pool.
+
+    This deliberately samples the live policy, not either EMA. The caller takes
+    its round-reference snapshot at the same point, so an accepted ratio's Gen
+    denominator and DGPO velocity anchor are the same policy.
+    """
+    from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+        AdaptiveOmniFoldPool,
+        gather_pool_across_ranks,
+    )
+    from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import (
+        EventPackingSpec,
+        pack_event_inputs,
+    )
+
+    core = _unwrap_core_evenet(model)
+    was_training = core.training
+    core.eval()
+    packed_chunks: list[Tensor] = []
+    truth_chunks: list[Tensor] = []
+    candidate_chunks: list[Tensor] = []
+    packing_spec: EventPackingSpec | None = None
+    collected = 0
+    per_rank_quota = (
+        None
+        if quota_events is None
+        else max(1, int(math.ceil(int(quota_events) / max(1, int(world_size)))))
+    )
+    data_iter = iter(data_shard.iter_torch_batches(**loader_config))
+    cuda_devices: list[int] = []
+    if device.type == "cuda":
+        cuda_devices = [
+            device.index if device.index is not None else torch.cuda.current_device()
+        ]
+    try:
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(int(seed) + int(rank))
+            while True:
+                batch_cpu, has_more = _next_batch_synced(
+                    data_iter,
+                    world_size=world_size,
+                    device=device,
+                )
+                if not has_more or batch_cpu is None:
+                    break
+                already_full = (
+                    per_rank_quota is not None and collected >= per_rank_quota
+                )
+                if not already_full:
+                    batch = batch_to_device(batch_cpu, device)
+                    batch_size = int(batch["x"].shape[0])
+                    valid = get_event_valid_mask(
+                        batch,
+                        batch_size,
+                        device,
+                        torch.float32,
+                    ) > 0
+                    if bool(valid.any().item()):
+                        generated = generate_neutrino_candidates(
+                            core,
+                            batch,
+                            sampler,
+                            K=1,
+                            num_ddim_steps=int(num_ddim_steps),
+                            device=device,
+                            parallel_chains=1,
+                            tqdm_k_chains=False,
+                            use_tqdm_ddim=False,
+                        )
+                        invisible = batch.get("x_invisible")
+                        if not isinstance(invisible, Tensor):
+                            raise KeyError("adaptive OmniFold fit needs x_invisible truth")
+                        if tuple(generated.shape[2:]) != (2, 2):
+                            raise ValueError(
+                                "Ztautau adaptive OmniFold requires generated "
+                                f"(K,B,2,2), got {tuple(generated.shape)}"
+                            )
+                        if int(invisible.shape[1]) < 2 or int(invisible.shape[2]) < 2:
+                            raise ValueError("adaptive OmniFold truth needs two 2D slots")
+                        packed, packing_spec = pack_event_inputs(batch, packing_spec)
+                        keep = valid.nonzero(as_tuple=True)[0]
+                        if per_rank_quota is not None:
+                            remaining = max(0, per_rank_quota - collected)
+                            keep = keep[:remaining]
+                        if int(keep.numel()) > 0:
+                            packed_chunks.append(packed[keep].detach().cpu())
+                            truth_chunks.append(
+                                invisible[keep, :2, :2]
+                                .reshape(len(keep), 4)
+                                .detach()
+                                .float()
+                                .cpu()
+                            )
+                            candidate_chunks.append(
+                                generated[:, keep, :2, :2]
+                                .permute(1, 0, 2, 3)
+                                .reshape(len(keep), 1, 4)
+                                .detach()
+                                .float()
+                                .cpu()
+                            )
+                            collected += int(keep.numel())
+                if per_rank_quota is not None:
+                    done = torch.tensor(
+                        [1 if collected >= per_rank_quota else 0],
+                        device=device,
+                        dtype=torch.int64,
+                    )
+                    if world_size > 1:
+                        dist.all_reduce(done, op=dist.ReduceOp.MIN)
+                    if int(done.item()) == 1:
+                        break
+    finally:
+        core.train(was_training)
+
+    if not packed_chunks or packing_spec is None:
+        raise RuntimeError("adaptive OmniFold pool collected no valid events")
+    local = {
+        "packed_event": torch.cat(packed_chunks, dim=0),
+        "truth": torch.cat(truth_chunks, dim=0),
+        "candidates": torch.cat(candidate_chunks, dim=0),
+        "packing_spec": packing_spec.to_dict(),
+    }
+    gathered = gather_pool_across_ranks(local, world_size=world_size)
+    if quota_events is not None:
+        stop = min(int(quota_events), int(gathered["truth"].shape[0]))
+        for key in ("packed_event", "truth", "candidates"):
+            gathered[key] = gathered[key][:stop]
+    pool = AdaptiveOmniFoldPool(
+        packed_event=gathered["packed_event"],
+        truth=gathered["truth"],
+        candidates=gathered["candidates"],
+        packing_spec=EventPackingSpec.from_dict(gathered["packing_spec"]),
+    )
+    if pool.n_events < 30:
+        raise RuntimeError(
+            f"adaptive OmniFold pool needs at least 30 valid events, got {pool.n_events}"
+        )
+    return pool
 
 
 @torch.no_grad()
@@ -5737,6 +6764,8 @@ def run_validation_epoch(
     val_tqdm_ddim: bool = False,
     max_batches: int | None = None,
     initial_state: dict[str, np.ndarray] | None = None,
+    full_diagnostics: bool = True,
+    metric_prefix: str = "val",
     rank: int = 0,
     world_size: int = 1,
 ) -> dict[str, Any]:
@@ -5760,6 +6789,12 @@ def run_validation_epoch(
     ``val_tqdm_ddim`` adds an inner bar for each DDIM chain (verbose).
 
     If ``max_batches`` is set, stop after that many local batches per rank (partial val).
+
+    ``full_diagnostics=False`` is the cheap monitoring tier: it computes only
+    current-policy reward scalars/quantiles and skips the reference rollout,
+    profile arrays, truth/pred matrices, images, and Ztautau/TARP diagnostics.
+    ``metric_prefix`` keeps those deliberately lower-statistics numbers separate
+    from the full ``val/*`` series.
 
     """
     is_rank0 = rank == 0
@@ -5790,7 +6825,24 @@ def run_validation_epoch(
 
     local_reward_chunks: list[np.ndarray] = []
     local_reward_event_chunks: list[np.ndarray] = []
-    legacy_kinematics = _supports_legacy_invisible_kinematics(
+    local_response_class_chunks: list[np.ndarray] = []
+    ztautau_cfg = getattr(global_config, "ztautau_domain", None)
+    dg_cfg = getattr(global_config, "dgpo", {})
+    ztautau_panel_cfg = _dgpo_cfg_get(dg_cfg, "ztautau_metrics", {})
+    tarp_cfg = _dgpo_cfg_get(dg_cfg, "tarp", {})
+    compact_wandb = _wandb_simplified_enabled()
+    ztautau_metrics_enabled = bool(
+        full_diagnostics
+        and ztautau_cfg is not None
+        and _dgpo_cfg_get(ztautau_cfg, "enabled", False)
+        and tuple(_dgpo_cfg_get(ztautau_cfg, "feature_names", ())) == ("theta", "phi")
+        and (
+            _dgpo_cfg_get(ztautau_panel_cfg, "enabled", False)
+            or _dgpo_cfg_get(tarp_cfg, "enabled", False)
+        )
+    )
+    local_ztautau_chunks: dict[str, list[np.ndarray]] = defaultdict(list)
+    legacy_kinematics = bool(full_diagnostics) and _supports_legacy_invisible_kinematics(
         cartesian=cartesian,
         feature_dim=len(_invisible_feature_names()) or None,
     )
@@ -5799,7 +6851,11 @@ def run_validation_epoch(
         cartesian=cartesian,
         feature_dim=len(_invisible_feature_names()) or None,
     )
-    profile_feature_names = tuple(_validation_profile_feature_names(cartesian=cartesian))
+    profile_feature_names = (
+        tuple(_validation_profile_feature_names(cartesian=cartesian))
+        if full_diagnostics
+        else ()
+    )
     local_pt_delta_event_mean_chunks: list[np.ndarray] = []
     local_profile_chunks: dict[str, list[np.ndarray]] = {
         f"{profile_name}_truth": []
@@ -5809,12 +6865,17 @@ def run_validation_epoch(
         f"{profile_name}_delta": []
         for profile_name in profile_feature_names
     })
-    all_plot_feature_names = _generation_monitor_feature_names(cartesian=cartesian)
+    all_plot_feature_names = (
+        _generation_monitor_feature_names(cartesian=cartesian)
+        if full_diagnostics
+        else ()
+    )
     local_truth_pred_all_chunks: dict[str, list[np.ndarray]] = {
         f"{feature_name}_{suffix}": []
         for feature_name in all_plot_feature_names
         for suffix in ("truth", "pred", "ref")
     }
+    local_truth_pred_class_chunks: list[np.ndarray] = []
     # pT in GeV (original physics scale, after expm1 inversion of log1p).
     bin_pt_edges = _diagnostic_bin_edges("pt")
     bin_eta_edges = _diagnostic_bin_edges("eta")
@@ -5858,13 +6919,13 @@ def run_validation_epoch(
         if is_rank0 and val_log_batches:
             _log.warning("[DGPO] val: rank=%s has no val shard; returning empty metrics.", rank)
         return {
-            "val/reward/mean": float("nan"),
-            "val/reward/median": float("nan"),
-            "val/reward/p10": float("nan"),
-            "val/reward/p30": float("nan"),
-            "val/reward/p70": float("nan"),
-            "val/reward/p90": float("nan"),
-            "val/winrate": float("nan"),
+            f"{metric_prefix}/reward/mean": float("nan"),
+            f"{metric_prefix}/reward/median": float("nan"),
+            f"{metric_prefix}/reward/p10": float("nan"),
+            f"{metric_prefix}/reward/p30": float("nan"),
+            f"{metric_prefix}/reward/p70": float("nan"),
+            f"{metric_prefix}/reward/p90": float("nan"),
+            f"{metric_prefix}/winrate": float("nan"),
         }
 
     batch_round = 0
@@ -5895,10 +6956,7 @@ def run_validation_epoch(
                 num_ddim_steps,
             )
 
-        buf: dict[str, Tensor] = {}
-        if ema_save is not None:
-            buf = _save_trainable_weights(model)
-            ema_save.copy_to(core)
+        buf = _maybe_install_ema_for_generation(ema_save, model, core)
         t_gen = time.perf_counter()
         chain_desc = f"val DDIM ({ep_str})"
         try:
@@ -5932,10 +6990,6 @@ def run_validation_epoch(
         m_sel = valid > 0
         vb = m_sel
 
-        k_sel = _kin_hist_candidate_indices_per_event(
-            rewards, candidates, batch_d, cartesian=cartesian
-        )
-
         if bool(vb.any().item()):
             if val_K == 1:
                 r_per_event = rewards[0, vb]
@@ -5946,6 +7000,36 @@ def run_validation_epoch(
             r_per_event_np = r_per_event.detach().float().cpu().numpy()
             local_reward_chunks.append(r_per_event_np)
             local_reward_event_chunks.append(r_per_event_np)
+            classification = batch_d.get("classification")
+            if full_diagnostics and isinstance(classification, Tensor):
+                if int(classification.numel()) != B:
+                    raise ValueError(
+                        "classification must contain one process ID per validation event"
+                    )
+                local_response_class_chunks.append(
+                    classification.reshape(B)[vb]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.int64, copy=False)
+                )
+
+        # The cheap tier deliberately stops here: no reference DDIM, no large
+        # per-event CPU arrays, no cross-rank plot gather, and no TARP.  A caller
+        # requesting win-rate still falls through because that scalar needs the
+        # reference-policy K=1 rollout.
+        if not full_diagnostics and not winrate_enabled:
+            if max_batches is not None and max_batches > 0 and batch_round >= max_batches:
+                if is_rank0 and val_log_batches:
+                    _log.info(
+                        "[DGPO] cheap val: stopping at validation_cheap_max_batches=%s.",
+                        max_batches,
+                    )
+                break
+            continue
+        k_sel = _kin_hist_candidate_indices_per_event(
+            rewards, candidates, batch_d, cartesian=cartesian
+        )
         selected_delta_arrays = _val_selected_delta_arrays(
             candidates,
             batch_d,
@@ -5971,6 +7055,14 @@ def run_validation_epoch(
             )
             for key, values in feature_arrays.items():
                 local_truth_pred_all_chunks[key].append(values)
+            if feature_arrays:
+                local_truth_pred_class_chunks.append(
+                    _val_class_index_flat_all_candidates(
+                        candidates,
+                        batch_d,
+                        device=device,
+                    )
+                )
 
         if legacy_kinematics:
             ppt, peta, pphi, tpt, teta, tphi = _val_pred_truth_kin_flat(
@@ -6001,6 +7093,13 @@ def run_validation_epoch(
                 local_truth_pred_all_chunks["py_pred"].append(all_py_p)
                 local_truth_pred_all_chunks["pz_truth"].append(all_pz_t)
                 local_truth_pred_all_chunks["pz_pred"].append(all_pz_p)
+                local_truth_pred_class_chunks.append(
+                    _val_class_index_flat_all_candidates(
+                        candidates,
+                        batch_d,
+                        device=device,
+                    )
+                )
 
             ppx, ppy, ppz, tpx, tpy, tpz = _val_pred_truth_cartesian_flat(
                 candidates,
@@ -6110,8 +7209,10 @@ def run_validation_epoch(
                 feature_names=all_plot_feature_names,
                 device=device,
             )
-            for key, values in ref_feature_arrays.items():
-                local_truth_pred_all_chunks[key.replace("_pred", "_ref")].append(values)
+            append_reference_prediction_arrays(
+                local_truth_pred_all_chunks,
+                ref_feature_arrays,
+            )
         elif legacy_kinematics:
             all_px_r, all_py_r, all_pz_r, _, _, _ = _val_pred_truth_cartesian_flat_all_candidates(
                 r_one,
@@ -6122,6 +7223,16 @@ def run_validation_epoch(
             local_truth_pred_all_chunks["px_ref"].append(all_px_r)
             local_truth_pred_all_chunks["py_ref"].append(all_py_r)
             local_truth_pred_all_chunks["pz_ref"].append(all_pz_r)
+
+        if ztautau_metrics_enabled:
+            ztautau_batch_arrays = collect_ztautau_validation_arrays(
+                candidates,
+                r_one,
+                batch_d,
+                valid,
+            )
+            for key, values in ztautau_batch_arrays.items():
+                local_ztautau_chunks[key].append(values)
 
         if winrate_enabled:
             rewards_ref, _ = reward_agg.compute(r_one, batch_d)
@@ -6239,6 +7350,10 @@ def run_validation_epoch(
     local_state = {
         "reward": _concat_np_chunks(local_reward_event_chunks),
         "pt_delta_mean": _concat_np_chunks(local_pt_delta_event_mean_chunks),
+        "class_index": _concat_np_chunks(local_response_class_chunks).astype(
+            np.int64,
+            copy=False,
+        ),
     }
     for profile_name in profile_feature_names:
         local_state[f"{profile_name}_truth"] = _concat_np_chunks(
@@ -6281,10 +7396,15 @@ def run_validation_epoch(
         ).reshape(-1)
         n_reward = min(init_reward.size, local_state["reward"].size)
         n_pt = min(init_pt_delta.size, local_state["pt_delta_mean"].size)
+        response_class_index = np.asarray(
+            local_state.get("class_index", np.array([], dtype=np.int64)),
+            dtype=np.int64,
+        ).reshape(-1)
         response_merged = _gather_val_array_dict(
             {
                 "reward_initial": init_reward[:n_reward],
                 "reward_current": local_state["reward"][:n_reward],
+                "reward_class_index": response_class_index[:n_reward],
                 "pt_delta_initial": init_pt_delta[:n_pt],
                 "pt_delta_current": local_state["pt_delta_mean"][:n_pt],
             },
@@ -6293,21 +7413,39 @@ def run_validation_epoch(
         )
     truth_pred_all_merged = _gather_val_array_dict(
         {
-            key: _concat_np_chunks(chunks)
-            for key, chunks in local_truth_pred_all_chunks.items()
+            **{
+                key: _concat_np_chunks(chunks)
+                for key, chunks in local_truth_pred_all_chunks.items()
+            },
+            "class_index": _concat_np_chunks(
+                local_truth_pred_class_chunks
+            ).astype(np.int64, copy=False),
         },
+        rank=rank,
+        world_size=world_size,
+    )
+    local_ztautau_arrays = {
+        key: np.concatenate(chunks, axis=0)
+        for key, chunks in local_ztautau_chunks.items()
+        if chunks
+    }
+    ztautau_arrays_merged = _gather_val_ndarray_dict(
+        local_ztautau_arrays,
         rank=rank,
         world_size=world_size,
     )
 
     out: dict[str, Any] = {
-        "val/reward/mean": _mean(sum_r, cnt_r),
-        "val/reward/median": p50,
-        "val/reward/p10": p10,
-        "val/reward/p30": p30,
-        "val/reward/p70": p70,
-        "val/reward/p90": p90,
-        "val/winrate": win_metric,
+        f"{metric_prefix}/reward/mean": _mean(sum_r, cnt_r),
+        f"{metric_prefix}/reward/median": p50,
+        f"{metric_prefix}/reward/p10": p10,
+        f"{metric_prefix}/reward/p30": p30,
+        f"{metric_prefix}/reward/p70": p70,
+        f"{metric_prefix}/reward/p90": p90,
+        f"{metric_prefix}/winrate": win_metric,
+        f"{metric_prefix}/meta/K": float(val_K),
+        f"{metric_prefix}/meta/batches_per_rank": float(n_val_batches),
+        f"{metric_prefix}/meta/full_diagnostics": float(full_diagnostics),
         "_val_initial_state": local_state,
     }
 
@@ -6327,39 +7465,103 @@ def run_validation_epoch(
             out[f"val_diagnostics/profile/{profile_name}/delta_mean"] = delta_mean
             out[f"val_diagnostics/profile/{profile_name}/slope"] = slope
             out[f"val_diagnostics/profile/{profile_name}/zero_delta_truth"] = zero_point
-            out[
-                f"val_diagnostics/profile/{profile_name}_delta_vs_truth_{profile_name}"
-            ] = _validation_delta_profile_figure(
-                truth_arr,
-                delta_arr,
-                profile_name=profile_name,
-                title=f"Validation {profile_name} residual vs truth {profile_name}",
-                truth_initial=profile_merged.get(f"initial_{truth_key}"),
-                delta_initial=profile_merged.get(f"initial_{delta_key}"),
-            )
-        if response_initial_state is not None:
-            out["val/response/reward_initial_vs_current"] = (
-                _response_matrix_figure(
-                    response_merged.get("reward_initial", np.array([], dtype=np.float64)),
-                    response_merged.get("reward_current", np.array([], dtype=np.float64)),
-                    xlabel="Initial validation reward",
-                    ylabel="Current validation reward",
-                    title="Validation 2D correlation: initial reward vs current reward",
+            if not compact_wandb:
+                out[
+                    f"val_diagnostics/profile/{profile_name}_delta_vs_truth_{profile_name}"
+                ] = _validation_delta_profile_figure(
+                    truth_arr,
+                    delta_arr,
+                    profile_name=profile_name,
+                    title=f"Validation {profile_name} residual vs truth {profile_name}",
+                    truth_initial=profile_merged.get(f"initial_{truth_key}"),
+                    delta_initial=profile_merged.get(f"initial_{delta_key}"),
                 )
+        if response_initial_state is not None:
+            reward_initial = response_merged.get(
+                "reward_initial", np.array([], dtype=np.float64)
             )
+            reward_current = response_merged.get(
+                "reward_current", np.array([], dtype=np.float64)
+            )
+            out["val/response/reward_initial_vs_current"] = _response_matrix_figure(
+                reward_initial,
+                reward_current,
+                xlabel="Initial validation reward",
+                ylabel="Current validation reward",
+                title="Validation 2D correlation: initial reward vs current reward",
+            )
+            for metric_name, metric_value in _truth_pred_scalar_metrics(
+                reward_initial,
+                reward_current,
+            ).items():
+                out[f"val/response/metrics/reward/{metric_name}"] = metric_value
+
+            reward_class_index = np.asarray(
+                response_merged.get(
+                    "reward_class_index", np.array([], dtype=np.int64)
+                ),
+                dtype=np.int64,
+            ).reshape(-1)
+            if reward_class_index.size not in {0, reward_initial.size}:
+                raise ValueError(
+                    "validation response process IDs lost event alignment: "
+                    f"classes={reward_class_index.size}, reward={reward_initial.size}"
+                )
+            if reward_class_index.size:
+                for process_id, process_name in enumerate(
+                    _event_signal_class_names()
+                ):
+                    process_mask = reward_class_index == int(process_id)
+                    if not np.any(process_mask):
+                        continue
+                    process_initial = reward_initial[process_mask]
+                    process_current = reward_current[process_mask]
+                    process_prefix = f"val/response/by_process/{process_name}"
+                    out[f"{process_prefix}/reward_initial_vs_current"] = (
+                        _response_matrix_figure(
+                            process_initial,
+                            process_current,
+                            xlabel="Initial validation reward",
+                            ylabel="Current validation reward",
+                            title=(
+                                "Validation reward response: initial vs current "
+                                f"({process_name})"
+                            ),
+                        )
+                    )
+                    for metric_name, metric_value in _truth_pred_scalar_metrics(
+                        process_initial,
+                        process_current,
+                    ).items():
+                        out[
+                            f"{process_prefix}/metrics/reward/{metric_name}"
+                        ] = metric_value
             if (
                 response_merged.get("pt_delta_initial", np.array([], dtype=np.float64)).size > 0
                 or response_merged.get("pt_delta_current", np.array([], dtype=np.float64)).size > 0
             ):
+                pt_delta_initial = response_merged.get(
+                    "pt_delta_initial", np.array([], dtype=np.float64)
+                )
+                pt_delta_current = response_merged.get(
+                    "pt_delta_current", np.array([], dtype=np.float64)
+                )
                 out["val/response/pt_delta_mean_initial_vs_current"] = (
                     _response_matrix_figure(
-                        response_merged.get("pt_delta_initial", np.array([], dtype=np.float64)),
-                        response_merged.get("pt_delta_current", np.array([], dtype=np.float64)),
+                        pt_delta_initial,
+                        pt_delta_current,
                         xlabel="Initial event mean delta pT [GeV]",
                         ylabel="Current event mean delta pT [GeV]",
                         title="Validation 2D correlation: initial vs current event mean delta pT",
                     )
                 )
+                for metric_name, metric_value in _truth_pred_scalar_metrics(
+                    pt_delta_initial,
+                    pt_delta_current,
+                ).items():
+                    out[
+                        f"val/response/metrics/pt_delta_mean/{metric_name}"
+                    ] = metric_value
         available_truth_pred_features = _available_truth_pred_features(
             truth_pred_all_merged,
             all_plot_feature_names,
@@ -6367,22 +7569,78 @@ def run_validation_epoch(
         for feature_name in available_truth_pred_features:
             truth_key = f"{feature_name}_truth"
             pred_key = f"{feature_name}_pred"
-            out[f"val_neutrino/all/{feature_name}_truth_vs_pred"] = _truth_pred_matrix_figure(
-                truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
-                truth_pred_all_merged.get(pred_key, np.array([], dtype=np.float64)),
-                xlabel=f"Truth {feature_name}",
-                ylabel=f"Pred {feature_name}",
-                title=(
-                    f"Validation 2D truth vs pred {feature_name} "
-                    f"({val_K} candidate{'s' if val_K != 1 else ''}, all)"
-                ),
-                bin_edges=_generation_special_bin_edges(feature_name),
+            feature_truth = truth_pred_all_merged.get(
+                truth_key, np.array([], dtype=np.float64)
+            )
+            feature_pred = truth_pred_all_merged.get(
+                pred_key, np.array([], dtype=np.float64)
+            )
+            out[f"val_neutrino/all/{feature_name}_truth_vs_pred"] = (
+                _truth_pred_matrix_figure(
+                    feature_truth,
+                    feature_pred,
+                    xlabel=f"Truth {feature_name}",
+                    ylabel=f"Pred {feature_name}",
+                    title=(
+                        f"Validation 2D truth vs pred {feature_name} "
+                        f"({val_K} candidate{'s' if val_K != 1 else ''}, all)"
+                    ),
+                    bin_edges=_generation_special_bin_edges(feature_name),
+                )
             )
             for metric_name, metric_value in _truth_pred_scalar_metrics(
-                truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
-                truth_pred_all_merged.get(pred_key, np.array([], dtype=np.float64)),
+                feature_truth,
+                feature_pred,
             ).items():
                 out[f"val_neutrino/all_metrics/{feature_name}/{metric_name}"] = metric_value
+
+            class_index = np.asarray(
+                truth_pred_all_merged.get(
+                    "class_index", np.array([], dtype=np.int64)
+                ),
+                dtype=np.int64,
+            ).reshape(-1)
+            if class_index.size not in {0, feature_truth.size}:
+                raise ValueError(
+                    "validation response process IDs lost candidate alignment: "
+                    f"classes={class_index.size}, feature={feature_truth.size}"
+                )
+            if class_index.size:
+                for process_id, process_name in enumerate(
+                    _event_signal_class_names()
+                ):
+                    process_truth, process_pred = select_truth_pred_by_class(
+                        feature_truth,
+                        feature_pred,
+                        class_index,
+                        class_id=int(process_id),
+                    )
+                    if process_truth.size == 0:
+                        continue
+                    process_prefix = (
+                        f"val_neutrino/by_process/{process_name}/{feature_name}"
+                    )
+                    out[f"{process_prefix}_truth_vs_pred"] = (
+                        _truth_pred_matrix_figure(
+                            process_truth,
+                            process_pred,
+                            xlabel=f"Truth {feature_name}",
+                            ylabel=f"Pred {feature_name}",
+                            title=(
+                                f"Validation response {feature_name} "
+                                f"({process_name}, all candidates)"
+                            ),
+                            bin_edges=_generation_special_bin_edges(feature_name),
+                        )
+                    )
+                    for metric_name, metric_value in _truth_pred_scalar_metrics(
+                        process_truth,
+                        process_pred,
+                    ).items():
+                        out[
+                            f"val_neutrino/by_process/{process_name}/metrics/"
+                            f"{feature_name}/{metric_name}"
+                        ] = metric_value
             bin_edges = _generation_special_bin_edges(feature_name)
             out[f"val_neutrino/jsd/current/{feature_name}"] = _array_histogram_jsd(
                 truth_pred_all_merged.get(truth_key, np.array([], dtype=np.float64)),
@@ -6394,7 +7652,7 @@ def run_validation_epoch(
                 truth_pred_all_merged.get(f"{feature_name}_ref", np.array([], dtype=np.float64)),
                 bin_edges=bin_edges,
             )
-        if legacy_kinematics:
+        if legacy_kinematics and not compact_wandb:
             out["val_neutrino/pt"] = _val_overlay_kin_figure(
                 h_pt_t,
                 h_pt_p,
@@ -6483,6 +7741,22 @@ def run_validation_epoch(
             out["val_mass/jsd/current/top_mass"] = _histogram_jsd(h_tm_t, h_tm_p)
             out["val_mass/jsd/ref/w_mass"] = _histogram_jsd(h_wm_t, h_wm_r)
             out["val_mass/jsd/ref/top_mass"] = _histogram_jsd(h_tm_t, h_tm_r)
+        if ztautau_metrics_enabled:
+            out.update(
+                build_ztautau_validation_metrics(
+                    ztautau_arrays_merged,
+                    val_k=val_K,
+                    tarp_config=tarp_cfg,
+                    metrics_config=ztautau_panel_cfg,
+                    include_images=bool(
+                        _dgpo_cfg_get(
+                            ztautau_panel_cfg,
+                            "log_images",
+                            True,
+                        )
+                    ),
+                )
+            )
     return out
 
 
@@ -6544,10 +7818,30 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     _assert_rl_enabled()
     platform_info = global_config.platform
 
+    matmul_precision = str(
+        _dgpo_cfg_get(global_config.dgpo, "float32_matmul_precision", "high")
+    ).lower()
+    if matmul_precision not in {"highest", "high", "medium"}:
+        raise ValueError(
+            "dgpo.float32_matmul_precision must be one of "
+            f"highest/high/medium, got {matmul_precision!r}"
+        )
+    torch.set_float32_matmul_precision(matmul_precision)
+    if is_rank0:
+        _log.info("[DGPO] float32 matmul precision=%s", matmul_precision)
+
     wandb_active = _start_wandb_run(disable=not wandb_flag) if is_rank0 else False
 
     # Per-rank Ray Data shards.  Ray Train assigns each worker a disjoint subset.
     train_shard = ray.train.get_dataset_shard("train")
+    fixed_omnifold_pool = bool(cfg.get("fixed_omnifold_pool", False))
+    omnifold_train_shard = (
+        ray.train.get_dataset_shard("omnifold_train")
+        if fixed_omnifold_pool
+        else train_shard
+    )
+    if omnifold_train_shard is None:
+        raise RuntimeError("fixed OmniFold pool dataset shard is unavailable")
     val_shard = ray.train.get_dataset_shard("validation") if val_events else None
 
     batch_size = int(platform_info.batch_size)
@@ -6560,8 +7854,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     }
     # Keep validation order deterministic so pre-DGPO and later response matrices
     # compare the same validation rows in the same per-rank order.
+    validation_batch_size = int(
+        _dgpo_cfg_get(global_config.dgpo, "validation_batch_size", batch_size)
+    )
+    if validation_batch_size < 1:
+        raise ValueError("dgpo.validation_batch_size must be positive")
     val_loader_cfg = {
-        "batch_size": batch_size,
+        "batch_size": validation_batch_size,
         "prefetch_batches": prefetch,
     }
 
@@ -6573,14 +7872,47 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     )
     eve_net = bundle.model
 
-    ckpt_dict = None
+    loaded_ckpt_dict = None
     if bundle.checkpoint_path is not None:
-        ckpt_dict = torch.load(
+        loaded_ckpt_dict = torch.load(
             str(bundle.checkpoint_path), map_location=device, weights_only=False
         )
+    checkpoint_load_mode = str(
+        _dgpo_cfg_get(global_config.dgpo, "checkpoint_load_mode", "resume")
+    ).strip().lower()
+    ckpt_dict = select_dgpo_training_state(
+        loaded_ckpt_dict,
+        load_mode=checkpoint_load_mode,
+    )
+    if is_rank0:
+        if checkpoint_load_mode == "weights_only" and loaded_ckpt_dict is not None:
+            _log.info(
+                "[DGPO] Fresh policy warm start from %s: ignoring checkpoint "
+                "optimizer/EMA/reference/epoch/OmniFold state.",
+                bundle.checkpoint_path,
+            )
+        else:
+            _log.info("[DGPO] checkpoint_load_mode=%s", checkpoint_load_mode)
 
     eve_net.train()
     apply_component_freezes(eve_net, global_config)
+    activation_checkpointing = bool(
+        _dgpo_cfg_get(global_config.dgpo, "activation_checkpointing", False)
+    )
+    checkpointed_pet_bodies = _set_dgpo_activation_checkpointing(
+        eve_net,
+        enabled=activation_checkpointing,
+    )
+    if activation_checkpointing and checkpointed_pet_bodies < 1:
+        raise RuntimeError(
+            "dgpo.activation_checkpointing=true but no checkpointable PET body was found"
+        )
+    if is_rank0:
+        _log.info(
+            "[DGPO] PET activation checkpointing=%s (%s body module(s)).",
+            activation_checkpointing,
+            checkpointed_pet_bodies,
+        )
     ref_model = make_reference_model(
         eve_net, global_config, bundle.normalization_dict, device, checkpoint=ckpt_dict
     )
@@ -6603,11 +7935,164 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     dtype = next(eve_net.parameters()).dtype
     # DDIM is the only rollout sampler.
     sampler = DDIMSampler(device=device)
+    dg = global_config.dgpo
     reward_agg = build_reward_aggregator(
         eve_net, device, normalization_dict=bundle.normalization_dict
     )
+    from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+        AdaptiveOmniFoldState,
+        adaptive_audit_protocol_signature,
+        resolve_adaptive_config,
+        validate_adaptive_pairing,
+    )
+    from RL.DGPO_neutrino.omnifold_ztautau.dgpo_reward import (
+        REWARD_STACK_CHECKPOINT_KEY,
+        validate_omnifold_reward_startup,
+    )
+
+    adaptive_cfg = resolve_adaptive_config(dg)
+    omnifold_pool_batch_size = int(
+        adaptive_cfg.pool_generation_batch_size
+        if adaptive_cfg.pool_generation_batch_size is not None
+        else batch_size
+    )
+    omnifold_train_loader_cfg = {
+        "batch_size": omnifold_pool_batch_size,
+        "prefetch_batches": prefetch,
+        "local_shuffle_buffer_size": omnifold_pool_batch_size * prefetch,
+    }
+    omnifold_val_loader_cfg = {
+        "batch_size": omnifold_pool_batch_size,
+        "prefetch_batches": prefetch,
+    }
+    if is_rank0 and adaptive_cfg.enabled:
+        _log.info(
+            "[DGPO/omnifold] K=1 pool generation batch/worker=%s "
+            "(DGPO policy batch/worker=%s; classifier global batch=%s).",
+            omnifold_pool_batch_size,
+            batch_size,
+            int(adaptive_cfg.fit.get("batch_size", 8192)),
+        )
+    omnifold_source = reward_agg.omnifold_source
+    if adaptive_cfg.enabled and omnifold_source is None:
+        raise ValueError(
+            "dgpo.adaptive_omnifold.enabled requires reward_config.type=omnifold"
+        )
+    saved_stack = (
+        None if ckpt_dict is None else ckpt_dict.get(REWARD_STACK_CHECKPOINT_KEY)
+    )
+    adaptive_state = AdaptiveOmniFoldState.from_dict(
+        None if ckpt_dict is None else ckpt_dict.get("dgpo_adaptive_omnifold_state")
+    )
+    resume_refit_version_completed_at_load = bool(
+        adaptive_state.resume_refit_once_completed
+        and (
+            not adaptive_cfg.refit_once_id
+            or adaptive_state.resume_refit_once_id == adaptive_cfg.refit_once_id
+        )
+    )
+    allow_reward_bundle_migration = bool(
+        saved_stack is not None
+        and adaptive_cfg.enabled
+        and adaptive_cfg.refit_once_on_resume
+        and bool(adaptive_cfg.refit_once_id)
+        and not resume_refit_version_completed_at_load
+    )
+    if saved_stack is not None:
+        if omnifold_source is None:
+            raise ValueError(
+                "DGPO checkpoint contains an OmniFold stack but the reward is disabled"
+            )
+        omnifold_source.load_stack_payload(
+            saved_stack,
+            allow_source_bundle_migration=allow_reward_bundle_migration,
+        )
+    elif (
+        ckpt_dict is not None
+        and int(ckpt_dict.get("dgpo_reward_round_id", 0)) > 0
+    ):
+        raise ValueError(
+            "adaptive DGPO checkpoint has a later reward round but no saved ratio stack"
+        )
+
+    reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+    if reward_checkpoint_metadata is not None:
+        validate_omnifold_reward_startup(
+            checkpoint=ckpt_dict,
+            current_metadata=reward_checkpoint_metadata,
+            policy_checkpoint=bundle.checkpoint_path,
+            allow_source_bundle_migration=allow_reward_bundle_migration,
+        )
+
+    if adaptive_cfg.enabled:
+        current_audit_signature = adaptive_audit_protocol_signature(adaptive_cfg)
+        restored_audit_signature = str(adaptive_state.audit_protocol_signature or "")
+        if not restored_audit_signature:
+            adaptive_state.audit_protocol_signature = current_audit_signature
+        elif restored_audit_signature != current_audit_signature:
+            if is_rank0:
+                _log.warning(
+                    "[DGPO/omnifold] restored audit protocol %s differs from %s; "
+                    "preserving the installed-round baseline and its original "
+                    "protocol provenance until a new reward round is accepted.",
+                    restored_audit_signature[:12] or "<legacy>",
+                    current_audit_signature[:12],
+                )
+    if omnifold_source is not None and not adaptive_state.probe_history:
+        adaptive_state.reward_round_id = int(omnifold_source.reward_round_id)
+    if (
+        ckpt_dict is not None
+        and "dgpo_reward_round_id" in ckpt_dict
+        and omnifold_source is not None
+        and int(ckpt_dict["dgpo_reward_round_id"])
+        != int(omnifold_source.reward_round_id)
+    ):
+        raise ValueError("checkpoint reward round and restored OmniFold stack disagree")
+    round_ref_model = (
+        make_round_reference_model(
+            ref_model,
+            global_config,
+            bundle.normalization_dict,
+            device,
+            checkpoint=ckpt_dict,
+        )
+        if adaptive_cfg.enabled
+        else ref_model
+    )
+    if (
+        omnifold_source is not None
+        and int(omnifold_source.reward_round_id) > 0
+        and not adaptive_cfg.enabled
+    ):
+        raise ValueError(
+            "checkpoint contains a dynamic OmniFold round; adaptive_omnifold "
+            "must remain enabled on resume"
+        )
+    if adaptive_cfg.enabled:
+        if val_shard is None:
+            raise ValueError(
+                "adaptive OmniFold needs platform.data_parquet_val_dir for held-out audits"
+            )
+        validate_adaptive_pairing(
+            reward_source=omnifold_source,
+            state=adaptive_state,
+            round_ref_model=round_ref_model,
+            checkpoint=ckpt_dict,
+            where="adaptive_startup",
+        )
     effective_batch = batch_size * world_size
-    steps_per_epoch = max(1, math.ceil(total_events / effective_batch))
+    validation_effective_batch = validation_batch_size * world_size
+    data_steps_per_pass = max(1, math.ceil(total_events / effective_batch))
+    configured_steps_per_epoch = dg.get("steps_per_epoch", None)
+    if configured_steps_per_epoch is None:
+        steps_per_epoch = data_steps_per_pass
+    else:
+        steps_per_epoch = int(configured_steps_per_epoch)
+        if steps_per_epoch < 1:
+            raise ValueError(
+                "dgpo.steps_per_epoch must be a positive optimizer-step count "
+                f"or null, got {configured_steps_per_epoch!r}"
+            )
     train_opt_lr = global_config.options.Training
     warm_up_factor = float(train_opt_lr.get("learning_rate_warm_up_factor", 1.0))
     warmup_steps = max(1, math.ceil(warm_up_factor * steps_per_epoch))
@@ -6630,7 +8115,6 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     "[DGPO] Could not load optimizer state (continuing fresh optimizer): %s", ex
                 )
 
-    dg = global_config.dgpo
     _vm_raw = dg.get("validation_max_batches", None)
     val_max_batches: int | None = None
     if _vm_raw is not None:
@@ -6642,14 +8126,52 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     _vm_raw,
                 )
             val_max_batches = None
+    _cheap_vm_raw = dg.get("validation_cheap_max_batches", 2)
+    val_cheap_max_batches: int | None = None
+    if _cheap_vm_raw is not None:
+        val_cheap_max_batches = int(_cheap_vm_raw)
+        if val_cheap_max_batches <= 0:
+            raise ValueError(
+                "dgpo.validation_cheap_max_batches must be positive or null, "
+                f"got {_cheap_vm_raw!r}"
+            )
     K = int(_dgpo_cfg_get(dg, "K", 1))
+    uses_omnifold_reward = any(
+        source.name == "omnifold" for source, _weight in reward_agg.sources
+    )
+    advantage_raw = dg.get("advantage_estimator", None)
+    if advantage_raw is None:
+        advantage_estimator = (
+            "leave_one_out_unscaled"
+            if uses_omnifold_reward
+            else ADVANTAGE_ESTIMATOR_ZSCORE
+        )
+    else:
+        advantage_estimator = str(advantage_raw)
+    if advantage_estimator not in VALID_ADVANTAGE_ESTIMATORS:
+        raise ValueError(
+            f"unsupported dgpo.advantage_estimator={advantage_estimator!r}; "
+            f"expected one of {sorted(VALID_ADVANTAGE_ESTIMATORS)}"
+        )
+    if uses_omnifold_reward and advantage_estimator != "leave_one_out_unscaled":
+        raise ValueError(
+            "OmniFold-guided DGPO requires advantage_estimator="
+            "leave_one_out_unscaled so the density-ratio scale is preserved"
+        )
+    if advantage_estimator == "leave_one_out_unscaled" and K < 2:
+        raise ValueError("leave_one_out_unscaled requires dgpo.K >= 2")
     val_K = max(1, int(dg.get("validation_K", 1)))
+    val_cheap_K = max(1, int(dg.get("validation_cheap_K", min(val_K, K))))
     rollout_parallel_chains = max(1, int(dg.get("rollout_parallel_chains", 1)))
     val_rollout_parallel_chains = max(
         1,
         int(dg.get("validation_rollout_parallel_chains", rollout_parallel_chains)),
     )
     validation_every_n_epochs = max(1, int(dg.get("validation_every_n_epochs", 1)))
+    validation_full_every_n_epochs = max(
+        1,
+        int(dg.get("validation_full_every_n_epochs", validation_every_n_epochs)),
+    )
     beta = float(_dgpo_cfg_get(dg, "beta", 1.0))
     # Training and validation use independent DDIM rollout-step budgets: training uses
     # num_ddim, validation uses num_ddim_val. The validation-specific key falls back
@@ -6665,23 +8187,128 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             rollout_parallel_chains,
             val_rollout_parallel_chains,
         )
+        _log.info(
+            "[DGPO] advantage_estimator=%s%s",
+            advantage_estimator,
+            " (required by OmniFold density-ratio reward)"
+            if uses_omnifold_reward
+            else "",
+        )
+        _log.info(
+            "[DGPO] validation tiers: cheap every=%s epoch(s), K=%s, max_batches=%s; "
+            "full every=%s epoch(s), K=%s, max_batches=%s.",
+            validation_every_n_epochs,
+            val_cheap_K,
+            val_cheap_max_batches,
+            validation_full_every_n_epochs,
+            val_K,
+            val_max_batches,
+        )
     log_every = max(1, int(dg.get("log_every", 1)))
     diagnostic_plot_names, diagnostic_plot_every = _resolve_diagnostic_plot_settings(dg)
     log_reward_dist_every = max(
         1, int(dg.get("log_reward_dist_every", diagnostic_plot_every))
     )
+    train_dist_enabled = bool(dg.get("train_dist_enabled", True))
+    requested_train_dist_classes: tuple[str, ...] = ()
+    train_dist_by_class_every = 1
+    train_dist_every = 1
+    representative_class_indices: dict[str, int] = {}
+    missing_representative_classes: tuple[str, ...] = ()
+    if train_dist_enabled:
+        requested_train_dist_classes = tuple(
+            str(name)
+            for name in (dg.get("train_dist_representative_classes", []) or [])
+        )
+        train_dist_by_class_every = max(
+            1, int(dg.get("train_dist_by_class_every_n_epochs", 5))
+        )
+        train_dist_every = max(
+            1, int(dg.get("train_dist_every_n_epochs", train_dist_by_class_every))
+        )
+        all_signal_classes = _event_signal_class_names()
+        signal_class_to_index = {
+            class_name: index for index, class_name in enumerate(all_signal_classes)
+        }
+        representative_class_indices = {
+            class_name: signal_class_to_index[class_name]
+            for class_name in requested_train_dist_classes
+            if class_name in signal_class_to_index
+        }
+        missing_representative_classes = tuple(
+            name
+            for name in requested_train_dist_classes
+            if name not in signal_class_to_index
+        )
+    if is_rank0 and train_dist_enabled and requested_train_dist_classes:
+        _log.info(
+            "[DGPO] pooled train_dist every=%s epoch(s); representative classes=%s every=%s epoch(s)",
+            train_dist_every,
+            tuple(representative_class_indices),
+            train_dist_by_class_every,
+        )
+        if missing_representative_classes:
+            _log.warning(
+                "[DGPO] representative train_dist classes absent from event_info: %s",
+                missing_representative_classes,
+            )
     diagnostic_profile_accumulate_steps = max(
         1, int(dg.get("diagnostic_profile_accumulate_steps", 1))
     )
     num_train_timesteps = max(1, int(dg.get("num_train_timesteps", 1)))
+    policy_eval_parallel_timesteps = max(
+        1,
+        int(dg.get("policy_eval_parallel_timesteps", 1)),
+    )
+    policy_eval_parallel_timesteps = min(
+        policy_eval_parallel_timesteps,
+        num_train_timesteps,
+    )
+    raw_policy_event_microbatch_size = dg.get(
+        "policy_eval_event_microbatch_size",
+        None,
+    )
+    policy_eval_event_microbatch_size: int | None = None
+    if raw_policy_event_microbatch_size is not None:
+        policy_eval_event_microbatch_size = int(raw_policy_event_microbatch_size)
+        if policy_eval_event_microbatch_size < 1:
+            raise ValueError(
+                "dgpo.policy_eval_event_microbatch_size must be positive or null"
+            )
+    if is_rank0:
+        _log.info(
+            "[DGPO] policy evaluation: %s noise draws, %s parallel timestep(s) per "
+            "forward, event microbatch=%s.",
+            num_train_timesteps,
+            policy_eval_parallel_timesteps,
+            policy_eval_event_microbatch_size or "full batch",
+        )
     _adv_raw = dg.get("adv_clip_max", None)
     adv_clip_max_cfg: float | None = float(_adv_raw) if _adv_raw is not None else None
     grad_clip_norm_cfg = float(dg.get("grad_clip_norm", _GRAD_CLIP_NORM))
     policy_eval_t_min_cfg = float(dg.get("policy_eval_t_min", 0.0))
     policy_eval_t_max_cfg = float(dg.get("policy_eval_t_max", 1.0))
-    # Frozen DGPO method (hardwired in train_step): z-score advantages, shared noise,
-    # accumulated sub-step gradients into one AdamW update, rollout EMA always on;
-    # no PPO clip or velocity KL anchor.
+    trust_cfg = dg.get("reference_trust", None) or {}
+    reference_trust_coefficient = (
+        float(_dgpo_cfg_get(trust_cfg, "coefficient", 0.0))
+        if bool(_dgpo_cfg_get(trust_cfg, "enabled", False))
+        else 0.0
+    )
+    if reference_trust_coefficient < 0.0 or not math.isfinite(
+        reference_trust_coefficient
+    ):
+        raise ValueError(
+            "dgpo.reference_trust.coefficient must be finite and nonnegative, got "
+            f"{reference_trust_coefficient}"
+        )
+    if is_rank0:
+        _log.info(
+            "[DGPO] round-reference shared-noise trust coefficient=%.4g (%s)",
+            reference_trust_coefficient,
+            "active" if reference_trust_coefficient > 0.0 else "disabled",
+        )
+    # Frozen DGPO method: configured per-event advantages, shared noise,
+    # accumulated sub-step gradients into one AdamW update, rollout EMA always on.
 
     proj_cfg_startup = resolve_projection_constraint_config(dg)
     constraint_ckpt_blob = (
@@ -6767,11 +8394,55 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
 
     save_dir_raw = global_config.options.Training.get("model_checkpoint_save_path", None)
     top_k_ckpt = int(global_config.options.Training.get("model_checkpoint_save_top_k", 5))
+    top_k_metric = str(
+        global_config.options.Training.get(
+            "model_checkpoint_top_k_metric",
+            "val/reward/mean",
+        )
+    )
+    top_k_mode = str(
+        global_config.options.Training.get("model_checkpoint_top_k_mode", "max")
+    ).lower()
+    supported_top_k_metrics = {
+        "val/reward/mean",
+        "staleness/audit_balanced_accuracy",
+    }
+    if top_k_metric not in supported_top_k_metrics:
+        raise ValueError(
+            "unsupported model_checkpoint_top_k_metric="
+            f"{top_k_metric!r}; expected one of {sorted(supported_top_k_metrics)}"
+        )
     ckpt_topk: _DgpoCheckpointTopK | None = None
     if save_dir_raw and is_rank0:
         ckpt_topk = _DgpoCheckpointTopK(
             Path(str(save_dir_raw)).expanduser().resolve(),
             top_k_ckpt,
+            metric_name=top_k_metric,
+            mode=top_k_mode,
+        )
+        _log.info(
+            "[DGPO] top-k checkpoint metric=%s mode=%s k=%s",
+            top_k_metric,
+            top_k_mode,
+            top_k_ckpt,
+        )
+
+    # Periodic ``last`` saves are evaluated at logical-epoch boundaries only, so
+    # checkpoint serialization never interrupts the middle of a 10-step control
+    # interval. Adaptive audit/refit boundaries and the final epoch save even
+    # when this cadence is zero or does not divide the current global step.
+    ckpt_every_n_steps = max(
+        0, int(global_config.dgpo.get("checkpoint_every_n_steps", 0))
+    )
+    ckpt_every_n_epochs = max(
+        0, int(global_config.dgpo.get("checkpoint_every_n_epochs", 0))
+    )
+    if is_rank0:
+        _log.info(
+            "[DGPO] last-checkpoint cadence=%s optimizer step(s) / %s logical "
+            "epoch(s), checked at logical-epoch/audit/final boundaries.",
+            ckpt_every_n_steps,
+            ckpt_every_n_epochs,
         )
 
     epochs = int(global_config.options.Training.epochs)
@@ -6797,8 +8468,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     if is_rank0:
         _log.info(
             "[DGPO] rank=%s/%s device=%s train_events≈%s val_events≈%s batch=%s train_K=%s val_K=%s "
-            "val_every_n_epochs=%s ddim=%s train_timesteps=%s steps/epoch≈%s epochs=%s "
-            "(z-score advantages, shared noise, accumulated substeps, rollout EMA on)",
+            "val_every_n_epochs=%s ddim=%s train_timesteps=%s steps/logical_epoch=%s "
+            "steps/data_pass≈%s epochs=%s "
+            "(advantage=%s, adaptive_omnifold=%s, staleness_every=%s)",
             rank,
             world_size,
             device,
@@ -6811,12 +8483,87 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             num_ddim,
             num_train_timesteps,
             steps_per_epoch,
+            data_steps_per_pass,
             epochs,
+            advantage_estimator,
+            adaptive_cfg.enabled,
+            adaptive_cfg.staleness_every_n_epochs,
         )
 
     wandb_mod = None
     if wandb_active:
         import wandb as wandb_mod
+
+    omnifold_live_log_index = 0
+    omnifold_phase_ids = _OMNIFOLD_LIVE_PHASE_IDS
+
+    def _log_omnifold_fit_progress(
+        phase: str,
+        row: Mapping[str, Any],
+        *,
+        epoch_value: int,
+    ) -> None:
+        """Publish rank-0 classifier progress without changing fit control."""
+        nonlocal omnifold_live_log_index
+        if not is_rank0:
+            return
+        phase_name = str(phase)
+        if phase_name not in omnifold_phase_ids:
+            raise ValueError(f"unknown OmniFold progress phase: {phase_name}")
+        omnifold_live_log_index += 1
+        fit_step = int(float(row.get("step", 0.0)))
+        iteration = int(float(row.get("iteration", 1.0)))
+        crossfit_fold = int(float(row.get("fold", 0.0)))
+        accepted_value = row.get("accepted")
+        prefix = f"omnifold_live/{phase_name}"
+        payload: dict[str, Any] = {
+            "omnifold_live/log_index": int(omnifold_live_log_index),
+            "omnifold_live/meta/phase_id": int(omnifold_phase_ids[phase_name]),
+            "omnifold_live/meta/fit_step": fit_step,
+            "omnifold_live/meta/iteration": iteration,
+            "omnifold_live/meta/crossfit_fold": crossfit_fold,
+            "omnifold_live/meta/dgpo_epoch": int(epoch_value),
+            "omnifold_live/meta/global_step": int(global_step),
+        }
+        for metric_name in (
+            "training_loss",
+            "training_balanced_accuracy",
+            "validation_loss",
+            "validation_balanced_accuracy",
+            "best_validation_loss",
+            "validation_auc",
+            "null_validation_loss",
+            "validation_loss_gain",
+            "accepted",
+            "saturated",
+            "threshold_reached",
+        ):
+            if metric_name in row:
+                payload[f"{prefix}/{metric_name}"] = row[metric_name]
+        _log.info(
+            "[DGPO/omnifold/live] phase=%s epoch=%s iteration=%s fold=%s "
+            "step=%s train_loss=%.6g val_loss=%.6g val_bal_acc=%.6g "
+            "val_auc=%.6g accepted=%s saturated=%s",
+            phase_name,
+            epoch_value,
+            iteration,
+            crossfit_fold,
+            fit_step,
+            float(row.get("training_loss", float("nan"))),
+            float(row.get("validation_loss", float("nan"))),
+            float(row.get("validation_balanced_accuracy", float("nan"))),
+            float(row.get("validation_auc", float("nan"))),
+            "n/a"
+            if accepted_value is None
+            else bool(float(accepted_value)),
+            bool(float(row.get("saturated", 0.0))),
+        )
+        if wandb_mod is not None:
+            _wandb_log_auxiliary(
+                wandb_mod,
+                payload,
+                current_global_step=int(global_step),
+            )
 
     val_baseline_state: dict[str, np.ndarray] | None = None
     val_profile_history: dict[str, dict[str, list[float]]] = {
@@ -6856,7 +8603,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             hist["delta_mean"].append(delta_mean)
             hist["slope"].append(slope)
             hist["zero"].append(zero)
-            if wandb_mod is None:
+            if wandb_mod is None or _wandb_simplified_enabled():
                 continue
             _x_label, y_label, display = _profile_axis_labels(profile_name)
             val_metrics[
@@ -6975,6 +8722,442 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         if world_size > 1 and dist.is_initialized():
             dist.barrier()
 
+    def _adaptive_state_payload() -> dict[str, Any] | None:
+        return adaptive_state.to_dict() if adaptive_cfg.enabled else None
+
+    def _adaptive_stack_payload() -> dict[str, Any] | None:
+        if not adaptive_cfg.enabled or omnifold_source is None:
+            return None
+        return omnifold_source.stack_payload()
+
+    def _assert_current_reward_reference_pairing(where: str) -> None:
+        if not adaptive_cfg.enabled or omnifold_source is None:
+            return
+        validate_adaptive_pairing(
+            reward_source=omnifold_source,
+            state=adaptive_state,
+            round_ref_model=round_ref_model,
+            checkpoint=None,
+            where=where,
+        )
+
+    def _run_adaptive_cycle(
+        *,
+        epoch: int,
+        baseline_only: bool = False,
+        force_refit: bool = False,
+    ) -> dict[str, Any]:
+        nonlocal reward_checkpoint_metadata
+        if not adaptive_cfg.enabled or omnifold_source is None:
+            return {}
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+            probe_installed_reward,
+            run_adaptive_refit,
+            update_controller,
+        )
+
+        if is_rank0:
+            _log.info(
+                "[DGPO/omnifold] K=1 fresh adapter audit at epoch=%s (cap=%s)",
+                epoch,
+                adaptive_cfg.probe_max_events,
+            )
+        score_pool = _materialize_adaptive_omnifold_pool(
+            val_shard,
+            omnifold_val_loader_cfg,
+            model=model,
+            sampler=sampler,
+            device=device,
+            world_size=world_size,
+            rank=rank,
+            quota_events=adaptive_cfg.probe_max_events,
+            num_ddim_steps=num_ddim_val,
+            seed=adaptive_cfg.probe_seed + 10000 * max(int(epoch), 0),
+        )
+        probe = probe_installed_reward(
+            omnifold_source,
+            score_pool,
+            cfg=adaptive_cfg,
+            device=device,
+            seed=adaptive_cfg.probe_seed + max(int(epoch), 0),
+            early_stop_auc_gap=(
+                float(adaptive_state.trigger_threshold)
+                if adaptive_state.calibrated and not baseline_only
+                else None
+            ),
+            progress_callback=lambda phase, row: _log_omnifold_fit_progress(
+                phase,
+                row,
+                epoch_value=int(epoch),
+            ),
+        )
+        trigger_refit = bool(force_refit)
+        if baseline_only or not adaptive_state.calibrated:
+            if (
+                adaptive_cfg.require_audit_saturation
+                and float(probe.get("audit_saturated", 0.0)) < 0.5
+            ):
+                raise RuntimeError(
+                    "initial adaptive OmniFold audit did not saturate; refusing "
+                    "to freeze an uncertified staleness threshold"
+                )
+            adaptive_state.install(
+                baseline_auc_gap=float(probe["weighted_auc_gap"]),
+                cfg=adaptive_cfg,
+                epoch=int(epoch),
+                round_id=int(omnifold_source.reward_round_id),
+            )
+            adaptive_state.audit_protocol_signature = current_audit_signature
+            adaptive_state.last_decision = "installed_baseline"
+            adaptive_state.probe_history.append(
+                {
+                    "epoch": float(epoch),
+                    "reward_round_id": float(adaptive_state.reward_round_id),
+                    "decision_recalibrate": 0.0,
+                    **{key: float(value) for key, value in probe.items()},
+                }
+            )
+            diagnostics: dict[str, Any] = {
+                **{f"staleness/{key}": float(value) for key, value in probe.items()},
+                "staleness/decision": "installed_baseline",
+                "staleness/trigger_recalibration": 0.0,
+                "staleness/trigger_threshold": float(
+                    adaptive_state.trigger_threshold
+                ),
+                "staleness/baseline_auc_gap": float(
+                    adaptive_state.baseline_auc_gap
+                ),
+                "staleness/previous_audit_auc_gap": float(
+                    adaptive_state.previous_audit_auc_gap
+                ),
+                "staleness/next_trigger_threshold": float(
+                    adaptive_state.trigger_threshold
+                ),
+                "staleness/reward_round_id": float(
+                    adaptive_state.reward_round_id
+                ),
+            }
+        else:
+            controller_trigger, diagnostics = update_controller(
+                adaptive_state,
+                probe,
+                cfg=adaptive_cfg,
+                epoch=int(epoch),
+            )
+            trigger_refit = bool(trigger_refit or controller_trigger)
+        if trigger_refit:
+            # No optimizer step occurs between this snapshot and any refit
+            # population. They therefore share this exact policy denominator.
+            policy_snapshot = _snapshot_policy_state_dict(model)
+            if is_rank0:
+                _log.info(
+                    "[DGPO/omnifold] %s; fitting current-policy K=1 pool "
+                    "(cap=%s)",
+                    (
+                        "one-shot resume adapter refit"
+                        if force_refit
+                        else "adapter staleness triggered"
+                    ),
+                    adaptive_cfg.pool_events,
+                )
+            fit_pool = _materialize_adaptive_omnifold_pool(
+                omnifold_train_shard,
+                omnifold_train_loader_cfg,
+                model=model,
+                sampler=sampler,
+                device=device,
+                world_size=world_size,
+                rank=rank,
+                quota_events=(
+                    None if fixed_omnifold_pool else adaptive_cfg.pool_events
+                ),
+                num_ddim_steps=num_ddim,
+                seed=adaptive_cfg.seed + int(adaptive_state.recalibration_count),
+            )
+            refit_score_pool = score_pool
+            if adaptive_cfg.refit_score_events != adaptive_cfg.probe_max_events:
+                if is_rank0:
+                    _log.info(
+                        "[DGPO/omnifold] materializing full held-out refit/"
+                        "acceptance pool (cap=%s; routine probe cap=%s)",
+                        adaptive_cfg.refit_score_events,
+                        adaptive_cfg.probe_max_events,
+                    )
+                refit_score_pool = _materialize_adaptive_omnifold_pool(
+                    val_shard,
+                    omnifold_val_loader_cfg,
+                    model=model,
+                    sampler=sampler,
+                    device=device,
+                    world_size=world_size,
+                    rank=rank,
+                    quota_events=adaptive_cfg.refit_score_events,
+                    num_ddim_steps=num_ddim_val,
+                    seed=(
+                        adaptive_cfg.probe_seed
+                        + 10000 * max(int(epoch), 0)
+                        + 1_000_003
+                    ),
+                )
+            refit_diagnostics = run_adaptive_refit(
+                state=adaptive_state,
+                cfg=adaptive_cfg,
+                reward_source=omnifold_source,
+                round_ref_model=round_ref_model,
+                policy_snapshot_state_dict=policy_snapshot,
+                fit_pool=fit_pool,
+                score_pool=refit_score_pool,
+                epoch=int(epoch),
+                device=device,
+                world_size=world_size,
+                progress_callback=lambda phase, row: _log_omnifold_fit_progress(
+                    phase,
+                    row,
+                    epoch_value=int(epoch),
+                ),
+            )
+            diagnostics.update(refit_diagnostics)
+            refit_accepted = (
+                float(refit_diagnostics.get("omnifold/accepted", 0.0)) >= 0.5
+            )
+            if refit_accepted:
+                # A newly installed reward round gets the protocol provenance
+                # of the audit that certified its new fixed baseline.
+                adaptive_state.audit_protocol_signature = current_audit_signature
+            if (
+                force_refit
+                and not refit_accepted
+            ):
+                # A rejected candidate cannot rewrite the incumbent round's
+                # certified baseline. Keep both its threshold and protocol
+                # provenance unchanged.
+                adaptive_state.last_decision = (
+                    "resume_refit_rejected_incumbent_baseline_preserved"
+                )
+                diagnostics.update(
+                    {
+                        "omnifold/resume_refit_kept_incumbent": 1.0,
+                        "omnifold/resume_refit_preserved_baseline": 1.0,
+                        "staleness/decision": adaptive_state.last_decision,
+                        "staleness/baseline_auc_gap": float(
+                            adaptive_state.baseline_auc_gap
+                        ),
+                        "staleness/trigger_threshold": float(
+                            adaptive_state.trigger_threshold
+                        ),
+                    }
+                )
+            reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+        _assert_current_reward_reference_pairing("adaptive_cycle")
+        if is_rank0:
+            _log.info(
+                "[DGPO/omnifold] epoch=%s decision=%s gap=%.5g threshold=%.5g round=%s",
+                epoch,
+                diagnostics.get("staleness/decision", adaptive_state.last_decision),
+                float(probe.get("weighted_auc_gap", float("nan"))),
+                float(
+                    diagnostics.get(
+                        "staleness/trigger_threshold",
+                        adaptive_state.trigger_threshold,
+                    )
+                ),
+                adaptive_state.reward_round_id,
+            )
+        return diagnostics
+
+    need_initial_omnifold_bootstrap = bool(
+        adaptive_cfg.enabled
+        and adaptive_cfg.bootstrap_on_start
+        and start_epoch == 0
+        and omnifold_source is not None
+        and not bool(getattr(omnifold_source, "is_installed", True))
+    )
+    if need_initial_omnifold_bootstrap:
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import run_adaptive_refit
+
+        if val_shard is None:
+            raise RuntimeError(
+                "in-DGPO OmniFold bootstrap needs a held-out validation shard"
+            )
+        if is_rank0:
+            _log.info(
+                "[DGPO/omnifold] bootstrap before policy training: materializing "
+                "K=1 train/held-out populations; every residual classifier must "
+                "saturate before its weights are snapshotted"
+            )
+        policy_snapshot = _snapshot_policy_state_dict(model)
+        score_pool = _materialize_adaptive_omnifold_pool(
+            val_shard,
+            omnifold_val_loader_cfg,
+            model=model,
+            sampler=sampler,
+            device=device,
+            world_size=world_size,
+            rank=rank,
+            quota_events=adaptive_cfg.refit_score_events,
+            num_ddim_steps=num_ddim_val,
+            seed=adaptive_cfg.probe_seed,
+        )
+        fit_pool = _materialize_adaptive_omnifold_pool(
+            omnifold_train_shard,
+            omnifold_train_loader_cfg,
+            model=model,
+            sampler=sampler,
+            device=device,
+            world_size=world_size,
+            rank=rank,
+            quota_events=(None if fixed_omnifold_pool else adaptive_cfg.pool_events),
+            num_ddim_steps=num_ddim,
+            seed=adaptive_cfg.seed,
+        )
+        bootstrap_metrics = run_adaptive_refit(
+            state=adaptive_state,
+            cfg=adaptive_cfg,
+            reward_source=omnifold_source,
+            round_ref_model=round_ref_model,
+            policy_snapshot_state_dict=policy_snapshot,
+            fit_pool=fit_pool,
+            score_pool=score_pool,
+            epoch=-1,
+            device=device,
+            world_size=world_size,
+            progress_callback=lambda phase, row: _log_omnifold_fit_progress(
+                phase,
+                row,
+                epoch_value=-1,
+            ),
+        )
+        bootstrap_metrics["omnifold/bootstrap_on_start"] = 1.0
+        reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+        accepted = float(bootstrap_metrics.get("omnifold/accepted", 0.0)) >= 0.5
+        if not accepted or not bool(getattr(omnifold_source, "is_installed", False)):
+            reason = bootstrap_metrics.get(
+                "omnifold/accept_reason", "initial ratio stack was not installed"
+            )
+            if adaptive_cfg.bootstrap_fail_closed:
+                raise RuntimeError(
+                    "initial in-DGPO OmniFold bootstrap failed closed: " + str(reason)
+                )
+            raise RuntimeError(
+                "DGPO cannot start without an installed OmniFold reward: " + str(reason)
+            )
+        adaptive_state.resume_refit_once_completed = True
+        adaptive_state.resume_refit_once_id = adaptive_cfg.refit_once_id
+        _assert_current_reward_reference_pairing("initial_omnifold_bootstrap")
+        if is_rank0:
+            _log.info(
+                "[DGPO/omnifold] bootstrap installed round=%s stored_iterations=%s "
+                "classifier_fits=%s",
+                adaptive_state.reward_round_id,
+                bootstrap_metrics.get("omnifold/iterations_fitted"),
+                bootstrap_metrics.get("omnifold/classifier_fits_total"),
+            )
+            if wandb_mod is not None:
+                _wandb_log_step(
+                    wandb_mod,
+                    {"epoch": -1, **bootstrap_metrics},
+                    step=int(global_step),
+                )
+            # Match the EveNet-private recovery boundary: persist the installed
+            # reward/controller/reference triplet before the potentially long
+            # epoch=-1 validation pass.  A timeout after a successful full-pool
+            # fit can then resume at DGPO epoch 0 without repeating bootstrap.
+            _dgpo_save_last_ckpt(
+                model,
+                ema_save,
+                optimizer,
+                ref_model,
+                last_completed_epoch=-1,
+                dgpo_next_epoch=0,
+                global_step=int(global_step),
+                ema_rollout=ema_rollout,
+                round_ref_model=round_ref_model,
+                reward_round_id=int(adaptive_state.reward_round_id),
+                dgpo_projection_constraint_state=(
+                    _dgpo_constraint_checkpoint_payload(constraint_state)
+                ),
+                dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                dgpo_omnifold_reward_stack=_adaptive_stack_payload(),
+            )
+        _barrier()
+
+    resume_refit_version_completed = bool(
+        adaptive_state.resume_refit_once_completed
+        and (
+            not adaptive_cfg.refit_once_id
+            or adaptive_state.resume_refit_once_id == adaptive_cfg.refit_once_id
+        )
+    )
+    need_resume_adapter_refit = bool(
+        adaptive_cfg.enabled
+        and adaptive_cfg.refit_once_on_resume
+        and start_epoch > 0
+        and omnifold_source is not None
+        and bool(getattr(omnifold_source, "is_installed", False))
+        and not resume_refit_version_completed
+    )
+    if need_resume_adapter_refit:
+        startup_refit_epoch = int(start_epoch) - 1
+        if is_rank0:
+            _log.info(
+                "[DGPO/omnifold] running the checkpointed one-shot adapter "
+                "refit version=%s before resumed DGPO epoch %s",
+                adaptive_cfg.refit_once_id or "<unversioned>",
+                start_epoch,
+            )
+        startup_refit_metrics = _run_adaptive_cycle(
+            epoch=startup_refit_epoch,
+            force_refit=True,
+        )
+        # Set this only after the complete distributed audit/refit returns. A
+        # timeout during fitting leaves the old checkpoint marker false, while
+        # the successful recovery checkpoint below makes every later resume a
+        # pure continuation with no repeated startup refit.
+        adaptive_state.resume_refit_once_completed = True
+        adaptive_state.resume_refit_once_id = adaptive_cfg.refit_once_id
+        startup_refit_metrics.update(
+            {
+                "omnifold/resume_refit_once_completed": 1.0,
+                "omnifold/resume_refit_once_accepted": float(
+                    startup_refit_metrics.get("omnifold/accepted", 0.0)
+                ),
+            }
+        )
+        _assert_current_reward_reference_pairing("resume_adapter_refit_once")
+        if is_rank0:
+            if wandb_mod is not None:
+                _wandb_log_step(
+                    wandb_mod,
+                    {"epoch": startup_refit_epoch, **startup_refit_metrics},
+                    step=int(global_step),
+                )
+            _dgpo_save_last_ckpt(
+                model,
+                ema_save,
+                optimizer,
+                ref_model,
+                last_completed_epoch=startup_refit_epoch,
+                dgpo_next_epoch=int(start_epoch),
+                global_step=int(global_step),
+                ema_rollout=ema_rollout,
+                round_ref_model=round_ref_model,
+                reward_round_id=int(adaptive_state.reward_round_id),
+                dgpo_projection_constraint_state=(
+                    _dgpo_constraint_checkpoint_payload(constraint_state)
+                ),
+                dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                dgpo_omnifold_reward_stack=_adaptive_stack_payload(),
+            )
+            _log.info(
+                "[DGPO/omnifold] one-shot adapter refit version=%s saved; "
+                "later resumes will inherit round=%s without repeating it",
+                adaptive_cfg.refit_once_id or "<unversioned>",
+                adaptive_state.reward_round_id,
+            )
+        _barrier()
+
     # Following the EveNet ``train.py`` pattern: no rank-0-only synchronous setup
     # before the training loop.  All ranks proceed straight into ``fit``-style
     # iteration and hit the data pipeline simultaneously, avoiding NCCL barriers
@@ -6987,7 +9170,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             )
         val_loader = val_shard.iter_torch_batches(**val_loader_cfg)
         est_val_batches = (
-            max(1, math.ceil(ve_initial / effective_batch)) if ve_initial > 0 else None
+            max(1, math.ceil(ve_initial / validation_effective_batch))
+            if ve_initial > 0
+            else None
         )
         initial_val_metrics = run_validation_epoch(
             model,
@@ -7038,7 +9223,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     wandb_mod,
                     initial_val_metrics,
                     epoch=-1,
-                    wandb_step=0,
+                    wandb_step=_wandb_train_step(global_step),
                 )
         _barrier()
     elif start_epoch > 0 and ve_initial > 0 and is_rank0:
@@ -7048,6 +9233,24 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             start_epoch,
         )
 
+    if (
+        adaptive_cfg.enabled
+        and adaptive_cfg.baseline_probe_on_start
+        and start_epoch == 0
+        and not adaptive_state.calibrated
+    ):
+        baseline_adaptive_metrics = _run_adaptive_cycle(
+            epoch=-1,
+            baseline_only=True,
+        )
+        if is_rank0 and wandb_mod is not None:
+            _wandb_log_step(
+                wandb_mod,
+                baseline_adaptive_metrics,
+                step=int(global_step),
+            )
+        _barrier()
+
     def constraint_ckpt_payload_for_save() -> dict[str, Any] | None:
         return _dgpo_constraint_checkpoint_payload(constraint_state)
 
@@ -7056,38 +9259,65 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             cartesian=_truth_generation_cartesian(),
             feature_dim=len(_invisible_feature_names()) or None,
         )
+        # With a configured step budget, an epoch is a control/logging interval,
+        # not a data boundary. Keep the streaming Ray iterator alive across those
+        # logical epochs so a 10-step epoch does not repeatedly consume the start
+        # of the shard. The iterator is renewed only after a complete data pass.
+        logical_epoch_step_budget = (
+            None if configured_steps_per_epoch is None else steps_per_epoch
+        )
+        train_it: Any | None = None
+        completed_data_passes = 0
 
         for epoch in range(start_epoch, epochs):
-            # Each call to ``iter_torch_batches`` produces a fresh streaming generator
-            # over this rank's shard.  ``local_shuffle_buffer_size`` (set in train_loader_cfg)
-            # provides per-shard random shuffling each epoch.
-            train_iter = train_shard.iter_torch_batches(**train_loader_cfg)
-            train_it = iter(train_iter)
-            num_diag_bins = _resolve_diagnostic_num_bins()
-
-            # Epoch-level histogram accumulators for training-distribution plots (all batches).
-            td_pt_p = np.zeros(num_diag_bins, dtype=np.float64)
-            td_pt_t = np.zeros(num_diag_bins, dtype=np.float64)
-            td_e_p = np.zeros(num_diag_bins, dtype=np.float64)
-            td_e_t = np.zeros(num_diag_bins, dtype=np.float64)
-            td_p_p = np.zeros(num_diag_bins, dtype=np.float64)
-            td_p_t = np.zeros(num_diag_bins, dtype=np.float64)
-            td_k1_pt_p = np.zeros(num_diag_bins, dtype=np.float64)
-            td_k1_pt_t = np.zeros(num_diag_bins, dtype=np.float64)
-            td_k1_e_p = np.zeros(num_diag_bins, dtype=np.float64)
-            td_k1_e_t = np.zeros(num_diag_bins, dtype=np.float64)
-            td_k1_p_p = np.zeros(num_diag_bins, dtype=np.float64)
-            td_k1_p_t = np.zeros(num_diag_bins, dtype=np.float64)
-            td_all_feature_names = _generation_monitor_feature_names(
-                cartesian=_truth_generation_cartesian()
+            if train_it is None:
+                # ``local_shuffle_buffer_size`` provides per-shard shuffling for
+                # every complete data pass.
+                train_it = iter(train_shard.iter_torch_batches(**train_loader_cfg))
+            collect_train_dist_epoch = bool(
+                wandb_flag
+                and train_dist_enabled
+                and scheduled_epoch(
+                    epoch,
+                    train_dist_every,
+                    include_epoch_zero=True,
+                )
             )
-            td_all_chunks: dict[str, list[np.ndarray]] = {
-                f"{feature_name}_{suffix}": []
-                for feature_name in td_all_feature_names
-                for suffix in ("truth", "pred")
-            }
-            stop_epoch = False
+
+            # These duplicate validation arrays and can be large. Do not even
+            # allocate the epoch accumulators unless this epoch will upload them.
+            td_all_feature_names: tuple[str, ...] = ()
+            td_all_chunks: dict[str, list[np.ndarray]] = {}
+            td_all_class_chunks: list[np.ndarray] = []
+            if collect_train_dist_epoch:
+                num_diag_bins = _resolve_diagnostic_num_bins()
+                td_pt_p = np.zeros(num_diag_bins, dtype=np.float64)
+                td_pt_t = np.zeros(num_diag_bins, dtype=np.float64)
+                td_e_p = np.zeros(num_diag_bins, dtype=np.float64)
+                td_e_t = np.zeros(num_diag_bins, dtype=np.float64)
+                td_p_p = np.zeros(num_diag_bins, dtype=np.float64)
+                td_p_t = np.zeros(num_diag_bins, dtype=np.float64)
+                td_k1_pt_p = np.zeros(num_diag_bins, dtype=np.float64)
+                td_k1_pt_t = np.zeros(num_diag_bins, dtype=np.float64)
+                td_k1_e_p = np.zeros(num_diag_bins, dtype=np.float64)
+                td_k1_e_t = np.zeros(num_diag_bins, dtype=np.float64)
+                td_k1_p_p = np.zeros(num_diag_bins, dtype=np.float64)
+                td_k1_p_t = np.zeros(num_diag_bins, dtype=np.float64)
+                td_all_feature_names = _generation_monitor_feature_names(
+                    cartesian=_truth_generation_cartesian()
+                )
+                td_all_chunks = {
+                    f"{feature_name}_{suffix}": []
+                    for feature_name in td_all_feature_names
+                    for suffix in ("truth", "pred")
+                }
+            steps_this_epoch = 0
             while True:
+                if (
+                    logical_epoch_step_budget is not None
+                    and steps_this_epoch >= logical_epoch_step_budget
+                ):
+                    break
                 if max_steps is not None and global_step >= max_steps:
                     last_done = epoch - 1 if epoch > 0 else 0
                     if is_rank0:
@@ -7100,7 +9330,14 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             dgpo_next_epoch=epoch,
                             global_step=global_step,
                             ema_rollout=ema_rollout,
+                            round_ref_model=(
+                                round_ref_model if adaptive_cfg.enabled else None
+                            ),
+                            reward_round_id=int(adaptive_state.reward_round_id),
                             dgpo_projection_constraint_state=constraint_ckpt_payload_for_save(),
+                            dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                            dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                            dgpo_omnifold_reward_stack=_adaptive_stack_payload(),
                         )
                         _log.info("[DGPO] max_steps=%s reached; stopping.", max_steps)
                     _barrier()
@@ -7110,17 +9347,39 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     train_it, world_size=world_size, device=device
                 )
                 if not has_more or batch_cpu is None:
-                    stop_epoch = True
-                    break
+                    train_it = None
+                    completed_data_passes += 1
+                    if is_rank0:
+                        _log.info(
+                            "[DGPO] completed data pass=%s at logical_epoch=%s "
+                            "global_step=%s.",
+                            completed_data_passes,
+                            epoch,
+                            global_step,
+                        )
+                    if logical_epoch_step_budget is None:
+                        break
+                    train_it = iter(
+                        train_shard.iter_torch_batches(**train_loader_cfg)
+                    )
+                    batch_cpu, has_more = _next_batch_synced(
+                        train_it, world_size=world_size, device=device
+                    )
+                    if not has_more or batch_cpu is None:
+                        raise RuntimeError(
+                            "DGPO training dataset produced no batches after "
+                            "restarting its iterator"
+                        )
 
                 batch_d = batch_to_device(batch_cpu, device)
                 reward_dist_step = wandb_active and (
-                    global_step % log_reward_dist_every == 0
+                    not _wandb_simplified_enabled()
+                    and global_step % log_reward_dist_every == 0
                 )
                 diagnostic_dist_step = wandb_active
                 metrics = train_step(
                     model,
-                    ref_model,
+                    round_ref_model if adaptive_cfg.enabled else ref_model,
                     ema_rollout,
                     ema_save,
                     batch_d,
@@ -7129,17 +9388,24 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     reward_agg,
                     beta=beta,
                     K=K,
+                    advantage_estimator=advantage_estimator,
                     num_ddim_steps=num_ddim,
                     rollout_parallel_chains=rollout_parallel_chains,
                     global_step=global_step,
                     epoch=epoch,
                     device=device,
                     dtype=dtype,
+                    reference_trust_coefficient=reference_trust_coefficient,
                     log_reward_dist=reward_dist_step,
                     log_diagnostic_dist=diagnostic_dist_step,
+                    collect_train_dist=collect_train_dist_epoch,
                     diagnostic_plot_names=diagnostic_plot_names,
                     diagnostic_plot_every=diagnostic_plot_every,
                     num_train_timesteps=num_train_timesteps,
+                    policy_eval_parallel_timesteps=policy_eval_parallel_timesteps,
+                    policy_eval_event_microbatch_size=(
+                        policy_eval_event_microbatch_size
+                    ),
                     adv_clip_max=adv_clip_max_cfg,
                     grad_clip_norm=grad_clip_norm_cfg,
                     policy_eval_t_min=policy_eval_t_min_cfg,
@@ -7155,7 +9421,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     _append_profile_accum(metrics)
                     _flush_profile_accum(step=global_step)
 
-                if legacy_train_kinematics:
+                if collect_train_dist_epoch and legacy_train_kinematics:
                     td_pt_p += metrics["_kin_h_pt_p"]
                     td_pt_t += metrics["_kin_h_pt_t"]
                     td_e_p += metrics["_kin_h_e_p"]
@@ -7168,13 +9434,16 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     td_k1_e_t += metrics["_kin_h_e_k1_t"]
                     td_k1_p_p += metrics["_kin_h_p_k1_p"]
                     td_k1_p_t += metrics["_kin_h_p_k1_t"]
-                for feature_name in td_all_feature_names:
-                    truth_key = f"_kin_all_{feature_name}_t"
-                    pred_key = f"_kin_all_{feature_name}_p"
-                    if truth_key not in metrics or pred_key not in metrics:
-                        continue
-                    td_all_chunks[f"{feature_name}_truth"].append(metrics[truth_key])
-                    td_all_chunks[f"{feature_name}_pred"].append(metrics[pred_key])
+                if collect_train_dist_epoch:
+                    for feature_name in td_all_feature_names:
+                        truth_key = f"_kin_all_{feature_name}_t"
+                        pred_key = f"_kin_all_{feature_name}_p"
+                        if truth_key not in metrics or pred_key not in metrics:
+                            continue
+                        td_all_chunks[f"{feature_name}_truth"].append(metrics[truth_key])
+                        td_all_chunks[f"{feature_name}_pred"].append(metrics[pred_key])
+                    if "_kin_all_class_index" in metrics:
+                        td_all_class_chunks.append(metrics["_kin_all_class_index"])
 
                 if is_rank0 and global_step % log_every == 0:
                     _log.info(
@@ -7193,12 +9462,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         metrics["reward/monitor/mean_gap"],
                     )
                 global_step += 1
+                steps_this_epoch += 1
 
             # --- Epoch-end: build training-distribution figures from accumulated histograms ---
             if wandb_mod is not None:
                 _flush_profile_accum(step=max(global_step - 1, 0), force=True)
 
-            if legacy_train_kinematics and world_size > 1:
+            if collect_train_dist_epoch and legacy_train_kinematics and world_size > 1:
                 td_stack = np.stack([
                     td_pt_p, td_pt_t, td_e_p, td_e_t, td_p_p, td_p_t,
                     td_k1_pt_p, td_k1_pt_t, td_k1_e_p, td_k1_e_t, td_k1_p_p, td_k1_p_t,
@@ -7212,16 +9482,20 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 ) = [td_merged[i] for i in range(12)]
 
             td_all_merged: dict[str, np.ndarray] = {}
-            td_all_merged = _gather_val_array_dict(
-                {
-                    key: _concat_np_chunks(chunks)
-                    for key, chunks in td_all_chunks.items()
-                },
-                rank=rank,
-                world_size=world_size,
-            )
+            if collect_train_dist_epoch:
+                td_all_merged = _gather_val_array_dict(
+                    {
+                        **{
+                            key: _concat_np_chunks(chunks)
+                            for key, chunks in td_all_chunks.items()
+                        },
+                        "class_index": _concat_np_chunks(td_all_class_chunks),
+                    },
+                    rank=rank,
+                    world_size=world_size,
+                )
 
-            if is_rank0 and wandb_mod is not None:
+            if is_rank0 and wandb_mod is not None and collect_train_dist_epoch:
                 _td_bin_pt = _diagnostic_bin_edges("pt")
                 _td_bin_eta = _diagnostic_bin_edges("eta")
                 _td_bin_phi = _diagnostic_bin_edges("phi")
@@ -7295,6 +9569,59 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             td_all_merged.get(f"{feature_name}_pred", np.array([], dtype=np.float64)),
                         ).items():
                             td_log[f"train_dist/all_metrics/{feature_name}/{metric_name}"] = metric_value
+                    log_representative_classes = bool(
+                        representative_class_indices
+                        and (
+                            int(epoch) == 0
+                            or (int(epoch) + 1) % train_dist_by_class_every == 0
+                        )
+                    )
+                    if log_representative_classes:
+                        class_index = np.asarray(
+                            td_all_merged.get(
+                                "class_index",
+                                np.array([], dtype=np.int64),
+                            ),
+                            dtype=np.int64,
+                        ).reshape(-1)
+                        for class_name, class_id in representative_class_indices.items():
+                            class_mask = class_index == int(class_id)
+                            if not np.any(class_mask):
+                                continue
+                            for feature_name in _available_truth_pred_features(
+                                td_all_merged,
+                                td_all_feature_names,
+                            ):
+                                truth_class, pred_class = select_truth_pred_by_class(
+                                    td_all_merged[f"{feature_name}_truth"],
+                                    td_all_merged[f"{feature_name}_pred"],
+                                    class_index,
+                                    class_id=int(class_id),
+                                )
+                                td_log[
+                                    f"train_dist/by_class/{class_name}/"
+                                    f"{feature_name}_truth_vs_pred"
+                                ] = _truth_pred_matrix_figure(
+                                    truth_class,
+                                    pred_class,
+                                    xlabel=f"Truth {feature_name}",
+                                    ylabel=f"Pred {feature_name}",
+                                    title=(
+                                        f"Train 2D truth vs pred {feature_name} "
+                                        f"({class_name}, all K candidates)"
+                                    ),
+                                    bin_edges=_generation_special_bin_edges(
+                                        feature_name
+                                    ),
+                                )
+                                for metric_name, metric_value in _truth_pred_scalar_metrics(
+                                    truth_class,
+                                    pred_class,
+                                ).items():
+                                    td_log[
+                                        f"train_dist/by_class_metrics/{class_name}/"
+                                        f"{feature_name}/{metric_name}"
+                                    ] = metric_value
                     if len(td_log) > 1:
                         _wandb_log_with_step(
                             wandb_mod,
@@ -7305,26 +9632,40 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     _log.warning("[DGPO] train_dist figures failed at epoch=%s: %s", epoch, _e)
 
             ve = int(val_events) if val_events is not None else 0
-            run_epoch_val = ve > 0 and val_shard is not None and _dgpo_should_run_validation_epoch(
-                epoch, validation_every_n_epochs
+            validation_tier = validation_schedule_tier(
+                epoch,
+                cheap_every_n_epochs=validation_every_n_epochs,
+                full_every_n_epochs=validation_full_every_n_epochs,
             )
-            if not run_epoch_val and ve > 0 and val_shard is not None and is_rank0:
-                if (epoch + 1) % validation_every_n_epochs != 0:
-                    _log.info(
-                        "[DGPO] val: skipped epoch=%s (validation_every_n_epochs=%s; "
-                        "next val at epoch=%s).",
-                        epoch,
-                        validation_every_n_epochs,
-                        epoch + (validation_every_n_epochs - (epoch + 1) % validation_every_n_epochs),
-                    )
+            run_epoch_val = (
+                ve > 0
+                and val_shard is not None
+                and validation_tier is not None
+            )
             if run_epoch_val:
+                full_validation = validation_tier == "full"
+                active_val_k = val_K if full_validation else val_cheap_K
+                active_max_batches = (
+                    val_max_batches if full_validation else val_cheap_max_batches
+                )
+                active_prefix = "val" if full_validation else "val_cheap"
+                active_compute_winrate = bool(
+                    full_validation
+                    and dg.get("validation_compute_winrate", False)
+                )
                 if is_rank0:
                     _log.info(
-                        "[DGPO] val: requesting val iterator (Ray read+preprocess may take a long time; "
-                        "first DDIM batch logs after rows arrive).",
+                        "[DGPO] %s validation: requesting iterator (K=%s, max_batches=%s).",
+                        validation_tier,
+                        active_val_k,
+                        active_max_batches,
                     )
                 val_loader = val_shard.iter_torch_batches(**val_loader_cfg)
-                est_val_batches = max(1, math.ceil(ve / effective_batch)) if ve > 0 else None
+                est_val_batches = (
+                    max(1, math.ceil(ve / validation_effective_batch))
+                    if ve > 0
+                    else None
+                )
                 val_metrics = run_validation_epoch(
                     model,
                     ref_model,
@@ -7332,33 +9673,52 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     val_loader,
                     sampler,
                     reward_agg,
-                    val_K=val_K,
+                    val_K=active_val_k,
                     num_ddim_steps=num_ddim_val,
                     device=device,
                     dtype=dtype,
                     cartesian=_truth_generation_cartesian(),
-                    compute_winrate=bool(dg.get("validation_compute_winrate", False)),
+                    compute_winrate=active_compute_winrate,
                     epoch=epoch,
                     est_total_batches=est_val_batches,
-                    val_log_batches=bool(dg.get("validation_log_batches", True)),
-                    val_rollout_parallel_chains=val_rollout_parallel_chains,
-                    val_tqdm_k_chains=bool(dg.get("validation_tqdm_k_chains", True)),
-                    val_tqdm_ddim=bool(dg.get("validation_tqdm_ddim", False)),
-                    max_batches=val_max_batches,
-                    initial_state=val_baseline_state,
+                    val_log_batches=bool(
+                        dg.get(
+                            "validation_log_batches"
+                            if full_validation
+                            else "validation_cheap_log_batches",
+                            full_validation,
+                        )
+                    ),
+                    val_rollout_parallel_chains=min(
+                        val_rollout_parallel_chains,
+                        active_val_k,
+                    ),
+                    val_tqdm_k_chains=bool(
+                        full_validation
+                        and dg.get("validation_tqdm_k_chains", True)
+                    ),
+                    val_tqdm_ddim=bool(
+                        full_validation
+                        and dg.get("validation_tqdm_ddim", False)
+                    ),
+                    max_batches=active_max_batches,
+                    initial_state=(val_baseline_state if full_validation else None),
+                    full_diagnostics=full_validation,
+                    metric_prefix=active_prefix,
                     rank=rank,
                     world_size=world_size,
                 )
                 if is_rank0:
-                    _append_validation_history_plots(val_metrics, epoch_value=epoch)
+                    if full_validation:
+                        _append_validation_history_plots(val_metrics, epoch_value=epoch)
                     _log.info(
-                        "[DGPO] val epoch=%s r_mean=%.6f r_med=%.6f p10=%.6f p90=%.6f winrate=%.4f",
+                        "[DGPO] %s val epoch=%s r_mean=%.6f r_med=%.6f p10=%.6f p90=%.6f",
+                        validation_tier,
                         epoch,
-                        val_metrics["val/reward/mean"],
-                        val_metrics["val/reward/median"],
-                        val_metrics["val/reward/p10"],
-                        val_metrics["val/reward/p90"],
-                        val_metrics["val/winrate"],
+                        val_metrics[f"{active_prefix}/reward/mean"],
+                        val_metrics[f"{active_prefix}/reward/median"],
+                        val_metrics[f"{active_prefix}/reward/p10"],
+                        val_metrics[f"{active_prefix}/reward/p90"],
                     )
                     if wandb_mod is not None:
                         _wandb_log_validation(
@@ -7367,9 +9727,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             epoch=epoch,
                             wandb_step=_wandb_epoch_end_step(global_step),
                         )
-                    if ckpt_topk is not None:
+                    if (
+                        full_validation
+                        and ckpt_topk is not None
+                        and top_k_metric == "val/reward/mean"
+                    ):
                         ckpt_topk.maybe_save(
-                            val_reward_mean=val_metrics["val/reward/mean"],
+                            score=val_metrics["val/reward/mean"],
                             last_completed_epoch=epoch,
                             dgpo_next_epoch=epoch + 1,
                             global_step=global_step,
@@ -7378,27 +9742,122 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             optimizer=optimizer,
                             ref_model=ref_model,
                             ema_rollout=ema_rollout,
+                            round_ref_model=(
+                                round_ref_model if adaptive_cfg.enabled else None
+                            ),
+                            reward_round_id=int(adaptive_state.reward_round_id),
                             dgpo_projection_constraint_state=constraint_ckpt_payload_for_save(),
+                            dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                            dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                            dgpo_omnifold_reward_stack=_adaptive_stack_payload(),
                         )
 
             _barrier()
 
-            if is_rank0:
-                _dgpo_save_last_ckpt(
-                    model,
-                    ema_save,
-                    optimizer,
-                    ref_model,
-                    last_completed_epoch=epoch,
-                    dgpo_next_epoch=epoch + 1,
-                    global_step=global_step,
-                    ema_rollout=ema_rollout,
-                    dgpo_projection_constraint_state=constraint_ckpt_payload_for_save(),
+            adaptive_cycle_ran = False
+            if adaptive_cfg.enabled:
+                from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+                    should_probe_epoch,
                 )
-            _barrier()
 
-            # ``stop_epoch`` is set when this rank's shard ran dry; nothing else to do.
-            del stop_epoch
+                if should_probe_epoch(
+                    epoch,
+                    adaptive_cfg.staleness_every_n_epochs,
+                ):
+                    adaptive_cycle_ran = True
+                    adaptive_metrics = _run_adaptive_cycle(epoch=epoch)
+                    if is_rank0:
+                        if wandb_mod is not None:
+                            _wandb_log_with_step(
+                                wandb_mod,
+                                adaptive_metrics,
+                                step=_wandb_epoch_end_step(global_step),
+                            )
+                        if (
+                            ckpt_topk is not None
+                            and top_k_metric
+                            == "staleness/audit_balanced_accuracy"
+                        ):
+                            audit_saturated = (
+                                float(
+                                    adaptive_metrics.get(
+                                        "staleness/audit_saturated",
+                                        0.0,
+                                    )
+                                )
+                                >= 0.5
+                            )
+                            if audit_saturated:
+                                ckpt_topk.maybe_save(
+                                    score=float(
+                                        adaptive_metrics.get(
+                                            "staleness/audit_balanced_accuracy",
+                                            float("nan"),
+                                        )
+                                    ),
+                                    last_completed_epoch=epoch,
+                                    dgpo_next_epoch=epoch + 1,
+                                    global_step=global_step,
+                                    model=model,
+                                    ema_save=ema_save,
+                                    optimizer=optimizer,
+                                    ref_model=ref_model,
+                                    ema_rollout=ema_rollout,
+                                    round_ref_model=round_ref_model,
+                                    reward_round_id=int(
+                                        adaptive_state.reward_round_id
+                                    ),
+                                    dgpo_projection_constraint_state=(
+                                        constraint_ckpt_payload_for_save()
+                                    ),
+                                    dgpo_omnifold_reward_metadata=(
+                                        reward_checkpoint_metadata
+                                    ),
+                                    dgpo_adaptive_omnifold_state=(
+                                        _adaptive_state_payload()
+                                    ),
+                                    dgpo_omnifold_reward_stack=(
+                                        _adaptive_stack_payload()
+                                    ),
+                                )
+                            else:
+                                _log.info(
+                                    "[DGPO] audit not saturated at epoch=%s; "
+                                    "skipping audit-accuracy top-k checkpoint.",
+                                    epoch,
+                                )
+                    _barrier()
+
+            checkpoint_due = bool(
+                (ckpt_every_n_steps > 0 and global_step % ckpt_every_n_steps == 0)
+                or (
+                    ckpt_every_n_epochs > 0
+                    and (epoch + 1) % ckpt_every_n_epochs == 0
+                )
+                or adaptive_cycle_ran
+                or epoch + 1 >= epochs
+            )
+            if checkpoint_due:
+                if is_rank0:
+                    _dgpo_save_last_ckpt(
+                        model,
+                        ema_save,
+                        optimizer,
+                        ref_model,
+                        last_completed_epoch=epoch,
+                        dgpo_next_epoch=epoch + 1,
+                        global_step=global_step,
+                        ema_rollout=ema_rollout,
+                        round_ref_model=(
+                            round_ref_model if adaptive_cfg.enabled else None
+                        ),
+                        reward_round_id=int(adaptive_state.reward_round_id),
+                        dgpo_projection_constraint_state=constraint_ckpt_payload_for_save(),
+                        dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                        dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                        dgpo_omnifold_reward_stack=_adaptive_stack_payload(),
+                    )
+                _barrier()
 
         if is_rank0:
             _log.info("[DGPO] finished %s epochs (%s optimizer steps).", epochs, global_step)
@@ -7441,23 +9900,30 @@ def main() -> None:
     _assert_rl_enabled()
     global_config.display()
     platform_info = global_config.platform
-    # Default 0: let Ray set per-worker CUDA_VISIBLE_DEVICES. With ``1`` (full node
-    # visibility), Ray Train + ``ScalingConfig(GPU: 1)`` can call ``torch.cuda.set_device``
-    # with local_rank 3 while Slurm only exposes fewer GPUs on that node →
-    # ``DeferredCudaCallError: device=3, num_gpus=...``. Override with ``export
-    # RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` only if you need the old
-    # Shifter/NCCL workaround from ``NERSC/start_interactive_ray.sh``.
-    os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "0")
+    # Leave Ray's CUDA masking opt-out absent by default. Ray treats a present,
+    # non-empty value as enabled, so exporting the string ``0`` is not a safe
+    # false value. Explicit truthy values remain available for the legacy
+    # Shifter/NCCL workaround.
+    ray_cuda_opt_out_key = "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
+    ray_cuda_opt_out = os.environ.get(ray_cuda_opt_out_key)
+    if ray_cuda_opt_out is not None and ray_cuda_opt_out.strip().lower() in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        os.environ.pop(ray_cuda_opt_out_key, None)
+        ray_cuda_opt_out = None
 
     runtime_env = {
         "env_vars": {
             "PYTHONPATH": f"{_REPO_ROOT}:{os.environ.get('PYTHONPATH', '')}",
             "TORCH_NCCL_TIMEOUT": "180",
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": os.environ[
-                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
-            ],
         },
     }
+    if ray_cuda_opt_out is not None:
+        runtime_env["env_vars"][ray_cuda_opt_out_key] = ray_cuda_opt_out
     if "WANDB_API_KEY" in os.environ:
         runtime_env["env_vars"]["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
@@ -7528,6 +9994,24 @@ def main() -> None:
     )
 
     datasets: dict[str, Any] = {"train": train_ds}
+    from RL.DGPO_neutrino.omnifold_ztautau.adaptive import resolve_adaptive_config
+
+    launch_adaptive_cfg = resolve_adaptive_config(global_config.dgpo)
+    fixed_omnifold_pool = bool(
+        launch_adaptive_cfg.enabled and launch_adaptive_cfg.pool_events is not None
+    )
+    if fixed_omnifold_pool:
+        # Choose the identities globally before Ray Train shards the dataset.
+        # This immutable, seeded Dataset is reused by the bootstrap and every
+        # adaptive refit; only the live-policy K=1 candidates are regenerated.
+        datasets["omnifold_train"] = train_ds.random_shuffle(
+            seed=int(launch_adaptive_cfg.pool_selection_seed)
+        ).limit(int(launch_adaptive_cfg.pool_events))
+        _log.info(
+            "[DGPO/launch] fixed OmniFold fit population: events=%s seed=%s",
+            min(int(launch_adaptive_cfg.pool_events), int(total_events)),
+            launch_adaptive_cfg.pool_selection_seed,
+        )
     if val_ds is not None and val_events:
         datasets["validation"] = val_ds
 
@@ -7564,6 +10048,7 @@ def main() -> None:
         "wandb": not args.no_wandb,
         "total_events": int(total_events),
         "val_events": int(val_events) if val_events else 0,
+        "fixed_omnifold_pool": fixed_omnifold_pool,
     }
 
     trainer = TorchTrainer(
