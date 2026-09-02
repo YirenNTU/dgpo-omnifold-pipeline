@@ -69,6 +69,10 @@ class _FakePET(nn.Module):
         self.projection_dim = 8
         self.feature_embedding = nn.Linear(4, 8)
         self.transformer_blocks = nn.ModuleList([nn.Identity()])
+        self.adapters = nn.ModuleList(
+            [evenet_ratio_module.Adapter(8, bottleneck=4, dropout=0.0)]
+        )
+        self.last_attn_mask: Tensor | None = None
 
     def forward(
         self,
@@ -77,13 +81,14 @@ class _FakePET(nn.Module):
         input_points: Tensor,
         mask: Tensor,
         time: Tensor,
-        attn_mask: Tensor,
+        attn_mask: Tensor | None,
         time_masking: Tensor,
-        adapters: nn.ModuleList,
+        adapters: nn.ModuleList | None,
     ) -> Tensor:
-        del input_points, time, attn_mask, time_masking
+        del input_points, time, time_masking
+        self.last_attn_mask = attn_mask
         encoded = self.feature_embedding(input_features)
-        for adapter in adapters:
+        for adapter in self.adapters if adapters is None else adapters:
             encoded = adapter(encoded)
         return encoded * mask
 
@@ -99,7 +104,7 @@ class _FakeZtautauBackbone(nn.Module):
         self.sequential_normalizer = _IdentityNormalizer(4)
         self.invisible_normalizer = _IdentityNormalizer(2)
         self.global_normalizer = _IdentityNormalizer(2)
-        self.invisible_projector = nn.Linear(2, 4)
+        self.InvisibleInputProjector = nn.Linear(2, 4)
         self.GlobalEmbedding = _FakeGlobalEmbedding()
         self.PET = _FakePET()
         self.network_cfg = SimpleNamespace(
@@ -121,7 +126,7 @@ class _FakeZtautauBackbone(nn.Module):
         return x * mask
 
     def project_invisible_inputs(self, x: Tensor, mask: Tensor) -> Tensor:
-        return self.invisible_projector(x) * mask
+        return self.InvisibleInputProjector(x) * mask
 
 
 def _event_batch(batch_size: int = 3) -> dict[str, Tensor]:
@@ -143,6 +148,62 @@ class TestEventPacking(unittest.TestCase):
 
 
 class TestZtautauRatioClassifier(unittest.TestCase):
+    def test_full_finetune_uses_only_registered_internal_pet_adapters(self) -> None:
+        packed, spec = pack_event_inputs(_event_batch())
+        backbone = _FakeZtautauBackbone()
+        model = EvenetAdapterRatioClassifier(
+            backbone,
+            spec,
+            train_backbone=True,
+            decoder_hidden_dim=8,
+            decoder_layers=1,
+            decoder_heads=2,
+            adapter_bottleneck=4,
+        )
+        self.assertFalse(hasattr(model.bank, "pet_adapters"))
+        self.assertFalse(
+            any(key.startswith("pet_adapters.") for key in model.bank.state_dict())
+        )
+        self.assertGreater(
+            model.trainable_parameter_counts["internal_pet_adapters"], 0
+        )
+        model.train()
+        self.assertTrue(backbone.training)
+        model.eval()
+        self.assertFalse(backbone.training)
+        model(packed, torch.randn(3, 4))
+
+    def test_new_classifier_uses_full_self_attention(self) -> None:
+        packed, spec = pack_event_inputs(_event_batch())
+        backbone = _FakeZtautauBackbone()
+        model = EvenetAdapterRatioClassifier(
+            backbone,
+            spec,
+            asymmetric_attention=False,
+            decoder_hidden_dim=8,
+            decoder_layers=1,
+            decoder_heads=2,
+            adapter_bottleneck=4,
+        )
+        model(packed, torch.randn(3, 4))
+        self.assertIsNone(backbone.PET.last_attn_mask)
+
+    def test_legacy_classifier_can_restore_asymmetric_attention(self) -> None:
+        packed, spec = pack_event_inputs(_event_batch())
+        backbone = _FakeZtautauBackbone()
+        model = EvenetAdapterRatioClassifier(
+            backbone,
+            spec,
+            asymmetric_attention=True,
+            decoder_hidden_dim=8,
+            decoder_layers=1,
+            decoder_heads=2,
+            adapter_bottleneck=4,
+        )
+        model(packed, torch.randn(3, 4))
+        self.assertIsNotNone(backbone.PET.last_attn_mask)
+        self.assertEqual(tuple(backbone.PET.last_attn_mask.shape), (7, 7))
+
     def test_accepts_four_dimensional_k1_and_grouped_candidates(self) -> None:
         packed, spec = pack_event_inputs(_event_batch())
         model = EvenetAdapterRatioClassifier(
@@ -180,6 +241,78 @@ class TestZtautauRatioClassifier(unittest.TestCase):
         frozen._load_checkpoint(1)
         restored = classifier.state_dict()[body_keys[0]]
         self.assertTrue(torch.equal(restored, second[body_keys[0]]))
+
+    def test_invisible_projector_trains_without_opening_the_frozen_backbone(self) -> None:
+        _packed, spec = pack_event_inputs(_event_batch(batch_size=2))
+        classifier = EvenetAdapterRatioClassifier(
+            _FakeZtautauBackbone(),
+            spec,
+            train_invisible_projector=True,
+            decoder_hidden_dim=8,
+            decoder_layers=1,
+            decoder_heads=2,
+            adapter_bottleneck=4,
+        )
+        body_names = {
+            name for name, _parameter in classifier._trainable_backbone_parameters()
+        }
+        self.assertTrue(
+            {
+                "InvisibleInputProjector.weight",
+                "InvisibleInputProjector.bias",
+            }.issubset(body_names)
+        )
+        self.assertTrue(any(name.startswith("PET.adapters.") for name in body_names))
+        self.assertEqual(body_names, set(classifier.peft_payload()["body"]))
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in classifier.backbone.InvisibleInputProjector.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in classifier.backbone.PET.adapters.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in classifier.backbone.PET.feature_embedding.parameters()
+            )
+        )
+
+    def test_legacy_payload_roundtrip_does_not_add_new_flags(self) -> None:
+        _packed, spec = pack_event_inputs(_event_batch(batch_size=2))
+        backbone = _FakeZtautauBackbone()
+
+        def build(_spec):
+            return EvenetAdapterRatioClassifier(
+                backbone,
+                _spec,
+                decoder_hidden_dim=8,
+                decoder_layers=1,
+                decoder_heads=2,
+                adapter_bottleneck=4,
+            )
+
+        original = build(spec).peft_payload()
+        original["classifier_config"].pop("train_invisible_projector")
+        original["classifier_config"].pop("asymmetric_attention")
+        restored = EvenetAdapterRatioClassifier.from_peft_payload(
+            original,
+            model_builder=build,
+            device=torch.device("cpu"),
+        )
+        roundtrip = restored.peft_payload()
+        self.assertNotIn(
+            "train_invisible_projector", roundtrip["classifier_config"]
+        )
+        self.assertNotIn("asymmetric_attention", roundtrip["classifier_config"])
+        self.assertTrue(
+            all(name.startswith("PET.adapters.") for name in roundtrip["body"])
+        )
 
 
 class TestResidualRatioStack(unittest.TestCase):
@@ -483,6 +616,17 @@ class TestRatioFitProgress(unittest.TestCase):
         self.assertEqual(sorted(torch.cat(first_epoch).tolist()), list(range(10)))
         self.assertEqual(sorted(torch.cat(second_epoch).tolist()), list(range(10)))
 
+    def test_epoch_shuffle_can_drop_short_last_batch(self) -> None:
+        batcher = _EpochShuffleBatcher(
+            size=10, batch_size=4, seed=17, drop_last=True
+        )
+        first_epoch = [batcher.draw(step) for step in range(2)]
+        second_epoch = [batcher.draw(step) for step in range(2, 4)]
+        self.assertEqual([len(batch) for batch in first_epoch], [4, 4])
+        self.assertEqual([len(batch) for batch in second_epoch], [4, 4])
+        self.assertEqual(len(torch.unique(torch.cat(first_epoch))), 8)
+        self.assertEqual(len(torch.unique(torch.cat(second_epoch))), 8)
+
     def test_null_max_epochs_builds_an_unbounded_epoch_fit(self) -> None:
         config = ztautau_stage.build_fit_config(
             {
@@ -502,6 +646,24 @@ class TestRatioFitProgress(unittest.TestCase):
         self.assertEqual(config.train_microbatch_size_per_rank, 7)
         self.assertEqual(config.min_steps, 4)
         self.assertEqual(config.validation_interval_steps, 4)
+        self.assertEqual(config.validation_patience_evaluations, 10)
+
+    def test_drop_last_uses_only_complete_batches_for_epoch_length(self) -> None:
+        config = ztautau_stage.build_fit_config(
+            {
+                "batch_size": 32,
+                "drop_last_batch": True,
+                "safety_max_epochs": None,
+                "min_epochs": 1,
+                "validation_interval_epochs": 1,
+                "validation_patience_epochs": 10,
+            },
+            n_train=100,
+            n_validation=20,
+        )
+        self.assertTrue(config.drop_last_batch)
+        self.assertEqual(config.min_steps, 3)
+        self.assertEqual(config.validation_interval_steps, 3)
         self.assertEqual(config.validation_patience_evaluations, 10)
 
     def test_training_microbatches_reconstruct_the_full_batch_update(self) -> None:
@@ -849,6 +1011,42 @@ class _FakeFrozenReward(nn.Module):
 
 
 class TestDgpoOmniFoldReward(unittest.TestCase):
+    def test_in_dgpo_bootstrap_forwards_trainable_projector_flag(self) -> None:
+        from RL.DGPO_neutrino import dgpo_trainer
+
+        config = SimpleNamespace(
+            reward_config=SimpleNamespace(
+                type="omnifold",
+                weight=1.0,
+                omnifold=SimpleNamespace(
+                    bootstrap_in_dgpo=True,
+                    bundle_file=None,
+                    backbone_checkpoint="unused-by-mock.ckpt",
+                ),
+            ),
+            dgpo=SimpleNamespace(
+                adaptive_omnifold=SimpleNamespace(
+                    recalibration=SimpleNamespace(
+                        train_invisible_projector=True,
+                    )
+                )
+            ),
+        )
+        with mock.patch.object(dgpo_trainer, "global_config", config), mock.patch.object(
+            dgpo_reward_module,
+            "build_uninstalled_ztautau_omnifold_reward",
+            return_value=mock.sentinel.reward,
+        ) as build_reward:
+            aggregator = dgpo_trainer.build_reward_aggregator(
+                nn.Identity(),
+                torch.device("cpu"),
+                normalization_dict={},
+            )
+
+        classifier_config = build_reward.call_args.kwargs["classifier_config"]
+        self.assertTrue(classifier_config["train_invisible_projector"])
+        self.assertIs(aggregator.sources[0][0], mock.sentinel.reward)
+
     def _reward(self, batch: dict[str, Tensor], policy_sha: str = "a" * 64):
         _packed, spec = pack_event_inputs(batch)
         stack = _FakeFrozenReward(spec).eval()
@@ -1065,6 +1263,7 @@ class TestDgpoOmniFoldReward(unittest.TestCase):
                     "kind": "ztautau_evenet_omnifold_reward",
                     "candidates_per_event_for_fit": 1,
                     "classifier": {
+                        "adapter_placement": "internal",
                         "adapter_bottleneck": 4,
                         "decoder_hidden_dim": 8,
                         "decoder_layers": 1,

@@ -269,48 +269,15 @@ class ZtautauOmniFoldReward(BaseReward):
             first_increment.get("classifier_config") or {}
         )
         if not saved_classifier_config:
-            # Checkpoints written before classifier architecture metadata can
-            # still be resumed after shrinking the new audit/refit head. Infer
-            # tensor-determined dimensions and use the pretrained EveNet's
-            # attention-head default, which matches the legacy 256x2x8 head.
-            saved_state = dict(first_increment.get("state") or {})
-            norm_weight = saved_state.get("decoder.output_norm.weight")
-            if norm_weight is None:
-                raise ValueError(
-                    "legacy adaptive OmniFold checkpoint has no decoder shape"
-                )
-            layer_ids = {
-                int(str(key).split(".")[2])
-                for key in saved_state
-                if str(key).startswith("decoder.blocks.")
-                and len(str(key).split(".")) > 3
-                and str(key).split(".")[2].isdigit()
-            }
-            adapter_down = next(
-                (
-                    value
-                    for key, value in saved_state.items()
-                    if str(key).startswith("pet_adapters.")
-                    and str(key).endswith(".down.weight")
-                ),
-                None,
+            raise ValueError(
+                "adaptive OmniFold checkpoint predates the internal-adapter "
+                "classifier schema; restart from the diffusion checkpoint"
             )
-            saved_classifier_config = {
-                "decoder_hidden_dim": int(norm_weight.numel()),
-                "decoder_layers": max(layer_ids, default=-1) + 1,
-                "decoder_heads": int(
-                    getattr(
-                        self.model_builder.backbone.network_cfg.Classification,
-                        "num_attention_heads",
-                        1,
-                    )
-                ),
-                "adapter_bottleneck": (
-                    self.model_builder._adapter_bottleneck
-                    if adapter_down is None
-                    else int(adapter_down.shape[0])
-                ),
-            }
+        if saved_classifier_config.get("adapter_placement") != "internal":
+            raise ValueError(
+                "external-adapter OmniFold rewards are no longer supported; "
+                "restart from the diffusion checkpoint"
+            )
 
         def _classifier_factory(spec: EventPackingSpec):
             return self.model_builder.make_classifier(
@@ -328,6 +295,23 @@ class ZtautauOmniFoldReward(BaseReward):
                 decoder_heads=int(saved_classifier_config["decoder_heads"]),
                 adapter_bottleneck=int(
                     saved_classifier_config["adapter_bottleneck"]
+                ),
+                # Legacy reward stacks did not train/save this projector. Keep
+                # their exact frozen-body semantics during restore so their
+                # integrity digest remains stable; newly fitted stacks persist
+                # the flag and the projector tensors in ``body``.
+                train_invisible_projector=bool(
+                    saved_classifier_config.get(
+                        "train_invisible_projector", False
+                    )
+                ),
+                train_backbone=bool(
+                    saved_classifier_config.get("train_backbone", False)
+                ),
+                # Payloads written before this field used the asymmetric mask.
+                # New fits persist ``False`` and use full self-attention.
+                asymmetric_attention=bool(
+                    saved_classifier_config.get("asymmetric_attention", True)
                 ),
             )
 
@@ -429,7 +413,13 @@ def build_uninstalled_ztautau_omnifold_reward(
         adapter_bottleneck=int(classifier_config.get("adapter_bottleneck", 16)),
         train_layernorm=bool(classifier_config.get("train_layernorm", False)),
         train_encoder=bool(classifier_config.get("train_encoder", False)),
+        train_invisible_projector=bool(
+            classifier_config.get("train_invisible_projector", False)
+        ),
         train_backbone=train_backbone,
+        asymmetric_attention=bool(
+            classifier_config.get("asymmetric_attention", False)
+        ),
         head_dropout=float(classifier_config.get("head_dropout", 0.1)),
         decoder_hidden_dim=int(classifier_config.get("decoder_hidden_dim", 256)),
         decoder_layers=int(classifier_config.get("decoder_layers", 2)),
@@ -470,7 +460,7 @@ def load_ztautau_omnifold_reward(
     device: torch.device,
     expected_iterations: int | None = None,
 ) -> ZtautauOmniFoldReward:
-    """Restore the standalone fit artifact on a frozen EveNet PEFT backbone."""
+    """Restore a standalone internal-adapter EveNet ratio artifact."""
 
     bundle_path = Path(bundle_file).expanduser().resolve()
     backbone_path = Path(backbone_checkpoint).expanduser().resolve()
@@ -493,6 +483,11 @@ def load_ztautau_omnifold_reward(
         raise ValueError(
             "OmniFold bundle is missing classifier architecture metadata; refit it "
             "with the current standalone stage"
+        )
+    if classifier_cfg.get("adapter_placement") != "internal":
+        raise ValueError(
+            "standalone OmniFold artifact does not use the required internal "
+            "PET adapters; refit it with the current stage"
         )
     provenance = payload.get("provenance")
     if not isinstance(provenance, Mapping):
@@ -518,7 +513,14 @@ def load_ztautau_omnifold_reward(
         adapter_bottleneck=int(classifier_cfg["adapter_bottleneck"]),
         train_layernorm=bool(classifier_cfg.get("train_layernorm", False)),
         train_encoder=bool(classifier_cfg.get("train_encoder", False)),
+        train_invisible_projector=bool(
+            classifier_cfg.get("train_invisible_projector", False)
+        ),
         train_backbone=bool(classifier_cfg.get("train_backbone", False)),
+        # Standalone artifacts predating this field used the asymmetric mask.
+        asymmetric_attention=bool(
+            classifier_cfg.get("asymmetric_attention", True)
+        ),
         head_dropout=float(classifier_cfg["head_dropout"]),
         decoder_hidden_dim=int(classifier_cfg["decoder_hidden_dim"]),
         decoder_layers=int(classifier_cfg["decoder_layers"]),

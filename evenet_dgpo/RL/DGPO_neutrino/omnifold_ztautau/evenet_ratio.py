@@ -6,10 +6,10 @@ density ratio and adds its logit to the cumulative log weight.  There is deliber
 no OmniFold Step-2 projection classifier in this module.
 
 The adaptive path owns one reusable classifier architecture and creates fresh
-cross-fit fold instances for every residual.  It may train either the PEFT bank
-alone or an independent full EveNet body, saves only held-out improvements over
-the exact null classifier, and propagates only out-of-fold logits into later
-training weights.  A no-op/invalid classifier is not part of the reward. Runtime
+cross-fit fold instances for every residual. It trains PET's registered internal
+adapters and may also fine-tune the complete active EveNet body, saving held-out
+improvements over the exact null classifier, and propagating only out-of-fold
+logits into later training weights. A no-op/invalid classifier is not part of the reward. Runtime
 staleness is decided by a fresh temporary audit classifier on the fully reweighted
 population; it is independent from the reward classifier and discarded afterward.
 """
@@ -28,7 +28,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from evenet.network.body.adapter import Adapter
 from evenet.network.body.embedding import PointCloudPositionalEmbedding
 
 
@@ -97,10 +96,9 @@ def unpack_event_inputs(packed: Tensor, spec: EventPackingSpec) -> dict[str, Ten
     return result
 
 
-PEFT_SCHEMA_VERSION = 5
+PEFT_SCHEMA_VERSION = 6
 _BACKBONE_STATE_PREFIX = "_backbone."
 _BANK_REQUIRED_PREFIXES = (
-    "pet_adapters.",
     "position_encoder.",
     "decoder.",
     "output.",
@@ -136,24 +134,43 @@ def configure_adapter_training(
     *,
     train_layernorm: bool = False,
     train_encoder: bool = False,
+    train_invisible_projector: bool = False,
     train_backbone: bool = False,
 ) -> None:
     """Freeze the shared body, then optionally reopen selected tensors.
 
-    ``train_backbone`` opens every body parameter, including PET attention.
-    Adapters and the decoder live in the PEFT bank. ``train_encoder`` opens
-    GlobalEmbedding (AdaLN event token). ObjectEncoder is unused on this path.
-    ``train_layernorm`` opens every affine norm in the body. Shared-backbone
-    OmniFold keeps all flags off.
+    PET's registered internal adapters are always trainable. ``train_backbone``
+    additionally opens every module on this classifier's forward path,
+    including PET attention.
+    ``train_encoder`` opens GlobalEmbedding (AdaLN event token).
+    ``train_invisible_projector`` opens only the projector that maps normalized
+    neutrino features into the PET input basis. ObjectEncoder is unused on this
+    path. ``train_layernorm`` opens every affine norm in the body.
     """
 
     pet = getattr(model, "PET", None)
     if pet is None:
         raise ValueError("EveNet ratio classifier requires a PET body")
     freeze_shared_backbone(model)
+    adapters = getattr(pet, "adapters", None)
+    if adapters is None or len(adapters) == 0:
+        raise ValueError("EveNet ratio classifier requires internal PET adapters")
+    for parameter in adapters.parameters():
+        parameter.requires_grad_(True)
     if train_backbone:
-        for parameter in model.parameters():
-            parameter.requires_grad_(True)
+        # ObjectEncoder and the task heads are not called by the ratio forward.
+        # Do not checkpoint/optimize unreachable parameters under the label
+        # "full fine-tune"; open every module that actually produces logits.
+        for name in (
+            "GroupedSequentialEmbedding",
+            "GlobalEmbedding",
+            "InvisibleInputProjector",
+            "PET",
+        ):
+            module = getattr(model, name, None)
+            if module is not None:
+                for parameter in module.parameters():
+                    parameter.requires_grad_(True)
         model.eval()
         return
     if train_layernorm:
@@ -161,6 +178,15 @@ def configure_adapter_training(
             if _is_norm_module(module):
                 for parameter in module.parameters(recurse=False):
                     parameter.requires_grad_(True)
+    if train_invisible_projector:
+        projector = getattr(model, "InvisibleInputProjector", None)
+        if projector is None:
+            raise ValueError(
+                "train_invisible_projector=true requires "
+                "backbone.InvisibleInputProjector"
+            )
+        for parameter in projector.parameters():
+            parameter.requires_grad_(True)
     if train_encoder:
         encoder = getattr(model, "GlobalEmbedding", None)
         if encoder is not None:
@@ -342,7 +368,7 @@ class CandidateConditionedRatioHead(AdaLNZeroCandidateDecoder):
 
 
 class EvenetRatioPEFTBank(nn.Module):
-    """PET adapters, slot identity, decoder, and scalar readout."""
+    """Slot identity, decoder, and scalar readout for an internal-adapter PET."""
 
     def __init__(
         self,
@@ -352,18 +378,10 @@ class EvenetRatioPEFTBank(nn.Module):
         hidden_dim: int,
         num_layers: int,
         num_heads: int,
-        pet_layers: int,
-        adapter_bottleneck: int,
         max_position_length: int,
         dropout: float,
     ) -> None:
         super().__init__()
-        self.pet_adapters = nn.ModuleList(
-            [
-                Adapter(token_dim, bottleneck=int(adapter_bottleneck), dropout=float(dropout))
-                for _ in range(int(pet_layers))
-            ]
-        )
         self.position_encoder = PointCloudPositionalEmbedding(
             num_points=int(max_position_length),
             embed_dim=int(token_dim),
@@ -389,7 +407,6 @@ class EvenetRatioPEFTBank(nn.Module):
         hidden_dim: int,
         num_layers: int,
         num_heads: int,
-        adapter_bottleneck: int | None = None,
         position_state: Mapping[str, Tensor] | None = None,
     ) -> "EvenetRatioPEFTBank":
         pet_cfg = backbone.network_cfg.Body.PET
@@ -397,26 +414,14 @@ class EvenetRatioPEFTBank(nn.Module):
         truth_cfg = getattr(backbone.network_cfg, "TruthGeneration", None)
         pet = backbone.PET
         _require_pet_adapter_flag(pet)
-        pet_layers = int(
-            getattr(pet, "num_layers", None)
-            or len(getattr(pet, "transformer_blocks", ()))
-            or len(getattr(pet, "adapters", ()))
-        )
         token_dim = int(getattr(pet, "projection_dim", None) or getattr(pet_cfg, "hidden_dim", hidden_dim))
         event_dim = int(getattr(global_cfg, "hidden_dim", token_dim))
-        bottleneck = int(
-            adapter_bottleneck
-            if adapter_bottleneck is not None
-            else getattr(pet, "adapter_bottleneck", getattr(pet_cfg, "adapter_bottleneck", 16))
-        )
         bank = cls(
             token_dim=token_dim,
             event_dim=event_dim,
             hidden_dim=int(hidden_dim),
             num_layers=int(num_layers),
             num_heads=int(num_heads),
-            pet_layers=pet_layers,
-            adapter_bottleneck=bottleneck,
             max_position_length=int(getattr(truth_cfg, "max_position_length", 36)),
             dropout=float(dropout),
         )
@@ -451,7 +456,9 @@ class EvenetAdapterRatioClassifier(nn.Module):
         bank: EvenetRatioPEFTBank | None = None,
         train_layernorm: bool = False,
         train_encoder: bool = False,
+        train_invisible_projector: bool = False,
         train_backbone: bool = False,
+        asymmetric_attention: bool = False,
         head_dropout: float | None = None,
         decoder_hidden_dim: int | None = None,
         decoder_layers: int | None = None,
@@ -478,11 +485,16 @@ class EvenetAdapterRatioClassifier(nn.Module):
             backbone,
             train_layernorm=train_layernorm,
             train_encoder=train_encoder,
+            train_invisible_projector=train_invisible_projector,
             train_backbone=train_backbone,
         )
         self._train_layernorm = bool(train_layernorm)
         self._train_encoder = bool(train_encoder)
+        self._train_invisible_projector = bool(train_invisible_projector)
+        self._include_train_invisible_projector_in_payload = True
         self._train_backbone = bool(train_backbone)
+        self._asymmetric_attention = bool(asymmetric_attention)
+        self._include_asymmetric_attention_in_payload = True
         self._backbone_state_keys = tuple(
             name
             for name, parameter in backbone.named_parameters()
@@ -534,10 +546,15 @@ class EvenetAdapterRatioClassifier(nn.Module):
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
-            adapter_bottleneck=adapter_bottleneck,
             position_state=position_state,
         )
         self.bank.assert_complete()
+        internal_adapters = getattr(backbone.PET, "adapters", None)
+        if internal_adapters is None or len(internal_adapters) == 0:
+            raise RuntimeError(
+                "OmniFold requires backbone.PET.adapters; external adapters "
+                "are not supported by PEFT schema v6"
+            )
         self.trainable_parameter_counts = {
             group: sum(
                 int(parameter.numel())
@@ -550,8 +567,9 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 ("position_encoder", "bank.position_encoder."),
                 ("object_encoder", "backbone.ObjectEncoder."),
                 ("global_embedding", "backbone.GlobalEmbedding."),
+                ("invisible_projector", "backbone.InvisibleInputProjector."),
                 ("pet", "backbone.PET."),
-                ("pet_adapters", "bank.pet_adapters."),
+                ("internal_pet_adapters", "backbone.PET.adapters."),
             )
         }
         self.trainable_parameter_counts["total"] = sum(
@@ -559,6 +577,14 @@ class EvenetAdapterRatioClassifier(nn.Module):
             for parameter in self.parameters()
             if parameter.requires_grad
         )
+        if (
+            self._train_invisible_projector
+            and self.trainable_parameter_counts["invisible_projector"] <= 0
+        ):
+            raise RuntimeError(
+                "OmniFold requested a trainable InvisibleInputProjector, but "
+                "none of its parameters reached the classifier optimizer view"
+            )
         _log.info(
             "[DGPO/omnifold] ratio classifier trainable parameters: %s "
             "(head_dropout=%.3g bank=%s)",
@@ -571,6 +597,19 @@ class EvenetAdapterRatioClassifier(nn.Module):
     @property
     def backbone(self) -> nn.Module:
         return self._shared.module
+
+    def train(self, mode: bool = True):
+        """Keep the unregistered EveNet body in the correct stochastic mode."""
+
+        super().train(mode)
+        if self._train_backbone:
+            self.backbone.train(mode)
+        else:
+            self.backbone.eval()
+            # Internal adapters are trainable even when the pretrained body is
+            # frozen; enable their dropout without enabling frozen PET dropout.
+            self.backbone.PET.adapters.train(mode)
+        return self
 
     def _trainable_backbone_parameters(
         self,
@@ -745,13 +784,23 @@ class EvenetAdapterRatioClassifier(nn.Module):
         n_visible = int(visible.shape[1])
         full = torch.cat((visible, invisible_projected), dim=1)
         full_mask = torch.cat((visible_mask, invisible_mask), dim=1)
-        is_invisible = torch.cat(
-            (
-                torch.zeros(n_visible, dtype=torch.bool, device=x.device),
-                torch.ones(self.num_invisible_slots, dtype=torch.bool, device=x.device),
+        attention_mask = None
+        if self._asymmetric_attention:
+            # Legacy reward checkpoints were trained with visible queries
+            # blocked from attending to invisible keys. Preserve that behavior
+            # only while restoring those frozen stacks; new fits use full
+            # bidirectional self-attention.
+            is_invisible = torch.cat(
+                (
+                    torch.zeros(n_visible, dtype=torch.bool, device=x.device),
+                    torch.ones(
+                        self.num_invisible_slots,
+                        dtype=torch.bool,
+                        device=x.device,
+                    ),
+                )
             )
-        )
-        attention_mask = (~is_invisible[:, None]) & is_invisible[None, :]
+            attention_mask = (~is_invisible[:, None]) & is_invisible[None, :]
         time_masking = torch.cat(
             (torch.zeros_like(visible_mask), invisible_mask), dim=1
         ).float()
@@ -765,7 +814,8 @@ class EvenetAdapterRatioClassifier(nn.Module):
             attn_mask=attention_mask,
             time=time,
             time_masking=time_masking,
-            adapters=self.bank.pet_adapters,
+            # ``None`` always selects PET's registered internal adapter stack.
+            adapters=None,
         )
         memory_tokens = encoded[:, :n_visible]
         memory_mask = visible_mask
@@ -809,13 +859,26 @@ class EvenetAdapterRatioClassifier(nn.Module):
             },
         }
         if getattr(self, "_include_classifier_config_in_payload", True):
-            payload["classifier_config"] = {
+            classifier_config = {
                 "head_dropout": self._head_dropout,
                 "decoder_hidden_dim": self._decoder_hidden_dim,
                 "decoder_layers": self._decoder_layers,
                 "decoder_heads": self._decoder_heads,
                 "adapter_bottleneck": self._adapter_bottleneck,
+                "train_backbone": self._train_backbone,
             }
+            if getattr(
+                self, "_include_train_invisible_projector_in_payload", True
+            ):
+                classifier_config["train_invisible_projector"] = (
+                    self._train_invisible_projector
+                )
+            if getattr(self, "_include_asymmetric_attention_in_payload", True):
+                classifier_config["asymmetric_attention"] = (
+                    self._asymmetric_attention
+                )
+            classifier_config["adapter_placement"] = "internal"
+            payload["classifier_config"] = classifier_config
         return payload
 
     @classmethod
@@ -834,6 +897,14 @@ class EvenetAdapterRatioClassifier(nn.Module):
         # restore an older reward stack without changing its integrity digest.
         model._include_classifier_config_in_payload = (
             "classifier_config" in payload
+        )
+        model._include_train_invisible_projector_in_payload = (
+            "train_invisible_projector"
+            in dict(payload.get("classifier_config") or {})
+        )
+        model._include_asymmetric_attention_in_payload = (
+            "asymmetric_attention"
+            in dict(payload.get("classifier_config") or {})
         )
         expected_width = int(payload.get("candidate_width", model.candidate_width))
         if expected_width != model.candidate_width:
@@ -930,7 +1001,9 @@ class EvenetAdapterModelBuilder:
         adapter_bottleneck: int = 16,
         train_layernorm: bool = False,
         train_encoder: bool = False,
+        train_invisible_projector: bool = False,
         train_backbone: bool = False,
+        asymmetric_attention: bool = False,
         head_dropout: float | None = None,
         decoder_hidden_dim: int | None = None,
         decoder_layers: int | None = None,
@@ -969,10 +1042,9 @@ class EvenetAdapterModelBuilder:
         self._device = device
         self._train_layernorm = bool(train_layernorm)
         self._train_encoder = bool(train_encoder)
+        self._train_invisible_projector = bool(train_invisible_projector)
         self._train_backbone = bool(train_backbone)
-        self._uses_independent_backbone = bool(
-            self._train_layernorm or self._train_encoder or self._train_backbone
-        )
+        self._asymmetric_attention = bool(asymmetric_attention)
         self._head_dropout = None if head_dropout is None else float(head_dropout)
         self._adapter_bottleneck = int(adapter_bottleneck)
         self._decoder_hidden_dim = decoder_hidden_dim
@@ -1032,7 +1104,6 @@ class EvenetAdapterModelBuilder:
         decoder_hidden_dim: int | None = None,
         decoder_layers: int | None = None,
         decoder_heads: int | None = None,
-        adapter_bottleneck: int | None = None,
     ) -> EvenetRatioPEFTBank:
         source = self._backbone if backbone is None else backbone
         resolved_dropout = (
@@ -1071,11 +1142,6 @@ class EvenetAdapterModelBuilder:
                     1,
                 )
             ),
-            adapter_bottleneck=(
-                self._adapter_bottleneck
-                if adapter_bottleneck is None
-                else int(adapter_bottleneck)
-            ),
             position_state=self._position_state,
         ).to(self._device)
 
@@ -1091,6 +1157,9 @@ class EvenetAdapterModelBuilder:
         decoder_layers: int | None = None,
         decoder_heads: int | None = None,
         adapter_bottleneck: int | None = None,
+        train_invisible_projector: bool | None = None,
+        train_backbone: bool | None = None,
+        asymmetric_attention: bool | None = None,
     ) -> EvenetAdapterRatioClassifier:
         if (
             bank is None
@@ -1099,11 +1168,24 @@ class EvenetAdapterModelBuilder:
             and name in self._classifiers
         ):
             return self._classifiers[name]
-        backbone = (
-            self._fresh_backbone()
-            if self._uses_independent_backbone
-            else self._backbone
+        resolved_train_invisible_projector = (
+            self._train_invisible_projector
+            if train_invisible_projector is None
+            else bool(train_invisible_projector)
         )
+        resolved_train_backbone = (
+            self._train_backbone
+            if train_backbone is None
+            else bool(train_backbone)
+        )
+        resolved_asymmetric_attention = (
+            self._asymmetric_attention
+            if asymmetric_attention is None
+            else bool(asymmetric_attention)
+        )
+        # Internal PET adapters are always trainable, so every classifier/fold
+        # must own an isolated body even when the rest of the backbone is frozen.
+        backbone = self._fresh_backbone()
         if bank is None:
             bank = self.make_bank(
                 backbone,
@@ -1111,7 +1193,6 @@ class EvenetAdapterModelBuilder:
                 decoder_hidden_dim=decoder_hidden_dim,
                 decoder_layers=decoder_layers,
                 decoder_heads=decoder_heads,
-                adapter_bottleneck=adapter_bottleneck,
             )
             if name is not None:
                 self._banks[name] = bank
@@ -1121,7 +1202,9 @@ class EvenetAdapterModelBuilder:
             bank=bank,
             train_layernorm=self._train_layernorm,
             train_encoder=self._train_encoder,
-            train_backbone=self._train_backbone,
+            train_invisible_projector=resolved_train_invisible_projector,
+            train_backbone=resolved_train_backbone,
+            asymmetric_attention=resolved_asymmetric_attention,
             head_dropout=(
                 self._head_dropout if head_dropout is None else head_dropout
             ),

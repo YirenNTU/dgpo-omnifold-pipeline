@@ -2,7 +2,7 @@
 # Launch after the 4-node Ray cluster is up:
 #   shifter python3 evenet_dgpo/RL/DGPO_neutrino/dgpo_trainer.py \
 #     config/dgpo_omnifold_ztautau.yaml \
-#     --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_pool1200k_fit600kxfold2_nullguard_tempering_0p75_b256_step10_audit10_rawcls_cls32k_eval32k_val10_full10_train2d20_ckpt100_stale400k_score300k_poolgen1024_pairfix_tf32_auditgap_auc55_auconly_resume5104/ray_results
+#     --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_bestdiff_acceptance_adapteronly/ray_results
 #
 # This is the materialized base+DGPO configuration. Diffusion pretraining
 # continues to use config/train_diffusion_nersc.yaml independently.
@@ -22,21 +22,22 @@ nersc:
   ray:
     start_script: /global/homes/y/yiren/ml_pipeline/NERSC/start_interactive_ray.sh
     temp_dir: /tmp/r${UID}_${SLURM_JOB_ID}
-    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_pool1200k_fit600kxfold2_nullguard_tempering_0p75_b256_step10_audit10_rawcls_cls32k_eval32k_val10_full10_train2d20_ckpt100_stale400k_score300k_poolgen1024_pairfix_tf32_auditgap_auc55_auconly_resume5104/ray_results
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_bestdiff_acceptance_adapteronly/ray_results
     experimental_noset_cuda_visible_devices: null
   execution:
     mode: ray_train_ddp
     workers: 16
     gpus_per_worker: 1
     command: shifter python3 evenet_dgpo/RL/DGPO_neutrino/dgpo_trainer.py config/dgpo_omnifold_ztautau.yaml
-      --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_pool1200k_fit600kxfold2_nullguard_tempering_0p75_b256_step10_audit10_rawcls_cls32k_eval32k_val10_full10_train2d20_ckpt100_stale400k_score300k_poolgen1024_pairfix_tf32_auditgap_auc55_auconly_resume5104/ray_results
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_bestdiff_acceptance_adapteronly/ray_results
   reproducibility:
     dataset_shuffle_seed: 42
     note: EveNet currently hard-codes the Ray dataset shuffle seed to 42; model and
       diffusion RNG seeding are not yet exposed through the training YAML.
 platform:
-  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_post_training_40pct/train
-  data_parquet_val_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/val-diffusion
+  # Use exactly the same fixed seed-42 5% identities as diffusion pretraining.
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_5pct_seed42/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42/val
   number_of_workers: 16
   resources_per_worker:
     CPU: 20
@@ -47,7 +48,7 @@ platform:
 logger:
   wandb:
     project: nu2flow-RL
-    run_name: Ztautau-DGPO-adapter-regularized-resume-crossfit2-audit600k-auc51
+    run_name: dgpo_omnifold_5pct_bestdiff_acceptance_adapteronly
     tags:
     - NERSC
     - Ztautau
@@ -55,20 +56,31 @@ logger:
     - OmniFoldReward
     - TARP
     - TargetedPhysics
+    - Diffusion5pctInit
+    - TrainableInvisibleProjector
+    - DirectionalPETAttention
+    - CandidateVisibleCrossAttention
+    - AdapterOnlyClassifier
+    - InternalPETAdapter
     entity: ytchou97-university-of-washington
     simplified: true
   local:
-    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_ztautau/logs
-    name: EveNet-OmniFold-DGPO-adapter-regularized-resume-audit600k-pool1200k-crossfit2-auc51
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_bestdiff_acceptance_adapteronly/logs
+    name: dgpo_omnifold_5pct_bestdiff_acceptance_adapteronly
     version: v1
 options:
   default: evenet_defaults/options.yaml
   Training:
     total_epochs: 1500
     epochs: 1500
-    # Continue the stable adapter-only run in its durable checkpoint root.
-    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_ztautau/checkpoints
-    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_ztautau/checkpoints/last.ckpt
+    # DGPO's reward changes whenever OmniFold is refitted, so reward-ranked
+    # checkpoints are not comparable across rounds. Keep only unpruned recovery
+    # snapshots and the atomic last.ckpt pointer.
+    model_checkpoint_save_top_k: 0
+    # Resume the corrected best-diffusion DGPO run, including optimizer,
+    # epoch/step, reference policies, reward stack, and adaptive controller.
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_bestdiff_acceptance_adapteronly/checkpoints
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_bestdiff_acceptance_adapteronly/checkpoints/last.ckpt
     pretrain_model_load_path: null
     freeze_modules: []
     diffusion_every_n_epochs: 20
@@ -140,7 +152,9 @@ options:
       decay: 0.999
       start_epoch: 0
       update_every_n_steps: 1
-      replace_model_after_load: true
+      # W&B selected epoch 224 by live val/loss, so load its live state_dict
+      # instead of replacing it with the separately tracked EMA shadow.
+      replace_model_after_load: false
       replace_model_at_end: false
       use_for_generation: false
     ProgressiveTraining:
@@ -158,9 +172,9 @@ options:
     val_split:
     - 0.8
     - 1.0
-    # Strong-only audit needs a real 600k population. Full DGPO validation still
-    # obeys validation_max_batches, while OmniFold acceptance remains capped at 300k.
-    val_dataset_limit: 600000
+    # This directory is already the fixed 20% validation subset (~119k). Do not
+    # limit it a second time; full DGPO validation is separately batch-capped.
+    val_dataset_limit: 1.0
   Metrics:
     Generation-Binning:
       neutrino-energy:
@@ -228,14 +242,16 @@ reward_config:
   omnifold:
     bootstrap_in_dgpo: true
     bundle_file: null
-    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
-    # Share one frozen EveNet classifier body and fit only its PEFT bank.
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_5pct_seed42/checkpoints/epoch=224_train=0.1291_val=0.1279.ckpt
+    # Each OmniFold fold builds its own classifier body from this checkpoint.
 ztautau_domain:
   enabled: true
   feature_names:
   - theta
   - phi
 dgpo:
+  # Full DGPO resume from the checkpoint above.
+  checkpoint_load_mode: resume
   # Match EveNet pretraining: faster tensor-core matmuls with float32 I/O.
   float32_matmul_precision: medium
   advantage_estimator: leave_one_out_unscaled
@@ -267,10 +283,10 @@ dgpo:
   # gradient-bearing policy in four 256-event chunks to bound activation memory.
   policy_eval_event_microbatch_size: 256
   policy_eval_parallel_timesteps: 1
-  # One recovery checkpoint every 100 optimizer steps, aligned with the
-  # 10-logical-epoch audit/full-validation boundary. Audit/refit and final
-  # boundaries are saved even when they do not land exactly on this cadence.
-  checkpoint_every_n_steps: 100
+  # Update the recovery checkpoint every five logical epochs. Audit/refit and
+  # final boundaries are also saved when they do not land on this cadence.
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 5
   # Short logical epochs do not restart the Ray iterator. With 16 workers and
   # batch_size=1024, one 1.6M-event data pass is about 98 optimizer steps, or
   # about 10 logical epochs.
@@ -318,34 +334,44 @@ dgpo:
     log_only: false
     baseline_probe_on_start: true
     # No-grad K=1 DDIM population generation only. Independent of the DGPO
-    # policy batch (1024) and classifier effective global batch (131072/class).
+    # policy batch (1024) and classifier global batch (16384 per class).
     pool_generation_batch_size: 1024
-    # Fresh adapter staleness audit every 100 optimizer steps: 10 DGPO logical
-    # epochs. Incumbent/candidate acceptance audits remain event-driven and run
-    # only after a staleness audit triggers a reward refit.
-    staleness_every_n_epochs: 10
+    # Cheap fresh-classifier staleness probe every 50 optimizer steps: five
+    # DGPO logical epochs. A positive probe launches a fresh cross-fit stack,
+    # which must reach 100k held-out residual closure and then pass the fresh
+    # candidate acceptance audit before installation.
+    staleness_every_n_epochs: 5
     trigger:
       # Fixed installed-round controller: retrain when the current weighted
-      # |AUC-0.5| exceeds the certified round baseline by the tunable 0.01
-      # AUC-gap margin. This is the sole retraining threshold hyperparameter.
-      retrain_auc_margin: 0.01
+      # |AUC-0.5| exceeds the same-50k-protocol baseline by 0.005, i.e. half an
+      # AUC percentage point.
+      retrain_auc_margin: 0.005
+      # Avoid leaving a locally adequate but stale reward installed through a
+      # long policy plateau. Checked at the 5-epoch probe cadence; the fresh
+      # cross-fit candidate must still reach saturated residual closure and
+      # pass the fresh acceptance audit.
+      max_reward_age_epochs: 20
       required_consecutive_epochs: 1
       # A threshold crossing may stop a routine audit immediately; a healthy
-      # decision and every candidate acceptance still require saturation.
+      # routine-audit decision still requires saturation.
       require_audit_saturation: true
       power_alpha: 0.05
       power_target: 0.8
       probe_seed: 20260818
-      # Fresh adapter audit population. The 60/20/20 split gives 360k fit,
-      # 120k early-stop, and 120k final held-out audit events.
-      probe_max_events: 600000
-    # One weighted judge is used for staleness/acceptance; the old raw judge is
-    # deliberately omitted. Every epoch traverses the complete fit split.
+      # Cheap routine probe. Its 60/20/20 split gives 30k fit, 10k early-stop,
+      # and 10k untouched audit events. At the configured 0.005 AUC margin this
+      # is intentionally a sensitive sentinel. New stacks establish their
+      # controller baseline with this same protocol after candidate acceptance.
+      probe_max_events: 50000
+    # One weighted judge is used for staleness and the installed-round baseline;
+    # the old raw judge is omitted. Each epoch uses all complete shuffled
+    # batches and drops only its undersized final batch.
     audit_fit:
-      # Effective global batch per class: 8192 rows/GPU across 16 GPUs.
-      # Backward is split into 2048-row per-rank microbatches to preserve memory.
-      batch_size: 131072
-      train_microbatch_size_per_rank: 2048
+      # 1024 event conditions per worker and optimizer step across 16 workers.
+      # Truth/generated are evaluated separately for the same nominal batch.
+      batch_size: 16384
+      train_microbatch_size_per_rank: 1024
+      drop_last_batch: true
       learning_rate: 0.0002
       weight_decay: 0.0005
       sampling: independent_epoch_shuffle
@@ -362,48 +388,62 @@ dgpo:
       candidates_per_event: 1
       bootstrap_on_start: true
       bootstrap_fail_closed: true
-      # The first resume from the legacy adapter checkpoint performs one fresh
-      # adapter-only refit. Completion is persisted in the DGPO checkpoint, so
-      # every later resume inherits the new reward/baseline without repeating it.
+      # A new run builds the initial reward before the first DGPO update.
       refit_once_on_resume: true
-      refit_once_id: adapter_regularized_v1
-      # Total fixed cross-fit population. With two folds, each classifier fits
-      # the complementary 600k events and predicts the other 600k out-of-fold.
-      pool_events: 1200000
-      # Independent held-out population for residual gates/final acceptance.
-      score_pool_events: 300000
+      # Adapter-only fitting with PET's registered internal adapters.
+      refit_once_id: internal_adapter_crossattention_5pct_v12_bestdiff_auc051
+      # Cross-fit the fixed 5% population. The 208,354 events split evenly
+      # into two 104,177-event folds. Each epoch drops only its shuffled short
+      # final batch; reshuffling rotates which events are omitted next epoch.
+      pool_events: 208354
+      # Independent held-out population for residual closure and final fresh
+      # candidate acceptance.
+      score_pool_events: 100000
       pool_selection_seed: 42
       min_iterations: 2
-      max_iterations: 12
-      # Final candidate gate: fresh held-out OmniFold balanced accuracy must be
-      # strictly below 0.51.
+      max_iterations: 5
+      # After residual closure, a completely fresh classifier must be unable to
+      # distinguish truth from candidate-weighted generation beyond 51% BA.
+      acceptance_audit_enabled: true
       acceptance_max_balanced_accuracy: 0.51
       tempering: 0.75
       # Event-level OOF recurrence: each training weight is predicted by a
       # classifier that did not fit that event. Fold models train sequentially.
       crossfit_folds: 2
-      # Cross-fit ensemble continues only while its independent held-out
-      # oriented AUC is > 0.51; AUC <= 0.51 is the no-op/closure stop.
+      # Continue residual correction while the independent held-out oriented
+      # AUC is > 0.51. AUC <= 0.51 is residual closure; the completed stack
+      # must then pass the separate fresh acceptance audit.
       residual_min_auc_gain: 0.01
       seed: 20260819
       score_row_budget: 8192
       adapter_bottleneck: 16
-      # These flags affect only the OmniFold classifier. The DGPO policy body
-      # remains trainable through options.Training.Components above.
+      # Each fold receives an independent copy of the same frozen pretrained
+      # body. PET uses its registered internal adapter stack; no external
+      # adapters are created by the classifier head.
       train_layernorm: false
       train_encoder: false
+      # This module exists in the current diffusion architecture but was absent
+      # from the legacy pretraining checkpoint. Train and checkpoint it with
+      # every fresh cross-fit classifier instead of freezing random weights.
+      train_invisible_projector: true
       train_backbone: false
+      # Restore the pretrained diffusion direction: visible queries cannot read
+      # invisible candidate keys, while invisible queries can read the visible
+      # event. The candidate decoder then applies explicit cross-attention to
+      # the read-only visible PET memory.
+      asymmetric_attention: true
       decoder_hidden_dim: 128
       decoder_layers: 1
       decoder_heads: 4
       head_dropout: 0.15
       fit:
-        # Per-class global effective batch. With 16 ranks this is 8192 truth and
-        # 8192 generated rows per rank, evaluated as four 2048-row microbatches;
-        # the two classes use separate forwards.
-        # Effective global batch per class: 8192 rows/GPU across 16 GPUs.
-        batch_size: 131072
-        train_microbatch_size_per_rank: 2048
+        # 1024 event conditions per worker and optimizer step. The 104,177-event
+        # fold takes six complete global optimizer steps per classifier epoch;
+        # the shuffled 5873-event remainder is dropped. Truth
+        # and generated graphs are evaluated/backpropagated separately.
+        batch_size: 16384
+        train_microbatch_size_per_rank: 1024
+        drop_last_batch: true
         learning_rate: 0.0002
         weight_decay: 0.0005
         sampling: independent_epoch_shuffle
@@ -416,7 +456,7 @@ dgpo:
         # Internal classifier early-stopping/best-checkpoint tolerance only;
         # held-out BCE is not an outer OmniFold iteration usefulness gate.
         validation_min_delta: 0.0001
-        # Shared by residual validation and fresh/acceptance audit evaluation.
+        # Batched evaluation of the independent residual-validation pool.
         validation_batch_size: 65536
         progress_every_n_steps: 10
         restore_best: true

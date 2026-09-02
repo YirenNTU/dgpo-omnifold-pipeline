@@ -79,7 +79,8 @@ cd /global/homes/y/yiren/ml_pipeline
 
 export PYTHONPATH="$PWD/evenet_dgpo:$PWD:${PYTHONPATH:-}"
 export TORCH_NCCL_TIMEOUT=180
-export WANDB_API_KEY=<YOUR_WANDB_API_KEY>
+export WANDB_API_KEY=2a0d7e3df0ce2abff1442fc210a5da54c19ea850
+
 
 source NERSC/start_interactive_ray.sh
 ```

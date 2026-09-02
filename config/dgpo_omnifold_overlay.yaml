@@ -179,11 +179,13 @@ dgpo:
       # PET scoring is bounded by events*candidates, not just event count.
       score_row_budget: 512
       adapter_bottleneck: 16
-      # Freeze the classifier's EveNet body. These flags do not freeze the live
-      # DGPO policy, whose backbone remains trainable through Training.Components.
+      # Full-finetune an independent pretrained body in each fold, using PET's
+      # registered internal adapters rather than a classifier-owned copy.
       train_layernorm: false
       train_encoder: false
-      train_backbone: false
+      train_invisible_projector: true
+      train_backbone: true
+      asymmetric_attention: false
       decoder_hidden_dim: 256
       decoder_layers: 2
       decoder_heads: 8
@@ -191,6 +193,7 @@ dgpo:
       fit:
         batch_size: 8192
         learning_rate: 3.0e-4
+        backbone_learning_rate: 1.0e-5
         weight_decay: 1.0e-4
         sampling: independent_epoch_shuffle
         safety_max_epochs: 300

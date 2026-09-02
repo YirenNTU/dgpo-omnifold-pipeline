@@ -66,7 +66,9 @@ class AdaptiveOmniFoldConfig:
     staleness_every_n_epochs: int
     pool_generation_batch_size: int | None
     retrain_auc_margin: float
+    max_reward_age_epochs: int | None
     required_consecutive_epochs: int
+    retrain_cooldown_epochs: int
     require_audit_saturation: bool
     power_alpha: float
     power_target: float
@@ -78,6 +80,7 @@ class AdaptiveOmniFoldConfig:
     candidates_per_event: int
     min_iterations: int
     max_iterations: int
+    acceptance_audit_enabled: bool
     acceptance_max_balanced_accuracy: float
     tempering: float
     crossfit_folds: int
@@ -115,8 +118,14 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         retrain_auc_margin=float(
             _cfg_get(trigger, "retrain_auc_margin", 0.01)
         ),
+        max_reward_age_epochs=_optional_int(
+            _cfg_get(trigger, "max_reward_age_epochs", None)
+        ),
         required_consecutive_epochs=max(
             1, int(_cfg_get(trigger, "required_consecutive_epochs", 1))
+        ),
+        retrain_cooldown_epochs=max(
+            0, int(_cfg_get(trigger, "retrain_cooldown_epochs", 0))
         ),
         require_audit_saturation=bool(
             _cfg_get(trigger, "require_audit_saturation", True)
@@ -139,6 +148,9 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         candidates_per_event=int(_cfg_get(recal, "candidates_per_event", 1)),
         min_iterations=int(_cfg_get(recal, "min_iterations", 2)),
         max_iterations=int(_cfg_get(recal, "max_iterations", 12)),
+        acceptance_audit_enabled=bool(
+            _cfg_get(recal, "acceptance_audit_enabled", True)
+        ),
         acceptance_max_balanced_accuracy=float(
             _cfg_get(recal, "acceptance_max_balanced_accuracy", 0.51)
         ),
@@ -174,6 +186,11 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         raise ValueError("acceptance_max_balanced_accuracy must lie in (0.5, 1)")
     if not 0.0 < config.retrain_auc_margin < 0.5:
         raise ValueError("retrain_auc_margin must lie in (0, 0.5)")
+    if (
+        config.max_reward_age_epochs is not None
+        and config.max_reward_age_epochs < 1
+    ):
+        raise ValueError("max_reward_age_epochs must be positive or null")
     if not 0.0 < config.power_alpha < 1.0:
         raise ValueError("power_alpha must lie in (0, 1)")
     if not 0.0 < config.power_target < 1.0:
@@ -296,7 +313,7 @@ def adaptive_audit_protocol_signature(cfg: AdaptiveOmniFoldConfig) -> str:
     """Fingerprint the audit protocol that certified an installed baseline."""
 
     payload = {
-        "schema": "single-weighted-audit-asymmetric-stop-v3",
+        "schema": "cheap-weighted-trigger-baseline-v4",
         "probe_max_events": cfg.probe_max_events,
         "require_audit_saturation": cfg.require_audit_saturation,
         "score_row_budget": cfg.score_row_budget,
@@ -315,6 +332,35 @@ def should_probe_epoch(epoch: int, every_n_epochs: int) -> bool:
     if int(epoch) == -1:
         return True
     return (int(epoch) + 1) % max(1, int(every_n_epochs)) == 0
+
+
+def reward_refit_due_to_age(
+    state: AdaptiveOmniFoldState,
+    *,
+    epoch: int,
+    max_reward_age_epochs: int | None,
+) -> tuple[bool, int]:
+    """Return whether the installed reward reached its configured maximum age.
+
+    This is evaluated only at the normal audit cadence. The candidate still
+    has to reach the configured cross-fit residual closure before installation.
+    """
+
+    # A baseline-only protocol refresh also calls ``state.install`` but does
+    # not replace the reward. Prefer the accepted-refit timestamp so such a
+    # refresh cannot make an old reward appear young again.
+    age_anchor = (
+        state.last_recalibration_epoch
+        if state.last_recalibration_epoch is not None
+        else state.installed_at_epoch
+    )
+    reward_age = max(0, int(epoch) - int(age_anchor))
+    if max_reward_age_epochs is None:
+        return False, reward_age
+    limit = int(max_reward_age_epochs)
+    if limit < 1:
+        raise ValueError("max_reward_age_epochs must be positive or null")
+    return reward_age >= limit, reward_age
 
 
 def validate_adaptive_pairing(
@@ -381,15 +427,35 @@ def update_controller(
     exceeded = bool(
         decision_eligible and final_gap_exceeded
     )
+    epochs_since_recalibration = (
+        None
+        if state.last_recalibration_epoch is None
+        else max(0, int(epoch) - int(state.last_recalibration_epoch))
+    )
+    cooldown_active = bool(
+        cfg.retrain_cooldown_epochs > 0
+        and epochs_since_recalibration is not None
+        and epochs_since_recalibration < cfg.retrain_cooldown_epochs
+    )
+    # Keep probing during cooldown for observability, but do not carry stale
+    # evidence across the protected interval.  A post-cooldown refit therefore
+    # needs the configured number of fresh consecutive confirmations.
     state.probe_exceedance_streak = (
-        state.probe_exceedance_streak + 1
+        0
+        if cooldown_active
+        else state.probe_exceedance_streak + 1
         if exceeded
         else 0
     )
-    fired = state.probe_exceedance_streak >= cfg.required_consecutive_epochs
+    fired = bool(
+        not cooldown_active
+        and state.probe_exceedance_streak >= cfg.required_consecutive_epochs
+    )
     recalibrate = bool(fired and not cfg.log_only)
     decision = (
-        "audit_unsaturated"
+        "cooldown"
+        if cooldown_active
+        else "audit_unsaturated"
         if not decision_eligible
         else "stale_log_only"
         if fired and cfg.log_only
@@ -427,6 +493,15 @@ def update_controller(
         ),
         "staleness/required_consecutive_epochs": float(
             cfg.required_consecutive_epochs
+        ),
+        "staleness/retrain_cooldown_epochs": float(
+            cfg.retrain_cooldown_epochs
+        ),
+        "staleness/cooldown_active": float(cooldown_active),
+        "staleness/epochs_since_recalibration": float(
+            epochs_since_recalibration
+            if epochs_since_recalibration is not None
+            else -1
         ),
         "staleness/log_only": float(cfg.log_only),
     }
@@ -470,6 +545,19 @@ class AdaptiveOmniFoldPool:
             packed_event=self.packed_event.to(device=device, dtype=torch.float32),
             truth=self.truth.to(device=device, dtype=torch.float32),
             candidates=self.candidates.to(device=device, dtype=torch.float32),
+            packing_spec=self.packing_spec,
+        )
+
+    def prefix(self, max_events: int | None) -> "AdaptiveOmniFoldPool":
+        """Return a deterministic prefix without copying the underlying tensors."""
+
+        if max_events is None or int(max_events) >= self.n_events:
+            return self
+        count = max(1, int(max_events))
+        return AdaptiveOmniFoldPool(
+            packed_event=self.packed_event[:count],
+            truth=self.truth[:count],
+            candidates=self.candidates[:count],
             packing_spec=self.packing_spec,
         )
 
@@ -773,6 +861,7 @@ def run_adaptive_refit(
     policy_snapshot_state_dict: Mapping[str, Tensor],
     fit_pool: AdaptiveOmniFoldPool,
     score_pool: AdaptiveOmniFoldPool,
+    baseline_pool: AdaptiveOmniFoldPool | None = None,
     epoch: int,
     device: torch.device,
     world_size: int,
@@ -781,6 +870,13 @@ def run_adaptive_refit(
     """Fit, independently audit, and atomically install reward/reference pair."""
     if fit_pool.packing_spec != score_pool.packing_spec:
         raise RuntimeError("adaptive fit and held-out pools use different EveNet shapes")
+    if (
+        baseline_pool is not None
+        and baseline_pool.packing_spec != score_pool.packing_spec
+    ):
+        raise RuntimeError(
+            "adaptive acceptance and trigger-baseline pools use different EveNet shapes"
+        )
     score_on_device = score_pool.to(device)
     fit_config = build_fit_config(
         cfg.fit,
@@ -852,43 +948,114 @@ def run_adaptive_refit(
     new_stack.assert_frozen()
     acceptance_seed = cfg.probe_seed + 1000 + int(state.recalibration_count)
     initial_bootstrap = not bool(getattr(reward_source, "is_installed", True))
-    candidate_log_weight = score_reward_on_pool(
-        new_stack,
-        score_pool,
-        row_budget=cfg.score_row_budget,
-    )
-    candidate_probe = _weight_diagnostics(candidate_log_weight)
-    candidate_probe.update(
-        fit_fresh_audit(
-            pool=score_pool,
-            log_weight=candidate_log_weight,
-            model_builder=reward_source.model_builder,
-            cfg=cfg,
-            device=device,
-            seed=acceptance_seed,
-            progress_callback=(
-                None
-                if progress_callback is None
-                else lambda row: progress_callback("acceptance_audit", row)
-            ),
-        )
-    )
+    candidate_probe: dict[str, float] = {}
     all_saturated = bool(result.diagnostics) and all(
         bool(getattr(item, "saturated", False)) for item in result.diagnostics
     )
-    audit_gap = float(candidate_probe["audit_observed_auc_gap"])
-    audit_accuracy = float(candidate_probe["audit_balanced_accuracy"])
     accuracy_limit = float(cfg.acceptance_max_balanced_accuracy)
-    accepted_local = bool(
-        all_saturated
-        and candidate_probe.get("audit_saturated", 0.0) >= 0.5
-        and math.isfinite(audit_accuracy)
-        and audit_accuracy < accuracy_limit
+    closure_auc = float(
+        getattr(result.diagnostics[-1], "validation_auc", float("nan"))
     )
+    closure_limit = 0.5 + float(cfg.residual_min_auc_gain)
+    candidate_probe.update(
+        {
+            "residual_closure_auc": closure_auc,
+            "residual_closure_auc_gap": abs(closure_auc - 0.5),
+        }
+    )
+    if cfg.acceptance_audit_enabled:
+        candidate_log_weight = score_reward_on_pool(
+            new_stack,
+            score_pool,
+            row_budget=cfg.score_row_budget,
+        )
+        candidate_probe.update(_weight_diagnostics(candidate_log_weight))
+        candidate_probe.update(
+            fit_fresh_audit(
+                pool=score_pool,
+                log_weight=candidate_log_weight,
+                model_builder=reward_source.model_builder,
+                cfg=cfg,
+                device=device,
+                seed=acceptance_seed,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda row: progress_callback("acceptance_audit", row)
+                ),
+            )
+        )
+        del candidate_log_weight
+        audit_accuracy = float(candidate_probe["audit_balanced_accuracy"])
+        accepted_local = bool(
+            all_saturated
+            and candidate_probe.get("audit_saturated", 0.0) >= 0.5
+            and math.isfinite(audit_accuracy)
+            and audit_accuracy < accuracy_limit
+        )
+    else:
+        audit_accuracy = float("nan")
+        accepted_local = bool(
+            all_saturated
+            and math.isfinite(closure_auc)
+            and closure_auc <= closure_limit
+        )
     accepted = _broadcast_bool(
         accepted_local,
         world_size=world_size,
         device=device,
+    )
+    # Residual closure is evaluated on the large independent score pool. A
+    # separate cheap pool establishes the installed round's staleness baseline
+    # with exactly the same sample size/protocol used by routine probes.
+    baseline_probe = candidate_probe
+    if accepted and baseline_pool is not None:
+        baseline_log_weight = score_reward_on_pool(
+            new_stack,
+            baseline_pool,
+            row_budget=cfg.score_row_budget,
+        )
+        baseline_probe = _weight_diagnostics(baseline_log_weight)
+        baseline_probe.update(
+            fit_fresh_audit(
+                pool=baseline_pool,
+                log_weight=baseline_log_weight,
+                model_builder=reward_source.model_builder,
+                cfg=cfg,
+                device=device,
+                seed=acceptance_seed + 1_000_003,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda row: progress_callback("baseline_audit", row)
+                ),
+            )
+        )
+        baseline_gap_candidate = float(
+            baseline_probe["audit_observed_auc_gap"]
+        )
+        baseline_ready_local = bool(
+            math.isfinite(baseline_gap_candidate)
+            and baseline_gap_candidate >= 0.0
+            and (
+                not cfg.require_audit_saturation
+                or baseline_probe.get("audit_saturated", 0.0) >= 0.5
+            )
+        )
+        # With the extra candidate-acceptance classifier disabled, this audit
+        # establishes the staleness-controller baseline only; it must not veto
+        # a stack that already reached the configured cross-fit closure.
+        if cfg.acceptance_audit_enabled:
+            accepted = _broadcast_bool(
+                baseline_ready_local,
+                world_size=world_size,
+                device=device,
+            )
+    baseline_gap = float(
+        baseline_probe.get(
+            "audit_observed_auc_gap",
+            candidate_probe["residual_closure_auc_gap"],
+        )
     )
     diagnostics: dict[str, Any] = {
         "omnifold/accepted": float(accepted),
@@ -900,11 +1067,18 @@ def run_adaptive_refit(
             )
         ),
         "omnifold/all_fits_saturated": float(all_saturated),
+        "omnifold/acceptance_audit_enabled": float(
+            cfg.acceptance_audit_enabled
+        ),
         "omnifold/acceptance_max_balanced_accuracy": accuracy_limit,
         "omnifold/initial_bootstrap": float(initial_bootstrap),
         **{
             f"omnifold/candidate/{key}": float(value)
             for key, value in candidate_probe.items()
+        },
+        **{
+            f"omnifold/baseline/{key}": float(value)
+            for key, value in baseline_probe.items()
         },
     }
     for index, fit_diag in enumerate(result.diagnostics, start=1):
@@ -931,12 +1105,20 @@ def run_adaptive_refit(
         state.recalibrations_rejected += 1
         state.probe_exceedance_streak = 0
         state.last_decision = "recalibration_rejected"
-        accept_reason = (
-            "candidate did not reach saturated balanced-accuracy closure: "
-            f"accuracy={audit_accuracy:.5g}, required<{accuracy_limit:.5g}, "
-            f"fits_saturated={all_saturated}, "
-            f"audit_saturated={bool(candidate_probe.get('audit_saturated', 0.0))}"
-        )
+        if cfg.acceptance_audit_enabled:
+            accept_reason = (
+                "candidate did not reach saturated acceptance/baseline closure: "
+                f"accuracy={audit_accuracy:.5g}, required<{accuracy_limit:.5g}, "
+                f"fits_saturated={all_saturated}, "
+                f"audit_saturated={bool(candidate_probe.get('audit_saturated', 0.0))}, "
+                f"baseline_saturated={bool(baseline_probe.get('audit_saturated', 0.0))}"
+            )
+        else:
+            accept_reason = (
+                "candidate did not reach saturated cross-fit residual closure: "
+                f"auc={closure_auc:.5g}, required<={closure_limit:.5g}, "
+                f"fits_saturated={all_saturated}"
+            )
         diagnostics.update(
             {
                 "omnifold/accept_reason": accept_reason,
@@ -976,7 +1158,7 @@ def run_adaptive_refit(
         freeze_reference_model(round_ref_model)
         raise
     state.install(
-        baseline_auc_gap=audit_gap,
+        baseline_auc_gap=baseline_gap,
         cfg=cfg,
         epoch=epoch,
         round_id=new_round,
@@ -987,7 +1169,14 @@ def run_adaptive_refit(
     diagnostics.update(
         {
             "omnifold/accept_reason": (
-                "candidate reached saturated balanced-accuracy closure"
+                "candidate reached saturated cross-fit residual closure; "
+                "fresh acceptance audit disabled"
+                if not cfg.acceptance_audit_enabled
+                else (
+                    "candidate reached saturated balanced-accuracy closure"
+                    if baseline_pool is None
+                    else "candidate passed acceptance and trigger-baseline audits"
+                )
             ),
             "omnifold/reward_round_id": float(new_round),
             "omnifold/reference_sha256": reference_digest,
@@ -1012,6 +1201,7 @@ __all__ = [
     "gather_pool_across_ranks",
     "probe_installed_reward",
     "resolve_adaptive_config",
+    "reward_refit_due_to_age",
     "run_adaptive_refit",
     "should_probe_epoch",
     "update_controller",

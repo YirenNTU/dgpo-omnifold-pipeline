@@ -14,6 +14,7 @@ from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
     AdaptiveOmniFoldState,
     adaptive_audit_protocol_signature,
     resolve_adaptive_config,
+    reward_refit_due_to_age,
     run_adaptive_refit,
     should_probe_epoch,
     update_controller,
@@ -28,8 +29,13 @@ def _config(
     log_only: bool = False,
     candidates_per_event: int = 1,
     retrain_auc_margin: float = 0.01,
+    acceptance_audit_enabled: bool = True,
     acceptance_max_balanced_accuracy: float = 0.51,
+    residual_min_auc_gain: float = 1.0e-3,
     require_audit_saturation: bool = False,
+    max_reward_age_epochs: int | None = 20,
+    required_consecutive_epochs: int = 1,
+    retrain_cooldown_epochs: int = 0,
 ):
     return resolve_adaptive_config(
         {
@@ -40,7 +46,9 @@ def _config(
                 "pool_generation_batch_size": 1024,
                 "trigger": {
                     "retrain_auc_margin": retrain_auc_margin,
-                    "required_consecutive_epochs": 1,
+                    "max_reward_age_epochs": max_reward_age_epochs,
+                    "required_consecutive_epochs": required_consecutive_epochs,
+                    "retrain_cooldown_epochs": retrain_cooldown_epochs,
                     "require_audit_saturation": require_audit_saturation,
                     "probe_max_events": 100,
                 },
@@ -57,9 +65,11 @@ def _config(
                     "score_pool_events": 200,
                     "min_iterations": 2,
                     "max_iterations": 4,
+                    "acceptance_audit_enabled": acceptance_audit_enabled,
                     "acceptance_max_balanced_accuracy": (
                         acceptance_max_balanced_accuracy
                     ),
+                    "residual_min_auc_gain": residual_min_auc_gain,
                 },
             }
         }
@@ -80,6 +90,8 @@ class TestAdaptiveConfig(unittest.TestCase):
         self.assertEqual(cfg.audit_fit["validation_patience_epochs"], 5.0)
         self.assertFalse(cfg.require_audit_saturation)
         self.assertEqual(cfg.retrain_auc_margin, 0.01)
+        self.assertEqual(cfg.max_reward_age_epochs, 20)
+        self.assertTrue(cfg.acceptance_audit_enabled)
         self.assertEqual(cfg.acceptance_max_balanced_accuracy, 0.51)
         self.assertEqual(cfg.crossfit_folds, 2)
         self.assertAlmostEqual(cfg.residual_min_auc_gain, 1.0e-3)
@@ -96,6 +108,37 @@ class TestAdaptiveConfig(unittest.TestCase):
         self.assertTrue(should_probe_epoch(-1, 7))
         self.assertFalse(should_probe_epoch(0, 2))
         self.assertTrue(should_probe_epoch(1, 2))
+
+    def test_reward_age_forces_refit_only_at_configured_limit(self) -> None:
+        cfg = _config(max_reward_age_epochs=20)
+        state = AdaptiveOmniFoldState()
+        state.install(baseline_auc_gap=0.01, cfg=cfg, epoch=9, round_id=1)
+        due, age = reward_refit_due_to_age(
+            state,
+            epoch=19,
+            max_reward_age_epochs=cfg.max_reward_age_epochs,
+        )
+        self.assertFalse(due)
+        self.assertEqual(age, 10)
+        due, age = reward_refit_due_to_age(
+            state,
+            epoch=29,
+            max_reward_age_epochs=cfg.max_reward_age_epochs,
+        )
+        self.assertTrue(due)
+        self.assertEqual(age, 20)
+
+    def test_reward_age_trigger_can_be_disabled(self) -> None:
+        cfg = _config(max_reward_age_epochs=None)
+        state = AdaptiveOmniFoldState()
+        state.install(baseline_auc_gap=0.01, cfg=cfg, epoch=-1, round_id=0)
+        due, age = reward_refit_due_to_age(
+            state,
+            epoch=999,
+            max_reward_age_epochs=cfg.max_reward_age_epochs,
+        )
+        self.assertFalse(due)
+        self.assertEqual(age, 1000)
 
     def test_auc_power_reports_when_half_percent_gap_is_underpowered(self) -> None:
         diagnostics = adaptive_module._auc_power_diagnostics(
@@ -125,6 +168,73 @@ class TestAdaptiveConfig(unittest.TestCase):
 
 
 class TestAdaptiveController(unittest.TestCase):
+    def test_two_consecutive_crossings_are_required_when_configured(self) -> None:
+        cfg = _config(
+            retrain_auc_margin=0.005,
+            required_consecutive_epochs=2,
+        )
+        state = AdaptiveOmniFoldState()
+        state.install(baseline_auc_gap=0.01, cfg=cfg, epoch=-1, round_id=1)
+
+        trigger, diagnostics = update_controller(
+            state,
+            {"weighted_auc_gap": 0.02},
+            cfg=cfg,
+            epoch=4,
+        )
+        self.assertFalse(trigger)
+        self.assertEqual(diagnostics["staleness/decision"], "threshold_exceeded")
+        self.assertEqual(state.probe_exceedance_streak, 1)
+
+        trigger, diagnostics = update_controller(
+            state,
+            {"weighted_auc_gap": 0.021},
+            cfg=cfg,
+            epoch=9,
+        )
+        self.assertTrue(trigger)
+        self.assertEqual(diagnostics["staleness/decision"], "recalibrate")
+        self.assertEqual(state.probe_exceedance_streak, 2)
+
+    def test_cooldown_requires_fresh_post_cooldown_crossings(self) -> None:
+        cfg = _config(
+            retrain_auc_margin=0.005,
+            required_consecutive_epochs=2,
+            retrain_cooldown_epochs=10,
+        )
+        state = AdaptiveOmniFoldState()
+        state.install(baseline_auc_gap=0.01, cfg=cfg, epoch=20, round_id=2)
+        state.last_recalibration_epoch = 20
+
+        trigger, diagnostics = update_controller(
+            state,
+            {"weighted_auc_gap": 0.03},
+            cfg=cfg,
+            epoch=25,
+        )
+        self.assertFalse(trigger)
+        self.assertEqual(diagnostics["staleness/decision"], "cooldown")
+        self.assertEqual(diagnostics["staleness/cooldown_active"], 1.0)
+        self.assertEqual(state.probe_exceedance_streak, 0)
+
+        trigger, diagnostics = update_controller(
+            state,
+            {"weighted_auc_gap": 0.03},
+            cfg=cfg,
+            epoch=30,
+        )
+        self.assertFalse(trigger)
+        self.assertEqual(state.probe_exceedance_streak, 1)
+
+        trigger, diagnostics = update_controller(
+            state,
+            {"weighted_auc_gap": 0.031},
+            cfg=cfg,
+            epoch=35,
+        )
+        self.assertTrue(trigger)
+        self.assertEqual(state.probe_exceedance_streak, 2)
+
     def test_trigger_compares_to_installed_round_baseline(self) -> None:
         cfg = _config(retrain_auc_margin=0.005)
         state = AdaptiveOmniFoldState()
@@ -480,7 +590,10 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
     def test_initial_bootstrap_skips_missing_incumbent_and_installs_candidate(
         self,
     ) -> None:
-        cfg = _config()
+        cfg = _config(
+            acceptance_audit_enabled=False,
+            residual_min_auc_gain=0.01,
+        )
         state = AdaptiveOmniFoldState()
         spec = EventPackingSpec(
             {
@@ -530,26 +643,16 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
         source = _Source()
         fit_result = SimpleNamespace(
             diagnostics=(
-                SimpleNamespace(saturated=True),
-                SimpleNamespace(saturated=True),
+                SimpleNamespace(saturated=True, validation_auc=0.58),
+                SimpleNamespace(saturated=True, validation_auc=0.51),
             ),
             iterations=2,
         )
-        candidate_audit = {
-            "weighted_auc_gap": 0.01,
-            "audit_observed_auc_gap": 0.01,
-            "audit_balanced_accuracy": 0.50,
-            "audit_saturated": 1.0,
-        }
         progress_events: list[tuple[str, int]] = []
 
         def _fit_side_effect(**kwargs):
             kwargs["progress_callback"]({"iteration": 1.0, "step": 10.0})
             return fit_result
-
-        def _audit_side_effect(**kwargs):
-            kwargs["progress_callback"]({"iteration": 1.0, "step": 10.0})
-            return candidate_audit
 
         with (
             mock.patch.object(
@@ -570,7 +673,7 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
             mock.patch.object(
                 adaptive_module,
                 "fit_fresh_audit",
-                side_effect=_audit_side_effect,
+                side_effect=AssertionError("acceptance audit must be disabled"),
             ) as fresh_audit,
         ):
             diagnostics = run_adaptive_refit(
@@ -593,16 +696,17 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
         self.assertEqual(diagnostics["omnifold/initial_bootstrap"], 1.0)
         self.assertEqual(
             diagnostics["omnifold/accept_reason"],
-            "candidate reached saturated balanced-accuracy closure",
+            "candidate reached saturated cross-fit residual closure; "
+            "fresh acceptance audit disabled",
         )
         self.assertEqual(state.reward_round_id, 1)
         self.assertIsNotNone(source.installed)
         self.assertEqual(source.installed[1]["round_id"], 1)
-        score_reward.assert_called_once()
-        fresh_audit.assert_called_once()
+        score_reward.assert_not_called()
+        fresh_audit.assert_not_called()
         self.assertEqual(
             progress_events,
-            [("residual_reward", 10), ("acceptance_audit", 10)],
+            [("residual_reward", 10)],
         )
         for key, expected in snapshot.items():
             torch.testing.assert_close(round_ref.state_dict()[key], expected)
@@ -662,6 +766,13 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
             "audit_balanced_accuracy": 0.50,
             "audit_saturated": 1.0,
         }
+        cheap_baseline_audit = {
+            "weighted_auc_gap": 0.03,
+            "audit_observed_auc_gap": 0.03,
+            "audit_balanced_accuracy": 0.50,
+            "audit_saturated": 1.0,
+        }
+        audit_results = iter((candidate_audit, cheap_baseline_audit))
         progress_events: list[tuple[str, int]] = []
 
         def _fit_side_effect(**kwargs):
@@ -670,7 +781,7 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
 
         def _audit_side_effect(**kwargs):
             kwargs["progress_callback"]({"iteration": 1.0, "step": 10.0})
-            return candidate_audit
+            return next(audit_results)
 
         with (
             mock.patch.object(
@@ -686,7 +797,9 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
             mock.patch.object(
                 adaptive_module,
                 "score_reward_on_pool",
-                return_value=torch.zeros(32, 1),
+                side_effect=lambda _stack, scored_pool, **_kwargs: torch.zeros(
+                    scored_pool.n_events, 1
+                ),
             ),
             mock.patch.object(
                 adaptive_module,
@@ -702,6 +815,7 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
                 policy_snapshot_state_dict=snapshot,
                 fit_pool=pool,
                 score_pool=pool,
+                baseline_pool=pool.prefix(30),
                 epoch=1,
                 device=torch.device("cpu"),
                 world_size=1,
@@ -711,12 +825,16 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
             )
         self.assertEqual(diagnostics["omnifold/accepted"], 1.0)
         self.assertEqual(state.reward_round_id, 1)
+        self.assertAlmostEqual(state.baseline_auc_gap, 0.03)
+        self.assertAlmostEqual(state.trigger_threshold, 0.04)
+        self.assertEqual(diagnostics["omnifold/baseline/probe_events"], 30.0)
         self.assertIsNotNone(source.installed)
         self.assertEqual(
             progress_events,
             [
                 ("residual_reward", 10),
                 ("acceptance_audit", 10),
+                ("baseline_audit", 10),
             ],
         )
         self.assertEqual(source.installed[1]["round_id"], 1)

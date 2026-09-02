@@ -1,0 +1,19 @@
+# Materialize a reproducible row-level 5% subset of the full Ztautau
+# train-diffusion population. This fixed seed-42 population is used only for
+# the rapid diffusion -> OmniFold-guided DGPO validity study. Validation is
+# materialized separately by subset_ztautau_validation_20pct.yaml.
+
+source:
+  data_parquet_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/train-diffusion
+
+output:
+  train_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_5pct_seed42/train
+  val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_5pct_seed42/_val_unused
+  copy_sidecars: true
+
+subset:
+  fraction: 0.05
+  # Keep every selected row in the training output. Validation is independent.
+  val_split: [1.0, 1.0]
+  seed: 42
+  shuffle: true

@@ -137,6 +137,7 @@ _OMNIFOLD_LIVE_PHASE_IDS = {
     "residual_reward": 0,
     "acceptance_audit": 1,
     "staleness_audit": 2,
+    "baseline_audit": 3,
 }
 
 _GRAD_CLIP_NORM = 1.0
@@ -1842,7 +1843,13 @@ def build_reward_aggregator(
                 "adapter_bottleneck": 16,
                 "train_layernorm": False,
                 "train_encoder": False,
+                # Keep this in the explicit hand-off to the OmniFold builder.
+                # The recalibration block is converted to a plain allow-listed
+                # mapping here, so omitting the key silently freezes the
+                # projector even when the YAML enables it.
+                "train_invisible_projector": False,
                 "train_backbone": False,
+                "asymmetric_attention": False,
                 "head_dropout": 0.1,
                 "decoder_hidden_dim": 256,
                 "decoder_layers": 2,
@@ -4808,15 +4815,27 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "staleness/trigger_threshold": "Fixed installed-round threshold: baseline_auc_gap + retrain_auc_margin.",
         "staleness/previous_audit_auc_gap": "Weighted |AUC-0.5| from the immediately preceding routine audit. Diagnostic only; it is not the trigger anchor.",
         "staleness/next_trigger_threshold": "Current installed-baseline threshold; it remains fixed until a new reward round is installed.",
-        "staleness/baseline_auc_gap": "Weighted held-out |AUC-0.5| that certified the currently installed OmniFold reward round and remains the trigger anchor until a better candidate is installed.",
+        "staleness/baseline_auc_gap": "Weighted held-out |AUC-0.5| measured with the same cheap routine-probe population size and fit protocol; it remains the trigger anchor until a better candidate is installed.",
         "staleness/auc_gap_delta_from_baseline": "Current weighted AUC gap minus the fixed installed-round baseline gap.",
         "staleness/required_auc_gap_increase": "Configured retrain_auc_margin required above the installed baseline.",
+        "staleness/probe_exceedance_streak": "Number of consecutive eligible post-cooldown audits whose final held-out AUC gap exceeded the installed-round threshold.",
+        "staleness/required_consecutive_epochs": "Configured number of consecutive threshold-crossing audits required before AUC-based recalibration.",
+        "staleness/retrain_cooldown_epochs": "Minimum DGPO epochs after an accepted reward installation during which audits remain diagnostic and cannot trigger another refit.",
+        "staleness/cooldown_active": "1 when the reward-refresh cooldown currently blocks AUC- and age-based recalibration.",
+        "staleness/epochs_since_recalibration": "DGPO epochs since the last accepted reward installation; -1 before any accepted recalibration timestamp exists.",
+        "staleness/reward_age_epochs": "DGPO epochs elapsed since the currently installed reward round was accepted.",
+        "staleness/max_reward_age_epochs": "Configured maximum installed reward age; reaching it proposes a fresh cross-fit candidate at the next routine audit.",
+        "staleness/age_refit_due": "1 when the installed reward has reached max_reward_age_epochs.",
+        "staleness/age_trigger_recalibration": "1 when reward age, rather than the AUC-gap controller, authorizes a refit attempt.",
         "staleness/decision": "Adaptive controller decision: audit_unsaturated, healthy, threshold_exceeded, recalibrate, or a recalibration outcome.",
         "omnifold/bootstrap_on_start": "1 when the initial K=1 OmniFold population fit was performed inside DGPO before any policy optimizer step.",
         "omnifold/classifier_fits_total": "Number of classifier fits attempted in the residual sequence, including the final closure classifier. Trainable scope follows the active OmniFold classifier config.",
         "omnifold/iterations_fitted": "Number of saturated discriminating classifier snapshots stored in the cumulative reward; excludes the final closure-only classifier.",
-        "omnifold/candidate/audit_balanced_accuracy": "Fresh held-out weighted balanced accuracy used by the candidate installation gate; it must be strictly below acceptance_max_balanced_accuracy.",
-        "omnifold/acceptance_max_balanced_accuracy": "Configured strict upper bound for the candidate's fresh held-out weighted balanced accuracy.",
+        "omnifold/candidate/audit_balanced_accuracy": "Fresh held-out weighted balanced accuracy used only when the optional candidate acceptance audit is enabled.",
+        "omnifold/baseline/audit_observed_auc_gap": "Fresh weighted |AUC-0.5| measured on the cheap routine-sized pool immediately before installing a candidate; this becomes the fixed staleness baseline.",
+        "omnifold/baseline/probe_events": "Event count used to certify the cheap staleness baseline for the newly installed reward round.",
+        "omnifold/acceptance_audit_enabled": "1 when a second fresh classifier gates candidate installation; 0 when saturated cross-fit residual closure installs the stack directly.",
+        "omnifold/acceptance_max_balanced_accuracy": "Configured strict upper bound when the optional candidate acceptance audit is enabled.",
         "omnifold/fit/iter*/saturated": "1 when that residual classifier fit reached its configured validation saturation/early-stop condition.",
         "omnifold/fit/iter*/stored_in_reward": "1 when that saturated classifier snapshot was stored as a cumulative log-ratio increment; 0 for the final closure-only classifier.",
         "omnifold/fit/iter*/validation_balanced_accuracy": "Held-out balanced accuracy for this residual fit. The next iteration begins only after saturation; closure is assessed against the configured chance band.",
@@ -4884,16 +4903,20 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.validation_tqdm_ddim": "If true: show a tqdm progress bar for every DDIM step within each chain (very verbose). Typical: false (too much output).",
         "dgpo.adaptive_omnifold.enabled": "Run K=1 fresh EveNet audits during DGPO and refit/install a new ratio stack plus its paired round-reference policy when stale.",
         "dgpo.adaptive_omnifold.staleness_every_n_epochs": "Independent cadence for the fresh K=1 audit; it does not change validation_K or dgpo.K.",
-        "dgpo.adaptive_omnifold.pool_generation_batch_size": "Per-worker Ray batch used only to generate no-grad K=1 live-policy populations for OmniFold fit, stale probes, and acceptance audits. Independent of platform.batch_size and classifier fit.batch_size.",
+        "dgpo.adaptive_omnifold.pool_generation_batch_size": "Per-worker Ray batch used only to generate no-grad K=1 live-policy populations for OmniFold fit and stale probes. Independent of platform.batch_size and classifier fit.batch_size.",
         "dgpo.adaptive_omnifold.audit_fit.train_microbatch_size_per_rank": "Per-GPU gradient-bearing audit classifier rows per class and forward. Multiple microbatches reconstruct one configured global optimizer batch without retaining their activation graphs.",
-        "dgpo.adaptive_omnifold.trigger.probe_max_events": "Event cap for the frequent K=1 staleness audit. This may be smaller than recalibration.score_pool_events; it does not reduce the final refit/acceptance population.",
-        "dgpo.adaptive_omnifold.trigger.retrain_auc_margin": "Sole retraining threshold hyperparameter. Refit when weighted |AUC-0.5| is strictly greater than installed baseline_auc_gap plus this margin.",
+        "dgpo.adaptive_omnifold.trigger.probe_max_events": "Event cap for the frequent K=1 staleness audit. This may be smaller than recalibration.score_pool_events; it does not reduce the residual-validation population.",
+        "dgpo.adaptive_omnifold.trigger.retrain_auc_margin": "AUC-based retraining threshold. Refit when weighted |AUC-0.5| is strictly greater than installed baseline_auc_gap plus this margin.",
+        "dgpo.adaptive_omnifold.trigger.max_reward_age_epochs": "Optional maximum installed reward age. At the next regular audit, reaching this age forces a fresh cross-fit candidate; configured residual closure is still required before installation.",
+        "dgpo.adaptive_omnifold.trigger.required_consecutive_epochs": "Number of consecutive eligible routine audits that must exceed the installed-round threshold before AUC-based refitting.",
+        "dgpo.adaptive_omnifold.trigger.retrain_cooldown_epochs": "Minimum epochs after an accepted reward installation before another routine AUC- or age-triggered refit is allowed; audits continue during cooldown.",
         "dgpo.adaptive_omnifold.trigger.require_audit_saturation": "If true, an unsaturated audit is diagnostic only: it resets the exceedance streak and cannot trigger retraining.",
         "dgpo.adaptive_omnifold.recalibration.pool_events": "Global event count in the fixed current-policy K=1 fit population. When set, the driver creates one seeded subset and bootstrap/refits reuse the same identities; null drains the ordinary train shards.",
-        "dgpo.adaptive_omnifold.recalibration.score_pool_events": "Held-out K=1 population used for residual gating and the candidate balanced-accuracy acceptance audit. Kept separate from the routine staleness probe.",
+        "dgpo.adaptive_omnifold.recalibration.score_pool_events": "Held-out K=1 population used for cross-fit residual gating. Kept separate from the routine staleness probe.",
         "dgpo.adaptive_omnifold.recalibration.fit.train_microbatch_size_per_rank": "Per-GPU gradient-bearing residual-classifier rows per class and forward. Gradients accumulate across these chunks before one optimizer step and one distributed gradient average.",
         "dgpo.adaptive_omnifold.recalibration.residual_min_auc_gain": "The sole outer-iteration usefulness gate: a residual classifier is stored only when held-out AUC is strictly greater than 0.5 plus this value. Held-out BCE remains diagnostic. Larger values widen the closure band and stop residual iterations earlier.",
-        "dgpo.adaptive_omnifold.recalibration.acceptance_max_balanced_accuracy": "Install a saturated refit candidate only when its fresh held-out weighted balanced accuracy is strictly below this value.",
+        "dgpo.adaptive_omnifold.recalibration.acceptance_audit_enabled": "Enable a second fresh-classifier candidate gate after cross-fit residual closure. Disable it to install directly at residual closure.",
+        "dgpo.adaptive_omnifold.recalibration.acceptance_max_balanced_accuracy": "When the optional candidate acceptance audit is enabled, require its fresh held-out weighted balanced accuracy to be strictly below this value.",
         "dgpo.adaptive_omnifold.recalibration.pool_selection_seed": "Seed used once by the driver to choose the fixed global OmniFold fit identities. It does not control K=1 DDIM noise or classifier optimization.",
         # --- reward_config ---
         "reward_config.type": "Reward backend. 'omnifold' uses the frozen truth-free conditional log-density-ratio bundle; 'component_normalized_truth_distance' uses truth matching; 'calibration_magnitude' uses tau direction-change magnitude.",
@@ -5031,6 +5054,9 @@ _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
         "omnifold/all_fits_saturated",
         "omnifold/bootstrap_on_start",
         "omnifold/candidate/audit_balanced_accuracy",
+        "omnifold/baseline/audit_observed_auc_gap",
+        "omnifold/baseline/probe_events",
+        "omnifold/baseline/audit_saturated",
         "omnifold/reward_round_id",
         "omnifold/recalibration_count",
         "staleness/weighted_auc_gap",
@@ -5082,6 +5108,12 @@ def _wandb_simplified_keep(key: str, value: Any) -> bool:
             "weighted_auc_gap",
             "audit_validation_auc",
             "audit_balanced_accuracy",
+            "audit_saturated",
+        }
+    if key.startswith("omnifold/baseline/"):
+        return key.rsplit("/", 1)[-1] in {
+            "audit_observed_auc_gap",
+            "probe_events",
             "audit_saturated",
         }
     if key.startswith("val_diagnostics/profile/"):
@@ -8752,6 +8784,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             return {}
         from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
             probe_installed_reward,
+            reward_refit_due_to_age,
             run_adaptive_refit,
             update_controller,
         )
@@ -8845,19 +8878,65 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 epoch=int(epoch),
             )
             trigger_refit = bool(trigger_refit or controller_trigger)
+            age_refit_due, reward_age = reward_refit_due_to_age(
+                adaptive_state,
+                epoch=int(epoch),
+                max_reward_age_epochs=adaptive_cfg.max_reward_age_epochs,
+            )
+            cooldown_active = bool(
+                float(diagnostics.get("staleness/cooldown_active", 0.0)) >= 0.5
+            )
+            age_trigger = bool(
+                age_refit_due
+                and not adaptive_cfg.log_only
+                and not cooldown_active
+            )
+            diagnostics.update(
+                {
+                    "staleness/reward_age_epochs": float(reward_age),
+                    "staleness/max_reward_age_epochs": float(
+                        adaptive_cfg.max_reward_age_epochs
+                        if adaptive_cfg.max_reward_age_epochs is not None
+                        else float("nan")
+                    ),
+                    "staleness/age_refit_due": float(age_refit_due),
+                    "staleness/age_trigger_recalibration": float(age_trigger),
+                }
+            )
+            if age_trigger and not trigger_refit:
+                trigger_refit = True
+                adaptive_state.last_decision = "max_reward_age_recalibrate"
+                diagnostics["staleness/decision"] = (
+                    adaptive_state.last_decision
+                )
+                diagnostics["staleness/trigger_recalibration"] = 1.0
+                diagnostics["staleness/trigger_reason"] = "max_reward_age"
+            elif controller_trigger:
+                diagnostics["staleness/trigger_reason"] = "auc_gap"
+            elif age_refit_due and cooldown_active:
+                diagnostics["staleness/trigger_reason"] = (
+                    "max_reward_age_cooldown"
+                )
+            elif age_refit_due and adaptive_cfg.log_only:
+                diagnostics["staleness/trigger_reason"] = "max_reward_age_log_only"
         if trigger_refit:
             # No optimizer step occurs between this snapshot and any refit
             # population. They therefore share this exact policy denominator.
             policy_snapshot = _snapshot_policy_state_dict(model)
             if is_rank0:
+                if force_refit:
+                    refit_label = "one-shot resume adapter refit"
+                elif (
+                    diagnostics.get("staleness/trigger_reason")
+                    == "max_reward_age"
+                ):
+                    refit_label = "reward maximum age reached"
+                else:
+                    refit_label = "adapter staleness triggered"
                 _log.info(
                     "[DGPO/omnifold] %s; fitting current-policy K=1 pool "
                     "(cap=%s)",
-                    (
-                        "one-shot resume adapter refit"
-                        if force_refit
-                        else "adapter staleness triggered"
-                    ),
+                    refit_label,
                     adaptive_cfg.pool_events,
                 )
             fit_pool = _materialize_adaptive_omnifold_pool(
@@ -8878,8 +8957,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             if adaptive_cfg.refit_score_events != adaptive_cfg.probe_max_events:
                 if is_rank0:
                     _log.info(
-                        "[DGPO/omnifold] materializing full held-out refit/"
-                        "acceptance pool (cap=%s; routine probe cap=%s)",
+                        "[DGPO/omnifold] materializing full held-out residual-"
+                        "validation pool (cap=%s; routine probe cap=%s)",
                         adaptive_cfg.refit_score_events,
                         adaptive_cfg.probe_max_events,
                     )
@@ -8907,6 +8986,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 policy_snapshot_state_dict=policy_snapshot,
                 fit_pool=fit_pool,
                 score_pool=refit_score_pool,
+                # Establish the new reward's controller baseline on the same
+                # cheap protocol used by subsequent staleness probes.
+                baseline_pool=score_pool,
                 epoch=int(epoch),
                 device=device,
                 world_size=world_size,
@@ -8924,6 +9006,20 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 # A newly installed reward round gets the protocol provenance
                 # of the audit that certified its new fixed baseline.
                 adaptive_state.audit_protocol_signature = current_audit_signature
+                diagnostics.update(
+                    {
+                        "staleness/decision": adaptive_state.last_decision,
+                        "staleness/baseline_auc_gap": float(
+                            adaptive_state.baseline_auc_gap
+                        ),
+                        "staleness/trigger_threshold": float(
+                            adaptive_state.trigger_threshold
+                        ),
+                        "staleness/next_trigger_threshold": float(
+                            adaptive_state.trigger_threshold
+                        ),
+                    }
+                )
             if (
                 force_refit
                 and not refit_accepted
@@ -9018,6 +9114,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             policy_snapshot_state_dict=policy_snapshot,
             fit_pool=fit_pool,
             score_pool=score_pool,
+            # Residual closure uses the full score pool; establish the trigger
+            # baseline with the same cheap population used by routine audits.
+            baseline_pool=score_pool.prefix(adaptive_cfg.probe_max_events),
             epoch=-1,
             device=device,
             world_size=world_size,

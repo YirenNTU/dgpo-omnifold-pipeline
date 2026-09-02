@@ -303,7 +303,9 @@ class RatioFitConfig:
     steps: int | None = 400
     batch_size: int = 128
     train_microbatch_size_per_rank: int | None = None
+    drop_last_batch: bool = False
     learning_rate: float = 2e-3
+    backbone_learning_rate: float | None = None
     weight_decay: float = 1e-6
     sampling: str = "independent_with_replacement"
     min_steps: int = 0
@@ -325,7 +327,14 @@ class RatioFitConfig:
             and int(self.train_microbatch_size_per_rank) < 1
         ):
             raise ValueError("train_microbatch_size_per_rank must be positive or null")
-        if self.learning_rate <= 0.0 or self.weight_decay < 0.0:
+        if (
+            self.learning_rate <= 0.0
+            or (
+                self.backbone_learning_rate is not None
+                and self.backbone_learning_rate <= 0.0
+            )
+            or self.weight_decay < 0.0
+        ):
             raise ValueError("optimizer parameters are outside their valid range")
         if self.sampling not in {
             "independent_with_replacement", "independent_epoch_shuffle",
@@ -612,12 +621,19 @@ def draw_epoch_shuffle_class_indices(
 
 
 class _EpochShuffleBatcher:
-    """Yield one deterministic permutation per epoch, including its short last batch."""
+    """Yield deterministic epoch permutations, optionally dropping the remainder."""
 
-    def __init__(self, size: int, batch_size: int, seed: int) -> None:
+    def __init__(
+        self, size: int, batch_size: int, seed: int, *, drop_last: bool = False
+    ) -> None:
         self.size = int(size)
         self.batch_size = int(batch_size)
         self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        if self.drop_last and self.size < self.batch_size:
+            raise ValueError(
+                "drop_last_batch requires at least one complete global batch"
+            )
         self._epoch = -1
         self._permutation: Tensor | None = None
 
@@ -631,11 +647,17 @@ class _EpochShuffleBatcher:
         return self._permutation
 
     def draw(self, step: int) -> Tensor:
-        steps_per_epoch = max(1, math.ceil(self.size / self.batch_size))
+        steps_per_epoch = (
+            self.size // self.batch_size
+            if self.drop_last
+            else max(1, math.ceil(self.size / self.batch_size))
+        )
         epoch = int(step) // steps_per_epoch
         batch_in_epoch = int(step) % steps_per_epoch
         start = batch_in_epoch * self.batch_size
-        stop = min(start + self.batch_size, self.size)
+        stop = start + self.batch_size if self.drop_last else min(
+            start + self.batch_size, self.size
+        )
         return self._permutation_for(epoch)[start:stop]
 
 
@@ -807,7 +829,15 @@ def fit_density_ratio(
             )
         k_train = int(config.train_candidates_per_event)
         n_neg_flat = int(negative_sample.shape[0]) * k_train
-        negative_epoch_steps = max(1, math.ceil(n_neg_flat / int(config.batch_size)))
+        negative_epoch_steps = (
+            n_neg_flat // int(config.batch_size)
+            if config.drop_last_batch
+            else max(1, math.ceil(n_neg_flat / int(config.batch_size)))
+        )
+        if negative_epoch_steps < 1:
+            raise ValueError(
+                "drop_last_batch removed the entire negative training population"
+            )
         neg_c = neg_z = neg_w = None
 
         def _materialize_negatives(epoch: int) -> None:
@@ -827,7 +857,10 @@ def fit_density_ratio(
             neg_w = global_mean_one(flat_w.to(device=device, dtype=dtype))
             if config.sampling == "independent_epoch_shuffle":
                 negative_batcher = _EpochShuffleBatcher(
-                    len(neg_z), config.batch_size, seed + 1 + 10_007 * int(epoch)
+                    len(neg_z),
+                    config.batch_size,
+                    seed + 1 + 10_007 * int(epoch),
+                    drop_last=config.drop_last_batch,
                 )
             current_neg_epoch = int(epoch)
 
@@ -851,8 +884,49 @@ def fit_density_ratio(
         positive_index, negative_index = draw_independent_class_indices(
             len(pos_z), len(neg_z), config.batch_size, config.steps, seed
         )
+    named_trainable = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    if config.backbone_learning_rate is None:
+        optimizer_parameters: Any = [
+            parameter for _, parameter in named_trainable
+        ]
+    else:
+        # Preserve pretrained representations with a conservative LR while
+        # allowing newly initialized internal adapters, the invisible input
+        # projector, and classifier head to learn at the regular head LR.
+        fast_backbone_prefixes = (
+            "backbone.PET.adapters.",
+            "backbone.InvisibleInputProjector.",
+        )
+        slow_backbone = [
+            parameter
+            for name, parameter in named_trainable
+            if name.startswith("backbone.")
+            and not name.startswith(fast_backbone_prefixes)
+        ]
+        fast_parameters = [
+            parameter
+            for name, parameter in named_trainable
+            if not name.startswith("backbone.")
+            or name.startswith(fast_backbone_prefixes)
+        ]
+        optimizer_parameters = []
+        if fast_parameters:
+            optimizer_parameters.append(
+                {"params": fast_parameters, "lr": config.learning_rate}
+            )
+        if slow_backbone:
+            optimizer_parameters.append(
+                {
+                    "params": slow_backbone,
+                    "lr": config.backbone_learning_rate,
+                }
+            )
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        optimizer_parameters,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -985,11 +1059,17 @@ def fit_density_ratio(
     positive_batcher = None
     if config.sampling == "independent_epoch_shuffle":
         positive_batcher = _EpochShuffleBatcher(
-            len(pos_z), config.batch_size, seed
+            len(pos_z),
+            config.batch_size,
+            seed,
+            drop_last=config.drop_last_batch,
         )
         if not resample_neg:
             negative_batcher = _EpochShuffleBatcher(
-                len(neg_z), config.batch_size, seed + 1
+                len(neg_z),
+                config.batch_size,
+                seed + 1,
+                drop_last=config.drop_last_batch,
             )
         elif steps_completed > 0:
             _materialize_negatives(steps_completed // negative_epoch_steps)
@@ -1059,27 +1139,43 @@ def fit_density_ratio(
             micro_fraction = float(micro_stop - micro_start) / float(local_rows)
             pos_micro_i = pos_i[micro_start:micro_stop]
             neg_micro_i = neg_i[micro_start:micro_stop]
+
+            # Backpropagate the two balanced-class terms separately. Building
+            # both PET graphs before one backward nearly doubles peak memory
+            # during a full-backbone fit, while linearity of differentiation
+            # makes these two backward calls mathematically equivalent to the
+            # previous backward on their sum.
             pos_logit = model(pos_c[pos_micro_i], pos_z[pos_micro_i])
-            neg_logit = model(neg_c[neg_micro_i], neg_z[neg_micro_i])
-            micro_loss = 0.5 * (
-                (pos_w[pos_micro_i] * F.softplus(-pos_logit)).mean()
-                + (neg_w[neg_micro_i] * F.softplus(neg_logit)).mean()
-            )
-            (micro_loss * micro_fraction).backward()
+            pos_loss = (
+                pos_w[pos_micro_i] * F.softplus(-pos_logit)
+            ).mean()
+            (0.5 * micro_fraction * pos_loss).backward()
             with torch.no_grad():
-                loss += micro_loss.detach() * micro_fraction
+                pos_loss_value = pos_loss.detach()
                 pos_credit = (pos_logit > 0.0).to(dtype) + 0.5 * (
                     pos_logit == 0.0
-                ).to(dtype)
-                neg_credit = (neg_logit < 0.0).to(dtype) + 0.5 * (
-                    neg_logit == 0.0
                 ).to(dtype)
                 pos_accuracy += (
                     pos_w[pos_micro_i] * pos_credit
                 ).mean() * micro_fraction
+            del pos_logit, pos_loss
+
+            neg_logit = model(neg_c[neg_micro_i], neg_z[neg_micro_i])
+            neg_loss = (
+                neg_w[neg_micro_i] * F.softplus(neg_logit)
+            ).mean()
+            (0.5 * micro_fraction * neg_loss).backward()
+            with torch.no_grad():
+                loss += (
+                    0.5 * (pos_loss_value + neg_loss.detach()) * micro_fraction
+                )
+                neg_credit = (neg_logit < 0.0).to(dtype) + 0.5 * (
+                    neg_logit == 0.0
+                ).to(dtype)
                 neg_accuracy += (
                     neg_w[neg_micro_i] * neg_credit
                 ).mean() * micro_fraction
+            del neg_logit, neg_loss
         _average_gradients(model)
         optimizer.step()
         with torch.no_grad():

@@ -1,0 +1,19 @@
+# Materialize a reproducible row-level 20% subset of the canonical independent
+# Ztautau val-diffusion population. Diffusion and DGPO validity runs both read
+# this exact seed-42 validation population.
+
+source:
+  data_parquet_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/val-diffusion
+
+output:
+  # The subset utility writes selected rows to the configured train_dir when
+  # val_split=[1,1]. This directory is consumed as validation by training.
+  train_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42/val
+  val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42/_unused
+  copy_sidecars: true
+
+subset:
+  fraction: 0.2
+  val_split: [1.0, 1.0]
+  seed: 42
+  shuffle: true

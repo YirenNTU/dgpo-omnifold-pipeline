@@ -282,7 +282,16 @@ def build_fit_config(
     block: Mapping[str, Any], *, n_train: int, n_validation: int
 ) -> RatioFitConfig:
     global_batch = int(block.get("batch_size", 8192))
-    steps_per_epoch = max(1, math.ceil(int(n_train) / global_batch))
+    drop_last_batch = bool(block.get("drop_last_batch", False))
+    steps_per_epoch = (
+        int(n_train) // global_batch
+        if drop_last_batch
+        else max(1, math.ceil(int(n_train) / global_batch))
+    )
+    if steps_per_epoch < 1:
+        raise ValueError(
+            "drop_last_batch requires n_train >= the configured global batch"
+        )
     interval_epochs = float(block.get("validation_interval_epochs", 0.2))
     patience_epochs = float(block.get("validation_patience_epochs", 5.0))
     if interval_epochs <= 0.0 or patience_epochs <= 0.0:
@@ -313,7 +322,13 @@ def build_fit_config(
             if block.get("train_microbatch_size_per_rank") is None
             else int(block["train_microbatch_size_per_rank"])
         ),
+        drop_last_batch=drop_last_batch,
         learning_rate=float(block.get("learning_rate", 1.0e-3)),
+        backbone_learning_rate=(
+            None
+            if block.get("backbone_learning_rate") is None
+            else float(block["backbone_learning_rate"])
+        ),
         weight_decay=float(block.get("weight_decay", 1.0e-4)),
         sampling=str(block.get("sampling", "independent_epoch_shuffle")),
         min_steps=min_steps,
@@ -392,7 +407,11 @@ def fit_omnifold(
         adapter_bottleneck=int(config.get("adapter_bottleneck", 16)),
         train_layernorm=bool(config.get("train_layernorm", False)),
         train_encoder=bool(config.get("train_encoder", False)),
+        train_invisible_projector=bool(
+            config.get("train_invisible_projector", False)
+        ),
         train_backbone=bool(config.get("train_backbone", False)),
+        asymmetric_attention=bool(config.get("asymmetric_attention", False)),
         head_dropout=float(config.get("head_dropout", 0.1)),
         decoder_hidden_dim=int(config.get("decoder_hidden_dim", 256)),
         decoder_layers=int(config.get("decoder_layers", 2)),
@@ -453,7 +472,14 @@ def fit_omnifold(
             "adapter_bottleneck": int(config.get("adapter_bottleneck", 16)),
             "train_layernorm": bool(config.get("train_layernorm", False)),
             "train_encoder": bool(config.get("train_encoder", False)),
+            "train_invisible_projector": bool(
+                config.get("train_invisible_projector", False)
+            ),
             "train_backbone": bool(config.get("train_backbone", False)),
+            "asymmetric_attention": bool(
+                config.get("asymmetric_attention", False)
+            ),
+            "adapter_placement": "internal",
             "decoder_hidden_dim": int(config.get("decoder_hidden_dim", 256)),
             "decoder_layers": int(config.get("decoder_layers", 2)),
             "decoder_heads": int(config.get("decoder_heads", 8)),
