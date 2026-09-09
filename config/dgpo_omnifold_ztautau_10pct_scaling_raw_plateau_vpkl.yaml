@@ -1,0 +1,484 @@
+# Scaling study: diffusion, DGPO and classifiers limited to 10% data.
+# All rows in the fixed seed-42 10% dataset are eligible; no second subsampling.
+# Both policy and classifier backbone start from the configured 10% checkpoint.
+# Explicitly load its live state_dict, never ema_state_dict.
+# First launch bootstraps OmniFold for this policy, saves it, and fits the
+# pre-DGPO raw baseline. Restart restores this run's own complete last.ckpt.
+# Classifiers use a stable internal 80/20 split, shared across refits/monitors.
+# Physics validation panels reuse this pool and are NOT an external test set.
+
+nersc:
+  reproducibility:
+    diffusion_pretrain_fraction: 0.10
+    dgpo_training_fraction: 0.10
+    classifier_backbone_protocol: matched_10pct_pretrain
+    note: Diffusion policy and classifier use the 10% checkpoint; all post-training populations are limited to 10%.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_rawplateau_vpkl_v18_scaling_seed42/ray_results
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_omnifold_ztautau_10pct_scaling_raw_plateau_vpkl.yaml
+      --
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_rawplateau_vpkl_v18_scaling_seed42/ray_results
+
+platform:
+  # This is already the complete materialized seed-42 10% training dataset. Do not
+  # apply another fractional limit below.
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_10pct_seed42/train
+  # Alias of the SAME pool: no external validation data are loaded.
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_10pct_seed42/train
+  # DGPO expands each event by K candidates and eight policy-evaluation
+  # timesteps.
+  batch_size: 512
+  number_of_workers: 16
+  resources_per_worker:
+    CPU: 15
+    GPU: 1
+
+logger:
+  wandb:
+    profile: critical
+    simplified: true
+    resume: never
+    project: nu2flow-RL
+    entity: ytchou97-university-of-washington
+    # New W&B run; first launch starts from the 10% diffusion model at step zero.
+    run_name: dgpo_omnifold_10pct_v18_scaling_monitor5steps_patience5
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - OmniFoldReward
+      - DiffusionPretrain10pct
+      - PretrainLiveStateDict
+      - ScalingLawAllData10pct
+      - Matched10pctClassifierBackbone
+      - DGPOTrain10pct
+      - OmniFoldTrain10pct
+      - OmniFoldAllBudgetedValidation
+      - AutoResumeOmniFoldCheckpoint
+      - ResumeOwnScalingCheckpoint
+      - BootstrapOmniFoldFor10pctPolicy
+      - NewExperimentFromPretrain
+      - WarmStartRawMonitor
+      - OmniFoldWarmStartIterations12
+      - DGPOAdamWDecay1e3
+      - RawAUCPlateau5ChecksBestRollback
+      - ClassifierTrustTV05
+      - VPPathKL
+      - DeterministicDGPOPolicy
+      - NoPolicyDropout
+      - SequentialVPTrustBackward
+      - PairedCommonNoiseTrustPool
+      - NoAttentionWeights
+      - FrozenUnusedObjectEncoder
+      - LivePolicyRollout
+      - DGPOBatch512
+      - RoundTrustRadius10To02Decay09
+      - MonitorEveryEpoch
+      - RawMonitorEvery5Steps
+      - RawMonitorFull10pct
+      - TrustMonitorFullBudgetedPool
+      - TrustAuditPatience5
+      - TrustUnsafeLCBEarlyStop2
+      - TrustProbe128PerRank
+      - TrustBacktracks8
+      - Coefficient1
+      - Tempering1
+      - FourierTopologyEmbedding
+      - TrainableGroupedSequentialEmbedding
+      - TrainableInvisibleProjector
+      - ClassifierLR2e4
+      - FoldLocalBatch2048
+      - ClassifierScoreBatch2048
+      - DGPOValidation15RoundsPerRank
+      - NoMicrobatchAccumulation
+      - ClassifierGradClip5
+      - ClassifierFiniteGuard
+      - NoAcceptanceAudit
+      - RawAUCBestCheckpointRollback
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_rawplateau_vpkl_v18_scaling_seed42/logs
+    name: dgpo_omnifold_10pct_rawplateau_vpkl_v18_scaling_seed42
+    version: v18_scaling_10pct_seed42
+
+options:
+  Dataset:
+    # Use every event in the materialized 10% directory; do not subsample twice.
+    dataset_limit: 1.0
+    # The validation alias uses the same complete pool.
+    val_dataset_limit: 1.0
+  Training:
+    total_epochs: 150
+    epochs: 150
+    # Explicit AdamW decoupled decay for DGPO (the existing effective default).
+    # Apply this configuration again after restoring optimizer moments.
+    weight_decay: 0.001
+    decoupled_weight_decay: true
+    # First launch loads this supervised diffusion checkpoint in weights-only
+    # mode. Restart resumes only this scaling experiment's own DGPO last.ckpt.
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    pretrain_model_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_rawplateau_vpkl_v18_scaling_seed42/checkpoints
+    model_checkpoint_save_top_k: 0
+    # The neutrino forward never calls ObjectEncoder. Freezing it keeps this
+    # unreachable 4.76M-parameter subtree out of EMA and trust snapshots.
+    Components:
+      InvisibleInputProjector:
+        weight_decay: 0.001
+      GroupedSequentialEmbedding:
+        weight_decay: 0.001
+      GlobalEmbedding:
+        weight_decay: 0.001
+      PET:
+        weight_decay: 0.001
+      TruthGeneration:
+        weight_decay: 0.001
+      ObjectEncoder:
+        freeze:
+          type: full
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+    EMA:
+      # Applies to BOTH the diffusion policy and OmniFold backbone loader.
+      replace_model_after_load: false
+      # Keep the checkpoint/save EMA, but DGPO rollouts must come from the live
+      # policy paired with the installed OmniFold reward. This also avoids a
+      # second GPU-resident EMA shadow.
+      use_for_generation: false
+
+# The current DGPO policy runs in train mode while its frozen reference runs in
+# eval mode. Keep every stochastic layer on the neutrino diffusion path off so
+# equal parameters give exactly equal shared-noise velocity predictions.
+network:
+  Body:
+    GroupedSequentialEmbedding:
+      dropout: 0.0
+    GlobalEmbedding:
+      dropout: 0.0
+    PET:
+      feature_drop: 0.0
+      dropout: 0.0
+      drop_probability: 0.0
+  TruthGeneration:
+    feature_drop: 0.0
+    dropout: 0.0
+    drop_probability: 0.0
+
+rl:
+  enabled: true
+
+reward_config:
+  type: omnifold
+  weight: 1.0
+  omnifold:
+    bootstrap_in_dgpo: true
+    bundle_file: null
+    # Classifier initialization also uses only the 10% diffusion checkpoint.
+    # Fit new ratio heads for this policy; never reuse another run's reward.
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+
+ztautau_domain:
+  enabled: true
+  feature_names: [theta, phi]
+  token_sources:
+    event_token: event_token
+    object_token: object_token
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1.0
+    target_delta_phi_to_pi: 0.0
+
+dgpo:
+  # Cold DGPO start from the 10% diffusion model; reference/optimizer/EMA are
+  # rebuilt from it. Do not import any earlier DGPO run's state or reward.
+  auto_resume_from_last: true
+  auto_resume_best_source_checkpoint_dir: null
+  best_source_start_new_experiment: false
+  auto_resume_fallback_checkpoint_path: null
+  checkpoint_load_mode: weights_only
+  # Shared-noise DGPO and VP path-KL require the train-mode current policy to
+  # be deterministic. Startup fails closed if any policy-path dropout remains.
+  require_deterministic_policy: true
+  float32_matmul_precision: medium
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  beta: 1.0
+  beta_kl: 0.0
+  adv_clip_max: null
+  grad_clip_norm: 1.0
+  num_ddim_steps: 20
+  num_train_timesteps: 8
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  activation_checkpointing: true
+  # VP path-KL adds a second gradient-bearing policy graph.
+  policy_eval_event_microbatch_size: 128
+  policy_eval_parallel_timesteps: 1
+  # Keep the no-grad rollout peak at 4 * 512 = 2048 rows after doubling B.
+  rollout_parallel_chains: 4
+  sequential_vp_trust_backward: true
+  steps_per_epoch: 10
+  log_every: 1
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 5
+
+  reference_trust:
+    enabled: true
+    # Keep the coefficient-one VP-weighted trust surrogate unchanged.
+    coefficient: 1.0
+    objective: vp_path_kl
+    vp_path_kl:
+      diagnostic: false
+      logsnr_min: -20.0
+      logsnr_max: 20.0
+    adaptive_boundary:
+      enabled: true
+      # Fixed within each installed reward round. After successful refit and
+      # reference recentering: delta_r=max(0.02, 0.10 * 0.9**r).
+      # Old checkpoints start this schedule at r=0 on resume; new checkpoints
+      # preserve it. Cold bootstrap also starts at r=0. Monitors, failed refits,
+      # and policy-only rollback never advance or reset the schedule.
+      radius_mode: round_decay
+      distance: vp_path_kl
+      # This is a finite-probe VP-weighted KL surrogate, not an exact output
+      # KL bound. Keep the epoch-level classifier as the distribution monitor.
+      delta_max: 0.10
+      delta_floor: 0.02
+      round_decay_factor: 0.9
+      initial_raw_auc_gap: null
+      warning_fraction: 0.9
+      adaptive_power: 2.0
+      auc_confidence_z: 1.96
+      auc_stop_gap: 0.005
+      reset_adam_first_moment_on_install: true
+      reset_adam_first_moment_on_zero_step: false
+      enforcement: post_step_backtracking
+      backtrack_factor: 0.5
+      max_backtracks: 8
+      probe_events_per_rank: 128
+      fixed_probe_per_reward_round: true
+      interior_fraction: 1.0
+      radius_calibration:
+        enabled: false
+        bidirectional: false
+        allow_expansion: false
+        cross_round_nonexpanding: false
+        scale_policy_lr: false
+        refit_on_exhaustion: false
+        round_acceptance_enabled: false
+        trajectory_search_enabled: false
+        signed_direction_probe:
+          enabled: false
+          recover_reverse_only: false
+          scales: [0.25, 0.5, 1.0]
+        lookahead_extragradient:
+          enabled: false
+          scale: 0.5
+
+  variance_regularization:
+    enabled: false
+    weight: 0.0
+    features: null
+  projection_constraint:
+    type: none
+
+  validation_K: 16
+  validation_num_ddim_steps: 20
+  validation_batch_size: 512
+  validation_every_n_epochs: 1
+  validation_full_every_n_epochs: 1
+  # Per rank: 15 * 16 GPUs * 512 events = 122,880 validation events.
+  validation_max_batches: 15
+  validation_compute_winrate: false
+  validation_log_batches: true
+  validation_rollout_parallel_chains: 8
+  train_dist_enabled: false
+  ztautau_metrics:
+    enabled: true
+    candidate_index: 0
+    bins: 60
+    log_images: true
+    image_observables: [topology/cos_opening, topology/delta_phi_to_pi]
+  tarp:
+    enabled: true
+    profile: visible_acoplanarity
+    n_bins: 4
+    min_events: 500
+    arms: [full, rank_copula]
+    n_null_assignments: 399
+    n_reference_trials: 8
+    seed: 20260820
+    alpha: 0.05
+    pooled_panel: true
+
+  adaptive_omnifold:
+    enabled: true
+    log_only: false
+    monitor_mode: raw_plateau_refit
+    single_pool_train_validation: true
+    single_pool_split_seed: 42
+    baseline_probe_on_start: false
+    fixed_audit_panel: true
+    pool_generation_batch_size: 1024
+    # Keep 10-step epochs/LR schedule. Raw checks at steps 5, 10, 15, ...;
+    # trust and physics validation retain their epoch cadence.
+    staleness_every_n_epochs: 1
+    staleness_every_n_steps: 5
+    trigger:
+      raw_audit_enabled: true
+      # Retain raw-monitor weights only, with new samples and a new optimizer.
+      # Stable condition-hash 80/20 identities prevent train/validation swapping.
+      warm_start_classifier: true
+      raw_improvement_min_delta: 0.0
+      max_reward_age_epochs: null
+      # Wait for five consecutive valid saturated checks without a new best.
+      # An improvement or invalid/unsaturated check breaks the miss streak.
+      # Then restore the
+      # lowest raw-AUC checkpoint in this reward round before fitting OmniFold.
+      required_consecutive_checks: 5
+      rollback_to_best_on_plateau: true
+      retrain_cooldown_epochs: 0
+      require_audit_saturation: true
+      power_alpha: 0.05
+      power_target: 0.8
+      probe_seed: 20260905
+      # Full 10% pool, including both internal fit and validation identities.
+      probe_max_events: null
+    classifier_trust:
+      enabled: true
+      # Run at epoch end (not at the additional mid-epoch raw check), uncapped
+      # current/reference prefix from the same one-pass common-noise panel.
+      every_n_epochs: 1
+      probe_max_events: null
+      # Ideal equal-prior BA=0.525 corresponds to TV=0.05.
+      max_balanced_accuracy: 0.525
+      confidence_z: 1.96
+      required_consecutive_epochs: 1
+      require_saturation: true
+      # A significantly unsafe classifier is already a valid drift witness;
+      # stop after two consecutive validation LCB crossings instead of waiting
+      # for loss saturation. A near-chance/safe result still needs patience.
+      unsafe_early_stop:
+        enabled: true
+        confidence_z: 1.96
+        required_consecutive_validations: 2
+      audit_fit:
+        validation_patience_epochs: 5.0
+    audit_fit:
+      # In single-pool mode the global batch is capped to the actual fit size
+      # (GPU-aligned) if necessary. Never silently discard an entire small fold.
+      batch_size: 8192
+      train_microbatch_size_per_rank: 512
+      drop_last_batch: true
+      learning_rate: 0.0002
+      weight_decay: 0.0005
+      gradient_clip_norm: 5.0
+      sampling: independent_epoch_shuffle
+      safety_max_epochs: null
+      min_steps: 0
+      min_epochs: 1
+      validation_interval_epochs: 1.0
+      validation_patience_epochs: 10.0
+      validation_min_delta: 0.0001
+      # This is a per-rank row budget. Keep inference at the proven local
+      # training batch size so post-fit scoring cannot allocate a 65k PET pass.
+      validation_batch_size: 2048
+      progress_every_n_steps: 10
+      restore_best: true
+      require_saturation: false
+    recalibration:
+      # Refit the same fold weights from the previous installed reward round.
+      # Iteration 3 onward and trust monitors stay freshly initialized.
+      # Raw-monitor warm starts use their separate trigger cache above.
+      # Legacy checkpoints without saved fold provenance fit fresh once first.
+      # Only model weights transfer; each fit builds a new optimizer using
+      # OmniFold's own fit settings, never DGPO's weight decay or Adam state.
+      warm_start_iterations: [1, 2]
+      candidates_per_event: 1
+      bootstrap_on_start: true
+      bootstrap_fail_closed: true
+      # Initial bootstrap supplies this policy's reward; no legacy one-shot
+      # migration/refit is needed when resuming its own complete checkpoint.
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      refit_once_id: ""
+      # No independent train_parquet_dir override: bootstrap/refits reuse the
+      # configured complete pre-materialized 10% DGPO training dataset.
+      pool_events: null
+      # All 10% identities are used: outer 80% fit / 20% validation. The two
+      # reward folds are formed within the fit 80%; closure uses the val 20%.
+      score_pool_events: null
+      pool_selection_seed: 42
+      min_iterations: 1
+      max_iterations: 10
+      # No independent acceptance/topology audit after residual closure.
+      acceptance_audit_enabled: false
+      acceptance_max_balanced_accuracy: 0.51
+      topology_acceptance_audit_enabled: false
+      topology_acceptance_max_auc_gap: 0.005
+      topology_acceptance_repeats: 1
+      periodic_pair_features: true
+      topology_fourier_embedding: true
+      topology_max_harmonic: 4
+      topology_include_theta_pair: true
+      topology_hidden_dim: 64
+      topology_embedding_dim: 32
+      topology_fusion_hidden_dim: 64
+      topology_dropout: 0.25
+      # Untempered density ratio: reward estimates log(q/p_round).
+      tempering: 1.0
+      crossfit_folds: 2
+      # Stop after the first saturated residual no-op with AUC <= 0.505.
+      residual_min_auc_gain: 0.005
+      seed: 20260906
+      # All installed-reward scoring is also chunked at 2048 rows per rank.
+      score_row_budget: 2048
+      adapter_bottleneck: 16
+      train_layernorm: false
+      train_encoder: false
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+      train_backbone: false
+      asymmetric_attention: true
+      decoder_hidden_dim: 192
+      decoder_layers: 2
+      decoder_heads: 4
+      head_dropout: 0.25
+      fit:
+        # Diagnose the unresolved finite-forward / NaN-backward crash. This
+        # records the actual failing operation and synchronizes errors on DDP.
+        anomaly_detection_steps: 10
+        # One optimizer update per forward: 16 GPUs * 2048 events/GPU/class.
+        # Small pools cap the global batch to the smallest actual cross-fit fold.
+        batch_size: 32768
+        train_microbatch_size_per_rank: 2048
+        drop_last_batch: true
+        # Fresh head plus GroupedSequentialEmbedding/InvisibleInputProjector use
+        # this LR. The inherited TruthGeneration position encoder uses the
+        # conservative backbone_learning_rate below.
+        learning_rate: 0.0002
+        backbone_learning_rate: 0.00001
+        # Independent classifier regularization, unchanged by warm start.
+        weight_decay: 0.0005
+        gradient_clip_norm: 5.0
+        sampling: independent_epoch_shuffle
+        safety_max_epochs: null
+        # Required-saturation fits must complete at least one optimizer step
+        # before validation-patience stopping can certify convergence.
+        min_steps: 1
+        min_epochs: 1
+        validation_interval_epochs: 1.0
+        validation_patience_epochs: 10.0
+        validation_min_delta: 0.0001
+        # OOF and validation scoring use this per rank; 65536 OOMs after fit.
+        validation_batch_size: 2048
+        progress_every_n_steps: 10
+        restore_best: true
+        require_saturation: true

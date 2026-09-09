@@ -122,6 +122,156 @@ def select_dgpo_training_state(
     )
 
 
+def resolve_dgpo_auto_resume_checkpoint(
+    checkpoint_save_path: str | Path | None,
+    *,
+    enabled: bool,
+    fallback_checkpoint_path: str | Path | None = None,
+    best_source_checkpoint_dir: str | Path | None = None,
+) -> Path | None:
+    """Return this run's recoverable ``last.ckpt`` when automatic resume is enabled.
+
+    Prefer ``<checkpoint_save_path>/last.ckpt`` so later launches continue the
+    same branch. A new branch may require either its parent's best saturated
+    raw-AUC snapshot or an explicit fallback recovery snapshot (for example an
+    accepted OmniFold bootstrap), but not both.
+    Without either recovery checkpoint, a fresh ablation can still use
+    ``checkpoint_load_mode=weights_only`` with a supervised diffusion checkpoint.
+    """
+    if not enabled:
+        return None
+    if not checkpoint_save_path:
+        raise ValueError(
+            "dgpo.auto_resume_from_last=true requires "
+            "options.Training.model_checkpoint_save_path"
+        )
+    save_root = Path(str(checkpoint_save_path)).expanduser().resolve()
+    if best_source_checkpoint_dir:
+        source_root = Path(str(best_source_checkpoint_dir)).expanduser().resolve()
+        if source_root == save_root:
+            raise ValueError("best-checkpoint resume requires a separate output directory")
+        if fallback_checkpoint_path:
+            raise ValueError("choose either best-source resume or an explicit fallback checkpoint")
+    candidate = (
+        Path(str(checkpoint_save_path)).expanduser().resolve() / "last.ckpt"
+    )
+    if candidate.is_file():
+        return candidate.resolve()
+    if best_source_checkpoint_dir:
+        return resolve_best_raw_auc_checkpoint(best_source_checkpoint_dir)
+    if fallback_checkpoint_path:
+        fallback = Path(str(fallback_checkpoint_path)).expanduser().resolve()
+        if not fallback.is_file():
+            raise FileNotFoundError(
+                "configured DGPO auto-resume fallback checkpoint does not "
+                f"exist: {fallback}"
+            )
+        return fallback
+    return None
+
+
+def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
+    """Map tensor storage when possible: best-point selection only needs metadata."""
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except RuntimeError as exc:
+        if "mmap can only be used" not in str(exc):
+            raise
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"DGPO checkpoint is not a mapping: {path}")
+    return payload
+
+
+def _completed_raw_monitor_records(state: dict[str, Any]) -> list[tuple[float, int, int, int]]:
+    records = []
+    for row in state.get("probe_history", ()) or ():
+        if not isinstance(row, dict):
+            continue
+        try:
+            gap = float(row["raw_auc_gap"])
+            saturated = float(row["raw_audit_saturated"])
+            epoch, step = float(row["epoch"]), float(row["global_step"])
+            next_epoch = float(row.get("checkpoint_next_epoch", epoch + 1))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if (
+            math.isfinite(gap) and 0.0 <= gap <= 0.5
+            and math.isfinite(saturated) and saturated >= 0.5
+            and epoch.is_integer() and epoch >= -1
+            and step.is_integer() and step >= 0
+            and next_epoch.is_integer() and next_epoch >= 0
+            and next_epoch in (epoch, epoch + 1)
+        ):
+            records.append((gap, int(epoch), int(step), int(next_epoch)))
+    return records
+
+
+def resolve_best_raw_auc_checkpoint(checkpoint_dir: str | Path) -> Path:
+    """Select a complete best snapshot from the parent's recorded raw monitors.
+
+    Never silently substitute last, a runner-up, or a supervised checkpoint.
+    Only the parent's last checkpoint and the selected snapshot are opened;
+    tensor storage is memory mapped rather than scanning every large file.
+    """
+    root = Path(checkpoint_dir).expanduser().resolve()
+    last = root / "last.ckpt"
+    if not last.is_file():
+        raise FileNotFoundError(f"best-source last.ckpt does not exist: {last}")
+    last_payload = _load_checkpoint_metadata(last)
+    state = last_payload.get("dgpo_adaptive_omnifold_state")
+    if not isinstance(state, dict):
+        raise ValueError(f"best-source checkpoint has no adaptive monitor state: {last}")
+    records = _completed_raw_monitor_records(state)
+    if not records:
+        raise ValueError(f"no completed saturated raw-AUC monitor records in {last}")
+    # Match the controller's strict improvement rule: retain the earlier point
+    # on ties instead of preferentially choosing a later, equally scored model.
+    gap, epoch, step, next_epoch = min(records)
+    selected = root / dgpo_snapshot_checkpoint_name(
+        last_completed_epoch=epoch, dgpo_next_epoch=next_epoch, global_step=step,
+    )
+    del state, last_payload
+    if not selected.is_file():
+        raise FileNotFoundError(
+            f"recorded best raw-AUC checkpoint is missing (gap={gap:.8g}): {selected}"
+        )
+    payload = _load_checkpoint_metadata(selected)
+    required = {
+        "state_dict", "dgpo_checkpoint_version", "dgpo_next_epoch",
+        "dgpo_optimizer_state_dict", "dgpo_ref_state_dict",
+        "dgpo_round_ref_state_dict", "dgpo_round_ref_sha256",
+        "dgpo_omnifold_reward_metadata", "dgpo_omnifold_reward_stack",
+        "dgpo_adaptive_omnifold_state",
+    }
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise ValueError(f"best raw-AUC checkpoint is incomplete: {selected}; missing={missing}")
+    if (
+        payload.get("epoch") != epoch or payload.get("global_step") != step
+        or payload["dgpo_next_epoch"] != next_epoch
+        or int(payload["dgpo_checkpoint_version"]) < 1
+    ):
+        raise ValueError(f"best raw-AUC checkpoint epoch/step metadata mismatch: {selected}")
+    if next_epoch == epoch and int(payload.get("dgpo_epoch_step", 0)) <= 0:
+        raise ValueError(f"best mid-epoch checkpoint has no within-epoch progress: {selected}")
+    selected_state = payload["dgpo_adaptive_omnifold_state"]
+    if not isinstance(selected_state, dict):
+        raise ValueError(f"best raw-AUC checkpoint has invalid adaptive state: {selected}")
+    matching = [
+        record for record in _completed_raw_monitor_records(selected_state)
+        if record[1:] == (epoch, step, next_epoch)
+    ]
+    if not matching or not math.isclose(matching[-1][0], gap, rel_tol=1e-10, abs_tol=1e-12):
+        raise ValueError(f"best snapshot does not corroborate its recorded raw-AUC score: {selected}")
+    _log.info(
+        "[DGPO/model] Best-source resume: %s -> epoch=%s step=%s raw_auc_gap=%.8g "
+        "(lowest of %s saturated monitor records); loading full state from %s",
+        last, epoch, step, gap, len(records), selected,
+    )
+    return selected.resolve()
+
+
 def dgpo_snapshot_checkpoint_name(
     *,
     last_completed_epoch: int,
@@ -168,9 +318,11 @@ def load_weights_like_configure_model(
 ) -> dict[str, Any]:
     """Load Lightning checkpoint: respect EMA replace flags like ``EveNetEngine.configure_model``.
 
-    When ``for_dgpo_training`` is True the EMA ``replace_model_after_load`` flag is **ignored**:
+    When resuming a DGPO checkpoint for training, the EMA replace flag is ignored:
     DGPO resumes from ``state_dict`` and restores the EMA shadow separately via :func:`make_ema`.
     For DGPO checkpoints saved by current code, ``state_dict`` is the live trainable model.
+    Supervised cold starts and classifier backbones respect the EMA flag; set
+    ``replace_model_after_load: false`` to explicitly select their live weights.
     """
     ema_cfg = config.options.Training.get("EMA", None) or {}
     ema_enable = bool(ema_cfg.get("enable", False))
@@ -180,11 +332,13 @@ def load_weights_like_configure_model(
     is_dgpo_ckpt = int(ckpt.get("dgpo_checkpoint_version", 0)) >= 1
 
     if for_dgpo_training and is_dgpo_ckpt:
-        safe_load_state(model, ckpt["state_dict"])
+        weight_source = "state_dict"
     elif ema_enable and "ema_state_dict" in ckpt and ema_replace:
-        safe_load_state(model, ckpt["ema_state_dict"])
+        weight_source = "ema_state_dict"
     else:
-        safe_load_state(model, ckpt["state_dict"])
+        weight_source = "state_dict"
+    safe_load_state(model, ckpt[weight_source])
+    _log.info("[DGPO/model] Loaded checkpoint weights from %s: %s", weight_source, ckpt_path)
     return ckpt
 
 
@@ -313,6 +467,85 @@ def apply_component_freezes(model: EveNetModel, config: Config) -> None:
         "[DGPO/model] Component freeze from YAML: %s | trainable params: %s",
         applied if applied else "(none)",
         f"{n_train:,}",
+    )
+
+
+_DGPO_NEUTRINO_POLICY_MODULES = (
+    "GroupedSequentialEmbedding",
+    "GlobalEmbedding",
+    "PET",
+    "TruthGeneration",
+)
+
+
+def assert_dgpo_neutrino_policy_deterministic(model: nn.Module) -> None:
+    """Fail if the train-mode neutrino policy contains stochastic dropout.
+
+    DGPO evaluates the current and reference policies on the same ``(x_t, t)``.
+    A stochastic current-policy forward would make that comparison nonzero even
+    when both policies have identical parameters.  The OmniFold classifier is a
+    separate model and is deliberately outside this policy-only check.
+    """
+
+    dropout_types = tuple(
+        dropout_type
+        for dropout_type in (
+            nn.Dropout,
+            nn.Dropout1d,
+            nn.Dropout2d,
+            nn.Dropout3d,
+            nn.AlphaDropout,
+            nn.FeatureAlphaDropout,
+        )
+        if isinstance(dropout_type, type)
+    )
+    violations: list[str] = []
+    checked: set[int] = set()
+    roots_found: list[str] = []
+    for root_name in _DGPO_NEUTRINO_POLICY_MODULES:
+        root = getattr(model, root_name, None)
+        if root is None:
+            continue
+        roots_found.append(root_name)
+        for relative_name, module in root.named_modules():
+            if id(module) in checked:
+                continue
+            checked.add(id(module))
+            qualified_name = (
+                root_name if not relative_name else f"{root_name}.{relative_name}"
+            )
+            probability: float | None = None
+            if isinstance(module, dropout_types):
+                probability = float(module.p)
+            elif isinstance(module, nn.MultiheadAttention):
+                probability = float(module.dropout)
+            elif module.__class__.__name__ in {"RandomDrop", "StochasticDepth"}:
+                probability = float(getattr(module, "drop_prob", 0.0))
+            if probability is not None and probability > 0.0:
+                violations.append(f"{qualified_name}={probability:g}")
+
+    missing = [
+        name
+        for name in ("GlobalEmbedding", "PET", "TruthGeneration")
+        if name not in roots_found
+    ]
+    if missing:
+        raise RuntimeError(
+            "deterministic DGPO neutrino policy check could not find required "
+            f"module(s): {', '.join(missing)}"
+        )
+    if violations:
+        raise RuntimeError(
+            "dgpo.require_deterministic_policy=true, but stochastic layers remain "
+            "on the train-mode neutrino policy path: "
+            + ", ".join(violations)
+            + ". Set network.Body.{GroupedSequentialEmbedding,GlobalEmbedding,PET} "
+            "and network.TruthGeneration dropout/feature_drop/drop_probability "
+            "values to 0."
+        )
+    _log.info(
+        "[DGPO/model] Deterministic neutrino policy guard passed (%d modules checked).",
+        len(checked),
     )
 
 
@@ -537,6 +770,7 @@ def save_lightning_compatible_checkpoint(
     last_completed_epoch: int,
     dgpo_next_epoch: int,
     global_step: int,
+    dgpo_epoch_step: int = 0,
     optimizer: Optimizer | None = None,
     ref_model: nn.Module | None = None,
     round_ref_model: nn.Module | None = None,
@@ -549,10 +783,13 @@ def save_lightning_compatible_checkpoint(
 ) -> None:
     """Write a ``.ckpt`` file using the same tensor layout as Lightning + EveNetEngine.
 
-    ``last_completed_epoch`` is the last fully finished training epoch index (0-based).
+    ``last_completed_epoch`` is the last finished epoch, or the current epoch
+    for a mid-epoch monitor/interrupt snapshot (0-based).
     ``dgpo_next_epoch`` is the next epoch index the loop should run (equals
     ``last_completed_epoch + 1`` after a full epoch; can equal ``last_completed_epoch`` when
     saving mid-epoch interrupt).
+    ``dgpo_epoch_step`` records completed steps inside an unfinished logical
+    epoch; completed-epoch snapshots use zero.
 
     ``ref_model`` — frozen reference policy. Its ``state_dict`` is saved as
     ``dgpo_ref_state_dict`` so the anchor survives across resume sessions.
@@ -568,6 +805,7 @@ def save_lightning_compatible_checkpoint(
     except Exception:
         payload["pytorch-lightning_version"] = "2.0.0"
     payload["dgpo_next_epoch"] = int(dgpo_next_epoch)
+    payload["dgpo_epoch_step"] = int(dgpo_epoch_step)
     if optimizer is not None:
         payload["dgpo_optimizer_state_dict"] = optimizer.state_dict()
     if ref_model is not None:

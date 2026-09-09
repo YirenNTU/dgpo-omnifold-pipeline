@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 import torch
@@ -24,6 +25,107 @@ ADVANTAGE_ESTIMATOR_LOO_UNSCALED = "leave_one_out_unscaled"
 VALID_ADVANTAGE_ESTIMATORS = frozenset(
     {ADVANTAGE_ESTIMATOR_ZSCORE, ADVANTAGE_ESTIMATOR_LOO_UNSCALED}
 )
+
+REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE = "velocity_mse"
+REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL = "vp_path_kl"
+VALID_REFERENCE_TRUST_OBJECTIVES = frozenset(
+    {
+        REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE,
+        REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+    }
+)
+
+
+def _scalar_softplus(value: float) -> float:
+    """Numerically stable scalar softplus used by the cosine-time sampler."""
+
+    return max(value, 0.0) + math.log1p(math.exp(-abs(value)))
+
+
+def sample_cosine_vp_path_kl_timesteps(
+    count: int,
+    batch_size: int,
+    *,
+    total_strata: int | None = None,
+    stratum_offset: int = 0,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float32,
+    logsnr_min: float = -20.0,
+    logsnr_max: float = 20.0,
+    generator: torch.Generator | None = None,
+) -> tuple[Tensor, float]:
+    """Sample stratified cosine-schedule times for a VP path-KL estimate.
+
+    For the cosine schedule used by EveNet, write
+    ``alpha(t)=cos(a*t+b)`` and ``sigma(t)=sin(a*t+b)``.  The v-space
+    reverse-SDE path-KL integrand has time weight
+    ``w(t)=beta(t)*alpha(t)^2/sigma(t)^2 = 2*a*cot(a*t+b)``.  This function
+    samples from ``rho(t)=w(t)/Z`` by inverse CDF, so callers only need the
+    returned normalization ``Z`` rather than a high-variance per-time weight.
+
+    ``count`` consecutive strata starting at ``stratum_offset`` are returned
+    as a ``(count, batch_size)`` tensor.  Splitting one logical draw across
+    calls is supported by keeping ``total_strata`` fixed and advancing the
+    offset.
+    """
+
+    count_i = int(count)
+    batch_i = int(batch_size)
+    strata_i = count_i if total_strata is None else int(total_strata)
+    offset_i = int(stratum_offset)
+    if count_i < 1:
+        raise ValueError("count must be positive")
+    if batch_i < 1:
+        raise ValueError("batch_size must be positive")
+    if strata_i < 1:
+        raise ValueError("total_strata must be positive")
+    if offset_i < 0 or offset_i + count_i > strata_i:
+        raise ValueError(
+            "stratum_offset and count must select strata within total_strata"
+        )
+    if (
+        not isinstance(dtype, torch.dtype)
+        or not torch.empty((), dtype=dtype).is_floating_point()
+    ):
+        raise TypeError("dtype must be a real floating-point torch dtype")
+
+    logsnr_min_f = float(logsnr_min)
+    logsnr_max_f = float(logsnr_max)
+    if not math.isfinite(logsnr_min_f) or not math.isfinite(logsnr_max_f):
+        raise ValueError("logsnr endpoints must be finite")
+    if logsnr_min_f >= logsnr_max_f:
+        raise ValueError("logsnr_min must be smaller than logsnr_max")
+
+    # log(sigma^2) = -softplus(logSNR).  Its endpoint difference is exactly
+    # integral_0^1 beta(t)*alpha(t)^2/sigma(t)^2 dt for this schedule.
+    log_sigma_sq_start = -_scalar_softplus(logsnr_max_f)
+    log_sigma_sq_end = -_scalar_softplus(logsnr_min_f)
+    normalization = log_sigma_sq_end - log_sigma_sq_start
+    if not math.isfinite(normalization) or normalization <= 0.0:
+        raise ValueError("cosine VP path-KL normalization must be finite and positive")
+
+    # Compute the inverse CDF in float64 to avoid rounding the default
+    # high-logSNR endpoint to exactly t=0 before the final dtype conversion.
+    jitter = torch.rand(
+        (count_i, batch_i),
+        device=device,
+        dtype=torch.float64,
+        generator=generator,
+    )
+    stratum = torch.arange(
+        offset_i,
+        offset_i + count_i,
+        device=device,
+        dtype=torch.float64,
+    ).unsqueeze(1)
+    quantile = (stratum + jitter) / float(strata_i)
+    log_sigma_sq = log_sigma_sq_start + quantile * normalization
+    sin_angle = torch.exp(0.5 * log_sigma_sq).clamp(min=0.0, max=1.0)
+
+    angle_start = math.atan(math.exp(-0.5 * logsnr_max_f))
+    angle_end = math.atan(math.exp(-0.5 * logsnr_min_f))
+    time = (torch.asin(sin_angle) - angle_start) / (angle_end - angle_start)
+    return time.clamp_(0.0, 1.0).to(dtype=dtype), float(normalization)
 
 
 def compute_per_event_advantage(
@@ -167,33 +269,190 @@ def build_reference_trust_loss(
     noise_mask: Tensor,
     *,
     L_ref_2d: Tensor | None = None,
+    objective: str = REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE,
+    path_kl_normalizer: float | Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Shared-noise velocity-MSE trust proxy against the active round reference.
+    """Shared-noise trust objective against the active round reference.
 
     The policy and frozen reference are evaluated on the same ``(t, eps)`` draw,
     so gradients flow only through ``model_v`` while the installed OmniFold
-    round reference remains the fixed denominator/velocity anchor.
+    round reference remains the fixed denominator/velocity anchor.  The legacy
+    ``velocity_mse`` objective remains the default.  ``vp_path_kl`` expects
+    times drawn by :func:`sample_cosine_vp_path_kl_timesteps` and computes
+    ``0.5 * Z * mean_rows(sum_active_dims((model_v-ref_v)^2))``.
     """
     if model_v.shape != ref_v.shape:
         raise ValueError(
             f"model_v {tuple(model_v.shape)} and ref_v {tuple(ref_v.shape)} must match"
         )
-    mask = noise_mask.expand_as(model_v).to(dtype=model_v.dtype)
+    if model_v.ndim < 2:
+        raise ValueError("model_v and ref_v must have a row and feature dimension")
+    if objective not in VALID_REFERENCE_TRUST_OBJECTIVES:
+        raise ValueError(
+            f"unsupported reference trust objective: {objective!r}; "
+            f"expected one of {sorted(VALID_REFERENCE_TRUST_OBJECTIVES)}"
+        )
+    try:
+        mask = noise_mask.expand_as(model_v).to(
+            device=model_v.device,
+            dtype=model_v.dtype,
+        )
+    except RuntimeError as exc:
+        raise ValueError(
+            f"noise_mask {tuple(noise_mask.shape)} cannot expand to "
+            f"model_v {tuple(model_v.shape)}"
+        ) from exc
+    if not torch.isfinite(mask).all() or (mask < 0).any():
+        raise ValueError("noise_mask must contain finite, non-negative values")
+
+    squared_difference = (model_v - ref_v.detach()).pow(2) * mask
     denominator = mask.sum().clamp(min=1.0e-8)
-    velocity_mse = (
-        (model_v - ref_v.detach()).pow(2) * mask
-    ).sum() / denominator
-    trust_loss = 0.5 * velocity_mse
+    velocity_mse = squared_difference.sum() / denominator
+
+    vp_path_kl: Tensor | None = None
+    if path_kl_normalizer is not None:
+        normalizer = torch.as_tensor(
+            path_kl_normalizer,
+            device=model_v.device,
+            dtype=model_v.dtype,
+        ).detach()
+        if normalizer.numel() != 1:
+            raise ValueError("path_kl_normalizer must be a scalar")
+        normalizer = normalizer.reshape(())
+        if not torch.isfinite(normalizer) or normalizer <= 0:
+            raise ValueError("path_kl_normalizer must be finite and positive")
+        row_sum = squared_difference.reshape(model_v.shape[0], -1).sum(dim=1)
+        vp_path_kl = 0.5 * normalizer * row_sum.mean()
+    elif objective == REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL:
+        raise ValueError("vp_path_kl objective requires path_kl_normalizer")
+
+    trust_loss = (
+        vp_path_kl
+        if objective == REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL
+        else 0.5 * velocity_mse
+    )
     diagnostics: dict[str, Tensor] = {
         "reference_trust/loss": trust_loss.detach(),
         "reference_trust/velocity_mse": velocity_mse.detach(),
     }
+    if vp_path_kl is not None:
+        diagnostics["reference_trust/vp_path_kl"] = vp_path_kl.detach()
+        diagnostics["reference_trust/vp_path_kl_normalizer"] = (
+            normalizer.detach()
+        )
     if L_ref_2d is not None:
         reference_mean = L_ref_2d.detach().mean().clamp(min=1.0e-12)
         diagnostics["reference_trust/velocity_mse_ratio"] = (
             velocity_mse.detach() / reference_mean
         )
     return trust_loss, diagnostics
+
+
+def adaptive_trust_update_scale(
+    distance: float,
+    *,
+    delta: float,
+    warning_fraction: float,
+) -> tuple[float, bool]:
+    """Return a linear near-boundary step scale and a fail-closed stop flag."""
+
+    distance_f = float(distance)
+    delta_f = float(delta)
+    warning_f = float(warning_fraction)
+    if not math.isfinite(delta_f) or delta_f <= 0.0:
+        raise ValueError("adaptive trust delta must be finite and positive")
+    if not 0.0 < warning_f < 1.0:
+        raise ValueError("adaptive trust warning_fraction must lie in (0, 1)")
+    if not math.isfinite(distance_f):
+        return 0.0, True
+    if distance_f >= delta_f:
+        return 0.0, True
+    warning = warning_f * delta_f
+    if distance_f <= warning:
+        return 1.0, False
+    scale = (delta_f - distance_f) / (delta_f - warning)
+    return min(max(float(scale), 0.0), 1.0), False
+
+
+def adaptive_trust_backtracking_scales(
+    initial_scale: float,
+    *,
+    factor: float,
+    max_backtracks: int,
+) -> tuple[float, ...]:
+    """Return strictly decreasing absolute step scales for trust backtracking."""
+
+    scale = float(initial_scale)
+    factor_f = float(factor)
+    count = int(max_backtracks)
+    if not math.isfinite(scale) or not 0.0 < scale <= 1.0:
+        raise ValueError("adaptive trust initial_scale must lie in (0, 1]")
+    if not math.isfinite(factor_f) or not 0.0 < factor_f < 1.0:
+        raise ValueError("adaptive trust backtrack factor must lie in (0, 1)")
+    if count < 1:
+        raise ValueError("adaptive trust max_backtracks must be positive")
+    return tuple(scale * factor_f**index for index in range(1, count + 1))
+
+
+def reset_adam_first_moment(optimizer: Any) -> int:
+    """Zero Adam/AdamW ``exp_avg`` buffers without changing variance or LR state."""
+
+    state = getattr(optimizer, "state", None)
+    if state is None:
+        inner = getattr(optimizer, "optimizer", None)
+        state = getattr(inner, "state", None)
+    if state is None:
+        raise TypeError("optimizer does not expose an Adam-style state mapping")
+    reset = 0
+    for parameter_state in state.values():
+        if not isinstance(parameter_state, Mapping):
+            continue
+        first_moment = parameter_state.get("exp_avg")
+        if isinstance(first_moment, Tensor):
+            first_moment.zero_()
+            reset += 1
+    return reset
+
+
+@torch.no_grad()
+def rebase_trainable_params_for_extragradient_(
+    model: torch.nn.Module,
+    base_params: Mapping[str, Tensor],
+) -> int:
+    """Move parameters to the extragradient base without touching gradients.
+
+    The caller first evaluates/backpropagates the vector field at a virtual
+    look-ahead model.  Rebasing immediately before ``optimizer.step()`` makes
+    that look-ahead gradient update the original incumbent, which is the
+    defining predictive-corrective operation of extragradient.  Gradients and
+    optimizer state intentionally remain unchanged.
+    """
+
+    trainable = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    missing = sorted(set(trainable) - set(base_params))
+    extra = sorted(set(base_params) - set(trainable))
+    if missing or extra:
+        raise KeyError(
+            "extragradient base parameter keys differ from the live model: "
+            f"missing={missing[:5]} extra={extra[:5]}"
+        )
+    for name, parameter in trainable.items():
+        base = base_params[name]
+        if tuple(base.shape) != tuple(parameter.shape):
+            raise ValueError(
+                "extragradient base parameter shape differs for "
+                f"{name!r}: {tuple(base.shape)} vs {tuple(parameter.shape)}"
+            )
+        if not torch.isfinite(base).all():
+            raise FloatingPointError(
+                f"extragradient base parameter {name!r} is non-finite"
+            )
+        parameter.copy_(base.to(device=parameter.device, dtype=parameter.dtype))
+    return len(trainable)
 
 
 def predict_x0_normalized_from_velocity_diffusion(

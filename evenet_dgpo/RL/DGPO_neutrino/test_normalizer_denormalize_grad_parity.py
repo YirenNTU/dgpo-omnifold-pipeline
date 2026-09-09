@@ -72,6 +72,28 @@ def _make_normalizer(*, padding: int = 0, inv_cdf_index: list[int] | None = None
 
 
 class TestDenormalizeGradParity(unittest.TestCase):
+    def test_normalizer_forward_clears_nonfinite_padding(self) -> None:
+        norm = _make_normalizer()
+        x = torch.randn(2, 3, 4)
+        mask = torch.ones(2, 3, 1, dtype=torch.bool)
+        mask[:, -1] = False
+        x[:, -1] = float("nan")
+
+        out = norm(x, mask=mask)
+
+        self.assertTrue(torch.isfinite(out).all())
+        torch.testing.assert_close(out[:, -1], torch.zeros_like(out[:, -1]))
+
+    def test_normalizer_forward_does_not_hide_nonfinite_valid_input(self) -> None:
+        norm = _make_normalizer()
+        x = torch.randn(1, 2, 4)
+        mask = torch.ones(1, 2, 1, dtype=torch.bool)
+        x[0, 0, 0] = float("nan")
+
+        out = norm(x, mask=mask)
+
+        self.assertTrue(torch.isnan(out[0, 0, 0]))
+
     def test_forward_matches_original_without_inv_cdf(self) -> None:
         norm = _make_normalizer()
         x = torch.randn(5, 2, 4)

@@ -1,0 +1,17 @@
+# Classifier-only A/B/C, using the ALREADY generated and verified step-260 pool.
+# No DGPO, new diffusion generation, OmniFold stack, or W&B resume.
+replay_dir: /pscratch/sd/y/yiren/Ztautau/raw_monitor_replay_step260_old_vs_cold100_v1
+output_dir: /pscratch/sd/y/yiren/Ztautau/raw_monitor_init_ablation_step260_v1
+workers: 16
+steps: 200
+# Same fixed seed for all arm initializations, sample order and training dropout.
+seed: 20268895
+batch_size: 32768
+microbatch_size: 2048
+score_batch_size: 2048
+learning_rate: 0.0002
+weight_decay: 0.0005
+gradient_clip_norm: 5.0
+evaluation_steps: [0, 10, 25, 50, 100, 200]
+minimum_validation_events: 2000
+positive_control_auc_tolerance: 0.005

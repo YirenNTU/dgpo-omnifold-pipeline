@@ -403,6 +403,9 @@ def build_ztautau_validation_metrics(
                 "panels use a fixed unbiased policy draw and never select by reward"
             )
         bins = max(10, int(_cfg_get(metrics_config, "bins", 60)))
+        image_observables = _cfg_get(metrics_config, "image_observables", None)
+        if image_observables is not None:
+            image_observables = set(image_observables)
 
         observable_names = sorted(
             key[: -len("/truth")]
@@ -433,7 +436,7 @@ def build_ztautau_validation_metrics(
                 output[f"val_ztautau/residual/{label}/{name}/abs_mean"] = (
                     float(np.mean(np.abs(residual))) if residual.size else float("nan")
                 )
-            if include_images:
+            if include_images and (image_observables is None or name in image_observables):
                 output[f"val_ztautau/{name}"] = _overlay_image(
                     name, truth, current, reference, edges
                 )

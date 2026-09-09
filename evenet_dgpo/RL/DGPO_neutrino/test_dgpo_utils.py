@@ -36,11 +36,18 @@ sys.modules.setdefault("evenet.utilities.debug_tool", _dbg)
 from evenet.utilities.diffusion_sampler import get_logsnr_alpha_sigma
 
 from RL.DGPO_neutrino.dgpo_utils import (
+    REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE,
+    REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+    adaptive_trust_backtracking_scales,
+    adaptive_trust_update_scale,
     build_dgpo_loss,
     build_reference_trust_loss,
     compute_per_event_advantage,
     predict_x0_normalized_from_velocity_diffusion,
+    rebase_trainable_params_for_extragradient_,
+    reset_adam_first_moment,
     repeat_batch_for_candidates,
+    sample_cosine_vp_path_kl_timesteps,
 )
 from RL.DGPO_neutrino.sampling import generate_neutrino_candidates
 
@@ -244,6 +251,293 @@ class TestBuildDGPOLoss(unittest.TestCase):
 
 
 class TestReferenceTrustLoss(unittest.TestCase):
+    def test_sequential_vp_backward_matches_combined_gradient(self):
+        """Two independent backwards preserve the exact summed objective."""
+
+        torch.manual_seed(97)
+        K, B, features = 3, 4, 5
+        combined_model = torch.nn.Linear(features, features)
+        sequential_model = torch.nn.Linear(features, features)
+        sequential_model.load_state_dict(combined_model.state_dict())
+
+        main_inputs = torch.randn(K * B, features)
+        main_targets = torch.randn(K * B, features)
+        trust_inputs = torch.randn(K * B, features)
+        trust_reference = torch.randn(K * B, 1, features)
+        trust_mask = torch.ones(K * B, 1, 1)
+        reference_losses = torch.rand(K, B) + 0.25
+        advantages = torch.randn(K, B)
+        trust_coefficient = 0.37
+        accumulation_weight = 0.125
+
+        def _main_loss(module):
+            prediction = module(main_inputs)
+            current_losses = (
+                (prediction - main_targets).square().mean(dim=-1).reshape(K, B)
+            )
+            loss, _ = build_dgpo_loss(
+                current_losses,
+                reference_losses,
+                advantages,
+                beta_dgpo=1.0,
+                K=K,
+            )
+            return loss
+
+        def _trust_loss(module):
+            current_velocity = module(trust_inputs).reshape(K * B, 1, features)
+            loss, _ = build_reference_trust_loss(
+                current_velocity,
+                trust_reference,
+                trust_mask,
+                L_ref_2d=reference_losses,
+                objective=REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+                path_kl_normalizer=20.0,
+            )
+            return loss
+
+        combined_total = (
+            _main_loss(combined_model)
+            + trust_coefficient * _trust_loss(combined_model)
+        ) * accumulation_weight
+        combined_total.backward()
+
+        sequential_main = _main_loss(sequential_model)
+        (sequential_main * accumulation_weight).backward()
+        sequential_trust = _trust_loss(sequential_model)
+        (trust_coefficient * sequential_trust * accumulation_weight).backward()
+
+        torch.testing.assert_close(
+            combined_total.detach(),
+            (
+                sequential_main.detach()
+                + trust_coefficient * sequential_trust.detach()
+            )
+            * accumulation_weight,
+        )
+        for combined_parameter, sequential_parameter in zip(
+            combined_model.parameters(), sequential_model.parameters()
+        ):
+            torch.testing.assert_close(
+                combined_parameter.grad,
+                sequential_parameter.grad,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+
+    def test_cosine_vp_path_kl_sampler_is_stratified_and_normalized(self):
+        torch.manual_seed(101)
+        count, batch_size, total_strata, offset = 3, 7, 5, 1
+        times, normalizer = sample_cosine_vp_path_kl_timesteps(
+            count,
+            batch_size,
+            total_strata=total_strata,
+            stratum_offset=offset,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(times.shape, (count, batch_size))
+        self.assertEqual(times.dtype, torch.float32)
+        self.assertAlmostEqual(normalizer, 20.0, places=10)
+        self.assertTrue(torch.all((times >= 0.0) & (times <= 1.0)))
+
+        # Under rho(t)=w(t)/Z, the CDF is the normalized change in
+        # log(sigma(t)^2).  Every returned row must stay in its requested
+        # global stratum even after the nonlinear inverse-CDF transform.
+        _, _, sigma = get_logsnr_alpha_sigma(times.reshape(-1))
+        log_sigma_sq = sigma.double().square().log().reshape(count, batch_size)
+        log_sigma_sq_at_zero = -torch.nn.functional.softplus(
+            torch.tensor(20.0, dtype=torch.float64)
+        )
+        quantiles = (log_sigma_sq - log_sigma_sq_at_zero) / normalizer
+        for local_index in range(count):
+            lower = (offset + local_index) / total_strata
+            upper = (offset + local_index + 1) / total_strata
+            self.assertTrue(torch.all(quantiles[local_index] >= lower - 2e-6))
+            self.assertTrue(torch.all(quantiles[local_index] <= upper + 2e-6))
+
+    def test_cosine_vp_path_kl_sampler_validates_partition_and_dtype(self):
+        with self.assertRaisesRegex(ValueError, "within total_strata"):
+            sample_cosine_vp_path_kl_timesteps(
+                3,
+                2,
+                total_strata=4,
+                stratum_offset=2,
+            )
+        with self.assertRaisesRegex(TypeError, "floating-point"):
+            sample_cosine_vp_path_kl_timesteps(2, 2, dtype=torch.int64)
+        with self.assertRaisesRegex(ValueError, "logsnr_min"):
+            sample_cosine_vp_path_kl_timesteps(
+                2,
+                2,
+                logsnr_min=20.0,
+                logsnr_max=-20.0,
+            )
+
+    def test_vp_path_kl_uses_dimension_sum_and_keeps_legacy_diagnostics(self):
+        model_v = torch.tensor(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[2.0, 0.0], [1.0, 5.0]],
+            ],
+            requires_grad=True,
+        )
+        ref_v = torch.zeros_like(model_v, requires_grad=True)
+        mask = torch.tensor([[[1.0], [0.0]], [[1.0], [1.0]]])
+        normalizer = 20.0
+
+        loss, diagnostics = build_reference_trust_loss(
+            model_v,
+            ref_v,
+            mask,
+            L_ref_2d=torch.full((1, 2), 2.0),
+            objective=REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+            path_kl_normalizer=normalizer,
+        )
+
+        # Active per-row squared sums are 1^2+2^2=5 and
+        # 2^2+0^2+1^2+5^2=30: 0.5 * 20 * mean([5, 30]) = 175.
+        self.assertEqual(float(loss), 175.0)
+        self.assertEqual(float(diagnostics["reference_trust/vp_path_kl"]), 175.0)
+        self.assertEqual(float(diagnostics["reference_trust/loss"]), 175.0)
+        self.assertAlmostEqual(
+            float(diagnostics["reference_trust/velocity_mse"]),
+            35.0 / 6.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(diagnostics["reference_trust/velocity_mse_ratio"]),
+            (35.0 / 6.0) / 2.0,
+            places=6,
+        )
+
+        loss.backward()
+        self.assertIsNotNone(model_v.grad)
+        self.assertIsNone(ref_v.grad)
+        expected_gradient = normalizer / 2.0 * model_v.detach() * mask
+        torch.testing.assert_close(model_v.grad, expected_gradient)
+
+    def test_vp_path_kl_requires_positive_scalar_normalizer(self):
+        args = (
+            torch.ones(2, 1, 2),
+            torch.zeros(2, 1, 2),
+            torch.ones(2, 1, 1),
+        )
+        with self.assertRaisesRegex(ValueError, "requires path_kl_normalizer"):
+            build_reference_trust_loss(
+                *args,
+                objective=REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+            )
+        for invalid in (0.0, float("nan"), torch.ones(2)):
+            with self.subTest(normalizer=invalid):
+                with self.assertRaisesRegex(ValueError, "path_kl_normalizer"):
+                    build_reference_trust_loss(
+                        *args,
+                        objective=REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+                        path_kl_normalizer=invalid,
+                    )
+
+    def test_legacy_reference_trust_objective_is_unchanged(self):
+        model_v = torch.tensor([[[1.0, 3.0]]], requires_grad=True)
+        ref_v = torch.zeros_like(model_v)
+        loss, diagnostics = build_reference_trust_loss(
+            model_v,
+            ref_v,
+            torch.ones(1, 1, 1),
+            objective=REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE,
+        )
+        self.assertEqual(float(loss), 2.5)
+        self.assertNotIn("reference_trust/vp_path_kl", diagnostics)
+
+    def test_adaptive_backtracking_scales_are_absolute_and_decreasing(self):
+        scales = adaptive_trust_backtracking_scales(
+            0.8,
+            factor=0.5,
+            max_backtracks=4,
+        )
+        self.assertEqual(scales, (0.4, 0.2, 0.1, 0.05))
+
+    def test_adaptive_backtracking_rejects_invalid_factor(self):
+        with self.assertRaisesRegex(ValueError, "factor"):
+            adaptive_trust_backtracking_scales(
+                1.0,
+                factor=1.0,
+                max_backtracks=4,
+            )
+
+    def test_adaptive_boundary_scale(self):
+        scale, hit = adaptive_trust_update_scale(
+            0.0004,
+            delta=0.001,
+            warning_fraction=0.8,
+        )
+        self.assertEqual(scale, 1.0)
+        self.assertFalse(hit)
+
+        scale, hit = adaptive_trust_update_scale(
+            0.0009,
+            delta=0.001,
+            warning_fraction=0.8,
+        )
+        self.assertAlmostEqual(scale, 0.5)
+        self.assertFalse(hit)
+
+        scale, hit = adaptive_trust_update_scale(
+            0.001,
+            delta=0.001,
+            warning_fraction=0.8,
+        )
+        self.assertEqual(scale, 0.0)
+        self.assertTrue(hit)
+
+    def test_reset_adam_first_moment_preserves_second_moment(self):
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.AdamW([parameter], lr=0.1)
+        parameter.grad = torch.tensor([2.0])
+        optimizer.step()
+        second_before = optimizer.state[parameter]["exp_avg_sq"].clone()
+
+        reset_count = reset_adam_first_moment(optimizer)
+
+        self.assertEqual(reset_count, 1)
+        torch.testing.assert_close(
+            optimizer.state[parameter]["exp_avg"],
+            torch.zeros_like(parameter),
+        )
+        torch.testing.assert_close(
+            optimizer.state[parameter]["exp_avg_sq"],
+            second_before,
+        )
+
+    def test_extragradient_rebase_applies_lookahead_gradient_from_anchor(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(2.0)
+        anchor = {"weight": torch.tensor([[1.0]])}
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        loss = (model(torch.ones(1, 1)) - 4.0).square().mean()
+        loss.backward()
+        lookahead_gradient = model.weight.grad.detach().clone()
+        self.assertEqual(float(lookahead_gradient), -4.0)
+
+        count = rebase_trainable_params_for_extragradient_(model, anchor)
+        optimizer.step()
+
+        self.assertEqual(count, 1)
+        # The gradient was evaluated at weight=2, but the SGD update starts
+        # from the incumbent weight=1: 1 - 0.1*(-4) = 1.4.
+        torch.testing.assert_close(model.weight, torch.tensor([[1.4]]))
+
+    def test_extragradient_rebase_rejects_incomplete_snapshot(self):
+        model = torch.nn.Linear(1, 1, bias=True)
+        with self.assertRaisesRegex(KeyError, "keys differ"):
+            rebase_trainable_params_for_extragradient_(
+                model,
+                {"weight": model.weight.detach().clone()},
+            )
+
     def test_shared_policy_reference_match_is_zero(self):
         velocity = torch.randn(6, 2, 3)
         loss, diagnostics = build_reference_trust_loss(
@@ -322,6 +616,14 @@ class TestReferenceTrustLoss(unittest.TestCase):
                 torch.randn(4, 2, 3),
                 torch.randn(4, 2, 5),
                 torch.ones(4, 2, 1),
+            )
+
+    def test_mask_shape_mismatch_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "noise_mask"):
+            build_reference_trust_loss(
+                torch.randn(4, 2, 3),
+                torch.randn(4, 2, 3),
+                torch.ones(4, 4, 1),
             )
 
 

@@ -279,9 +279,22 @@ def load_pool(path: Path) -> dict[str, Any]:
 
 
 def build_fit_config(
-    block: Mapping[str, Any], *, n_train: int, n_validation: int
+    block: Mapping[str, Any], *, n_train: int, n_validation: int,
+    max_batch_population: int | None = None,
 ) -> RatioFitConfig:
     global_batch = int(block.get("batch_size", 8192))
+    if max_batch_population is not None:
+        from RL.DGPO_neutrino.omnifold_ztautau.ratio_fit import distributed_context
+
+        _, world_size = distributed_context()
+        available = min(int(n_train), int(max_batch_population))
+        if available < world_size:
+            raise ValueError("classifier fit population is smaller than the GPU worker count")
+        bounded_batch = min(global_batch, (available // world_size) * world_size)
+        if bounded_batch != global_batch:
+            _log.info("[DGPO/omnifold] small-pool global batch capped: %s -> %s (smallest fit=%s)",
+                      global_batch, bounded_batch, available)
+        global_batch = bounded_batch
     drop_last_batch = bool(block.get("drop_last_batch", False))
     steps_per_epoch = (
         int(n_train) // global_batch
@@ -314,6 +327,8 @@ def build_fit_config(
             max(1, math.ceil(float(block.get("min_epochs", 1)) * steps_per_epoch)),
         )
     )
+    if block.get("enforce_min_epochs", False):
+        min_steps = max(min_steps, math.ceil(float(block.get("min_epochs", 1)) * steps_per_epoch))
     return RatioFitConfig(
         steps=steps,
         batch_size=global_batch,
@@ -330,6 +345,11 @@ def build_fit_config(
             else float(block["backbone_learning_rate"])
         ),
         weight_decay=float(block.get("weight_decay", 1.0e-4)),
+        gradient_clip_norm=(
+            None
+            if block.get("gradient_clip_norm") is None
+            else float(block["gradient_clip_norm"])
+        ),
         sampling=str(block.get("sampling", "independent_epoch_shuffle")),
         min_steps=min_steps,
         validation_interval_steps=int(
@@ -354,6 +374,7 @@ def build_fit_config(
         ),
         require_saturation=bool(block.get("require_saturation", True)),
         train_candidates_per_event=1,
+        anomaly_detection_steps=int(block.get("anomaly_detection_steps", 0)),
     )
 
 
@@ -407,6 +428,9 @@ def fit_omnifold(
         adapter_bottleneck=int(config.get("adapter_bottleneck", 16)),
         train_layernorm=bool(config.get("train_layernorm", False)),
         train_encoder=bool(config.get("train_encoder", False)),
+        train_grouped_sequential_embedding=bool(
+            config.get("train_grouped_sequential_embedding", False)
+        ),
         train_invisible_projector=bool(
             config.get("train_invisible_projector", False)
         ),
@@ -472,6 +496,9 @@ def fit_omnifold(
             "adapter_bottleneck": int(config.get("adapter_bottleneck", 16)),
             "train_layernorm": bool(config.get("train_layernorm", False)),
             "train_encoder": bool(config.get("train_encoder", False)),
+            "train_grouped_sequential_embedding": bool(
+                config.get("train_grouped_sequential_embedding", False)
+            ),
             "train_invisible_projector": bool(
                 config.get("train_invisible_projector", False)
             ),

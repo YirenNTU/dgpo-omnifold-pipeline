@@ -47,9 +47,19 @@ class Normalizer(nn.Module):
         # Apply the log mask to the input tensor
         # x = torch.where(self.log_mask_expanded, torch.log1p(x), x)  # log1p(x) = log(1 + x) to avoid log(0) issues # TODO
         x = x.to(dtype=self.mean.dtype)
-        x = (x - self.mean) / self.std
+        mask_bool = None
         if mask is not None:
-            x = x * mask
+            # Multiplication is not a safe masking operation for padded
+            # inputs: IEEE-754 defines NaN * 0 as NaN.  Larger datasets are
+            # more likely to contain non-finite placeholder values in padded
+            # object slots, which would otherwise poison PET attention and
+            # its gradients.  Only padded entries are replaced; non-finite
+            # values in valid physics inputs remain visible to diagnostics.
+            mask_bool = mask.to(device=x.device, dtype=torch.bool)
+            x = torch.where(mask_bool, x, torch.zeros((), device=x.device, dtype=x.dtype))
+        x = (x - self.mean) / self.std
+        if mask_bool is not None:
+            x = torch.where(mask_bool, x, torch.zeros((), device=x.device, dtype=x.dtype))
         if len(self.inv_cdf_index) > 0:
             # After normalization, apply inverse CDF transformation
             x_partial = x[..., self.inv_cdf_index].contiguous()
@@ -59,8 +69,12 @@ class Normalizer(nn.Module):
             x_partial = (x_partial + (math.sqrt(3))) / (2 * (math.sqrt(3)))
             x_partial = torch.clamp(x_partial, 1e-6, 1 - 1e-6)
             x[..., self.inv_cdf_index] = self.normal.icdf(x_partial)
-            if mask is not None:
-                x = x * mask
+            if mask_bool is not None:
+                x = torch.where(
+                    mask_bool,
+                    x,
+                    torch.zeros((), device=x.device, dtype=x.dtype),
+                )
 
         return x
 

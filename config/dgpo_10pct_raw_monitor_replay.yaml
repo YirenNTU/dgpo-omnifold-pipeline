@@ -1,0 +1,18 @@
+# Standalone evaluation only. Does NOT launch DGPO or train any classifier.
+# Old/new validation intersection avoids leakage across the changed packing hash.
+base_config: config/train_diffusion_nersc.yaml
+old_overlay: config/dgpo_omnifold_ztautau_10pct_arch_control.yaml
+new_overlay: config/dgpo_omnifold_ztautau_10pct_arch_fourier_conditioning.yaml
+policy_checkpoint: /global/u2/y/yiren/Ztautau/Scaling_Law/10pct_checkpoint/f6b4ec46_step260/dgpo-epoch=25-next_ep=26-step=260.ckpt
+old_checkpoint: /global/u2/y/yiren/Ztautau/Scaling_Law/10pct_checkpoint/f6b4ec46_step260/dgpo-epoch=25-next_ep=26-step=260.ckpt
+# Must be the completed step-0 raw-monitor baseline, not the preceding bootstrap
+# without a monitor, and not last.ckpt after any DGPO policy updates.
+new_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_arch_fourier_conditioning_from260_minfold1000_warm12_monitorcold100_seed42/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+expected_policy_state_sha256: dc66b775e474070c12aa9f3bc5f67436921fa1dd36d78202ac4f9ed75d376378
+output_dir: /pscratch/sd/y/yiren/Ztautau/raw_monitor_replay_step260_old_vs_cold100_v1
+workers: 16
+pool_events: 250000
+generation_batch_size: 1024
+score_batch_size: 2048
+minimum_validation_events: 2000
+seed: 20260905

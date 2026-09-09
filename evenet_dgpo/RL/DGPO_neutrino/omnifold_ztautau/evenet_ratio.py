@@ -5,8 +5,9 @@ no detector response to invert.  Each round therefore fits one residual conditio
 density ratio and adds its logit to the cumulative log weight.  There is deliberately
 no OmniFold Step-2 projection classifier in this module.
 
-The adaptive path owns one reusable classifier architecture and creates fresh
-cross-fit fold instances for every residual. It trains PET's registered internal
+The adaptive path owns one reusable classifier architecture and creates separate
+cross-fit fold instances for every residual. Selected iterations can initialize
+from the previous round's weights using persistent event-based folds. It trains PET's registered internal
 adapters and may also fine-tune the complete active EveNet body, saving held-out
 improvements over the exact null classifier, and propagating only out-of-fold
 logits into later training weights. A no-op/invalid classifier is not part of the reward. Runtime
@@ -19,7 +20,7 @@ import hashlib
 import logging
 import math
 from copy import deepcopy
-from dataclasses import dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -34,6 +35,14 @@ from evenet.network.body.embedding import PointCloudPositionalEmbedding
 _log = logging.getLogger(__name__)
 
 _EVENT_KEYS = ("x", "x_mask", "conditions", "conditions_mask")
+_PAIRWISE_CONTEXT_KEYS = (
+    "lead_a_visible_px",
+    "lead_a_visible_py",
+    "lead_a_visible_pz",
+    "lead_b_visible_px",
+    "lead_b_visible_py",
+    "lead_b_visible_pz",
+)
 
 
 @dataclass(frozen=True)
@@ -57,24 +66,45 @@ class EventPackingSpec:
 
 
 def pack_event_inputs(
-    batch: Mapping[str, Any], spec: EventPackingSpec | None = None
+    batch: Mapping[str, Any],
+    spec: EventPackingSpec | None = None,
+    *,
+    include_pairwise_context: bool = False,
 ) -> tuple[Tensor, EventPackingSpec]:
-    """Pack the four deterministic EveNet inputs into one ``(B, D)`` tensor."""
+    """Pack deterministic EveNet inputs into one ``(B, D)`` tensor.
 
-    missing = [key for key in _EVENT_KEYS if not isinstance(batch.get(key), Tensor)]
+    Legacy reward checkpoints contain only ``_EVENT_KEYS``.  New topology-aware
+    classifiers additionally retain the two visible tau-leg four-vector
+    directions required to construct exact periodic pair features.  Passing an
+    existing ``spec`` always reproduces that checkpoint's original byte layout.
+    """
+
+    keys = (
+        tuple(spec.shapes)
+        if spec is not None
+        else _EVENT_KEYS
+        + (_PAIRWISE_CONTEXT_KEYS if include_pairwise_context else ())
+    )
+    missing = [key for key in keys if not isinstance(batch.get(key), Tensor)]
     if missing:
         raise KeyError(f"EveNet ratio classifier needs tensor inputs {missing}")
-    tensors = {key: batch[key] for key in _EVENT_KEYS}
+    tensors = {key: batch[key] for key in keys}
     batch_size = int(tensors["x"].shape[0])
     if any(int(value.shape[0]) != batch_size for value in tensors.values()):
         raise ValueError("all packed EveNet inputs must share their batch dimension")
     observed = EventPackingSpec(
-        {key: tuple(int(v) for v in value.shape[1:]) for key, value in tensors.items()}
+        {
+            key: tuple(int(v) for v in value.shape[1:])
+            for key, value in tensors.items()
+        }
     )
     if spec is not None and observed != spec:
         raise ValueError(f"event input shapes changed: expected {spec.shapes}, got {observed.shapes}")
     packed = torch.cat(
-        [tensors[key].reshape(batch_size, -1).to(dtype=torch.float32) for key in _EVENT_KEYS],
+        [
+            tensors[key].reshape(batch_size, -1).to(dtype=torch.float32)
+            for key in keys
+        ],
         dim=-1,
     )
     return packed, observed
@@ -87,13 +117,101 @@ def unpack_event_inputs(packed: Tensor, spec: EventPackingSpec) -> dict[str, Ten
         raise ValueError(f"packed events must be (B, {spec.width}), got {tuple(packed.shape)}")
     result: dict[str, Tensor] = {}
     offset = 0
-    for key in _EVENT_KEYS:
+    for key in spec.shapes:
         shape = spec.shapes[key]
         width = int(np.prod(shape))
         value = packed[:, offset : offset + width].reshape(len(packed), *shape)
         result[key] = value > 0.5 if key.endswith("mask") else value
         offset += width
     return result
+
+
+def periodic_tau_pair_features(
+    packed_event: Tensor,
+    candidate_flat: Tensor,
+    packing_spec: EventPackingSpec,
+    *,
+    max_harmonic: int = 1,
+    include_theta_pair: bool = False,
+) -> Tensor:
+    """Exact smooth pair features derived from visible legs and candidate deltas.
+
+    The returned channels are ``sin(n*delta_phi_tau)`` and
+    ``cos(n*delta_phi_tau)`` for ``n=1..max_harmonic``, followed by the 3D
+    tau-direction cosine. Optional normalized theta difference/sum channels
+    complete the pair geometry. They are
+    deterministic transformations of inputs already defining the conditional
+    density ratio, so exposing them changes finite-capacity efficiency rather
+    than the optimal OmniFold ratio.
+    """
+
+    if candidate_flat.ndim not in (2, 3) or int(candidate_flat.shape[-1]) != 4:
+        raise ValueError(
+            "periodic pair features require candidate shape (B,4) or (B,K,4), "
+            f"got {tuple(candidate_flat.shape)}"
+        )
+    if int(max_harmonic) < 1:
+        raise ValueError("max_harmonic must be at least one")
+    batch = unpack_event_inputs(packed_event, packing_spec)
+    missing = [key for key in _PAIRWISE_CONTEXT_KEYS if key not in batch]
+    if missing:
+        raise ValueError(
+            "periodic pair features require packed visible tau-leg directions; "
+            f"missing {missing}"
+        )
+
+    def _visible_angles(prefix: str) -> tuple[Tensor, Tensor]:
+        px = batch[f"{prefix}_px"].reshape(len(packed_event))
+        py = batch[f"{prefix}_py"].reshape(len(packed_event))
+        pz = batch[f"{prefix}_pz"].reshape(len(packed_event))
+        pt = torch.sqrt(px.square() + py.square() + 1.0e-12)
+        return torch.atan2(pt, pz), torch.atan2(py, px)
+
+    theta_vis_a, phi_vis_a = _visible_angles("lead_a_visible")
+    theta_vis_b, phi_vis_b = _visible_angles("lead_b_visible")
+    candidate = candidate_flat.reshape(*candidate_flat.shape[:-1], 2, 2)
+    if candidate_flat.ndim == 3:
+        theta_vis_a = theta_vis_a[:, None]
+        phi_vis_a = phi_vis_a[:, None]
+        theta_vis_b = theta_vis_b[:, None]
+        phi_vis_b = phi_vis_b[:, None]
+    theta_a = theta_vis_a + candidate[..., 0, 0]
+    theta_b = theta_vis_b + candidate[..., 1, 0]
+    phi_a = phi_vis_a + candidate[..., 0, 1]
+    phi_b = phi_vis_b + candidate[..., 1, 1]
+    delta_phi = phi_a - phi_b
+    harmonics: list[Tensor] = []
+    for frequency in range(1, int(max_harmonic) + 1):
+        harmonics.extend(
+            (
+                torch.sin(float(frequency) * delta_phi),
+                torch.cos(float(frequency) * delta_phi),
+            )
+        )
+    cos_delta_phi = harmonics[1]
+    cos_opening = (
+        torch.sin(theta_a) * torch.sin(theta_b) * cos_delta_phi
+        + torch.cos(theta_a) * torch.cos(theta_b)
+    )
+    features = [*harmonics, cos_opening]
+    if include_theta_pair:
+        features.extend(
+            (
+                (theta_a - theta_b) / math.pi,
+                (theta_a + theta_b) / math.pi - 1.0,
+            )
+        )
+    return torch.stack(features, dim=-1)
+
+
+def periodic_tau_pair_feature_dim(
+    max_harmonic: int = 1,
+    *,
+    include_theta_pair: bool = False,
+) -> int:
+    if int(max_harmonic) < 1:
+        raise ValueError("max_harmonic must be at least one")
+    return 2 * int(max_harmonic) + 1 + (2 if include_theta_pair else 0)
 
 
 PEFT_SCHEMA_VERSION = 6
@@ -134,6 +252,7 @@ def configure_adapter_training(
     *,
     train_layernorm: bool = False,
     train_encoder: bool = False,
+    train_grouped_sequential_embedding: bool = False,
     train_invisible_projector: bool = False,
     train_backbone: bool = False,
 ) -> None:
@@ -143,6 +262,8 @@ def configure_adapter_training(
     additionally opens every module on this classifier's forward path,
     including PET attention.
     ``train_encoder`` opens GlobalEmbedding (AdaLN event token).
+    ``train_grouped_sequential_embedding`` opens the visible-object input
+    embedding without unfreezing PET attention or the rest of the backbone.
     ``train_invisible_projector`` opens only the projector that maps normalized
     neutrino features into the PET input basis. ObjectEncoder is unused on this
     path. ``train_layernorm`` opens every affine norm in the body.
@@ -173,6 +294,15 @@ def configure_adapter_training(
                     parameter.requires_grad_(True)
         model.eval()
         return
+    if train_grouped_sequential_embedding:
+        grouped_embedding = getattr(model, "GroupedSequentialEmbedding", None)
+        if grouped_embedding is None:
+            raise ValueError(
+                "train_grouped_sequential_embedding=true requires "
+                "backbone.GroupedSequentialEmbedding"
+            )
+        for parameter in grouped_embedding.parameters():
+            parameter.requires_grad_(True)
     if train_layernorm:
         for module in model.modules():
             if _is_norm_module(module):
@@ -367,6 +497,66 @@ class CandidateConditionedRatioHead(AdaLNZeroCandidateDecoder):
         return self.output(hidden.reshape(hidden.shape[0], -1)).squeeze(-1)
 
 
+class PeriodicPairAuditClassifier(nn.Module):
+    """Small independent judge for the two-tau angular relationship only."""
+
+    def __init__(
+        self,
+        packing_spec: EventPackingSpec,
+        *,
+        hidden_dim: int = 64,
+        dropout: float = 0.10,
+        max_harmonic: int = 1,
+        include_theta_pair: bool = False,
+    ) -> None:
+        super().__init__()
+        if hidden_dim < 1:
+            raise ValueError("topology audit hidden_dim must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("topology audit dropout must lie in [0, 1)")
+        missing = [
+            key for key in _PAIRWISE_CONTEXT_KEYS if key not in packing_spec.shapes
+        ]
+        if missing:
+            raise ValueError(
+                "topology audit requires visible tau-leg context; "
+                f"missing {missing}"
+            )
+        self.packing_spec = packing_spec
+        self.max_harmonic = int(max_harmonic)
+        self.include_theta_pair = bool(include_theta_pair)
+        feature_dim = periodic_tau_pair_feature_dim(
+            self.max_harmonic,
+            include_theta_pair=self.include_theta_pair,
+        )
+        self.network = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 1),
+        )
+        final = self.network[-1]
+        assert isinstance(final, nn.Linear)
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+
+    def forward(self, packed_event: Tensor, candidate_flat: Tensor) -> Tensor:
+        output_shape = candidate_flat.shape[:-1]
+        features = periodic_tau_pair_features(
+            packed_event,
+            candidate_flat,
+            self.packing_spec,
+            max_harmonic=self.max_harmonic,
+            include_theta_pair=self.include_theta_pair,
+        )
+        logits = self.network(features.reshape(-1, features.shape[-1])).squeeze(-1)
+        return logits.reshape(output_shape)
+
+
 class EvenetRatioPEFTBank(nn.Module):
     """Slot identity, decoder, and scalar readout for an internal-adapter PET."""
 
@@ -380,21 +570,72 @@ class EvenetRatioPEFTBank(nn.Module):
         num_heads: int,
         max_position_length: int,
         dropout: float,
+        pairwise_feature_dim: int = 0,
+        topology_fourier_embedding: bool = False,
+        topology_conditioning: bool = False,
+        topology_hidden_dim: int = 64,
+        topology_embedding_dim: int = 32,
+        topology_fusion_hidden_dim: int = 64,
+        topology_dropout: float = 0.15,
     ) -> None:
         super().__init__()
         self.position_encoder = PointCloudPositionalEmbedding(
             num_points=int(max_position_length),
             embed_dim=int(token_dim),
         )
+        self.topology_conditioning = bool(topology_conditioning)
+        if self.topology_conditioning and not topology_fourier_embedding:
+            raise ValueError("topology_conditioning requires topology_fourier_embedding")
         self.decoder = AdaLNZeroCandidateDecoder(
             token_dim=int(token_dim),
-            event_dim=int(event_dim),
+            event_dim=int(event_dim) + (int(topology_embedding_dim) if self.topology_conditioning else 0),
             hidden_dim=int(hidden_dim),
             num_layers=int(num_layers),
             num_heads=int(num_heads),
             dropout=float(dropout),
         )
-        self.output = nn.Linear(self.decoder.num_slots * int(hidden_dim), 1)
+        self.pairwise_feature_dim = int(pairwise_feature_dim)
+        self.topology_fourier_embedding = bool(topology_fourier_embedding)
+        decoder_width = self.decoder.num_slots * int(hidden_dim)
+        if self.topology_fourier_embedding:
+            if self.pairwise_feature_dim < 1:
+                raise ValueError("Fourier topology embedding requires pair features")
+            if min(
+                int(topology_hidden_dim),
+                int(topology_embedding_dim),
+                int(topology_fusion_hidden_dim),
+            ) < 1:
+                raise ValueError("Fourier topology embedding dimensions must be positive")
+            if not 0.0 <= float(topology_dropout) < 1.0:
+                raise ValueError("topology_dropout must lie in [0, 1)")
+            self.topology_encoder = nn.Sequential(
+                nn.LayerNorm(self.pairwise_feature_dim),
+                nn.Linear(self.pairwise_feature_dim, int(topology_hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(float(topology_dropout)),
+                nn.Linear(int(topology_hidden_dim), int(topology_embedding_dim)),
+                nn.GELU(),
+            )
+            if self.topology_conditioning:
+                # Fourier context controls every decoder block through AdaLN;
+                # keep the ordinary two-token readout, with no late-fusion path.
+                self.output = nn.Linear(decoder_width, 1)
+            else:
+                self.fusion = nn.Sequential(
+                    nn.LayerNorm(decoder_width + int(topology_embedding_dim)),
+                    nn.Linear(
+                        decoder_width + int(topology_embedding_dim),
+                        int(topology_fusion_hidden_dim),
+                    ),
+                    nn.GELU(),
+                    nn.Dropout(float(topology_dropout)),
+                )
+                self.output = nn.Linear(int(topology_fusion_hidden_dim), 1)
+        else:
+            self.output = nn.Linear(
+                decoder_width + self.pairwise_feature_dim,
+                1,
+            )
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
@@ -407,6 +648,15 @@ class EvenetRatioPEFTBank(nn.Module):
         hidden_dim: int,
         num_layers: int,
         num_heads: int,
+        periodic_pair_features: bool = False,
+        topology_fourier_embedding: bool = False,
+        topology_conditioning: bool = False,
+        topology_max_harmonic: int = 1,
+        topology_include_theta_pair: bool = False,
+        topology_hidden_dim: int = 64,
+        topology_embedding_dim: int = 32,
+        topology_fusion_hidden_dim: int = 64,
+        topology_dropout: float = 0.15,
         position_state: Mapping[str, Tensor] | None = None,
     ) -> "EvenetRatioPEFTBank":
         pet_cfg = backbone.network_cfg.Body.PET
@@ -424,6 +674,20 @@ class EvenetRatioPEFTBank(nn.Module):
             num_heads=int(num_heads),
             max_position_length=int(getattr(truth_cfg, "max_position_length", 36)),
             dropout=float(dropout),
+            pairwise_feature_dim=(
+                periodic_tau_pair_feature_dim(
+                    topology_max_harmonic,
+                    include_theta_pair=topology_include_theta_pair,
+                )
+                if periodic_pair_features
+                else 0
+            ),
+            topology_fourier_embedding=topology_fourier_embedding,
+            topology_conditioning=topology_conditioning,
+            topology_hidden_dim=topology_hidden_dim,
+            topology_embedding_dim=topology_embedding_dim,
+            topology_fusion_hidden_dim=topology_fusion_hidden_dim,
+            topology_dropout=topology_dropout,
         )
         if position_state is not None:
             try:
@@ -441,6 +705,25 @@ class EvenetRatioPEFTBank(nn.Module):
         ]
         if missing:
             raise ValueError(f"EveNet PEFT bank is missing required groups: {missing}")
+        if self.topology_fourier_embedding:
+            for prefix in (("topology_encoder.",) if self.topology_conditioning else ("topology_encoder.", "fusion.")):
+                if not any(key.startswith(prefix) for key in keys):
+                    raise ValueError(
+                        f"Fourier topology PEFT bank is missing {prefix}"
+                    )
+
+    def score(self, decoder_readout: Tensor, pair_features: Tensor | None) -> Tensor:
+        if self.topology_conditioning:
+            return self.output(decoder_readout).squeeze(-1)
+        if self.topology_fourier_embedding:
+            if pair_features is None:
+                raise ValueError("Fourier topology bank requires pair features")
+            topology = self.topology_encoder(pair_features)
+            fused = self.fusion(torch.cat((decoder_readout, topology), dim=-1))
+            return self.output(fused).squeeze(-1)
+        if pair_features is not None:
+            decoder_readout = torch.cat((decoder_readout, pair_features), dim=-1)
+        return self.output(decoder_readout).squeeze(-1)
 
 
 class EvenetAdapterRatioClassifier(nn.Module):
@@ -456,9 +739,19 @@ class EvenetAdapterRatioClassifier(nn.Module):
         bank: EvenetRatioPEFTBank | None = None,
         train_layernorm: bool = False,
         train_encoder: bool = False,
+        train_grouped_sequential_embedding: bool = False,
         train_invisible_projector: bool = False,
         train_backbone: bool = False,
         asymmetric_attention: bool = False,
+        periodic_pair_features: bool = False,
+        topology_fourier_embedding: bool = False,
+        topology_conditioning: bool = False,
+        topology_max_harmonic: int = 1,
+        topology_include_theta_pair: bool = False,
+        topology_hidden_dim: int = 64,
+        topology_embedding_dim: int = 32,
+        topology_fusion_hidden_dim: int = 64,
+        topology_dropout: float = 0.15,
         head_dropout: float | None = None,
         decoder_hidden_dim: int | None = None,
         decoder_layers: int | None = None,
@@ -485,16 +778,37 @@ class EvenetAdapterRatioClassifier(nn.Module):
             backbone,
             train_layernorm=train_layernorm,
             train_encoder=train_encoder,
+            train_grouped_sequential_embedding=(
+                train_grouped_sequential_embedding
+            ),
             train_invisible_projector=train_invisible_projector,
             train_backbone=train_backbone,
         )
         self._train_layernorm = bool(train_layernorm)
         self._train_encoder = bool(train_encoder)
+        self._train_grouped_sequential_embedding = bool(
+            train_grouped_sequential_embedding
+        )
+        self._include_train_grouped_sequential_embedding_in_payload = True
         self._train_invisible_projector = bool(train_invisible_projector)
         self._include_train_invisible_projector_in_payload = True
         self._train_backbone = bool(train_backbone)
         self._asymmetric_attention = bool(asymmetric_attention)
         self._include_asymmetric_attention_in_payload = True
+        self._periodic_pair_features = bool(periodic_pair_features)
+        self._include_periodic_pair_features_in_payload = True
+        self._topology_fourier_embedding = bool(topology_fourier_embedding)
+        self._topology_conditioning = bool(topology_conditioning)
+        if self._topology_fourier_embedding and not self._periodic_pair_features:
+            raise ValueError(
+                "topology_fourier_embedding requires periodic_pair_features"
+            )
+        self._topology_max_harmonic = int(topology_max_harmonic)
+        self._topology_include_theta_pair = bool(topology_include_theta_pair)
+        self._topology_hidden_dim = int(topology_hidden_dim)
+        self._topology_embedding_dim = int(topology_embedding_dim)
+        self._topology_fusion_hidden_dim = int(topology_fusion_hidden_dim)
+        self._topology_dropout = float(topology_dropout)
         self._backbone_state_keys = tuple(
             name
             for name, parameter in backbone.named_parameters()
@@ -502,6 +816,15 @@ class EvenetAdapterRatioClassifier(nn.Module):
         )
         self._shared = _SharedModuleRef(backbone)
         self.packing_spec = packing_spec
+        if self._periodic_pair_features:
+            missing_pair_context = [
+                key for key in _PAIRWISE_CONTEXT_KEYS if key not in packing_spec.shapes
+            ]
+            if missing_pair_context:
+                raise ValueError(
+                    "periodic pair features require visible tau-leg context in the "
+                    f"packing spec; missing {missing_pair_context}"
+                )
         self.bank_name = bank_name
         self.base_digest = base_digest or _module_digest(backbone)
         obj_cfg = backbone.network_cfg.Body.ObjectEncoder
@@ -546,6 +869,15 @@ class EvenetAdapterRatioClassifier(nn.Module):
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
+            periodic_pair_features=self._periodic_pair_features,
+            topology_fourier_embedding=self._topology_fourier_embedding,
+            topology_conditioning=self._topology_conditioning,
+            topology_max_harmonic=self._topology_max_harmonic,
+            topology_include_theta_pair=self._topology_include_theta_pair,
+            topology_hidden_dim=self._topology_hidden_dim,
+            topology_embedding_dim=self._topology_embedding_dim,
+            topology_fusion_hidden_dim=self._topology_fusion_hidden_dim,
+            topology_dropout=self._topology_dropout,
             position_state=position_state,
         )
         self.bank.assert_complete()
@@ -564,8 +896,14 @@ class EvenetAdapterRatioClassifier(nn.Module):
             for group, prefix in (
                 ("head", "bank.decoder."),
                 ("output", "bank.output."),
+                ("topology_encoder", "bank.topology_encoder."),
+                ("fusion", "bank.fusion."),
                 ("position_encoder", "bank.position_encoder."),
                 ("object_encoder", "backbone.ObjectEncoder."),
+                (
+                    "grouped_sequential_embedding",
+                    "backbone.GroupedSequentialEmbedding.",
+                ),
                 ("global_embedding", "backbone.GlobalEmbedding."),
                 ("invisible_projector", "backbone.InvisibleInputProjector."),
                 ("pet", "backbone.PET."),
@@ -577,6 +915,17 @@ class EvenetAdapterRatioClassifier(nn.Module):
             for parameter in self.parameters()
             if parameter.requires_grad
         )
+        if (
+            self._train_grouped_sequential_embedding
+            and self.trainable_parameter_counts[
+                "grouped_sequential_embedding"
+            ]
+            <= 0
+        ):
+            raise RuntimeError(
+                "OmniFold requested a trainable GroupedSequentialEmbedding, "
+                "but none of its parameters reached the classifier optimizer view"
+            )
         if (
             self._train_invisible_projector
             and self.trainable_parameter_counts["invisible_projector"] <= 0
@@ -606,6 +955,8 @@ class EvenetAdapterRatioClassifier(nn.Module):
             self.backbone.train(mode)
         else:
             self.backbone.eval()
+            if self._train_grouped_sequential_embedding:
+                self.backbone.GroupedSequentialEmbedding.train(mode)
             # Internal adapters are trainable even when the pretrained body is
             # frozen; enable their dropout without enabling frozen PET dropout.
             self.backbone.PET.adapters.train(mode)
@@ -737,12 +1088,23 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 f"({self.num_invisible_slots} slots x {self.invisible_input_dim} features), "
                 f"got {tuple(candidate_flat.shape)}"
             )
+        pair_features = None
+        if self._periodic_pair_features:
+            pair_features = periodic_tau_pair_features(
+                packed_event,
+                candidate_flat,
+                self.packing_spec,
+                max_harmonic=self._topology_max_harmonic,
+                include_theta_pair=self._topology_include_theta_pair,
+            )
         if candidate_flat.ndim == 3:
             bsz, count = int(candidate_flat.shape[0]), int(candidate_flat.shape[1])
             if int(packed_event.shape[0]) != bsz:
                 raise ValueError("event and candidate batch dimensions do not match")
             packed_event = packed_event[:, None, :].expand(-1, count, -1).reshape(bsz * count, -1)
             candidate_flat = candidate_flat.reshape(bsz * count, self.candidate_width)
+            if pair_features is not None:
+                pair_features = pair_features.reshape(bsz * count, -1)
         elif candidate_flat.ndim != 2:
             raise ValueError(
                 "candidate sample must be (B,F) or (B,K,F), "
@@ -758,6 +1120,20 @@ class EvenetAdapterRatioClassifier(nn.Module):
         if conditions.ndim == 2:
             conditions = conditions.unsqueeze(1)
         conditions_mask = batch["conditions_mask"].reshape(len(x), 1, 1)
+        # A multiplication-based mask cannot remove NaN padding (NaN * 0 is
+        # still NaN).  Clear only invalid slots before any learned projection;
+        # non-finite values in valid slots deliberately remain visible to the
+        # fit-time fail-fast diagnostics.
+        x = torch.where(
+            x_mask.bool(),
+            x,
+            torch.zeros((), device=x.device, dtype=x.dtype),
+        )
+        conditions = torch.where(
+            conditions_mask.bool(),
+            conditions,
+            torch.zeros((), device=conditions.device, dtype=conditions.dtype),
+        )
         expected = getattr(self.backbone.global_normalizer, "mean", None)
         if expected is not None and int(conditions.shape[-1]) != int(expected.shape[-1]):
             raise ValueError(
@@ -819,7 +1195,28 @@ class EvenetAdapterRatioClassifier(nn.Module):
         )
         memory_tokens = encoded[:, :n_visible]
         memory_mask = visible_mask
+        # Multihead cross-attention is undefined for a row whose every memory
+        # key is masked.  Some CUDA kernels return finite zeros in the forward
+        # pass but NaN gradients in the backward pass.  Supply one neutral
+        # sentinel only for truly empty visible events.  Ordinary events and
+        # their physics content are unchanged.
+        if n_visible < 1:
+            raise ValueError("EveNet ratio classifier needs at least one visible slot")
+        empty_visible = ~memory_mask.squeeze(-1).any(dim=1)
+        memory_tokens = torch.cat(
+            (memory_tokens, memory_tokens.new_zeros(len(x), 1, memory_tokens.shape[-1])),
+            dim=1,
+        )
+        memory_mask = torch.cat(
+            (memory_mask, empty_visible[:, None, None]),
+            dim=1,
+        )
         event_token = self._event_token_from_global(global_embedding)
+        if self.bank.topology_conditioning:
+            if pair_features is None:
+                raise ValueError("Fourier decoder conditioning requires candidate pair features")
+            topology = self.bank.topology_encoder(pair_features.to(event_token))
+            event_token = torch.cat((event_token, topology), dim=-1)
         candidate_tokens = self.bank.position_encoder(
             x=encoded[:, n_visible:],
             time_mask=invisible_mask.to(encoded.dtype),
@@ -831,7 +1228,13 @@ class EvenetAdapterRatioClassifier(nn.Module):
             memory_mask=memory_mask,
             event_token=event_token,
         )
-        logits = self.bank.output(hidden.reshape(hidden.shape[0], -1)).squeeze(-1)
+        readout = hidden.reshape(hidden.shape[0], -1)
+        if pair_features is not None:
+            pair_features = pair_features.to(
+                device=readout.device,
+                dtype=readout.dtype,
+            )
+        logits = self.bank.score(readout, pair_features)
         return logits.reshape(output_shape)
 
     def peft_payload(self) -> dict[str, Any]:
@@ -868,6 +1271,14 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 "train_backbone": self._train_backbone,
             }
             if getattr(
+                self,
+                "_include_train_grouped_sequential_embedding_in_payload",
+                True,
+            ):
+                classifier_config["train_grouped_sequential_embedding"] = (
+                    self._train_grouped_sequential_embedding
+                )
+            if getattr(
                 self, "_include_train_invisible_projector_in_payload", True
             ):
                 classifier_config["train_invisible_projector"] = (
@@ -877,7 +1288,30 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 classifier_config["asymmetric_attention"] = (
                     self._asymmetric_attention
                 )
+            if getattr(self, "_include_periodic_pair_features_in_payload", True):
+                classifier_config["periodic_pair_features"] = (
+                    self._periodic_pair_features
+                )
+            if (
+                self._topology_fourier_embedding
+                or self._topology_max_harmonic != 1
+                or self._topology_include_theta_pair
+            ):
+                classifier_config.update(
+                    {
+                        "topology_fourier_embedding": self._topology_fourier_embedding,
+                        "topology_max_harmonic": self._topology_max_harmonic,
+                        "topology_include_theta_pair": self._topology_include_theta_pair,
+                        "topology_hidden_dim": self._topology_hidden_dim,
+                        "topology_embedding_dim": self._topology_embedding_dim,
+                        "topology_fusion_hidden_dim": self._topology_fusion_hidden_dim,
+                        "topology_dropout": self._topology_dropout,
+                    }
+                )
             classifier_config["adapter_placement"] = "internal"
+            # Omit the default to preserve legacy PEFT payload digests.
+            if self._topology_conditioning:
+                classifier_config["topology_conditioning"] = True
             payload["classifier_config"] = classifier_config
         return payload
 
@@ -902,8 +1336,16 @@ class EvenetAdapterRatioClassifier(nn.Module):
             "train_invisible_projector"
             in dict(payload.get("classifier_config") or {})
         )
+        model._include_train_grouped_sequential_embedding_in_payload = (
+            "train_grouped_sequential_embedding"
+            in dict(payload.get("classifier_config") or {})
+        )
         model._include_asymmetric_attention_in_payload = (
             "asymmetric_attention"
+            in dict(payload.get("classifier_config") or {})
+        )
+        model._include_periodic_pair_features_in_payload = (
+            "periodic_pair_features"
             in dict(payload.get("classifier_config") or {})
         )
         expected_width = int(payload.get("candidate_width", model.candidate_width))
@@ -1001,9 +1443,19 @@ class EvenetAdapterModelBuilder:
         adapter_bottleneck: int = 16,
         train_layernorm: bool = False,
         train_encoder: bool = False,
+        train_grouped_sequential_embedding: bool = False,
         train_invisible_projector: bool = False,
         train_backbone: bool = False,
         asymmetric_attention: bool = False,
+        periodic_pair_features: bool = False,
+        topology_fourier_embedding: bool = False,
+        topology_conditioning: bool = False,
+        topology_max_harmonic: int = 1,
+        topology_include_theta_pair: bool = False,
+        topology_hidden_dim: int = 64,
+        topology_embedding_dim: int = 32,
+        topology_fusion_hidden_dim: int = 64,
+        topology_dropout: float = 0.15,
         head_dropout: float | None = None,
         decoder_hidden_dim: int | None = None,
         decoder_layers: int | None = None,
@@ -1042,9 +1494,21 @@ class EvenetAdapterModelBuilder:
         self._device = device
         self._train_layernorm = bool(train_layernorm)
         self._train_encoder = bool(train_encoder)
+        self._train_grouped_sequential_embedding = bool(
+            train_grouped_sequential_embedding
+        )
         self._train_invisible_projector = bool(train_invisible_projector)
         self._train_backbone = bool(train_backbone)
         self._asymmetric_attention = bool(asymmetric_attention)
+        self._periodic_pair_features = bool(periodic_pair_features)
+        self._topology_fourier_embedding = bool(topology_fourier_embedding)
+        self._topology_conditioning = bool(topology_conditioning)
+        self._topology_max_harmonic = int(topology_max_harmonic)
+        self._topology_include_theta_pair = bool(topology_include_theta_pair)
+        self._topology_hidden_dim = int(topology_hidden_dim)
+        self._topology_embedding_dim = int(topology_embedding_dim)
+        self._topology_fusion_hidden_dim = int(topology_fusion_hidden_dim)
+        self._topology_dropout = float(topology_dropout)
         self._head_dropout = None if head_dropout is None else float(head_dropout)
         self._adapter_bottleneck = int(adapter_bottleneck)
         self._decoder_hidden_dim = decoder_hidden_dim
@@ -1104,6 +1568,15 @@ class EvenetAdapterModelBuilder:
         decoder_hidden_dim: int | None = None,
         decoder_layers: int | None = None,
         decoder_heads: int | None = None,
+        periodic_pair_features: bool | None = None,
+        topology_fourier_embedding: bool | None = None,
+        topology_conditioning: bool | None = None,
+        topology_max_harmonic: int | None = None,
+        topology_include_theta_pair: bool | None = None,
+        topology_hidden_dim: int | None = None,
+        topology_embedding_dim: int | None = None,
+        topology_fusion_hidden_dim: int | None = None,
+        topology_dropout: float | None = None,
     ) -> EvenetRatioPEFTBank:
         source = self._backbone if backbone is None else backbone
         resolved_dropout = (
@@ -1119,6 +1592,49 @@ class EvenetAdapterModelBuilder:
         )
         resolved_heads = (
             self._decoder_heads if decoder_heads is None else int(decoder_heads)
+        )
+        resolved_periodic_pair_features = (
+            self._periodic_pair_features
+            if periodic_pair_features is None
+            else bool(periodic_pair_features)
+        )
+        resolved_topology_fourier_embedding = (
+            self._topology_fourier_embedding
+            if topology_fourier_embedding is None
+            else bool(topology_fourier_embedding)
+        )
+        resolved_topology_conditioning = (
+            self._topology_conditioning if topology_conditioning is None else bool(topology_conditioning)
+        )
+        resolved_topology_max_harmonic = (
+            self._topology_max_harmonic
+            if topology_max_harmonic is None
+            else int(topology_max_harmonic)
+        )
+        resolved_topology_include_theta_pair = (
+            self._topology_include_theta_pair
+            if topology_include_theta_pair is None
+            else bool(topology_include_theta_pair)
+        )
+        resolved_topology_hidden_dim = (
+            self._topology_hidden_dim
+            if topology_hidden_dim is None
+            else int(topology_hidden_dim)
+        )
+        resolved_topology_embedding_dim = (
+            self._topology_embedding_dim
+            if topology_embedding_dim is None
+            else int(topology_embedding_dim)
+        )
+        resolved_topology_fusion_hidden_dim = (
+            self._topology_fusion_hidden_dim
+            if topology_fusion_hidden_dim is None
+            else int(topology_fusion_hidden_dim)
+        )
+        resolved_topology_dropout = (
+            self._topology_dropout
+            if topology_dropout is None
+            else float(topology_dropout)
         )
         return EvenetRatioPEFTBank.from_backbone(
             source,
@@ -1142,6 +1658,15 @@ class EvenetAdapterModelBuilder:
                     1,
                 )
             ),
+            periodic_pair_features=resolved_periodic_pair_features,
+            topology_fourier_embedding=resolved_topology_fourier_embedding,
+            topology_conditioning=resolved_topology_conditioning,
+            topology_max_harmonic=resolved_topology_max_harmonic,
+            topology_include_theta_pair=resolved_topology_include_theta_pair,
+            topology_hidden_dim=resolved_topology_hidden_dim,
+            topology_embedding_dim=resolved_topology_embedding_dim,
+            topology_fusion_hidden_dim=resolved_topology_fusion_hidden_dim,
+            topology_dropout=resolved_topology_dropout,
             position_state=self._position_state,
         ).to(self._device)
 
@@ -1157,9 +1682,19 @@ class EvenetAdapterModelBuilder:
         decoder_layers: int | None = None,
         decoder_heads: int | None = None,
         adapter_bottleneck: int | None = None,
+        train_grouped_sequential_embedding: bool | None = None,
         train_invisible_projector: bool | None = None,
         train_backbone: bool | None = None,
         asymmetric_attention: bool | None = None,
+        periodic_pair_features: bool | None = None,
+        topology_fourier_embedding: bool | None = None,
+        topology_conditioning: bool | None = None,
+        topology_max_harmonic: int | None = None,
+        topology_include_theta_pair: bool | None = None,
+        topology_hidden_dim: int | None = None,
+        topology_embedding_dim: int | None = None,
+        topology_fusion_hidden_dim: int | None = None,
+        topology_dropout: float | None = None,
     ) -> EvenetAdapterRatioClassifier:
         if (
             bank is None
@@ -1173,6 +1708,11 @@ class EvenetAdapterModelBuilder:
             if train_invisible_projector is None
             else bool(train_invisible_projector)
         )
+        resolved_train_grouped_sequential_embedding = (
+            self._train_grouped_sequential_embedding
+            if train_grouped_sequential_embedding is None
+            else bool(train_grouped_sequential_embedding)
+        )
         resolved_train_backbone = (
             self._train_backbone
             if train_backbone is None
@@ -1182,6 +1722,49 @@ class EvenetAdapterModelBuilder:
             self._asymmetric_attention
             if asymmetric_attention is None
             else bool(asymmetric_attention)
+        )
+        resolved_periodic_pair_features = (
+            self._periodic_pair_features
+            if periodic_pair_features is None
+            else bool(periodic_pair_features)
+        )
+        resolved_topology_fourier_embedding = (
+            self._topology_fourier_embedding
+            if topology_fourier_embedding is None
+            else bool(topology_fourier_embedding)
+        )
+        resolved_topology_conditioning = (
+            self._topology_conditioning if topology_conditioning is None else bool(topology_conditioning)
+        )
+        resolved_topology_max_harmonic = (
+            self._topology_max_harmonic
+            if topology_max_harmonic is None
+            else int(topology_max_harmonic)
+        )
+        resolved_topology_include_theta_pair = (
+            self._topology_include_theta_pair
+            if topology_include_theta_pair is None
+            else bool(topology_include_theta_pair)
+        )
+        resolved_topology_hidden_dim = (
+            self._topology_hidden_dim
+            if topology_hidden_dim is None
+            else int(topology_hidden_dim)
+        )
+        resolved_topology_embedding_dim = (
+            self._topology_embedding_dim
+            if topology_embedding_dim is None
+            else int(topology_embedding_dim)
+        )
+        resolved_topology_fusion_hidden_dim = (
+            self._topology_fusion_hidden_dim
+            if topology_fusion_hidden_dim is None
+            else int(topology_fusion_hidden_dim)
+        )
+        resolved_topology_dropout = (
+            self._topology_dropout
+            if topology_dropout is None
+            else float(topology_dropout)
         )
         # Internal PET adapters are always trainable, so every classifier/fold
         # must own an isolated body even when the rest of the backbone is frozen.
@@ -1193,6 +1776,15 @@ class EvenetAdapterModelBuilder:
                 decoder_hidden_dim=decoder_hidden_dim,
                 decoder_layers=decoder_layers,
                 decoder_heads=decoder_heads,
+                periodic_pair_features=resolved_periodic_pair_features,
+                topology_fourier_embedding=resolved_topology_fourier_embedding,
+                topology_conditioning=resolved_topology_conditioning,
+                topology_max_harmonic=resolved_topology_max_harmonic,
+                topology_include_theta_pair=resolved_topology_include_theta_pair,
+                topology_hidden_dim=resolved_topology_hidden_dim,
+                topology_embedding_dim=resolved_topology_embedding_dim,
+                topology_fusion_hidden_dim=resolved_topology_fusion_hidden_dim,
+                topology_dropout=resolved_topology_dropout,
             )
             if name is not None:
                 self._banks[name] = bank
@@ -1202,9 +1794,21 @@ class EvenetAdapterModelBuilder:
             bank=bank,
             train_layernorm=self._train_layernorm,
             train_encoder=self._train_encoder,
+            train_grouped_sequential_embedding=(
+                resolved_train_grouped_sequential_embedding
+            ),
             train_invisible_projector=resolved_train_invisible_projector,
             train_backbone=resolved_train_backbone,
             asymmetric_attention=resolved_asymmetric_attention,
+            periodic_pair_features=resolved_periodic_pair_features,
+            topology_fourier_embedding=resolved_topology_fourier_embedding,
+            topology_conditioning=resolved_topology_conditioning,
+            topology_max_harmonic=resolved_topology_max_harmonic,
+            topology_include_theta_pair=resolved_topology_include_theta_pair,
+            topology_hidden_dim=resolved_topology_hidden_dim,
+            topology_embedding_dim=resolved_topology_embedding_dim,
+            topology_fusion_hidden_dim=resolved_topology_fusion_hidden_dim,
+            topology_dropout=resolved_topology_dropout,
             head_dropout=(
                 self._head_dropout if head_dropout is None else head_dropout
             ),
@@ -1257,9 +1861,26 @@ def peft_bank_factory(
     name: str | None = None,
     *,
     reset: bool = True,
+    classifier_overrides: Mapping[str, Any] | None = None,
 ) -> Callable[[], EvenetAdapterRatioClassifier]:
     """Build one classifier view, resetting the named bank when requested."""
 
+    overrides = dict(classifier_overrides or {})
+    if overrides:
+        dropout_keys = {"head_dropout", "topology_dropout"}
+        dimension_keys = {"decoder_hidden_dim", "decoder_layers", "decoder_heads"}
+        flag_keys = {"periodic_pair_features", "topology_fourier_embedding", "topology_conditioning"}
+        if set(overrides) - dropout_keys - dimension_keys - flag_keys:
+            raise ValueError("Unsupported classifier architecture override")
+        if any(not 0.0 <= float(overrides[key]) < 1.0 for key in dropout_keys & overrides.keys()):
+            raise ValueError("Classifier dropout must be in [0, 1)")
+        if any(type(overrides[key]) is not int or overrides[key] < 1 for key in dimension_keys & overrides.keys()):
+            raise ValueError("Classifier dimensions must be positive integers")
+        if any(type(overrides[key]) is not bool for key in flag_keys & overrides.keys()):
+            raise ValueError("Classifier feature flags must be boolean")
+        if not hasattr(builder, "make_classifier"):
+            raise TypeError("Classifier overrides require make_classifier")
+        return lambda: builder.make_classifier(packing_spec, name, reset=reset, **overrides)
     if name == "audit" and hasattr(builder, "reset_audit_bank"):
         return lambda: builder.reset_audit_bank(packing_spec)
     if hasattr(builder, "make_classifier"):
@@ -1280,6 +1901,7 @@ class ResidualIterationDiagnostics:
     validation_loss_gain: float
     accepted: bool
     rejection_reason: str | None = None
+    warm_started_folds: tuple[int, ...] = ()
 
     @property
     def saturated(self) -> bool:
@@ -1316,6 +1938,7 @@ class ResidualRatioResult:
     diagnostics: tuple[Any, ...]
     train_log_weight: Tensor
     validation_log_weight: Tensor | None
+    warm_start_state: dict[str, Any] | None = None
 
     @property
     def iterations(self) -> int:
@@ -1324,7 +1947,7 @@ class ResidualRatioResult:
 
 @dataclass(frozen=True)
 class EvenetAuditResult:
-    """Final event-held-out metrics from a fresh temporary EveNet judge."""
+    """Final evaluation metrics from a fresh temporary EveNet judge."""
 
     auc: float
     auc_gap: float
@@ -1335,6 +1958,10 @@ class EvenetAuditResult:
     fit_events: int
     early_stop_events: int
     audit_events: int
+    warm_started: bool = False
+    training_min_steps: int = 0
+    training_steps_per_epoch: int = 0
+    training_ready: bool = False
 
 
 @torch.no_grad()
@@ -1430,10 +2057,16 @@ def _seeded_model(
         return model_factory()
 
 
-def _scaled_crossfit_config(fit_config: Any, train_fraction: float) -> Any:
+def _scaled_crossfit_config(
+    fit_config: Any, train_fraction: float, *, min_steps_per_fold: int = 0,
+) -> Any:
     """Preserve epoch-based controls when a fold trains on fewer events."""
 
+    if type(min_steps_per_fold) is not int or min_steps_per_fold < 0:
+        raise ValueError("min_steps_per_fold must be a nonnegative integer")
     if not is_dataclass(fit_config):
+        if min_steps_per_fold:
+            raise TypeError("min_steps_per_fold requires a dataclass fit configuration")
         return fit_config
     fraction = float(train_fraction)
     if not 0.0 < fraction <= 1.0:
@@ -1466,6 +2099,11 @@ def _scaled_crossfit_config(fit_config: Any, train_fraction: float) -> Any:
             "checkpoint_interval_steps", allow_zero=True
         ),
     }
+    # This is an absolute optimizer-update floor AFTER fold-size scaling.
+    # A global min_steps=1000 would otherwise become roughly 500 per fold.
+    if steps is not None and steps < min_steps_per_fold:
+        raise ValueError("classifier step budget is smaller than min_steps_per_fold")
+    updates["min_steps"] = max(updates["min_steps"], min_steps_per_fold)
     return replace(fit_config, **updates)
 
 
@@ -1486,6 +2124,44 @@ def _crossfit_splits(
         fit_parts = [part for index, part in enumerate(holdouts) if index != fold]
         fit_index = torch.cat(fit_parts, dim=0)
         pairs.append((fit_index.to(device), holdout.to(device)))
+    return tuple(pairs)
+
+
+def _identity_crossfit_splits(
+    condition: Tensor, *, folds: int, seed: int
+) -> tuple[tuple[Tensor, Tensor], ...]:
+    """Keep an identity in the same fold across Ray reorderings and refits.
+
+    Only visible conditions enter the hash, never generated samples or policy
+    noise. Identical conditions always stay together, including duplicate rows.
+    Hash on rank zero and broadcast labels to avoid repeating CPU work per GPU.
+    """
+    from RL.DGPO_neutrino.omnifold_ztautau.ratio_fit import (
+        _broadcast_tensor, distributed_context,
+    )
+
+    rank, world = distributed_context()
+    labels = torch.zeros(len(condition), dtype=torch.int64, device=condition.device)
+    if rank == 0:
+        assignments = np.empty(len(condition), dtype=np.int64)
+        salt = f"residual-condition-v1:{int(seed)}:".encode()
+        for start in range(0, len(condition), 8192):
+            rows = condition[start:start + 8192].detach().cpu().numpy()
+            rows = np.array(rows, dtype="<f4", order="C", copy=True)
+            rows[rows == 0] = 0  # Canonicalize signed zero.
+            for offset, row in enumerate(rows):
+                digest = hashlib.sha256(salt + row.tobytes()).digest()
+                assignments[start + offset] = int.from_bytes(digest[:8], "little") % folds
+        labels.copy_(torch.from_numpy(assignments).to(labels.device))
+    if world > 1:
+        _broadcast_tensor(labels)
+    pairs = []
+    for fold in range(folds):
+        fit_index = torch.nonzero(labels != fold, as_tuple=True)[0]
+        holdout_index = torch.nonzero(labels == fold, as_tuple=True)[0]
+        if min(len(fit_index), len(holdout_index)) < 2:
+            raise ValueError("identity cross-fitting needs at least two events in each fold")
+        pairs.append((fit_index, holdout_index))
     return tuple(pairs)
 
 
@@ -1556,6 +2232,11 @@ def fit_residual_ratio_stack(
     validation_gen_sample: Tensor | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     device: torch.device | None = None,
+    warm_start_iterations: tuple[int, ...] = (),
+    warm_start_state: Mapping[str, Any] | None = None,
+    crossfit_seed: int | None = None,
+    crossfit_partition: str = "auto",
+    min_steps_per_fold: int = 0,
 ) -> ResidualRatioResult:
     """Fit safe residual increments with event-level cross-fitting.
 
@@ -1566,6 +2247,12 @@ def fit_residual_ratio_stack(
     threshold. Held-out BCE remains diagnostic but is not an outer-iteration gate.
     The first no-op/invalid proposal is kept in diagnostics but never added to the
     reward stack.
+
+    ``warm_start_iterations`` reuses only the corresponding previous fold's
+    weights. Matching event-hash fold provenance is mandatory; legacy or changed
+    protocols start fresh. Cumulative weights and classifier optimizers always
+    start fresh. The selected fitted models (including closure-only fits) are
+    returned as a CPU cache for the next refit.
     """
 
     from RL.DGPO_neutrino.omnifold_ztautau.ratio_fit import (
@@ -1610,12 +2297,48 @@ def fit_residual_ratio_stack(
         raise ValueError(
             "cross-fitted residual populations must share event identities"
         )
-    fold_pairs = _crossfit_splits(
-        n_events,
-        folds=int(crossfit_folds),
-        seed=int(seed) + 313,
-        device=gen_sample.device,
-    )
+    selected_iterations = tuple(int(value) for value in warm_start_iterations)
+    if crossfit_partition not in ("auto", "identity"):
+        raise ValueError("crossfit_partition must be 'auto' or 'identity'")
+    if type(min_steps_per_fold) is not int or min_steps_per_fold < 0:
+        raise ValueError("min_steps_per_fold must be a nonnegative integer")
+    if len(set(selected_iterations)) != len(selected_iterations) or any(
+        value < 1 or value > int(iterations) for value in selected_iterations
+    ):
+        raise ValueError("warm_start_iterations must be unique ids in [1, iterations]")
+    protocol = None
+    initial_states: dict[tuple[int, int], Mapping[str, Tensor]] = {}
+    if selected_iterations or crossfit_partition == "identity":
+        if not torch.equal(data_condition, gen_condition):
+            raise ValueError("warm-start cross-fitting requires paired event conditions")
+        protocol = {
+            "scheme": "condition_sha256_v1",
+            "folds": int(crossfit_folds),
+            "seed": int(seed if crossfit_seed is None else crossfit_seed),
+            "condition_width": int(gen_condition.shape[-1]),
+        }
+        fold_pairs = _identity_crossfit_splits(
+            gen_condition, folds=int(crossfit_folds), seed=protocol["seed"]
+        )
+        if warm_start_state is not None and warm_start_state.get("protocol") == protocol:
+            for entry in warm_start_state.get("models", ()):
+                iteration_id, fold_id = int(entry["iteration"]), int(entry["fold"])
+                if iteration_id in selected_iterations:
+                    key = (iteration_id, fold_id)
+                    if key in initial_states or not 1 <= fold_id <= int(crossfit_folds):
+                        raise ValueError("invalid or duplicate warm-start fold")
+                    initial_states[key] = entry["state"]
+        elif selected_iterations:
+            _log.info(
+                "[DGPO/omnifold] warm start unavailable: no matching saved fold "
+                "protocol; fit fresh classifiers and save identity-stable folds."
+            )
+    else:
+        fold_pairs = _crossfit_splits(
+            n_events, folds=int(crossfit_folds), seed=int(seed) + 313,
+            device=gen_sample.device,
+        )
+    next_warm_models: list[dict[str, Any]] = []
 
     train_logw = torch.zeros(
         gen_sample.shape[:-1],
@@ -1653,6 +2376,7 @@ def fit_residual_ratio_stack(
         validation_gen_logit: Tensor | None = None
         fold_snapshots: list[dict[str, Tensor]] = []
         fold_diagnostics: list[Any] = []
+        warm_started_folds: list[int] = []
         for fold_index, (fit_index, holdout_index) in enumerate(
             fold_pairs, start=1
         ):
@@ -1662,10 +2386,34 @@ def fit_residual_ratio_stack(
                 seed=fold_seed,
                 device=fit_device,
             ).to(fit_device)
+            initial_state = initial_states.get((iteration, fold_index))
+            if initial_state is not None:
+                # Copy weights into a fresh trainable instance. The installed
+                # reward stays frozen; no previous Adam moments or log weights
+                # are reused. Validate before a potentially partial load.
+                current_state = model.state_dict()
+                if set(initial_state) != set(current_state) or any(
+                    initial_state[key].shape != current_state[key].shape
+                    for key in current_state
+                ):
+                    raise ValueError("warm-start classifier architecture does not match")
+                if any(not torch.isfinite(value).all() for value in initial_state.values()):
+                    raise FloatingPointError("warm-start classifier has non-finite weights")
+                model.load_state_dict(initial_state, strict=True)
+                warm_started_folds.append(fold_index)
+            _log.info(
+                "[DGPO/omnifold] residual iteration=%s fold=%s warm_started=%s; "
+                "new optimizer and fresh policy samples",
+                iteration, fold_index, initial_state is not None,
+            )
             fold_config = _scaled_crossfit_config(
                 fit_config,
                 float(len(fit_index)) / float(n_events),
+                min_steps_per_fold=min_steps_per_fold,
             )
+            _log.info("[DGPO/omnifold] residual iteration=%s fold=%s minimum_updates=%s partition=%s",
+                      iteration, fold_index, getattr(fold_config, "min_steps", None),
+                      "identity" if selected_iterations or crossfit_partition == "identity" else "index")
             validation = (
                 validation_data_condition,
                 validation_data_sample,
@@ -1688,11 +2436,13 @@ def fit_residual_ratio_stack(
                 progress_callback=(
                     None
                     if progress_callback is None
-                    else lambda row, iteration=iteration, fold_index=fold_index: (
+                    else lambda row, iteration=iteration, fold_index=fold_index,
+                    warm_started=initial_state is not None: (
                         progress_callback(
                             {
                                 "iteration": float(iteration),
                                 "fold": float(fold_index),
+                                "warm_started": float(warm_started),
                                 **row,
                             }
                         )
@@ -1711,6 +2461,11 @@ def fit_residual_ratio_stack(
                     for name, value in model.state_dict().items()
                 }
             )
+            if iteration in selected_iterations:
+                next_warm_models.append({
+                    "iteration": iteration, "fold": fold_index,
+                    "state": fold_snapshots[-1],
+                })
             holdout_condition = gen_condition[holdout_index].to(fit_device)
             holdout_sample = gen_sample[holdout_index].to(fit_device)
             holdout_logit = _score_population(
@@ -1779,6 +2534,7 @@ def fit_residual_ratio_stack(
             validation_loss_gain=float(loss_gain),
             accepted=bool(useful),
             rejection_reason=rejection_reason,
+            warm_started_folds=tuple(warm_started_folds),
         )
         diagnostics.append(iteration_diag)
         if progress_callback is not None:
@@ -1798,6 +2554,7 @@ def fit_residual_ratio_stack(
                 "validation_loss_gain": float(loss_gain),
                 "accepted": float(useful),
                 "saturated": float(iteration_diag.saturated),
+                "warm_started_folds": float(len(warm_started_folds)),
             })
         if not useful:
             if not snapshots:
@@ -1839,7 +2596,29 @@ def fit_residual_ratio_stack(
         diagnostics=tuple(diagnostics),
         train_log_weight=train_logw.detach(),
         validation_log_weight=val_logw.detach(),
+        warm_start_state=(
+            {"protocol": protocol, "models": next_warm_models}
+            if protocol is not None else None
+        ),
     )
+
+
+def validate_monitor_training_readiness(value: Any) -> dict[str, float] | None:
+    """Validate opt-in, event-epoch training floors without an AUC target."""
+    if value is None:
+        return None
+    keys = {"cold_start_min_epochs", "warm_start_min_epochs"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise ValueError("monitor training_readiness requires cold_start_min_epochs and warm_start_min_epochs")
+    result = {}
+    for key in keys:
+        raw = value[key]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw < 1:
+            raise ValueError(f"monitor {key} must be finite and >= 1")
+        result[key] = float(raw)
+    if result["cold_start_min_epochs"] < result["warm_start_min_epochs"]:
+        raise ValueError("monitor cold-start floor must be >= warm-start floor")
+    return result
 
 
 def fit_independent_evenet_audit(
@@ -1854,17 +2633,41 @@ def fit_independent_evenet_audit(
     seed: int,
     audit_fraction: float = 0.20,
     early_stop_fraction: float = 0.20,
+    reuse_early_stop_for_audit: bool = False,
     early_stop_auc_gap: float | None = None,
+    early_stop_balanced_accuracy_lcb: float | None = None,
+    early_stop_balanced_accuracy_confidence_z: float = 1.96,
+    early_stop_balanced_accuracy_required_consecutive: int = 1,
+    warm_start_cache: dict[str, Any] | None = None,
+    identity_split_seed: int | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    training_readiness: Mapping[str, Any] | None = None,
 ) -> EvenetAuditResult:
-    """Fit a fresh temporary EveNet judge and score untouched event identities.
+    """Fit a temporary EveNet judge and score evaluation identities.
 
     Splitting happens before the candidate axis is flattened, so every candidate from
-    one event stays in exactly one of fit, early-stop, or final-audit.  The caller must
-    provide a factory that is distinct from all reward-classifier factories.
+    one event stays in exactly one split. By default fit, early-stop, and final-audit
+    are disjoint. ``reuse_early_stop_for_audit`` instead uses an 80/20 train/validation
+    protocol and reports final metrics on the restored-best model's validation split.
+    The caller must provide a factory distinct from all reward-classifier factories.
+    Optional raw-monitor warm starts use condition-hashed 80/20 identities and
+    transfer only weights, never optimizer or early-stopping state. Without a
+    cache (including trust monitors), initialization remains fresh.
+    Optional training readiness gives cold and certified warm fits separate
+    event-epoch floors. A completed fit certifies the training budget, not the
+    statistical power of this architecture or equality of the distributions.
     """
 
-    from RL.DGPO_neutrino.omnifold_ztautau.ratio_fit import fit_density_ratio
+    from RL.DGPO_neutrino.omnifold_ztautau.ratio_fit import RatioFitConfig, fit_density_ratio
+
+    readiness = validate_monitor_training_readiness(training_readiness)
+    if readiness is not None:
+        if not isinstance(fit_config, RatioFitConfig) or fit_config.sampling != "independent_epoch_shuffle":
+            raise ValueError("monitor training_readiness requires epoch-shuffle RatioFitConfig")
+        if not reuse_early_stop_for_audit or early_stop_fraction != .20 or identity_split_seed is None:
+            raise ValueError("monitor training_readiness requires identity-stable 80/20 train/validation")
+        if early_stop_auc_gap is not None or early_stop_balanced_accuracy_lcb is not None:
+            raise ValueError("monitor training_readiness cannot use classifier-trust threshold early stopping")
 
     n_events = int(data_condition.shape[0])
     if not (
@@ -1877,11 +2680,17 @@ def fit_independent_evenet_audit(
         raise ValueError("audit populations must share event identities")
     if n_events < 30:
         raise ValueError("independent EveNet audit needs at least 30 events")
-    if not 0.0 < audit_fraction < 0.5 or not 0.0 < early_stop_fraction < 0.5:
-        raise ValueError("audit and early-stop fractions must lie in (0, 0.5)")
+    if not 0.0 < early_stop_fraction < 0.5:
+        raise ValueError("early-stop fraction must lie in (0, 0.5)")
+    if not reuse_early_stop_for_audit and not 0.0 < audit_fraction < 0.5:
+        raise ValueError("audit fraction must lie in (0, 0.5)")
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
     order = torch.randperm(n_events, generator=generator)
-    n_audit = max(1, int(round(n_events * audit_fraction)))
+    n_audit = (
+        0
+        if reuse_early_stop_for_audit
+        else max(1, int(round(n_events * audit_fraction)))
+    )
     n_early = max(1, int(round(n_events * early_stop_fraction)))
     if n_audit + n_early >= n_events:
         raise ValueError("audit split leaves no fit events")
@@ -1892,8 +2701,69 @@ def fit_independent_evenet_audit(
     fit_idx, early_idx, audit_idx = (
         fit_idx.to(device), early_idx.to(device), audit_idx.to(device)
     )
+    split_seed = int(seed if identity_split_seed is None else identity_split_seed)
+    protocol = {"schema": "raw-monitor-condition-split-v1", "seed": split_seed, "folds": 5}
+    if warm_start_cache is not None or identity_split_seed is not None:
+        if not reuse_early_stop_for_audit or early_stop_fraction != 0.20:
+            raise ValueError("warm-start raw monitor requires identity-stable 80/20 train/validation")
+        # Never let an old training identity become validation when Ray reorders
+        # rows or the pool grows. The visible condition, not generated x, owns
+        # the assignment. Duplicate conditions therefore stay together too.
+        fit_idx, early_idx = _identity_crossfit_splits(
+            data_condition, folds=5, seed=split_seed,
+        )[0]
 
     model = _seeded_model(model_factory, seed=int(seed) + 71, device=device).to(device)
+    initial_state = (
+        warm_start_cache.get("state")
+        if warm_start_cache is not None and warm_start_cache.get("protocol") == protocol
+        else None
+    )
+    training_policy = None
+    if readiness is not None:
+        training_policy = {
+            "schema": "raw-monitor-training-readiness-v1",
+            "epoch_floors": readiness,
+            "fit_config": asdict(fit_config),
+            "condition_width": int(data_condition.shape[-1]),
+        }
+        if initial_state is not None and warm_start_cache.get("training_policy") != training_policy:
+            # An old 60-step null fit is not a certified warm start. This also
+            # rejects changed training/packing protocols without mutating cache.
+            initial_state = None
+            _log.info("[DGPO/omnifold] raw monitor training protocol changed or uncertified; cold-start fitting required")
+    if initial_state is not None:
+        current_state = model.state_dict()
+        if set(initial_state) != set(current_state) or any(
+            initial_state[key].shape != current_state[key].shape for key in current_state
+        ):
+            raise ValueError("raw monitor warm-start architecture mismatch")
+        if any(not torch.isfinite(value).all() for value in initial_state.values()):
+            raise FloatingPointError("raw monitor warm-start weights are non-finite")
+        model.load_state_dict(initial_state, strict=True)
+    training_steps_per_epoch = 0
+    if readiness is not None:
+        training_steps_per_epoch = (
+            len(fit_idx) // fit_config.batch_size if fit_config.drop_last_batch
+            else max(1, math.ceil(len(fit_idx) / fit_config.batch_size))
+        )
+        if training_steps_per_epoch < 1:
+            raise ValueError("monitor training fold is smaller than its drop-last batch")
+        min_epochs = readiness["warm_start_min_epochs" if initial_state is not None else "cold_start_min_epochs"]
+        fit_config = replace(
+            fit_config,
+            min_steps=max(fit_config.min_steps, math.ceil(min_epochs * training_steps_per_epoch)),
+            require_saturation=True,
+        )
+        fit_config.validate()  # Fail before training if a finite budget is too short.
+        _log.info(
+            "[DGPO/omnifold] raw monitor training budget: warm_started=%s fit_events=%s "
+            "steps_per_epoch=%s min_epochs=%s min_steps=%s patience_evaluations=%s",
+            initial_state is not None, len(fit_idx), training_steps_per_epoch,
+            min_epochs, fit_config.min_steps, fit_config.validation_patience_evaluations,
+        )
+    _log.info("[DGPO/omnifold] raw/audit warm_started=%s; optimizer and early stopping reset",
+              initial_state is not None)
     n_params = sum(int(parameter.numel()) for parameter in model.parameters())
     _log.info(
         "[DGPO/omnifold] audit classifier ready on %s (%s params); "
@@ -1946,43 +2816,72 @@ def fit_independent_evenet_audit(
         progress_callback=(
             None
             if progress_callback is None
-            else lambda row: progress_callback({"iteration": 1.0, **row})
+            else lambda row: progress_callback({
+                "iteration": 1.0, "warm_started": float(initial_state is not None), **row,
+            })
         ),
         validation_evaluator=evaluate_early_stop,
         stop_when_validation_auc_gap_exceeds=early_stop_auc_gap,
+        stop_when_validation_balanced_accuracy_lcb_exceeds=(
+            early_stop_balanced_accuracy_lcb
+        ),
+        validation_balanced_accuracy_lcb_confidence_z=(
+            early_stop_balanced_accuracy_confidence_z
+        ),
+        validation_balanced_accuracy_lcb_events_per_class=int(len(early_idx)),
+        validation_balanced_accuracy_lcb_required_consecutive=(
+            early_stop_balanced_accuracy_required_consecutive
+        ),
     )
     if bool(getattr(fit_config, "require_saturation", False)) and not bool(
         getattr(diagnostics, "saturated", False)
     ):
         raise RuntimeError("independent EveNet audit did not saturate")
+    training_ready = bool(
+        readiness is not None and diagnostics.saturated
+        and int(diagnostics.steps_completed or 0) >= fit_config.min_steps
+    )
+    if readiness is not None and not training_ready:
+        raise RuntimeError("raw monitor did not complete its required training budget; no cache or baseline committed")
     model.eval()
-    # Score the held-out split in batches and shard it across ranks. A single
+    score_idx = early_idx if reuse_early_stop_for_audit else audit_idx
+    # Score the selected evaluation split in batches and shard it across ranks. A single
     # full-population forward is both an OOM risk and 16x redundant work when
     # every rank runs the same audit.
     data_score = _score_population(
-        model, data_condition[audit_idx], data_sample[audit_idx], score_batch
+        model, data_condition[score_idx], data_sample[score_idx], score_batch
     ).reshape(-1)
     gen_score = _score_population(
-        model, gen_condition[audit_idx], gen_sample[audit_idx], score_batch
+        model, gen_condition[score_idx], gen_sample[score_idx], score_batch
     ).reshape(-1)
     if not bool(torch.isfinite(data_score).all().item()) or not bool(
         torch.isfinite(gen_score).all().item()
     ):
         raise FloatingPointError("independent EveNet audit produced NaN/Inf logits")
-    if not bool(torch.isfinite(gen_weight[audit_idx]).all().item()):
+    if not bool(torch.isfinite(gen_weight[score_idx]).all().item()):
         raise FloatingPointError("independent EveNet audit received NaN/Inf weights")
     _, balanced_accuracy, auc = _weighted_binary_score_metrics(
         data_score,
         gen_score,
-        gen_weight[audit_idx],
+        gen_weight[score_idx],
     )
     data_np = data_score.detach().cpu().numpy()
     gen_np = gen_score.detach().cpu().numpy()
-    gen_w = gen_weight[audit_idx].reshape(-1).detach().cpu().numpy().astype(np.float64)
+    gen_w = gen_weight[score_idx].reshape(-1).detach().cpu().numpy().astype(np.float64)
     gen_w = gen_w / max(float(np.mean(gen_w)), 1e-12)
     truth_tpr = float(np.mean(data_np > 0.0))
     gen_negative = (gen_np < 0.0).astype(np.float64)
     gen_tnr = float(np.sum(gen_w * gen_negative) / max(float(np.sum(gen_w)), 1e-12))
+    if warm_start_cache is not None:
+        # Commit only after fit + scoring succeed. No optimizer or generated
+        # data are inherited, and the reward/trust classifier banks stay separate.
+        next_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        if any(not torch.isfinite(value).all() for value in next_state.values()):
+            raise FloatingPointError("raw monitor fitted weights are non-finite")
+        warm_start_cache.clear()
+        warm_start_cache.update(protocol=protocol, state=next_state)
+        if training_policy is not None:
+            warm_start_cache["training_policy"] = training_policy
     return EvenetAuditResult(
         auc=auc,
         auc_gap=float(abs(auc - 0.5)),
@@ -1992,7 +2891,11 @@ def fit_independent_evenet_audit(
         fit_diagnostics=diagnostics,
         fit_events=int(len(fit_idx)),
         early_stop_events=int(len(early_idx)),
-        audit_events=int(len(audit_idx)),
+        audit_events=int(len(score_idx)),
+        warm_started=initial_state is not None,
+        training_min_steps=int(fit_config.min_steps) if readiness is not None else 0,
+        training_steps_per_epoch=training_steps_per_epoch,
+        training_ready=training_ready,
     )
 
 
@@ -2016,6 +2919,7 @@ class FrozenResidualRatioReward(nn.Module):
         tempering: float = 1.0,
         checkpoint_coefficients: tuple[float, ...] | None = None,
         checkpoint_iterations: tuple[int, ...] | None = None,
+        warm_start_state: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
         if checkpoints is None:
@@ -2079,6 +2983,11 @@ class FrozenResidualRatioReward(nn.Module):
             int(value) for value in checkpoint_iterations
         )
         self.tempering = float(tempering)
+        # Training-only CPU cache; never replayed in the cumulative reward and
+        # never moved onto each GPU by _apply. Includes a selected closure-only
+        # iteration if it was fitted but not installed as a ratio increment.
+        from RL.DGPO_neutrino.omnifold_ztautau.ratio_fit import _clone_to_cpu
+        self.warm_start_state = _clone_to_cpu(warm_start_state)
         self.eval()
         for parameter in self.parameters():
             parameter.requires_grad_(False)
@@ -2093,6 +3002,7 @@ class FrozenResidualRatioReward(nn.Module):
             tempering=float(tempering),
             checkpoint_coefficients=result.checkpoint_coefficients,
             checkpoint_iterations=result.checkpoint_iterations,
+            warm_start_state=result.warm_start_state,
         )
 
     @property
@@ -2161,7 +3071,7 @@ class FrozenResidualRatioReward(nn.Module):
         digests = {item.get("base_digest") for item in increments}
         if len(digests) != 1:
             raise ValueError("residual PEFT banks must share one frozen backbone digest")
-        return {
+        payload = {
             "schema_version": PEFT_SCHEMA_VERSION,
             "kind": "evenet_adapter_residual_crossfit",
             "tempering": float(self.tempering),
@@ -2170,6 +3080,10 @@ class FrozenResidualRatioReward(nn.Module):
             "increment_coefficients": list(self._checkpoint_coefficients),
             "increment_iterations": list(self._checkpoint_iterations),
         }
+        # Omit for legacy stacks so checkpoint digests still round-trip exactly.
+        if self.warm_start_state is not None:
+            payload["warm_start_state"] = deepcopy(self.warm_start_state)
+        return payload
 
     @classmethod
     def from_serializable_payload(
@@ -2230,6 +3144,7 @@ class FrozenResidualRatioReward(nn.Module):
                     range(1, len(checkpoints) + 1),
                 )
             ),
+            warm_start_state=payload.get("warm_start_state"),
         )
         reward.to(device).eval()
         reward.assert_frozen()
@@ -2244,6 +3159,7 @@ __all__ = [
     "EvenetAdapterModelBuilder",
     "EvenetAdapterRatioClassifier",
     "EvenetRatioPEFTBank",
+    "PeriodicPairAuditClassifier",
     "FrozenResidualRatioReward",
     "peft_bank_factory",
     "ResidualIterationDiagnostics",
@@ -2252,5 +3168,7 @@ __all__ = [
     "fit_residual_ratio_stack",
     "fit_independent_evenet_audit",
     "pack_event_inputs",
+    "periodic_tau_pair_feature_dim",
+    "periodic_tau_pair_features",
     "unpack_event_inputs",
 ]

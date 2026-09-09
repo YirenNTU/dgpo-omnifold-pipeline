@@ -1,0 +1,647 @@
+# Fourier-classifier convergence ablation. It resumes the v6 step-550
+# checkpoint whose policy/reward/reference pair already passed every startup
+# gate, keeping DGPO beta/reference-trust coefficient fixed at 1.0. This makes
+# reverse-only recovery the only new treatment instead of resampling a noisy
+# startup classifier. A saturated signed audit decision of -1 restores the
+# incumbent, clears AdamW state, and refits the reward on a newly generated
+# training pool without changing DGPO mathematics. The topology acceptance
+# ceiling is relaxed from AUC 0.505 to the requested AUC 0.51.
+# Launch after the 4-node Ray cluster is up:
+#   shifter python3 evenet_dgpo/RL/DGPO_neutrino/dgpo_trainer.py \
+#     config/dgpo_omnifold_ztautau_fourier_pair_round_guard_ablation.yaml \
+#     --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_fourier_pair_roundsearch_v7c_rewardmatched_topoauc051_signedrefresh_audit100k/ray_results
+#
+# This is the materialized base+DGPO configuration. Diffusion pretraining
+# continues to use config/train_diffusion_nersc.yaml independently.
+nersc:
+  submit: false
+  system: perlmutter
+  account: m5019_g
+  qos: regular
+  constraint: gpu
+  time: '10:00:00'
+  nodes: 4
+  gpus_per_node: 4
+  ntasks_per_node: 1
+  cpus_per_task: 128
+  image: registry.nersc.gov/m2616/avencast/evenet:1.3
+  repo_root: /global/homes/y/yiren/ml_pipeline
+  ray:
+    start_script: /global/homes/y/yiren/ml_pipeline/NERSC/start_interactive_ray.sh
+    temp_dir: /tmp/r${UID}_${SLURM_JOB_ID}
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_fourier_pair_roundsearch_v7c_rewardmatched_topoauc051_signedrefresh_audit100k/ray_results
+    experimental_noset_cuda_visible_devices: null
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: shifter python3 evenet_dgpo/RL/DGPO_neutrino/dgpo_trainer.py config/dgpo_omnifold_ztautau_fourier_pair_round_guard_ablation.yaml
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_fourier_pair_roundsearch_v7c_rewardmatched_topoauc051_signedrefresh_audit100k/ray_results
+  reproducibility:
+    dataset_shuffle_seed: 42
+    note: EveNet currently hard-codes the Ray dataset shuffle seed to 42; model and
+      diffusion RNG seeding are not yet exposed through the training YAML.
+platform:
+  # Use exactly the same fixed seed-42 5% identities as diffusion pretraining.
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_5pct_seed42/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42/val
+  number_of_workers: 16
+  resources_per_worker:
+    CPU: 20
+    GPU: 1
+  batch_size: 1024
+  prefetch_batches: 1
+  use_gpu: true
+logger:
+  wandb:
+    project: nu2flow-RL
+    run_name: dgpo_omnifold_5pct_epoch54_fourier_pair_roundsearch_v7c_rewardmatched_topoauc051_signedrefresh_audit100k
+    tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - OmniFoldReward
+    - TARP
+    - TargetedPhysics
+    - PeriodicPairFeatures
+    - FourierTopologyEmbedding
+    - PhiHarmonics4
+    - TopologyDropout025
+    - TopologySpecialistAudit
+    - Diffusion5pctInit
+    - TrainableInvisibleProjector
+    - DirectionalPETAttention
+    - CandidateVisibleCrossAttention
+    - AdapterOnlyClassifier
+    - InternalPETAdapter
+    - ToyStyleRetrainController
+    - ConsecutiveStaleAudits2
+    - NoExtraRefitCooldown
+    - AdaptiveFunctionalTrustBoundary
+    - StrictPostStepBacktracking
+    - RawAUCScaledRadius
+    - AdamFirstMomentReset
+    - FixedRoundTrustProbe
+    - InteriorTarget80pct
+    - FixedRadiusPerRewardRound
+    - CrossRoundNonexpandingRadius
+    - RadiusScaledPolicyLR
+    - ZeroStepAdamFirstMomentReset
+    - ClassifierCapacity192x2
+    - ClassifierDropout025
+    - TrustExhaustionRewardRefit
+    - ExhaustionScaleWindow10
+    - RoundAUCGuard
+    - RoundAnchorRollback
+    - FixedCommonRandomPanel
+    - BestTrajectoryCheckpoint
+    - SignedDirectionProbe
+    - SignedScales025050100
+    - ReverseOnlyFreshRewardRecovery
+    - FullOptimizerResetOnReverse
+    - FreshRewardFitPool
+    - MatchedV6CertifiedReward
+    - FailedDirectionPatience3
+    - TopologyAudit3Seeds
+    - TopologyAuditAUC051
+    - SameArchitectureAudit
+    - RawAudit100k
+    - AuditBatch4096
+    - RoutineAuditTrainValOnly
+    - ResidualMinIterations2
+    - ResidualClosureGap005
+    entity: ytchou97-university-of-washington
+    simplified: true
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_fourier_pair_roundsearch_v7c_rewardmatched_topoauc051_signedrefresh_audit100k/logs
+    name: dgpo_omnifold_5pct_epoch54_fourier_pair_roundsearch_v7c_rewardmatched_topoauc051_signedrefresh_audit100k
+    version: v7c_rewardmatched_topoauc051_signedrefresh_audit100k
+options:
+  default: evenet_defaults/options.yaml
+  Training:
+    total_epochs: 1500
+    epochs: 1500
+    # DGPO's reward changes whenever OmniFold is refitted, so reward-ranked
+    # checkpoints are not comparable across rounds. Keep only unpruned recovery
+    # snapshots and the atomic last.ckpt pointer.
+    model_checkpoint_save_top_k: 0
+    # Resume the exact v6 step-550 policy/reward/reference/controller state that
+    # passed every startup gate. New outputs remain isolated from the source.
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_fourier_pair_roundsearch_v7c_rewardmatched_topoauc051_signedrefresh_audit100k/checkpoints
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_fourier_pair_roundsearch_v6_signedprobe_residual2_audit100k_trainval/checkpoints/dgpo-epoch=54-next_ep=55-step=550.ckpt
+    pretrain_model_load_path: null
+    freeze_modules: []
+    diffusion_every_n_epochs: 20
+    diffusion_every_n_steps: 1
+    eval_metrics_every_n_epochs: 1
+    apply_event_weight: false
+    learning_rate: 0.0001
+    learning_rate_body: 1.0e-05
+    learning_rate_classification: 0.0002
+    learning_rate_median: 0.0002
+    Components:
+      InvisibleInputProjector:
+        learning_rate: 0.0001
+        optimizer_group: projector
+        optimizer_type: adamW
+      GroupedSequentialEmbedding:
+        learning_rate: 0.0001
+        optimizer_group: projector
+        optimizer_type: adamW
+        warm_up: true
+        weight_decay: 0.01
+        decoupled_weight_decay: true
+      GlobalEmbedding:
+        learning_rate: 1.0e-05
+        optimizer_group: body
+        optimizer_type: adamW
+        warm_up: true
+      PET:
+        learning_rate: 1.0e-05
+        optimizer_group: body
+        optimizer_type: adamW
+        warm_up: true
+      ObjectEncoder:
+        learning_rate: 1.0e-05
+        optimizer_group: object_encoder
+        optimizer_type: adamW
+        warm_up: true
+      Classification:
+        learning_rate: 0.0002
+        include: false
+        optimizer_type: adamW
+      Regression:
+        include: false
+      Assignment:
+        include: false
+      Segmentation:
+        include: false
+      GlobalGeneration:
+        include: false
+      ReconGeneration:
+        include: false
+      TruthGeneration:
+        include: true
+        diffusion_steps: 50
+        optimizer_type: adamW
+        learning_rate: 0.0001
+        optimizer_group: truth_generation
+    EarlyStopping:
+      patience: 1000
+      min_delta: 0.0
+      monitor: val/loss
+      mode: min
+      verbose: true
+    FAMO:
+      turn_on: false
+      detailed_loss: false
+    EMA:
+      enable: true
+      decay: 0.999
+      start_epoch: 0
+      update_every_n_steps: 1
+      # W&B selected epoch 224 by live val/loss, so load its live state_dict
+      # instead of replacing it with the separately tracked EMA shadow.
+      replace_model_after_load: false
+      replace_model_at_end: false
+      use_for_generation: false
+    ProgressiveTraining:
+      stages:
+      - name: neutrino_only
+        epoch_ratio: 1.0
+        transition_ratio: 0.0
+        loss_weights:
+          generation-truth:
+          - 1.0
+          - 1.0
+  Dataset:
+    dataset_limit: 1.0
+    normalization_file: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/normalization.pt
+    val_split:
+    - 0.8
+    - 1.0
+    # This directory is already the fixed 20% validation subset (~119k). Do not
+    # limit it a second time; full DGPO validation is separately batch-capped.
+    val_dataset_limit: 1.0
+  Metrics:
+    Generation-Binning:
+      neutrino-energy:
+      - 121
+      - 0
+      - 60
+      neutrino-pt:
+      - 121
+      - 0
+      - 60
+      neutrino-eta:
+      - 121
+      - -0.15
+      - 0.15
+      neutrino-phi:
+      - 121
+      - -0.05
+      - 0.05
+      neutrino-theta:
+      - 121
+      - -0.05
+      - 0.05
+    ObjectTag-Embedding:
+      enable: true
+      group_name: ObjectTag
+      label_feature: Part_pdgId
+      max_points: 10000
+      max_batches: 10
+      log_every_n_epochs: 20
+      alpha: 0.8
+      marker_size: 8.0
+      outlier_percentile_low: 0.5
+      outlier_percentile_high: 99.5
+      others_label: others
+      interested_labels:
+        '41': pi
+        '2': e
+        '6': mu
+        '21': gamma
+        '42': K
+        '47': pi0
+        '61': K_S0
+        '62': K_L0
+        '65': p
+        '66': n
+network:
+  default: evenet_defaults/network-20M.yaml
+  Body:
+    GroupedSequentialEmbedding:
+      hidden_dim_scale: 2.0
+      dropout: 0.0
+    PET:
+      feature_drop: 0.0
+  TruthGeneration:
+    feature_drop: 0.0
+event_info:
+  default: generated_event_info.yaml
+resonance:
+  default: resonance.yaml
+rl:
+  enabled: true
+reward_config:
+  type: omnifold
+  weight: 1.0
+  omnifold:
+    bootstrap_in_dgpo: true
+    bundle_file: null
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_5pct_seed42/checkpoints/epoch=224_train=0.1291_val=0.1279.ckpt
+    # Each OmniFold fold builds its own classifier body from this checkpoint.
+ztautau_domain:
+  enabled: true
+  feature_names:
+  - theta
+  - phi
+dgpo:
+  # Full DGPO resume from the checkpoint above.
+  checkpoint_load_mode: resume
+  # Match EveNet pretraining: faster tensor-core matmuls with float32 I/O.
+  float32_matmul_precision: medium
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  beta: 1.0
+  beta_kl: 0.0
+  reference_trust:
+    enabled: true
+    coefficient: 1.0
+    # Strict boundary shared by treatment and matched control. The independent
+    # empirical ablation switch is radius_calibration.enabled below.
+    adaptive_boundary:
+      enabled: true
+      distance: velocity_mse_ratio
+      delta_max: 0.001
+      delta_floor: 0.000005
+      # This branch resumes after the original bootstrap round. Preserve its
+      # raw AUC gap |0.807-0.5| so the resumed policy does not reset to delta_max.
+      # Omit this key for a fresh run; bootstrap then establishes it itself.
+      initial_raw_auc_gap: 0.307
+      # Linearly damp the complete AdamW step (including momentum) above 0.8δ.
+      warning_fraction: 0.8
+      # D is a squared functional distance, so square the statistically
+      # resolved raw-AUC gap ratio to shrink RMS update size linearly.
+      adaptive_power: 2.0
+      auc_confidence_z: 1.96
+      auc_stop_gap: 0.01
+      reset_adam_first_moment_on_install: true
+      # A fully rejected trust step must not carry outward Adam momentum forward.
+      reset_adam_first_moment_on_zero_step: true
+      # Strict treatment: evaluate the accepted policy on frozen shared-noise
+      # rows after AdamW. If the candidate exceeds delta, shrink the exact AdamW
+      # direction until it is feasible. A boundary does not force reward refit.
+      enforcement: post_step_backtracking
+      backtrack_factor: 0.5
+      max_backtracks: 16
+      # 256/rank x 16 ranks = 4096 distinct event conditions; K=8 rows each.
+      probe_events_per_rank: 256
+      # Hold event conditions, timesteps, noise and reference outputs fixed for
+      # the complete reward round. Distinct per-rank shards are saved in the
+      # checkpoint, so uninterrupted and resumed jobs use identical rows.
+      fixed_probe_per_reward_round: true
+      # Backtracking aims inside the hard radius rather than landing on its edge.
+      interior_fraction: 0.8
+      # Keep one fixed radius for the lifetime of a reward round. When the policy
+      # reaches the interior boundary and backtracking suppresses almost all of
+      # AdamW, refresh OmniFold and anchor a new round_ref instead of expanding.
+      radius_calibration:
+        enabled: true
+        bidirectional: true
+        allow_expansion: false
+        # Across reward installations, delta_r <= delta_(r-1).
+        cross_round_nonexpanding: true
+        # D is squared displacement, so eta_r/eta_0 = sqrt(delta_r/delta_0).
+        scale_policy_lr: true
+        policy_lr_scale_floor: 0.1
+        refit_on_exhaustion: true
+        exhaustion_distance_fraction: 0.98
+        exhaustion_mean_update_scale: 0.01
+        # Detect boundary starvation from the most recent ten optimizer steps;
+        # the 50-step controller history remains available for radius audits.
+        exhaustion_scale_window_steps: 10
+        # Compare raw |AUC-0.5| only across same-protocol installed rounds.
+        # A candidate must improve by more than z times the combined AUC SE.
+        round_acceptance_enabled: true
+        round_acceptance_confidence_z: 1.96
+        # Evaluate every routine audit on fixed event identities, DDIM noise,
+        # timestep schedule, and classifier seed. The lowest raw-AUC checkpoint
+        # along the real optimizer trajectory is reloaded at exhaustion and
+        # must still pass the independent 100k round-acceptance gate.
+        trajectory_search_enabled: true
+        # On the first routine audit of each independently trained direction,
+        # compare theta_ref +/- alpha*(theta-theta_ref) on the same fixed 100k
+        # event/noise/classifier-seed panel. A saturated reverse-only result
+        # rejects the local direction, restores theta_ref, clears all AdamW
+        # state, and refits the reward with a newly generated training pool.
+        signed_direction_probe:
+          enabled: true
+          recover_reverse_only: true
+          scales:
+          - 0.25
+          - 0.5
+          - 1.0
+        # Any statistically non-improving trajectory minimum is rolled back
+        # immediately and delta is halved. Stop only after three separately
+        # trained directions fail from the incumbent anchor.
+        failed_direction_patience: 3
+        # Retained for backward-compatible behavior when trajectory search is
+        # disabled; it is not the stopping counter in this ablation.
+        round_plateau_patience: 2
+        safety_factor: 0.5
+        expand_factor: 1.25
+        shrink_factor: 0.5
+        target_acceptance_rate: 0.5
+        target_update_scale: 0.05
+        safe_audits_required: 2
+        attempt_window_steps: 50
+        # Use the ten most recent accepted AdamW updates before each audit.
+        distance_window_steps: 10
+        min_distance_samples: 5
+        confidence_z: 1.96
+  num_ddim_steps: 20
+  # Recompute the 16 PET transformer blocks during backward instead of retaining
+  # all intermediate activations for the K*B current-policy forward.
+  activation_checkpointing: true
+  validation_K: 16
+  # Cheap monitoring stays frequent but only evaluates current-policy reward
+  # scalars on 2 batches/rank. It does not run the reference policy, plots, or TARP.
+  validation_cheap_K: 8
+  validation_cheap_max_batches: 2
+  validation_cheap_log_batches: false
+  validation_num_ddim_steps: 20
+  # Rollout is forward-only/no-grad, so evaluate all K=8 chains together.
+  # Gradient-bearing policy evaluation remains independently capped at 256 events.
+  rollout_parallel_chains: 8
+  validation_rollout_parallel_chains: 8
+  # Keep validation statistics/cost unchanged while DGPO training uses B=1024.
+  validation_batch_size: 512
+  num_train_timesteps: 8
+  # Keep the full B=1024 DGPO objective and one AdamW update, but evaluate the
+  # gradient-bearing policy in four 256-event chunks to bound activation memory.
+  policy_eval_event_microbatch_size: 256
+  policy_eval_parallel_timesteps: 1
+  # Update the recovery checkpoint every five logical epochs. Audit/refit and
+  # final boundaries are also saved when they do not land on this cadence.
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 5
+  # Short logical epochs do not restart the Ray iterator. With 16 workers and
+  # batch_size=1024, one 1.6M-event data pass is about 98 optimizer steps, or
+  # about 10 logical epochs.
+  steps_per_epoch: 10
+  adv_clip_max: null
+  grad_clip_norm: 1.0
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  ema_rollout_decay_max: 0.3
+  ema_rollout_decay_ramp: 0.001
+  log_every: 1
+  # Validation and the full K=16/TARP/physics plots share a two-epoch cadence;
+  # the full pass replaces the cheap pass instead of running both.
+  validation_every_n_epochs: 2
+  validation_full_every_n_epochs: 2
+  # Reward winrate is not used to judge the generative physics performance.
+  validation_compute_winrate: false
+  validation_log_batches: true
+  validation_max_batches: 13
+  diagnostic_plots:
+    enabled: false
+  # Full validation already covers the same distributions. Disable duplicate
+  # train_dist arrays, cross-rank gathers, and plots in the compact W&B profile.
+  train_dist_enabled: false
+  ztautau_metrics:
+    enabled: true
+    candidate_index: 0
+    bins: 60
+    log_images: true
+  tarp:
+    enabled: true
+    profile: visible_acoplanarity
+    n_bins: 4
+    min_events: 500
+    arms:
+    - full
+    - rank_copula
+    n_null_assignments: 399
+    n_reference_trials: 8
+    seed: 20260820
+    alpha: 0.05
+    pooled_panel: true
+  adaptive_omnifold:
+    enabled: true
+    log_only: false
+    baseline_probe_on_start: true
+    # No-grad K=1 DDIM population generation only. Independent of the DGPO
+    # policy batch (1024) and classifier global batch (4096 per class).
+    pool_generation_batch_size: 1024
+    # Cheap fresh-classifier staleness probe every 20 optimizer steps: two DGPO
+    # logical epochs. Two eligible consecutive positive probes launch a fresh
+    # cross-fit stack, which must reach 100k held-out residual closure and then
+    # pass the fresh candidate acceptance audit before installation.
+    staleness_every_n_epochs: 2
+    trigger:
+      # At every two-epoch staleness cycle, fit a second fresh classifier on
+      # truth vs unweighted current-policy generation. This reuses the same K=1
+      # rollout pool and is diagnostic only; retraining still uses weighted AUC.
+      raw_audit_enabled: true
+      # Fixed installed-round controller: retrain when the current weighted
+      # |AUC-0.5| exceeds the same-100k-protocol baseline by 0.005, i.e. half an
+      # AUC percentage point.
+      retrain_auc_margin: 0.005
+      # Ablation: remove unconditional age-based refresh and require the same
+      # two consecutive stale probes used by the stable toy experiment.
+      max_reward_age_epochs: null
+      required_consecutive_epochs: 2
+      # The two-epoch audit cadence is the only minimum spacing. Trust exhaustion
+      # already requires both a near-boundary policy and <1% effective AdamW
+      # scale, so an additional cooldown would only leave the policy at alpha=0.
+      retrain_cooldown_epochs: 0
+      # A threshold crossing may stop a routine audit immediately; a healthy
+      # routine-audit decision still requires saturation.
+      require_audit_saturation: true
+      power_alpha: 0.05
+      power_target: 0.8
+      probe_seed: 20260818
+      # High-power routine probe for this method-validation ablation. Its 80/20
+      # split gives 80k fit and 20k validation events. The restored-best model
+      # is scored on that validation split; no third untouched split is held
+      # out. New stacks establish their controller baseline with this same
+      # protocol after candidate acceptance.
+      probe_max_events: 100000
+    # One weighted judge is used for staleness and the installed-round baseline;
+    # the old raw judge is omitted. Each epoch uses all complete shuffled
+    # batches and drops only its undersized final batch.
+    audit_fit:
+      # 256 event conditions per worker and optimizer step across 16 workers.
+      # The 80k fit split yields nineteen complete optimizer steps per epoch;
+      # truth/generated are evaluated separately for the same nominal batch.
+      batch_size: 4096
+      train_microbatch_size_per_rank: 256
+      drop_last_batch: true
+      learning_rate: 0.0002
+      weight_decay: 0.0005
+      sampling: independent_epoch_shuffle
+      safety_max_epochs: null
+      # Do not let the cheap judge declare chance-level saturation before it
+      # has received the equivalent of ten complete 100k-protocol epochs.
+      min_steps: 190
+      min_epochs: 1
+      validation_interval_epochs: 1.0
+      validation_patience_epochs: 10.0
+      validation_min_delta: 0.0001
+      validation_batch_size: 65536
+      progress_every_n_steps: 10
+      restore_best: true
+      require_saturation: false
+    recalibration:
+      candidates_per_event: 1
+      bootstrap_on_start: true
+      bootstrap_fail_closed: true
+      # The source checkpoint already carries the certified v6 reward. Keep
+      # refit enabled for general resume safety, but match its completed v6 ID
+      # so this branch does not refit the startup reward again.
+      refit_once_on_resume: true
+      # Any genuinely new requested refit remains fail-closed.
+      refit_once_fail_closed: true
+      # Adapter-only fitting with PET's registered internal adapters.
+      # This exact marker is stored in the certified v6 step-550 checkpoint.
+      refit_once_id: internal_adapter_crossattention_fourierpair_h4_topodrop025_roundsearch_v6_signedprobe_residual2_audit100k_trainval
+      # Cross-fit the fixed 5% population. The 208,354 events split evenly
+      # into two 104,177-event folds. Each epoch drops only its shuffled short
+      # final batch; reshuffling rotates which events are omitted next epoch.
+      pool_events: 208354
+      # Independent held-out population for residual closure and final fresh
+      # candidate acceptance.
+      score_pool_events: 100000
+      pool_selection_seed: 42
+      # The v5 startup refit reached a saturated no-op at iteration 2
+      # (held-out AUC=0.502774). Treat that as residual closure rather than
+      # forcing a non-discriminating correction; the independent acceptance
+      # audit and three-seed topology audit remain fail-closed.
+      min_iterations: 2
+      max_iterations: 5
+      # After residual closure, a completely fresh classifier must be unable to
+      # distinguish truth from candidate-weighted generation beyond 51% BA.
+      acceptance_audit_enabled: true
+      acceptance_max_balanced_accuracy: 0.51
+      # Exact smooth tau-pair coordinates help the finite classifier resolve
+      # wrapped joint topology without changing the density-ratio target.
+      periodic_pair_features: true
+      # Fixed integer Fourier basis for wrapped tau-pair phi, followed by a
+      # small trainable topology FFN and nonlinear fusion with the decoder.
+      topology_fourier_embedding: true
+      topology_max_harmonic: 4
+      topology_include_theta_pair: true
+      topology_hidden_dim: 64
+      topology_embedding_dim: 32
+      topology_fusion_hidden_dim: 64
+      topology_dropout: 0.25
+      # Three fresh judges with the exact same EveNet+adapter+Fourier
+      # architecture and trainable scope as OmniFold must also find the
+      # reweighted population indistinguishable. Their weights and held-out
+      # splits remain independent of the reward classifier. The configured
+      # gap of 0.01 is the requested oriented-AUC ceiling of 0.51.
+      topology_acceptance_audit_enabled: true
+      topology_acceptance_max_auc_gap: 0.01
+      topology_acceptance_repeats: 3
+      tempering: 0.75
+      # Event-level OOF recurrence: each training weight is predicted by a
+      # classifier that did not fit that event. Fold models train sequentially.
+      crossfit_folds: 2
+      # Continue residual correction while the independent held-out oriented
+      # AUC is > 0.505. AUC <= 0.505 is residual closure; the completed stack
+      # must then pass the separate fresh acceptance audit.
+      residual_min_auc_gain: 0.005
+      seed: 20260819
+      score_row_budget: 8192
+      adapter_bottleneck: 16
+      # Each fold receives an independent copy of the same frozen pretrained
+      # body. PET uses its registered internal adapter stack; no external
+      # adapters are created by the classifier head.
+      train_layernorm: false
+      train_encoder: false
+      # This module exists in the current diffusion architecture but was absent
+      # from the legacy pretraining checkpoint. Train and checkpoint it with
+      # every fresh cross-fit classifier instead of freezing random weights.
+      train_invisible_projector: true
+      train_backbone: false
+      # Restore the pretrained diffusion direction: visible queries cannot read
+      # invisible candidate keys, while invisible queries can read the visible
+      # event. The candidate decoder then applies explicit cross-attention to
+      # the read-only visible PET memory.
+      asymmetric_attention: true
+      # Increase only the candidate decoder capacity; PET remains frozen and
+      # cross-fit plus stronger dropout control generalization.
+      decoder_hidden_dim: 192
+      decoder_layers: 2
+      decoder_heads: 4
+      head_dropout: 0.25
+      fit:
+        # 1024 event conditions per worker and optimizer step. The 104,177-event
+        # fold takes six complete global optimizer steps per classifier epoch;
+        # the shuffled 5873-event remainder is dropped. Truth
+        # and generated graphs are evaluated/backpropagated separately.
+        batch_size: 16384
+        train_microbatch_size_per_rank: 1024
+        drop_last_batch: true
+        learning_rate: 0.0002
+        weight_decay: 0.0005
+        sampling: independent_epoch_shuffle
+        safety_max_epochs: null
+        min_epochs: 1
+        # Saturation means ten complete epochs in a row without validation-loss
+        # improvement; there is no normal max-epoch stopping condition.
+        validation_interval_epochs: 1.0
+        validation_patience_epochs: 10.0
+        # Internal classifier early-stopping/best-checkpoint tolerance only;
+        # held-out BCE is not an outer OmniFold iteration usefulness gate.
+        validation_min_delta: 0.0001
+        # Batched evaluation of the independent residual-validation pool.
+        validation_batch_size: 65536
+        progress_every_n_steps: 10
+        restore_best: true
+        require_saturation: true
+  projection_constraint:
+    type: none

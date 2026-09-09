@@ -14,13 +14,18 @@ are not clipped during training or inference.
 from __future__ import annotations
 
 import copy
+import logging
 import math
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Sequence
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+
+
+_log = logging.getLogger(__name__)
 
 
 class OmniFoldPassOneESSError(RuntimeError):
@@ -179,6 +184,77 @@ def _average_gradients(model: nn.Module) -> None:
     )
 
 
+def _first_nonfinite_rank(
+    tensors: Sequence[Tensor],
+    *,
+    device: torch.device,
+    rank: int,
+    world: int,
+) -> int | None:
+    """Return the first rank containing NaN/Inf without desynchronizing DDP."""
+
+    locally_finite = torch.ones((), device=device, dtype=torch.bool)
+    for tensor in tensors:
+        locally_finite.logical_and_(torch.isfinite(tensor.detach()).all())
+    sentinel = torch.tensor(int(world), device=device, dtype=torch.int64)
+    rank_value = torch.tensor(int(rank), device=device, dtype=torch.int64)
+    first_bad_rank = torch.where(locally_finite, sentinel, rank_value)
+    if int(world) > 1:
+        torch.distributed.all_reduce(
+            first_bad_rank,
+            op=torch.distributed.ReduceOp.MIN,
+        )
+    value = int(first_bad_rank.item())
+    return None if value >= int(world) else value
+
+
+def _first_nonfinite_location(
+    tensors: Sequence[tuple[str, Tensor | None]],
+    *,
+    device: torch.device,
+    rank: int,
+    world: int,
+) -> tuple[int | None, str | None]:
+    """Locate NaN/Inf consistently on every rank without extra collectives.
+
+    Every rank supplies the same ordered labels.  Encoding rank and local
+    tensor index into one integer lets a single MIN reduction select the first
+    failing rank and its first failing tensor, so an exception cannot
+    desynchronize distributed workers.
+    """
+
+    stride = len(tensors) + 1
+    sentinel = int(world) * stride
+    finite_flags = torch.stack(
+        [
+            torch.ones((), device=device, dtype=torch.bool)
+            if tensor is None
+            else torch.isfinite(tensor.detach()).all()
+            for _name, tensor in tensors
+        ]
+    )
+    indices = torch.arange(len(tensors), device=device, dtype=torch.int64)
+    local_index = torch.where(
+        finite_flags,
+        torch.full_like(indices, len(tensors)),
+        indices,
+    ).min()
+    encoded = torch.where(
+        local_index < len(tensors),
+        int(rank) * stride + local_index,
+        torch.full_like(local_index, sentinel),
+    )
+    if int(world) > 1:
+        torch.distributed.all_reduce(encoded, op=torch.distributed.ReduceOp.MIN)
+    value = int(encoded.item())
+    if value >= sentinel:
+        return None, None
+    bad_rank, bad_index = divmod(value, stride)
+    if bad_index >= len(tensors):
+        raise RuntimeError("invalid distributed non-finite diagnostic index")
+    return bad_rank, tensors[bad_index][0]
+
+
 def _broadcast_flag(value: bool, device: torch.device) -> bool:
     _, world = distributed_context()
     if world <= 1:
@@ -307,6 +383,7 @@ class RatioFitConfig:
     learning_rate: float = 2e-3
     backbone_learning_rate: float | None = None
     weight_decay: float = 1e-6
+    gradient_clip_norm: float | None = None
     sampling: str = "independent_with_replacement"
     min_steps: int = 0
     validation_interval_steps: int = 0
@@ -318,8 +395,11 @@ class RatioFitConfig:
     progress_interval_steps: int = 0
     checkpoint_interval_steps: int = 0
     train_candidates_per_event: int | None = None
+    anomaly_detection_steps: int = 0
 
     def validate(self) -> None:
+        if self.anomaly_detection_steps < 0:
+            raise ValueError("anomaly_detection_steps must be nonnegative")
         if (self.steps is not None and self.steps < 1) or self.batch_size < 1:
             raise ValueError("steps must be positive or null; batch_size must be positive")
         if (
@@ -336,6 +416,11 @@ class RatioFitConfig:
             or self.weight_decay < 0.0
         ):
             raise ValueError("optimizer parameters are outside their valid range")
+        if self.gradient_clip_norm is not None and (
+            not math.isfinite(float(self.gradient_clip_norm))
+            or float(self.gradient_clip_norm) <= 0.0
+        ):
+            raise ValueError("gradient_clip_norm must be finite and positive or null")
         if self.sampling not in {
             "independent_with_replacement", "independent_epoch_shuffle",
         }:
@@ -392,6 +477,12 @@ class RatioFitDiagnostics:
     validation_auc: float | None = None
     saturated: bool = False
     threshold_reached: bool = False
+    threshold_reason: str | None = None
+    unsafe_balanced_accuracy_lcb_reached: bool = False
+    validation_oriented_balanced_accuracy: float | None = None
+    validation_balanced_accuracy_lcb: float | None = None
+    validation_balanced_accuracy_lcb_standard_error: float | None = None
+    validation_balanced_accuracy_lcb_streak: int = 0
     hit_step_cap: bool = False
     positive_seen_fraction: float = 0.0
     negative_seen_fraction: float = 0.0
@@ -771,6 +862,82 @@ def _as_module_state_dict(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+_FAST_BACKBONE_LR_PREFIXES = (
+    "backbone.PET.adapters.",
+    "backbone.InvisibleInputProjector.",
+    "backbone.GroupedSequentialEmbedding.",
+)
+
+
+def _uses_fast_ratio_learning_rate(parameter_name: str) -> bool:
+    """Return whether a ratio-classifier tensor uses the head/projector LR.
+
+    The ratio bank's slot-position encoder is initialized from the pretrained
+    diffusion TruthGeneration head.  Although it lives under ``bank`` after
+    that head is stripped, it is a pretrained representation rather than a
+    fresh classifier layer and must use the conservative backbone LR.
+    """
+
+    name = str(parameter_name)
+    if name.startswith("bank.position_encoder."):
+        return False
+    return not name.startswith("backbone.") or name.startswith(
+        _FAST_BACKBONE_LR_PREFIXES
+    )
+
+
+def _backward_ratio_class(
+    model: nn.Module,
+    condition: Tensor,
+    sample: Tensor,
+    weight: Tensor,
+    *,
+    positive: bool,
+    loss_scale: float,
+    diagnose: bool,
+    diagnostic_metadata: dict[str, Any] | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Keep the forward trace for an opt-in early-step backward diagnosis.
+
+    The caller coordinates exceptions across ranks before any gradient
+    collective. Never let an anomaly exception escape just one worker.
+    """
+    from .attention_diagnostic import AttentionFailureCapture
+    metadata = dict(diagnostic_metadata or {})
+    metadata.update({"class": "positive" if positive else "negative", "loss_scale": loss_scale})
+    capture = AttentionFailureCapture(model, condition, sample, weight, metadata)
+    context = torch.autograd.detect_anomaly(check_nan=True) if diagnose or capture.enabled else nullcontext()
+    with capture, context:
+        logits = model(condition, sample)
+        loss = (weight * F.softplus(-logits if positive else logits)).mean()
+        (loss_scale * loss).backward()
+        if capture.enabled and (
+            not torch.isfinite(loss).all()
+            or any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters())
+        ):
+            raise RuntimeError("attention diagnostic detected nonfinite loss or gradient")
+    return logits.detach(), loss.detach()
+
+
+def _broadcast_failure_message(
+    message: str, *, source_rank: int, rank: int, world: int, device: torch.device
+) -> str:
+    """Send one failing worker's diagnostic to all workers, including rank 0."""
+    if world <= 1:
+        return message
+    raw = message.encode("utf-8") if rank == source_rank else b""
+    size = torch.tensor(len(raw), device=device, dtype=torch.int64)
+    torch.distributed.broadcast(size, src=source_rank)
+    message_size = int(size.item())
+    if message_size == 0:
+        return ""
+    payload = torch.empty(message_size, device=device, dtype=torch.uint8)
+    if rank == source_rank:
+        payload.copy_(torch.tensor(list(raw), device=device, dtype=torch.uint8))
+    torch.distributed.broadcast(payload, src=source_rank)
+    return bytes(payload.cpu().tolist()).decode("utf-8")
+
+
 def fit_density_ratio(
     model: ConditionalRatioMLP,
     positive_condition: Tensor,
@@ -790,6 +957,10 @@ def fit_density_ratio(
         Callable[[nn.Module], tuple[float, float, float]] | None
     ) = None,
     stop_when_validation_auc_gap_exceeds: float | None = None,
+    stop_when_validation_balanced_accuracy_lcb_exceeds: float | None = None,
+    validation_balanced_accuracy_lcb_confidence_z: float = 1.96,
+    validation_balanced_accuracy_lcb_events_per_class: int | None = None,
+    validation_balanced_accuracy_lcb_required_consecutive: int = 1,
 ) -> RatioFitDiagnostics:
     """Fit balanced weighted classification on two independently sampled pools."""
 
@@ -807,6 +978,43 @@ def fit_density_ratio(
         if validation is None or validation_evaluator is None:
             raise ValueError(
                 "validation AUC-gap stopping requires validation and an AUC evaluator"
+            )
+    if stop_when_validation_balanced_accuracy_lcb_exceeds is not None:
+        threshold = float(
+            stop_when_validation_balanced_accuracy_lcb_exceeds
+        )
+        if not 0.5 < threshold < 1.0:
+            raise ValueError(
+                "validation balanced-accuracy LCB stop threshold must lie in "
+                "(0.5, 1)"
+            )
+        if (
+            not math.isfinite(
+                float(validation_balanced_accuracy_lcb_confidence_z)
+            )
+            or float(validation_balanced_accuracy_lcb_confidence_z) < 0.0
+        ):
+            raise ValueError(
+                "validation balanced-accuracy LCB confidence z must be "
+                "finite and nonnegative"
+            )
+        if (
+            validation_balanced_accuracy_lcb_events_per_class is None
+            or int(validation_balanced_accuracy_lcb_events_per_class) < 1
+        ):
+            raise ValueError(
+                "validation balanced-accuracy LCB stopping requires a "
+                "positive per-class event count"
+            )
+        if int(validation_balanced_accuracy_lcb_required_consecutive) < 1:
+            raise ValueError(
+                "validation balanced-accuracy LCB consecutive count must be "
+                "positive"
+            )
+        if validation is None or validation_evaluator is None:
+            raise ValueError(
+                "validation balanced-accuracy LCB stopping requires validation "
+                "and a balanced-accuracy evaluator"
             )
     pos_c, pos_z, pos_w = _flatten_population(
         positive_condition, positive_sample, positive_weight
@@ -889,29 +1097,45 @@ def fit_density_ratio(
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
     ]
+    trainable_parameters = [parameter for _, parameter in named_trainable]
+    first_bad_rank, first_bad_location = _first_nonfinite_location(
+        [
+            *(
+                (f"parameter:{name}", parameter)
+                for name, parameter in model.named_parameters()
+            ),
+            *(
+                (f"buffer:{name}", buffer)
+                for name, buffer in model.named_buffers()
+                if buffer.is_floating_point()
+            ),
+        ],
+        device=device,
+        rank=rank,
+        world=world,
+    )
+    if first_bad_rank is not None:
+        raise FloatingPointError(
+            "density-ratio classifier starts with non-finite model state: "
+            f"first_bad_rank={first_bad_rank}, location={first_bad_location}"
+        )
     if config.backbone_learning_rate is None:
         optimizer_parameters: Any = [
             parameter for _, parameter in named_trainable
         ]
     else:
         # Preserve pretrained representations with a conservative LR while
-        # allowing newly initialized internal adapters, the invisible input
-        # projector, and classifier head to learn at the regular head LR.
-        fast_backbone_prefixes = (
-            "backbone.PET.adapters.",
-            "backbone.InvisibleInputProjector.",
-        )
+        # allowing internal adapters, both input embeddings/projectors, and
+        # the classifier head to learn at the regular head LR.
         slow_backbone = [
             parameter
             for name, parameter in named_trainable
-            if name.startswith("backbone.")
-            and not name.startswith(fast_backbone_prefixes)
+            if not _uses_fast_ratio_learning_rate(name)
         ]
         fast_parameters = [
             parameter
             for name, parameter in named_trainable
-            if not name.startswith("backbone.")
-            or name.startswith(fast_backbone_prefixes)
+            if _uses_fast_ratio_learning_rate(name)
         ]
         optimizer_parameters = []
         if fast_parameters:
@@ -930,6 +1154,13 @@ def fit_density_ratio(
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+    if config.anomaly_detection_steps and rank == 0:
+        _log.info(
+            "[DGPO/omnifold] autograd anomaly detection enabled for first %s "
+            "fit steps; errors will identify backward operations (not just "
+            "the first affected parameter).",
+            config.anomaly_detection_steps,
+        )
     model.train()
     final_loss = torch.zeros((), device=device, dtype=dtype)
     final_accuracy = torch.zeros((), device=device, dtype=dtype)
@@ -947,11 +1178,19 @@ def fit_density_ratio(
     last_validation_loss = float("nan")
     last_validation_accuracy = float("nan")
     last_validation_auc = float("nan")
+    last_gradient_norm = float("nan")
+    last_gradient_clipped = False
     saturated = False
     threshold_reached = False
+    threshold_reason: str | None = None
     threshold_state: dict[str, Tensor] | None = None
     threshold_training_loss: float | None = None
     threshold_training_accuracy: float | None = None
+    unsafe_balanced_accuracy_lcb_reached = False
+    validation_oriented_balanced_accuracy = float("nan")
+    validation_balanced_accuracy_lcb = float("nan")
+    validation_balanced_accuracy_lcb_standard_error = float("nan")
+    validation_balanced_accuracy_lcb_streak = 0
     initial_validation_loss: float | None = None
     initial_validation_accuracy: float | None = None
     initial_validation_auc: float | None = None
@@ -959,12 +1198,21 @@ def fit_density_ratio(
     def run_validation() -> tuple[float, float, float]:
         if validation_evaluator is not None:
             loss_value, accuracy_value, auc_value = validation_evaluator(model)
-            return float(loss_value), float(accuracy_value), float(auc_value)
-        assert validation is not None
-        loss_value, accuracy_value = evaluate_density_ratio(
-            model, *validation, batch_size=config.validation_batch_size
-        )
-        return float(loss_value), float(accuracy_value), float("nan")
+        else:
+            assert validation is not None
+            loss_value, accuracy_value = evaluate_density_ratio(
+                model, *validation, batch_size=config.validation_batch_size
+            )
+            auc_value = float("nan")
+        if not math.isfinite(float(loss_value)) or not math.isfinite(
+            float(accuracy_value)
+        ):
+            raise FloatingPointError(
+                "density-ratio validation produced a non-finite loss or "
+                f"balanced accuracy: loss={loss_value}, "
+                f"balanced_accuracy={accuracy_value}"
+            )
+        return float(loss_value), float(accuracy_value), float(auc_value)
 
     if validation is not None and resume_state is None:
         # Preserve the pre-training no-op model.  Fresh EveNet residual heads are
@@ -1004,7 +1252,9 @@ def fit_density_ratio(
             raise ValueError("unsupported density-ratio recovery checkpoint schema")
         if int(resume_state.get("seed", -1)) != seed:
             raise ValueError("density-ratio recovery checkpoint seed mismatch")
-        if resume_state.get("fit_config") != asdict(config):
+        saved_fit_config = dict(resume_state.get("fit_config") or {})
+        saved_fit_config.setdefault("anomaly_detection_steps", 0)
+        if saved_fit_config != asdict(config):
             raise ValueError("density-ratio recovery checkpoint configuration mismatch")
         model.load_state_dict(resume_state["model_state"], strict=True)
         optimizer.load_state_dict(resume_state["optimizer_state"])
@@ -1042,10 +1292,41 @@ def fit_density_ratio(
                 last_validation_auc = float(validation_history[-1]["auc"])
         saturated = bool(resume_state["saturated"])
         threshold_reached = bool(resume_state.get("threshold_reached", False))
+        threshold_reason = resume_state.get("threshold_reason")
         threshold_state = resume_state.get("threshold_state")
         threshold_training_loss = resume_state.get("threshold_training_loss")
         threshold_training_accuracy = resume_state.get(
             "threshold_training_accuracy"
+        )
+        unsafe_balanced_accuracy_lcb_reached = bool(
+            resume_state.get(
+                "unsafe_balanced_accuracy_lcb_reached",
+                False,
+            )
+        )
+        validation_oriented_balanced_accuracy = float(
+            resume_state.get(
+                "validation_oriented_balanced_accuracy",
+                float("nan"),
+            )
+        )
+        validation_balanced_accuracy_lcb = float(
+            resume_state.get(
+                "validation_balanced_accuracy_lcb",
+                float("nan"),
+            )
+        )
+        validation_balanced_accuracy_lcb_standard_error = float(
+            resume_state.get(
+                "validation_balanced_accuracy_lcb_standard_error",
+                float("nan"),
+            )
+        )
+        validation_balanced_accuracy_lcb_streak = int(
+            resume_state.get(
+                "validation_balanced_accuracy_lcb_streak",
+                0,
+            )
         )
         final_loss = torch.tensor(
             float(resume_state["final_loss"]), device=device, dtype=dtype
@@ -1094,9 +1375,25 @@ def fit_density_ratio(
             "validation_history": copy.deepcopy(validation_history),
             "saturated": saturated,
             "threshold_reached": threshold_reached,
+            "threshold_reason": threshold_reason,
             "threshold_state": _clone_to_cpu(threshold_state),
             "threshold_training_loss": threshold_training_loss,
             "threshold_training_accuracy": threshold_training_accuracy,
+            "unsafe_balanced_accuracy_lcb_reached": (
+                unsafe_balanced_accuracy_lcb_reached
+            ),
+            "validation_oriented_balanced_accuracy": (
+                validation_oriented_balanced_accuracy
+            ),
+            "validation_balanced_accuracy_lcb": (
+                validation_balanced_accuracy_lcb
+            ),
+            "validation_balanced_accuracy_lcb_standard_error": (
+                validation_balanced_accuracy_lcb_standard_error
+            ),
+            "validation_balanced_accuracy_lcb_streak": (
+                validation_balanced_accuracy_lcb_streak
+            ),
             "final_loss": float(final_loss.cpu()),
             "final_accuracy": float(final_accuracy.cpu()),
         }
@@ -1134,6 +1431,20 @@ def fit_density_ratio(
         loss = torch.zeros((), device=device, dtype=dtype)
         pos_accuracy = torch.zeros((), device=device, dtype=dtype)
         neg_accuracy = torch.zeros((), device=device, dtype=dtype)
+        backward_error = ""
+        finite_stage = {
+            name: torch.ones((), device=device, dtype=torch.bool)
+            for name in (
+                "positive_sample",
+                "positive_weight",
+                "positive_logits",
+                "positive_loss",
+                "negative_sample",
+                "negative_weight",
+                "negative_logits",
+                "negative_loss",
+            )
+        }
         for micro_start in range(0, local_rows, microbatch_rows):
             micro_stop = min(micro_start + microbatch_rows, local_rows)
             micro_fraction = float(micro_stop - micro_start) / float(local_rows)
@@ -1145,11 +1456,33 @@ def fit_density_ratio(
             # during a full-backbone fit, while linearity of differentiation
             # makes these two backward calls mathematically equivalent to the
             # previous backward on their sum.
-            pos_logit = model(pos_c[pos_micro_i], pos_z[pos_micro_i])
-            pos_loss = (
-                pos_w[pos_micro_i] * F.softplus(-pos_logit)
-            ).mean()
-            (0.5 * micro_fraction * pos_loss).backward()
+            try:
+                pos_logit, pos_loss = _backward_ratio_class(
+                    model, pos_c[pos_micro_i], pos_z[pos_micro_i], pos_w[pos_micro_i],
+                    positive=True, loss_scale=0.5 * micro_fraction,
+                    diagnose=step < config.anomaly_detection_steps,
+                    diagnostic_metadata={"step": step + 1, "rank": rank, "fit_seed": seed,
+                                         "micro_start": micro_start, "micro_stop": micro_stop},
+                )
+            except RuntimeError as exc:
+                backward_error = (
+                    f"class=positive microbatch={micro_start}:{micro_stop} "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                break
+            with torch.no_grad():
+                finite_stage["positive_sample"].logical_and_(
+                    torch.isfinite(pos_z[pos_micro_i]).all()
+                )
+                finite_stage["positive_weight"].logical_and_(
+                    torch.isfinite(pos_w[pos_micro_i]).all()
+                )
+                finite_stage["positive_logits"].logical_and_(
+                    torch.isfinite(pos_logit).all()
+                )
+                finite_stage["positive_loss"].logical_and_(
+                    torch.isfinite(pos_loss)
+                )
             with torch.no_grad():
                 pos_loss_value = pos_loss.detach()
                 pos_credit = (pos_logit > 0.0).to(dtype) + 0.5 * (
@@ -1160,11 +1493,33 @@ def fit_density_ratio(
                 ).mean() * micro_fraction
             del pos_logit, pos_loss
 
-            neg_logit = model(neg_c[neg_micro_i], neg_z[neg_micro_i])
-            neg_loss = (
-                neg_w[neg_micro_i] * F.softplus(neg_logit)
-            ).mean()
-            (0.5 * micro_fraction * neg_loss).backward()
+            try:
+                neg_logit, neg_loss = _backward_ratio_class(
+                    model, neg_c[neg_micro_i], neg_z[neg_micro_i], neg_w[neg_micro_i],
+                    positive=False, loss_scale=0.5 * micro_fraction,
+                    diagnose=step < config.anomaly_detection_steps,
+                    diagnostic_metadata={"step": step + 1, "rank": rank, "fit_seed": seed,
+                                         "micro_start": micro_start, "micro_stop": micro_stop},
+                )
+            except RuntimeError as exc:
+                backward_error = (
+                    f"class=negative microbatch={micro_start}:{micro_stop} "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                break
+            with torch.no_grad():
+                finite_stage["negative_sample"].logical_and_(
+                    torch.isfinite(neg_z[neg_micro_i]).all()
+                )
+                finite_stage["negative_weight"].logical_and_(
+                    torch.isfinite(neg_w[neg_micro_i]).all()
+                )
+                finite_stage["negative_logits"].logical_and_(
+                    torch.isfinite(neg_logit).all()
+                )
+                finite_stage["negative_loss"].logical_and_(
+                    torch.isfinite(neg_loss)
+                )
             with torch.no_grad():
                 loss += (
                     0.5 * (pos_loss_value + neg_loss.detach()) * micro_fraction
@@ -1176,8 +1531,73 @@ def fit_density_ratio(
                     neg_w[neg_micro_i] * neg_credit
                 ).mean() * micro_fraction
             del neg_logit, neg_loss
+        zero_marker = torch.zeros((), device=device, dtype=dtype)
+        nan_marker = torch.full((), float("nan"), device=device, dtype=dtype)
+        first_bad_rank, first_bad_location = _first_nonfinite_location(
+            [
+                ("forward_or_backward_exception", nan_marker if backward_error else zero_marker),
+                *(
+                    (name, torch.where(finite, zero_marker, nan_marker))
+                    for name, finite in finite_stage.items()
+                ),
+                ("combined_loss", loss.detach()),
+                *(
+                    (f"gradient:{name}", parameter.grad)
+                    for name, parameter in named_trainable
+                ),
+            ],
+            device=device,
+            rank=rank,
+            world=world,
+        )
+        if first_bad_rank is not None:
+            failure_detail = _broadcast_failure_message(
+                backward_error, source_rank=first_bad_rank,
+                rank=rank, world=world, device=device,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            raise FloatingPointError(
+                "density-ratio classifier produced a non-finite loss or "
+                "gradient before optimizer.step: "
+                f"step={step + 1}, first_bad_rank={first_bad_rank}, "
+                f"location={first_bad_location}, "
+                f"learning_rate={config.learning_rate:.6g}, "
+                f"backbone_learning_rate={config.backbone_learning_rate}, "
+                f"autograd_detail={failure_detail or 'not captured; enable anomaly_detection_steps'}"
+            )
         _average_gradients(model)
+        if config.gradient_clip_norm is not None:
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_parameters,
+                max_norm=float(config.gradient_clip_norm),
+                error_if_nonfinite=False,
+            )
+            if not bool(torch.isfinite(gradient_norm).item()):
+                optimizer.zero_grad(set_to_none=True)
+                raise FloatingPointError(
+                    "density-ratio distributed gradient norm became non-finite "
+                    f"at step={step + 1}"
+                )
+            last_gradient_norm = float(gradient_norm.detach().cpu())
+            last_gradient_clipped = bool(
+                last_gradient_norm > float(config.gradient_clip_norm)
+            )
         optimizer.step()
+        first_bad_rank, first_bad_location = _first_nonfinite_location(
+            [
+                (f"parameter:{name}", parameter)
+                for name, parameter in named_trainable
+            ],
+            device=device,
+            rank=rank,
+            world=world,
+        )
+        if first_bad_rank is not None:
+            raise FloatingPointError(
+                "density-ratio optimizer produced a non-finite parameter: "
+                f"step={step + 1}, first_bad_rank={first_bad_rank}, "
+                f"location={first_bad_location}"
+            )
         with torch.no_grad():
             final_loss = _reduce_mean(loss.detach())
             final_accuracy = _reduce_mean(0.5 * (pos_accuracy + neg_accuracy))
@@ -1246,12 +1666,58 @@ def fit_density_ratio(
                 > float(stop_when_validation_auc_gap_exceeds)
             ):
                 threshold_reached = True
+                threshold_reason = "validation_auc_gap"
                 threshold_state = {
                     name: value.detach().clone()
                     for name, value in model.state_dict().items()
                 }
                 threshold_training_loss = float(final_loss.cpu())
                 threshold_training_accuracy = float(final_accuracy.cpu())
+            if (
+                stop_when_validation_balanced_accuracy_lcb_exceeds
+                is not None
+            ):
+                validation_oriented_balanced_accuracy = max(
+                    validation_accuracy,
+                    1.0 - validation_accuracy,
+                )
+                validation_balanced_accuracy_lcb_standard_error = math.sqrt(
+                    0.125
+                    / float(
+                        validation_balanced_accuracy_lcb_events_per_class
+                    )
+                )
+                validation_balanced_accuracy_lcb = (
+                    validation_oriented_balanced_accuracy
+                    - float(validation_balanced_accuracy_lcb_confidence_z)
+                    * validation_balanced_accuracy_lcb_standard_error
+                )
+                lcb_exceeded = bool(
+                    validation_balanced_accuracy_lcb
+                    > float(
+                        stop_when_validation_balanced_accuracy_lcb_exceeds
+                    )
+                )
+                validation_balanced_accuracy_lcb_streak = (
+                    validation_balanced_accuracy_lcb_streak + 1
+                    if lcb_exceeded
+                    else 0
+                )
+                if (
+                    validation_balanced_accuracy_lcb_streak
+                    >= int(
+                        validation_balanced_accuracy_lcb_required_consecutive
+                    )
+                ):
+                    threshold_reached = True
+                    threshold_reason = "validation_balanced_accuracy_lcb"
+                    unsafe_balanced_accuracy_lcb_reached = True
+                    threshold_state = {
+                        name: value.detach().clone()
+                        for name, value in model.state_dict().items()
+                    }
+                    threshold_training_loss = float(final_loss.cpu())
+                    threshold_training_accuracy = float(final_accuracy.cpu())
             threshold_reached = _broadcast_flag(threshold_reached, device)
         should_report_progress = progress_callback is not None and (
             (
@@ -1273,6 +1739,11 @@ def fit_density_ratio(
                 "training_balanced_accuracy": float(final_accuracy.cpu()),
                 "saturated": float(saturated),
             }
+            if math.isfinite(last_gradient_norm):
+                progress_row["gradient_norm"] = last_gradient_norm
+                progress_row["gradient_clipped"] = float(
+                    last_gradient_clipped
+                )
             if math.isfinite(last_validation_loss):
                 progress_row["validation_loss"] = last_validation_loss
             if math.isfinite(last_validation_accuracy):
@@ -1285,6 +1756,19 @@ def fit_density_ratio(
                     last_validation_auc - 0.5
                 )
             progress_row["threshold_reached"] = float(threshold_reached)
+            if math.isfinite(validation_balanced_accuracy_lcb):
+                progress_row["validation_oriented_balanced_accuracy"] = (
+                    validation_oriented_balanced_accuracy
+                )
+                progress_row["validation_balanced_accuracy_lcb"] = (
+                    validation_balanced_accuracy_lcb
+                )
+                progress_row[
+                    "validation_balanced_accuracy_lcb_standard_error"
+                ] = validation_balanced_accuracy_lcb_standard_error
+                progress_row[
+                    "validation_balanced_accuracy_lcb_streak"
+                ] = float(validation_balanced_accuracy_lcb_streak)
             if math.isfinite(best_validation_loss):
                 progress_row["best_validation_loss"] = best_validation_loss
             progress_callback(progress_row)
@@ -1348,6 +1832,28 @@ def fit_density_ratio(
         ),
         saturated=saturated,
         threshold_reached=threshold_reached,
+        threshold_reason=threshold_reason,
+        unsafe_balanced_accuracy_lcb_reached=(
+            unsafe_balanced_accuracy_lcb_reached
+        ),
+        validation_oriented_balanced_accuracy=(
+            validation_oriented_balanced_accuracy
+            if math.isfinite(validation_oriented_balanced_accuracy)
+            else None
+        ),
+        validation_balanced_accuracy_lcb=(
+            validation_balanced_accuracy_lcb
+            if math.isfinite(validation_balanced_accuracy_lcb)
+            else None
+        ),
+        validation_balanced_accuracy_lcb_standard_error=(
+            validation_balanced_accuracy_lcb_standard_error
+            if math.isfinite(validation_balanced_accuracy_lcb_standard_error)
+            else None
+        ),
+        validation_balanced_accuracy_lcb_streak=(
+            validation_balanced_accuracy_lcb_streak
+        ),
         hit_step_cap=hit_step_cap,
         positive_seen_fraction=positive_seen_fraction,
         negative_seen_fraction=negative_seen_fraction,

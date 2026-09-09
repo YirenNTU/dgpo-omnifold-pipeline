@@ -1,4 +1,36 @@
+# Original truth-guided DGPO post-training baseline, cold-started from the
+# diffusion policy trained on the full Ztautau dataset. This file is merged on
+# top of config/train_diffusion_nersc.yaml by scripts/train_neutrino_backend.py.
+# It deliberately keeps the original calibration-magnitude reward and does not
+# enable OmniFold, adaptive hard trust, signed probes, or extragradient.
+#
+# Launch after a separate 4-node Ray cluster is ready:
+#   shifter python3 scripts/train_neutrino_backend.py \
+#     --backend dgpo-evenet \
+#     --base-config config/train_diffusion_nersc.yaml \
+#     --overlay-config config/dgpo_post_training_overlay.yaml \
+#     -- \
+#     --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_original_fullpretrain_v1/ray_results
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_original_fullpretrain_v1/ray_results
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_post_training_overlay.yaml
+      --
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_original_fullpretrain_v1/ray_results
+
 platform:
+  # Use the same full-data corpus and validation split as supervised diffusion.
+  data_parquet_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/train-diffusion
+  data_parquet_val_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/val-diffusion
   # DGPO expands the effective forward size by K and policy-eval timesteps.
   # Keeping the pretraining batch of 2048 is too large here and tends to OOM.
   batch_size: 256
@@ -15,20 +47,24 @@ options:
     val_dataset_limit: 50000
   Training:
     # Stage 2: DGPO post-training.
-    # Point model_checkpoint_load_path at a supervised diffusion checkpoint for
-    # DGPO cold start, or at a DGPO last.ckpt for full DGPO resume.
-    model_checkpoint_load_path: /path/to/post_training_init_checkpoint.ckpt
+    # Load only policy weights from the full-data supervised checkpoint. DGPO
+    # starts at epoch/step zero with fresh optimizer, reference, and EMA state.
+    total_epochs: 150
+    epochs: 150
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
     pretrain_model_load_path: null
-    model_checkpoint_save_path: /path/to/output/dgpo_post_training/checkpoints
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_original_fullpretrain_v1/checkpoints
 
 logger:
   wandb:
     project: nu2flow-RL
     entity: ytchou97-university-of-washington
-    run_name: Ztautau-DGPO-PostTraining
-    tags: [NERSC, Ztautau, DGPO, TARP, TargetedPhysics]
+    run_name: Ztautau-Original-DGPO-FullPretrain-v1
+    tags: [NERSC, Ztautau, DGPO, OriginalDGPO, FullDatasetPretrain, CalibrationMagnitudeReward, NoOmniFold, NoAdaptiveTrust, TARP, TargetedPhysics]
   local:
-    name: EveNet-DGPO-PostTraining
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_original_fullpretrain_v1/logs
+    name: Ztautau-Original-DGPO-FullPretrain-v1
+    version: v1
 
 rl:
   enabled: true
@@ -52,6 +88,10 @@ ztautau_domain:
     target_delta_phi_to_pi: 0.0
 
 dgpo:
+  # This is a fresh DGPO run initialized from a supervised Lightning checkpoint,
+  # not a resume of its supervised optimizer/scheduler state.
+  checkpoint_load_mode: weights_only
+  beta: 1.0
   beta_kl: 5.0e-2
   variance_regularization:
     enabled: false
@@ -67,9 +107,11 @@ dgpo:
   # Cap validation work directly; val_dataset_limit under dgpo is not consumed
   # by the current trainer path.
   validation_compute_winrate: true
+  validation_every_n_epochs: 1
   rollout_parallel_chains: 5
   validation_rollout_parallel_chains: 8
   validation_log_batches: true
+  checkpoint_every_n_epochs: 5
   ztautau_metrics:
     enabled: true
     # Fixed unbiased draw for truth/current/reference 1D distributions.

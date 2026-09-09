@@ -9,6 +9,7 @@ objective from ``dgpo_utils.py``.
 from __future__ import annotations
 
 import argparse
+import copy
 import heapq
 import logging
 import math
@@ -20,7 +21,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -42,7 +43,7 @@ from ray.train import RunConfig, ScalingConfig
 from ray.train.torch import TorchTrainer
 
 from evenet.control.global_config import global_config
-from evenet.shared import make_process_fn, prepare_datasets
+from evenet.shared import make_process_fn, prepare_datasets, register_dataset
 from evenet.utilities.diffusion_sampler import (
     DDIMSampler,
     get_logsnr_alpha_sigma,
@@ -50,16 +51,25 @@ from evenet.utilities.diffusion_sampler import (
 
 from RL.DGPO_neutrino.dgpo_utils import (
     ADVANTAGE_ESTIMATOR_ZSCORE,
+    REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE,
+    REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
     VALID_ADVANTAGE_ESTIMATORS,
+    VALID_REFERENCE_TRUST_OBJECTIVES,
     _dgpo_cfg_get,
+    adaptive_trust_backtracking_scales,
+    adaptive_trust_update_scale,
     build_dgpo_loss,
     build_reference_trust_loss,
     compute_per_event_advantage,
     predict_x0_normalized_from_velocity_diffusion,
+    rebase_trainable_params_for_extragradient_,
+    reset_adam_first_moment,
     repeat_batch_for_candidates,
+    sample_cosine_vp_path_kl_timesteps,
 )
 from RL.DGPO_neutrino.model_utils import (
     apply_component_freezes,
+    assert_dgpo_neutrino_policy_deterministic,
     freeze_reference_model,
     generation_uses_ema_shadow,
     load_evenet_model_for_dgpo,
@@ -68,6 +78,7 @@ from RL.DGPO_neutrino.model_utils import (
     make_reference_model,
     make_round_reference_model,
     parse_dgpo_resume_from_checkpoint,
+    resolve_dgpo_auto_resume_checkpoint,
     save_lightning_compatible_checkpoint,
     select_dgpo_training_state,
     dgpo_snapshot_checkpoint_name,
@@ -121,14 +132,9 @@ from RL.DGPO_neutrino.diagnostics.ztautau_validation import (
 
 _log = logging.getLogger(__name__)
 
-# Highest W&B ``step=`` committed so far (rank-0 logging only).  Training logs use ``step=global_step``.
-# Epoch-end panels (val, train_dist) reuse the last training step of the epoch
-# but chart x-axis is ``epoch`` via ``wandb.define_metric``.
+# Highest committed transport row. Never use this as a scientific training axis:
+# many classifier-fit records can occur at the same completed DGPO step.
 _wandb_committed_step: int = -1
-# Live OmniFold fits happen between DGPO optimizer steps.  Reserve monotonically
-# increasing internal W&B rows for them while keeping ``global_step`` as the
-# scientific x-axis for policy metrics.
-_wandb_step_offset: int = 0
 
 # Single source of truth for live classifier phases.  W&B registration and the
 # runtime logger must stay in lock-step; otherwise a valid long-running fit can
@@ -136,8 +142,15 @@ _wandb_step_offset: int = 0
 _OMNIFOLD_LIVE_PHASE_IDS = {
     "residual_reward": 0,
     "acceptance_audit": 1,
-    "staleness_audit": 2,
-    "baseline_audit": 3,
+    "topology_acceptance_audit": 2,
+    "staleness_audit": 3,
+    "baseline_audit": 4,
+    "raw_staleness_audit": 5,
+    "signed_direction_audit": 6,
+    "raw_staleness_monitor": 7,
+    "reference_trust_monitor": 8,
+    "global_best_candidate": 9,
+    "global_best_incumbent": 10,
 }
 
 _GRAD_CLIP_NORM = 1.0
@@ -266,6 +279,7 @@ def _next_batch_synced(
     *,
     world_size: int,
     device: torch.device,
+    require_all_ranks: bool = True,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Pull the next batch from a per-rank Ray DataIterator with cross-rank termination sync.
 
@@ -273,7 +287,11 @@ def _next_batch_synced(
     we all-reduce a "has-more" flag with ``MIN``: the loop terminates as soon as **any** rank
     runs out of data. This may drop a few batches from longer shards but prevents NCCL hangs.
 
-    Returns ``(batch, all_have)``.  ``batch`` is ``None`` when the local shard is exhausted.
+    For unwrapped no-grad pool generation, ``require_all_ranks=False`` uses MAX
+    so longer shards can finish; empty ranks skip forward but join termination
+    collectives. Never use this mode for DDP training forwards.
+
+    Returns ``(batch, can_continue)``; ``batch`` is None if this rank is exhausted.
     """
     try:
         batch = next(iterator)
@@ -284,11 +302,111 @@ def _next_batch_synced(
 
     if world_size > 1:
         flag = torch.tensor([local_has], device=device, dtype=torch.int32)
-        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN if require_all_ranks else dist.ReduceOp.MAX)
         all_have = bool(flag.item() > 0)
     else:
         all_have = local_has > 0
     return batch, all_have
+
+
+def _all_ranks_scalar_finite(
+    value: Tensor,
+    *,
+    device: torch.device,
+    world_size: int,
+) -> bool:
+    """Return true only when every rank observes a finite scalar."""
+
+    local = torch.tensor(
+        int(bool(torch.isfinite(value.detach()).all().item())),
+        device=device,
+        dtype=torch.int32,
+    )
+    if world_size > 1:
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "distributed DGPO finite check requires an initialized process group"
+            )
+        dist.all_reduce(local, op=dist.ReduceOp.MIN)
+    return bool(local.item())
+
+
+@torch.no_grad()
+def _all_reduce_accumulated_gradients(
+    model: torch.nn.Module,
+    *,
+    world_size: int,
+) -> int:
+    """Average accumulated gradients without retaining overlapping DDP graphs.
+
+    Sequential VP-trust backward evaluates both policy graphs through the
+    unwrapped EveNet module. One flattened all-reduce per device/dtype group
+    reproduces DDP's mean gradient after all microbatches and loss components
+    have contributed.
+    """
+
+    if world_size <= 1:
+        return sum(
+            int(parameter.grad is not None)
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "distributed sequential VP-trust backward requires an initialized "
+            "process group"
+        )
+    grouped: dict[
+        tuple[torch.device, torch.dtype],
+        list[torch.nn.Parameter],
+    ] = defaultdict(list)
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            grouped[(parameter.device, parameter.dtype)].append(parameter)
+    reduced = 0
+    for (parameter_device, _), parameters in grouped.items():
+        # A conditional branch can leave a parameter unused on one rank but
+        # active on another.  Select the globally-active set first so every
+        # rank launches identical collectives; missing local gradients are the
+        # correct zero contribution to the distributed mean.
+        present = torch.tensor(
+            [int(parameter.grad is not None) for parameter in parameters],
+            device=parameter_device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(present, op=dist.ReduceOp.MAX)
+        active_parameters = [
+            parameter
+            for parameter, globally_present in zip(parameters, present.tolist())
+            if globally_present
+        ]
+        if not active_parameters:
+            continue
+        flat = torch.cat(
+            [
+                (
+                    parameter.grad.reshape(-1)
+                    if parameter.grad is not None
+                    else torch.zeros_like(parameter).reshape(-1)
+                )
+                for parameter in active_parameters
+            ]
+        )
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(float(world_size))
+        offset = 0
+        for parameter in active_parameters:
+            count = int(parameter.numel())
+            averaged = flat[offset : offset + count].view_as(parameter)
+            if parameter.grad is None:
+                # Clone so this small gradient does not retain the full flat
+                # all-reduce buffer after the helper returns.
+                parameter.grad = averaged.clone()
+            else:
+                parameter.grad.copy_(averaged)
+            offset += count
+            reduced += 1
+    return reduced
 
 
 def _truth_generation_cartesian() -> bool:
@@ -1843,6 +1961,7 @@ def build_reward_aggregator(
                 "adapter_bottleneck": 16,
                 "train_layernorm": False,
                 "train_encoder": False,
+                "train_grouped_sequential_embedding": False,
                 # Keep this in the explicit hand-off to the OmniFold builder.
                 # The recalibration block is converted to a plain allow-listed
                 # mapping here, so omitting the key silently freezes the
@@ -1850,6 +1969,14 @@ def build_reward_aggregator(
                 "train_invisible_projector": False,
                 "train_backbone": False,
                 "asymmetric_attention": False,
+                "periodic_pair_features": False,
+                "topology_fourier_embedding": False,
+                "topology_max_harmonic": 1,
+                "topology_include_theta_pair": False,
+                "topology_hidden_dim": 64,
+                "topology_embedding_dim": 32,
+                "topology_fusion_hidden_dim": 64,
+                "topology_dropout": 0.15,
                 "head_dropout": 0.1,
                 "decoder_hidden_dim": 256,
                 "decoder_layers": 2,
@@ -1859,6 +1986,8 @@ def build_reward_aggregator(
                 key: _dgpo_cfg_get(recal, key, default)
                 for key, default in classifier_defaults.items()
             }
+            if _dgpo_cfg_get(recal, "topology_conditioning", False):
+                classifier_config["topology_conditioning"] = True
             reward = build_uninstalled_ztautau_omnifold_reward(
                 backbone_checkpoint=backbone_checkpoint,
                 training_config=global_config,
@@ -1971,6 +2100,414 @@ class _PolicyEvaluationInputs:
     candidates_norm: Tensor
     batch_rep: dict[str, Any]
     noise_mask_rep: Tensor
+
+
+@dataclass(frozen=True)
+class _ReferenceTrustProbe:
+    """Frozen policy-evaluation rows reused for strict post-step trust checks."""
+
+    x_t: Tensor
+    t_rep: Tensor
+    noise_mask_rep: Tensor
+    ref_v: Tensor
+    batch_rep: dict[str, Any]
+    reference_loss_sum: Tensor
+    reference_loss_count: int
+    path_kl_normalizer: float | None = None
+
+
+def _capture_reference_trust_probe(
+    *,
+    x_t: Tensor,
+    t_rep: Tensor,
+    noise_mask_rep: Tensor,
+    ref_v: Tensor,
+    batch_rep: Mapping[str, Any],
+    L_ref_2d: Tensor,
+    K: int,
+    local_batch_size: int,
+    max_events: int,
+    path_kl_normalizer: float | None = None,
+) -> _ReferenceTrustProbe:
+    """Keep a bounded, graph-free subset of one existing shared-noise draw."""
+
+    local_B = int(local_batch_size)
+    probe_B = min(local_B, max(1, int(max_events)))
+    rows = torch.cat(
+        [
+            torch.arange(
+                candidate * local_B,
+                candidate * local_B + probe_B,
+                device=x_t.device,
+                dtype=torch.long,
+            )
+            for candidate in range(int(K))
+        ]
+    )
+    expected_rows = int(K) * local_B
+
+    def _select(value: Any) -> Any:
+        if (
+            isinstance(value, Tensor)
+            and value.ndim > 0
+            and int(value.shape[0]) == expected_rows
+        ):
+            return value.index_select(0, rows).detach()
+        return value.detach() if isinstance(value, Tensor) else value
+
+    reference_loss = L_ref_2d.reshape(int(K), local_B)[:, :probe_B]
+    return _ReferenceTrustProbe(
+        x_t=x_t.index_select(0, rows).detach(),
+        t_rep=t_rep.index_select(0, rows).detach(),
+        noise_mask_rep=noise_mask_rep.index_select(0, rows).detach(),
+        ref_v=ref_v.index_select(0, rows).detach(),
+        batch_rep={key: _select(value) for key, value in batch_rep.items()},
+        reference_loss_sum=reference_loss.detach().to(torch.float64).sum(),
+        reference_loss_count=int(reference_loss.numel()),
+        path_kl_normalizer=(
+            None
+            if path_kl_normalizer is None
+            else float(path_kl_normalizer)
+        ),
+    )
+
+
+def _reference_trust_probe_to_payload(
+    probe: _ReferenceTrustProbe,
+) -> dict[str, Any]:
+    """Serialize a fixed trust probe as CPU tensors for checkpoints/broadcast."""
+
+    def _cpu(value: Any) -> Any:
+        return value.detach().cpu() if isinstance(value, Tensor) else value
+
+    return {
+        "x_t": _cpu(probe.x_t),
+        "t_rep": _cpu(probe.t_rep),
+        "noise_mask_rep": _cpu(probe.noise_mask_rep),
+        "ref_v": _cpu(probe.ref_v),
+        "batch_rep": {key: _cpu(value) for key, value in probe.batch_rep.items()},
+        "reference_loss_sum": _cpu(probe.reference_loss_sum),
+        "reference_loss_count": int(probe.reference_loss_count),
+        "path_kl_normalizer": probe.path_kl_normalizer,
+    }
+
+
+def _reference_trust_probe_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> _ReferenceTrustProbe:
+    """Restore a checkpointed trust probe on the current worker device."""
+
+    required = {
+        "x_t",
+        "t_rep",
+        "noise_mask_rep",
+        "ref_v",
+        "batch_rep",
+        "reference_loss_sum",
+        "reference_loss_count",
+    }
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise ValueError(f"reference trust probe payload missing keys: {missing}")
+
+    def _device(value: Any) -> Any:
+        return value.to(device, non_blocking=True) if isinstance(value, Tensor) else value
+
+    batch_payload = payload["batch_rep"]
+    if not isinstance(batch_payload, Mapping):
+        raise TypeError("reference trust probe batch_rep must be a mapping")
+    return _ReferenceTrustProbe(
+        x_t=_device(payload["x_t"]),
+        t_rep=_device(payload["t_rep"]),
+        noise_mask_rep=_device(payload["noise_mask_rep"]),
+        ref_v=_device(payload["ref_v"]),
+        batch_rep={key: _device(value) for key, value in batch_payload.items()},
+        reference_loss_sum=_device(payload["reference_loss_sum"]),
+        reference_loss_count=int(payload["reference_loss_count"]),
+        path_kl_normalizer=(
+            None
+            if payload.get("path_kl_normalizer") is None
+            else float(payload["path_kl_normalizer"])
+        ),
+    )
+
+
+_PER_RANK_TRUST_PROBE_FORMAT = "per_rank_v1"
+
+
+def _gather_reference_trust_probe(
+    probe: _ReferenceTrustProbe,
+    *,
+    device: torch.device,
+    world_size: int,
+) -> tuple[_ReferenceTrustProbe, dict[str, Any]]:
+    """Keep each rank's distinct probe and checkpoint all rank-local shards.
+
+    The returned live probe remains local to the current rank.  The checkpoint
+    payload contains one CPU shard per rank so a resumed job with the same
+    world size restores exactly the same global probe without duplicating rank
+    0's event conditions across every worker.
+    """
+
+    local_payload = _reference_trust_probe_to_payload(probe)
+    if world_size > 1:
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "distributed fixed trust probe requires an initialized process group"
+            )
+        actual_world_size = int(dist.get_world_size())
+        if actual_world_size != int(world_size):
+            raise RuntimeError(
+                "fixed trust probe world-size mismatch: "
+                f"configured={world_size}, distributed={actual_world_size}"
+            )
+        rank_payloads: list[Any] = [None] * actual_world_size
+        dist.all_gather_object(rank_payloads, local_payload)
+    else:
+        rank_payloads = [local_payload]
+
+    normalized_payloads: list[dict[str, Any]] = []
+    for rank, payload in enumerate(rank_payloads):
+        if not isinstance(payload, Mapping):
+            raise RuntimeError(
+                f"fixed trust probe gather returned no payload for rank {rank}"
+            )
+        normalized_payloads.append(dict(payload))
+    checkpoint_payload: dict[str, Any] = {
+        "format": _PER_RANK_TRUST_PROBE_FORMAT,
+        "world_size": int(world_size),
+        "per_rank": normalized_payloads,
+    }
+    return probe, checkpoint_payload
+
+
+def _restore_reference_trust_probe(
+    payload: Mapping[str, Any],
+    *,
+    device: torch.device,
+    world_size: int,
+) -> _ReferenceTrustProbe:
+    """Restore this worker's shard, with compatibility for legacy payloads."""
+
+    if payload.get("format") != _PER_RANK_TRUST_PROBE_FORMAT:
+        # Legacy checkpoints stored one rank-0 probe shared by every worker.
+        return _reference_trust_probe_from_payload(payload, device=device)
+
+    saved_world_size = int(payload.get("world_size", -1))
+    if saved_world_size != int(world_size):
+        raise RuntimeError(
+            "cannot restore a fixed per-rank trust probe with a different world "
+            f"size: checkpoint={saved_world_size}, current={world_size}"
+        )
+    rank = int(dist.get_rank()) if world_size > 1 and dist.is_initialized() else 0
+    rank_payloads = payload.get("per_rank")
+    if not isinstance(rank_payloads, list) or len(rank_payloads) != saved_world_size:
+        raise ValueError("fixed trust probe checkpoint has invalid per-rank shards")
+    local_payload = rank_payloads[rank]
+    if not isinstance(local_payload, Mapping):
+        raise TypeError(f"fixed trust probe shard for rank {rank} is not a mapping")
+    return _reference_trust_probe_from_payload(local_payload, device=device)
+
+
+@torch.no_grad()
+def _measure_reference_trust_probe(
+    model: torch.nn.Module,
+    probe: _ReferenceTrustProbe,
+    *,
+    world_size: int,
+    distance: str = "velocity_mse_ratio",
+) -> tuple[float, float, float]:
+    """Return global ``(distance, velocity_mse, reference_loss)`` on fixed rows."""
+
+    distance_kind = str(distance).strip().lower()
+    if distance_kind not in {"velocity_mse_ratio", "vp_path_kl"}:
+        raise ValueError(
+            "reference trust probe distance must be velocity_mse_ratio or "
+            "vp_path_kl"
+        )
+    if distance_kind == "vp_path_kl" and probe.path_kl_normalizer is None:
+        raise ValueError("vp_path_kl trust probe is missing its normalizer")
+
+    was_training = bool(model.training)
+    model.eval()
+    try:
+        if isinstance(model, DDP):
+            model_v = model(
+                probe.x_t,
+                probe.batch_rep,
+                probe.t_rep,
+                probe.noise_mask_rep,
+            )
+        else:
+            model_v = model.predict_diffusion_vector(
+                noise_x=probe.x_t,
+                cond_x=probe.batch_rep,
+                time=probe.t_rep,
+                mode="neutrino",
+                noise_mask=probe.noise_mask_rep,
+            )
+    finally:
+        model.train(was_training)
+    if model_v.shape != probe.ref_v.shape:
+        raise RuntimeError(
+            "strict trust probe policy/reference shapes differ: "
+            f"{tuple(model_v.shape)} vs {tuple(probe.ref_v.shape)}"
+        )
+    mask = probe.noise_mask_rep.expand_as(model_v).to(dtype=model_v.dtype)
+    totals = torch.stack(
+        (
+            ((model_v - probe.ref_v).pow(2) * mask).sum().to(torch.float64),
+            mask.sum().to(torch.float64),
+            probe.reference_loss_sum.to(device=model_v.device, dtype=torch.float64),
+            torch.tensor(
+                float(probe.reference_loss_count),
+                device=model_v.device,
+                dtype=torch.float64,
+            ),
+            torch.tensor(
+                float(model_v.shape[0]),
+                device=model_v.device,
+                dtype=torch.float64,
+            ),
+        )
+    )
+    if world_size > 1 and dist.is_initialized():
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    velocity_mse = totals[0] / totals[1].clamp_min(1.0e-12)
+    reference_loss = totals[2] / totals[3].clamp_min(1.0)
+    distance_value = (
+        0.5
+        * float(probe.path_kl_normalizer)
+        * totals[0]
+        / totals[4].clamp_min(1.0)
+        if distance_kind == "vp_path_kl"
+        else velocity_mse / reference_loss.clamp_min(1.0e-12)
+    )
+    return (
+        float(distance_value.cpu()),
+        float(velocity_mse.cpu()),
+        float(reference_loss.cpu()),
+    )
+
+
+@torch.no_grad()
+def _assign_interpolated_trainable_params_(
+    model: torch.nn.Module,
+    theta_old: Mapping[str, Tensor],
+    theta_candidate: Mapping[str, Tensor],
+    fraction: float,
+) -> None:
+    """Assign ``old + fraction * (candidate - old)`` to trainable parameters."""
+
+    fraction_f = float(fraction)
+    if not math.isfinite(fraction_f) or not 0.0 <= fraction_f <= 1.0:
+        raise ValueError("trust interpolation fraction must lie in [0, 1]")
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name not in theta_old or name not in theta_candidate:
+            raise KeyError(f"missing trainable parameter {name!r} in trust snapshot")
+        old = theta_old[name].to(device=parameter.device, dtype=parameter.dtype)
+        candidate = theta_candidate[name].to(
+            device=parameter.device,
+            dtype=parameter.dtype,
+        )
+        parameter.data.copy_(old + fraction_f * (candidate - old))
+
+
+def _snapshot_signed_trainable_direction(
+    model: torch.nn.Module,
+    anchor_model: torch.nn.Module,
+) -> tuple[torch.nn.Module, dict[str, Tensor], dict[str, Tensor]]:
+    """Snapshot live and anchor tensors for one diagnostic policy direction."""
+
+    policy_core = unwrap_for_state_dict(model)
+    anchor_core = unwrap_for_state_dict(anchor_model)
+    current = snapshot_params(policy_core)
+    anchor_parameters = dict(anchor_core.named_parameters())
+    anchor: dict[str, Tensor] = {}
+    for name, current_value in current.items():
+        if name not in anchor_parameters:
+            raise KeyError(
+                f"round reference is missing trainable policy parameter {name!r}"
+            )
+        anchor_value = anchor_parameters[name]
+        if tuple(anchor_value.shape) != tuple(current_value.shape):
+            raise ValueError(
+                "round-reference parameter shape differs from live policy for "
+                f"{name!r}: {tuple(anchor_value.shape)} vs "
+                f"{tuple(current_value.shape)}"
+            )
+        anchor[name] = anchor_value.detach().to(
+            device=current_value.device,
+            dtype=current_value.dtype,
+        ).clone()
+    if not current:
+        raise RuntimeError("signed-direction probe found no trainable parameters")
+    return policy_core, anchor, current
+
+
+@torch.no_grad()
+def _assign_signed_trainable_direction_(
+    model: torch.nn.Module,
+    anchor: Mapping[str, Tensor],
+    current: Mapping[str, Tensor],
+    signed_scale: float,
+) -> None:
+    """Assign ``anchor + signed_scale * (current - anchor)`` without optimizer state."""
+
+    scale = float(signed_scale)
+    if not math.isfinite(scale) or not -1.0 <= scale <= 1.0:
+        raise ValueError("signed-direction scale must lie in [-1, 1]")
+    assigned = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name not in anchor or name not in current:
+            raise KeyError(f"missing trainable parameter {name!r} in signed snapshot")
+        anchor_value = anchor[name].to(
+            device=parameter.device,
+            dtype=parameter.dtype,
+        )
+        current_value = current[name].to(
+            device=parameter.device,
+            dtype=parameter.dtype,
+        )
+        parameter.data.copy_(
+            anchor_value + scale * (current_value - anchor_value)
+        )
+        assigned += 1
+    if assigned != len(current):
+        raise RuntimeError(
+            "signed-direction assignment did not consume every trainable snapshot: "
+            f"assigned={assigned}, snapshot={len(current)}"
+        )
+
+
+def _trainable_direction_rms(
+    anchor: Mapping[str, Tensor],
+    current: Mapping[str, Tensor],
+) -> float:
+    """RMS parameter displacement used only to detect a zero diagnostic direction."""
+
+    square_sum = 0.0
+    count = 0
+    if set(anchor) != set(current):
+        raise ValueError("signed-direction anchor/current parameter keys differ")
+    for name, anchor_value in anchor.items():
+        current_value = current[name]
+        if tuple(anchor_value.shape) != tuple(current_value.shape):
+            raise ValueError(
+                f"signed-direction parameter shape differs for {name!r}"
+            )
+        delta = current_value.detach().to(torch.float64) - anchor_value.detach().to(
+            torch.float64
+        )
+        square_sum += float(delta.square().sum().cpu())
+        count += int(delta.numel())
+    return math.sqrt(square_sum / max(count, 1))
 
 
 def _prepare_policy_evaluation_inputs(
@@ -2773,7 +3310,15 @@ def _build_train_metrics(
     out.update(param)
     for dk, dv in diag_last.items():
         if isinstance(dk, str) and (
-            dk.startswith(("projection/", "latent_constraint/", "train/regularization/", "reference_trust/"))
+            dk.startswith(
+                (
+                    "projection/",
+                    "latent_constraint/",
+                    "train/regularization/",
+                    "train/gradient_sync/",
+                    "reference_trust/",
+                )
+            )
             or dk == "train/loss/variance_regularization"
         ):
             out[dk] = float(dv.detach().float().cpu())
@@ -2953,9 +3498,84 @@ class _DgpoOptimizerWithSchedule:
         self,
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler.LambdaLR,
+        *,
+        cosine_config: Mapping[str, Any] | None = None,
+        warmup_steps: int = 1,
+        warmup_groups: list[bool] | None = None,
     ) -> None:
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.cosine_state: dict[str, Any] | None = None
+        if cosine_config is not None:
+            total = cosine_config.get("total_steps")
+            floor = float(cosine_config.get("min_lr_ratio", 0.1))
+            if isinstance(total, bool) or not isinstance(total, int) or total <= warmup_steps:
+                raise ValueError("cosine total_steps must be an integer greater than warmup_steps")
+            if not math.isfinite(floor) or not 0 < floor <= 1:
+                raise ValueError("cosine min_lr_ratio must be in (0, 1]")
+            groups = list(warmup_groups or [True] * len(optimizer.param_groups))
+            if len(groups) != len(optimizer.param_groups):
+                raise ValueError("cosine warmup group count mismatch")
+            self.cosine_state = {
+                "kind": "cosine", "total_steps": total, "min_lr_ratio": floor,
+                "warmup_steps": int(warmup_steps), "warmup_groups": groups,
+                "start_step": int(warmup_steps),
+                "anchor_factors": [1.0] * len(groups),
+            }
+            # Plain lambdas keep LambdaLR's state free of bound-object references.
+            self.scheduler.lr_lambdas = [
+                lambda step, i=i: self._cosine_factor(step, i) for i in range(len(groups))
+            ]
+            self._apply_cosine_lr()
+
+    def _cosine_factor(self, step: int, group: int) -> float:
+        s = self.cosine_state
+        assert s is not None
+        if step < s["warmup_steps"]:
+            return step / s["warmup_steps"] if s["warmup_groups"][group] else 1.0
+        progress = min(1.0, max(0.0, (step - s["start_step"]) /
+                                (s["total_steps"] - s["start_step"])))
+        factor = s["min_lr_ratio"] + (1 - s["min_lr_ratio"]) * .5 * (1 + math.cos(math.pi * progress))
+        return float(s["anchor_factors"][group]) * factor
+
+    def _apply_cosine_lr(self) -> None:
+        for i, pg in enumerate(self.param_groups):
+            pg["lr"] = self.scheduler.base_lrs[i] * self._cosine_factor(self.scheduler.last_epoch, i)
+        self.scheduler._last_lr = [pg["lr"] for pg in self.param_groups]
+
+    def _restore_cosine(self, state: Mapping[str, Any]) -> None:
+        assert self.cosine_state is not None
+        saved = state.get("lr_schedule")
+        current = self.cosine_state
+        if saved is not None:
+            for key in ("kind", "total_steps", "min_lr_ratio", "warmup_steps", "warmup_groups"):
+                if saved.get(key) != current[key]:
+                    raise ValueError(f"cosine resume protocol mismatch: {key}")
+            if not current["warmup_steps"] <= saved["start_step"] < current["total_steps"]:
+                raise ValueError("invalid saved cosine start_step")
+            anchors = saved["anchor_factors"]
+            if len(anchors) != len(self.param_groups) or any(
+                not math.isfinite(float(x)) or float(x) <= 0 for x in anchors
+            ):
+                raise ValueError("invalid saved cosine anchor_factors")
+            self.cosine_state = dict(saved)
+        else:
+            # One-time migration from linear->constant: anchor at saved LR,
+            # preserving Adam moments and scheduler clock with no LR jump.
+            step = int(self.scheduler.last_epoch)
+            if step >= current["total_steps"]:
+                raise ValueError("cosine total_steps must exceed the migration scheduler step")
+            current["start_step"] = max(current["warmup_steps"], step)
+            if step >= current["warmup_steps"]:
+                current["anchor_factors"] = [
+                    float(pg["lr"]) / float(base)
+                    for pg, base in zip(self.param_groups, self.scheduler.base_lrs, strict=True)
+                ]
+                if any(not math.isfinite(x) or x <= 0 for x in current["anchor_factors"]):
+                    raise ValueError("cosine migration requires finite positive saved learning rates")
+            _log.info("[DGPO] Migrated to cosine at scheduler_step=%s, saved_lrs=%s, end_step=%s, floor_ratio=%s",
+                      step, [pg["lr"] for pg in self.param_groups], current["total_steps"], current["min_lr_ratio"])
+        self._apply_cosine_lr()
 
     def step(self, *args: Any, **kwargs: Any) -> Any:
         return self.optimizer.step(*args, **kwargs)
@@ -2975,21 +3595,39 @@ class _DgpoOptimizerWithSchedule:
         return self.optimizer.state
 
     def state_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
         }
+        if self.cosine_state is not None:
+            result["lr_schedule"] = copy.deepcopy(self.cosine_state)
+        return result
 
     def load_state_dict(self, state: Any) -> None:
+        # Resume Adam moments/LR scheduling, but take weight decay from the
+        # current YAML. PyTorch otherwise silently restores the old group WD.
+        configured_weight_decay = [float(pg["weight_decay"]) for pg in self.param_groups]
+        if self.cosine_state is not None and not (
+            isinstance(state, dict) and "optimizer" in state and "scheduler" in state
+        ):
+            raise ValueError("cosine resume requires optimizer and scheduler state")
+        if isinstance(state, dict) and state.get("lr_schedule") is not None and self.cosine_state is None:
+            raise ValueError("checkpoint uses cosine; enable the matching lr_schedule to resume")
         if isinstance(state, dict) and "optimizer" in state:
             self.optimizer.load_state_dict(state["optimizer"])
             if "scheduler" in state:
                 self.scheduler.load_state_dict(state["scheduler"])
+            for pg, weight_decay in zip(self.param_groups, configured_weight_decay, strict=True):
+                pg["weight_decay"] = weight_decay
+            if self.cosine_state is not None:
+                self._restore_cosine(state)
             return
         try:
             self.optimizer.load_state_dict(state)
         except (ValueError, RuntimeError):
             raise
+        for pg, weight_decay in zip(self.param_groups, configured_weight_decay, strict=True):
+            pg["weight_decay"] = weight_decay
         _log.warning(
             "[DGPO] Loaded legacy optimizer state dict without scheduler keys; "
             "LambdaLR keeps its current step counter (may be out of sync with resume step).",
@@ -3813,6 +4451,21 @@ def train_step(
     device: torch.device,
     dtype: torch.dtype,
     reference_trust_coefficient: float = 0.0,
+    reference_trust_objective: str = REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE,
+    reference_trust_vp_path_kl_diagnostic: bool = False,
+    reference_trust_vp_logsnr_min: float = -20.0,
+    reference_trust_vp_logsnr_max: float = 20.0,
+    reference_trust_max_ratio: float | None = None,
+    reference_trust_distance: str = "velocity_mse_ratio",
+    reference_trust_warning_fraction: float = 0.8,
+    reference_trust_backtrack_factor: float = 0.5,
+    reference_trust_max_backtracks: int = 16,
+    reference_trust_probe_events_per_rank: int = 64,
+    reference_trust_fixed_probe_per_round: bool = False,
+    reference_trust_interior_fraction: float = 1.0,
+    reference_trust_policy_lr_scale: float = 1.0,
+    reference_trust_reset_adam_first_moment_on_zero_step: bool = False,
+    reference_trust_probe_cache: dict[str, Any] | None = None,
     log_reward_dist: bool = False,
     log_diagnostic_dist: bool = False,
     collect_train_dist: bool = True,
@@ -3827,21 +4480,80 @@ def train_step(
     policy_eval_t_max: float = 1.0,
     constraint_state: ProjectionConstraintState | None = None,
     world_size: int = 1,
+    extragradient_optimizer_base_params: Mapping[str, Tensor] | None = None,
 ) -> dict[str, Any]:
-    """Rollout once, accumulate the sub-step gradients, then one AdamW update + CPO repair.
+    """Rollout once, accumulate gradients, then apply one controlled AdamW update.
 
     Frozen method: EMA-rollout candidate generation (when the rollout EMA exists),
     shared noise across the K candidates, configured per-event advantages, pure
-    DGPO backward, and post-AdamW latent-SWD CPO projection repair.
+    DGPO backward, optional strict post-step trust backtracking, and optional
+    post-AdamW latent-SWD CPO projection repair.
     """
     # Frozen method constant: all K candidates share the diffusion timestep t and
     # noise eps during policy evaluation (only the DDIM chain index varies).
     shared_noise = True
+    trust_objective = str(reference_trust_objective).strip().lower()
+    if trust_objective not in VALID_REFERENCE_TRUST_OBJECTIVES:
+        raise ValueError(
+            f"unsupported reference trust objective: {trust_objective!r}; "
+            f"expected one of {sorted(VALID_REFERENCE_TRUST_OBJECTIVES)}"
+        )
+    trust_distance = str(reference_trust_distance).strip().lower()
+    if trust_distance not in {"velocity_mse_ratio", "vp_path_kl"}:
+        raise ValueError(
+            "reference_trust_distance must be velocity_mse_ratio or vp_path_kl"
+        )
+    if trust_distance == "vp_path_kl" and trust_objective != "vp_path_kl":
+        raise ValueError(
+            "a vp_path_kl hard boundary requires a vp_path_kl trust objective"
+        )
+    path_kl_evaluation_enabled = bool(
+        (reference_trust_coefficient > 0.0 or reference_trust_max_ratio is not None)
+        and (
+            trust_objective == REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL
+            or reference_trust_vp_path_kl_diagnostic
+            or trust_distance == "vp_path_kl"
+        )
+    )
+    sequential_vp_trust_backward = bool(
+        _dgpo_cfg_get(
+            global_config.dgpo,
+            "sequential_vp_trust_backward",
+            False,
+        )
+    )
+    if sequential_vp_trust_backward:
+        if reference_trust_coefficient <= 0.0:
+            raise ValueError(
+                "dgpo.sequential_vp_trust_backward requires a positive "
+                "reference_trust coefficient"
+            )
+        if trust_objective != REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL:
+            raise ValueError(
+                "dgpo.sequential_vp_trust_backward requires objective=vp_path_kl"
+            )
+        if int(policy_eval_parallel_timesteps) != 1:
+            raise ValueError(
+                "dgpo.sequential_vp_trust_backward currently requires "
+                "policy_eval_parallel_timesteps=1"
+            )
     model.train()
     ref_model.eval()
     freeze_reference_model(ref_model)
     proj_cfg = resolve_projection_constraint_config(global_config.dgpo)
     projection_active = bool(proj_cfg.active and constraint_state is not None)
+    if reference_trust_max_ratio is not None and projection_active:
+        raise ValueError(
+            "strict adaptive trust backtracking is incompatible with the "
+            "post-AdamW CPO projection; disable one of the two treatments"
+        )
+    if not 0.0 < float(reference_trust_interior_fraction) <= 1.0:
+        raise ValueError("reference_trust_interior_fraction must lie in (0, 1]")
+    trust_policy_lr_scale = float(reference_trust_policy_lr_scale)
+    if not math.isfinite(trust_policy_lr_scale) or not (
+        0.0 < trust_policy_lr_scale <= 1.0
+    ):
+        raise ValueError("reference_trust_policy_lr_scale must lie in (0, 1]")
     variance_reg_active = _variance_regularization_enabled(global_config.dgpo)
     variance_reg_weight = _variance_regularization_weight(global_config.dgpo)
     variance_reg_features = _variance_regularization_feature_names(global_config.dgpo)
@@ -3968,10 +4680,279 @@ def train_step(
         float(_dgpo_cfg_get(global_config.dgpo, "beta_kl", 0.0)),
     )
     optimizer_ran = False
+    trust_probe: _ReferenceTrustProbe | None = None
+    trust_probe_reused = False
+    if reference_trust_fixed_probe_per_round:
+        if reference_trust_probe_cache is None:
+            raise ValueError(
+                "fixed per-round trust probe requires reference_trust_probe_cache"
+            )
+        cached_probe = reference_trust_probe_cache.get("probe")
+        if cached_probe is not None:
+            if not isinstance(cached_probe, _ReferenceTrustProbe):
+                raise TypeError("reference trust probe cache contains invalid data")
+            trust_probe = cached_probe
+            trust_probe_reused = True
     chunk_sizes = {parallel_eval_steps}
     remainder = acc_steps % parallel_eval_steps
     if remainder:
         chunk_sizes.add(remainder)
+
+    def _dgpo_sequential_vp_substep(
+        *,
+        eval_batch: dict[str, Any],
+        eval_candidates: Tensor,
+        eval_advantages: Tensor,
+        eval_rewards: Tensor,
+        prepared_inputs: _PolicyEvaluationInputs,
+        trust_weight_correction: Tensor,
+        path_kl_stratum_offset: int,
+        path_kl_seed: int,
+        backward_weight: float,
+    ) -> list[tuple[Tensor, dict[str, Tensor]]]:
+        """Backward DGPO and VP trust before constructing the next graph.
+
+        Both losses retain their original scalar weights.  Running their
+        backward passes one after the other is algebraically identical to
+        backward on their sum, while ensuring their saved activations never
+        coexist.  Distributed gradients are averaged once after every event
+        microbatch/timestep has accumulated.
+        """
+
+        local_B = int(eval_batch["x"].shape[0])
+        (
+            L_cur,
+            L_ref,
+            _,
+            model_v,
+            _ref_v,
+            noise_mask_rep,
+            x_t,
+            _target_v,
+            t_rep,
+            batch_rep,
+            _eps_rep,
+        ) = policy_evaluation_step(
+            core,
+            ref_model,
+            eval_batch,
+            eval_candidates,
+            K=K,
+            shared_noise=shared_noise,
+            device=device,
+            dtype=dtype,
+            t=None,
+            t_min=policy_eval_t_min,
+            t_max=policy_eval_t_max,
+            num_timesteps=1,
+            prepared_inputs=prepared_inputs,
+        )
+        _dgpo_assert_train_step_invariants(
+            L_ref,
+            eval_advantages,
+            eval_rewards,
+        )
+        loss_vel, dlast = build_dgpo_loss(
+            L_cur,
+            L_ref,
+            eval_advantages,
+            beta_dgpo,
+            K,
+        )
+        kl_loss = L_cur.mean()
+        variance_loss = x_t.new_zeros(())
+        variance_diag: dict[str, Tensor] = {
+            "train/regularization/variance/active": x_t.new_tensor(
+                0.0, dtype=torch.float64
+            ),
+            "train/regularization/variance/active_features": x_t.new_tensor(
+                0.0, dtype=torch.float64
+            ),
+            "train/regularization/variance/raw": x_t.new_tensor(
+                0.0, dtype=torch.float64
+            ),
+        }
+        if variance_reg_active and variance_reg_weight > 0.0 and variance_reg_features:
+            pred_x0_norm, _, _ = predict_x0_normalized_from_velocity_diffusion(
+                x_t,
+                model_v,
+                t_rep,
+            )
+            pred_phys = core.invisible_normalizer.denormalize_grad(
+                pred_x0_norm,
+                mask=noise_mask_rep,
+                remove_padding=True,
+            )
+            truth_phys = batch_rep["x_invisible"][..., : pred_phys.shape[-1]].to(
+                device=pred_phys.device,
+                dtype=pred_phys.dtype,
+            )
+            variance_loss, variance_diag = _variance_matching_penalty(
+                pred_phys,
+                truth_phys,
+                noise_mask_rep,
+                cartesian=_truth_generation_cartesian(),
+                feature_names=_invisible_feature_names(),
+                selected_features=variance_reg_features,
+            )
+        main_loss = (
+            loss_vel
+            + beta_kl * kl_loss
+            + float(variance_reg_weight) * variance_loss
+        )
+        main_loss_detached = main_loss.detach()
+        dlast["loss_velocity_training"] = loss_vel.detach()
+        dlast["train/loss/kl"] = (beta_kl * kl_loss.detach()).to(
+            dtype=torch.float64
+        )
+        dlast["train/loss/variance_regularization"] = (
+            float(variance_reg_weight) * variance_loss.detach()
+        ).to(dtype=torch.float64)
+        dlast["kl_weight_mean"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
+        dlast["kl_weight_min"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
+        dlast["kl_weight_max"] = x_t.new_tensor(beta_kl, dtype=torch.float64)
+        dlast.update(variance_diag)
+
+        if not _all_ranks_scalar_finite(
+            main_loss,
+            device=device,
+            world_size=world_size,
+        ):
+            dlast["loss_total"] = main_loss_detached
+            return [(main_loss_detached, dlast)]
+
+        (main_loss * float(backward_weight)).backward()
+
+        # Drop every reference to the first autograd graph before constructing
+        # the independent full-time VP path graph.
+        del main_loss, loss_vel, kl_loss, variance_loss
+        del L_cur, L_ref, model_v, noise_mask_rep, x_t, t_rep, batch_rep
+
+        path_generator = torch.Generator(device=device)
+        path_generator.manual_seed(int(path_kl_seed))
+        path_t, path_kl_normalizer = sample_cosine_vp_path_kl_timesteps(
+            1,
+            local_B,
+            total_strata=acc_steps,
+            stratum_offset=path_kl_stratum_offset,
+            device=device,
+            dtype=torch.float32,
+            logsnr_min=reference_trust_vp_logsnr_min,
+            logsnr_max=reference_trust_vp_logsnr_max,
+            generator=path_generator,
+        )
+        path_nu = int(prepared_inputs.candidates_norm.shape[-2])
+        path_features = int(prepared_inputs.candidates_norm.shape[-1])
+        path_eps = torch.randn(
+            1,
+            local_B,
+            path_nu,
+            path_features,
+            device=device,
+            dtype=dtype,
+            generator=path_generator,
+        )
+        path_eps_rep = (
+            path_eps.unsqueeze(1)
+            .expand(1, K, local_B, path_nu, path_features)
+            .reshape(K * local_B, path_nu, path_features)
+        )
+        (
+            _path_L_cur,
+            path_L_ref,
+            _path_t_out,
+            path_model_v,
+            path_ref_v,
+            path_noise_mask,
+            _path_x_t,
+            _path_target_v,
+            _path_t_rep,
+            _path_batch_rep,
+            _path_eps_rep,
+        ) = policy_evaluation_step(
+            core,
+            ref_model,
+            eval_batch,
+            eval_candidates,
+            K=K,
+            shared_noise=shared_noise,
+            device=device,
+            dtype=dtype,
+            t=path_t,
+            eps_rep=path_eps_rep,
+            t_min=0.0,
+            t_max=1.0,
+            num_timesteps=1,
+            prepared_inputs=prepared_inputs,
+        )
+        trust_loss, trust_diagnostics = build_reference_trust_loss(
+            path_model_v,
+            path_ref_v,
+            path_noise_mask,
+            L_ref_2d=path_L_ref,
+            objective=REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+            path_kl_normalizer=path_kl_normalizer,
+        )
+        trust_component = (
+            float(reference_trust_coefficient)
+            * trust_weight_correction
+            * trust_loss
+        )
+        if not _all_ranks_scalar_finite(
+            trust_component,
+            device=device,
+            world_size=world_size,
+        ):
+            raise FloatingPointError(
+                "non-finite VP trust component after DGPO backward; refusing "
+                "to commit a partial sequential gradient"
+            )
+        (trust_component * float(backward_weight)).backward()
+
+        for trust_key in (
+            "reference_trust/loss",
+            "reference_trust/velocity_mse",
+        ):
+            trust_diagnostics[trust_key] = (
+                trust_diagnostics[trust_key] * trust_weight_correction
+            )
+        dlast.update(trust_diagnostics)
+        dlast["reference_trust/vp_path_kl_time_mean"] = path_t.detach().mean()
+        dlast["reference_trust/vp_path_kl_time_min"] = path_t.detach().min()
+        dlast["reference_trust/vp_path_kl_time_max"] = path_t.detach().max()
+        dlast["reference_trust/coefficient"] = torch.tensor(
+            float(reference_trust_coefficient),
+            device=device,
+            dtype=torch.float64,
+        )
+        dlast["reference_trust/objective_vp_path_kl"] = torch.tensor(
+            1.0,
+            device=device,
+            dtype=torch.float64,
+        )
+        dlast["reference_trust/vp_path_kl_diagnostic_enabled"] = torch.tensor(
+            float(reference_trust_vp_path_kl_diagnostic),
+            device=device,
+            dtype=torch.float64,
+        )
+        dlast["reference_trust/sequential_backward"] = torch.tensor(
+            1.0,
+            device=device,
+            dtype=torch.float64,
+        )
+        dlast["projection/active"] = torch.tensor(
+            1.0 if projection_active else 0.0,
+            device=device,
+            dtype=torch.float64,
+        )
+        dlast["projection/pure_dgpo_backward"] = torch.tensor(
+            1.0,
+            device=device,
+            dtype=torch.float64,
+        )
+        total_detached = main_loss_detached + trust_component.detach()
+        dlast["loss_total"] = total_detached
+        return [(total_detached, dlast)]
 
     def _dgpo_substeps(
         count: int,
@@ -3982,7 +4963,10 @@ def train_step(
         eval_rewards: Tensor,
         prepared_inputs: _PolicyEvaluationInputs,
         trust_weight_correction: Tensor,
+        path_kl_stratum_offset: int,
+        path_kl_seed: int,
     ) -> list[tuple[Tensor, dict[str, Tensor]]]:
+        nonlocal trust_probe
         local_B = int(eval_batch["x"].shape[0])
         (
             L_cur_all,
@@ -4025,6 +5009,97 @@ def train_step(
         x_t_all = x_t_all.reshape(count, rows_per_timestep, *x_t_all.shape[1:])
         t_rep_all = t_rep_all.reshape(count, rows_per_timestep)
 
+        path_L_ref_all: Tensor | None = None
+        path_model_v_all: Tensor | None = None
+        path_ref_v_all: Tensor | None = None
+        path_noise_mask_all: Tensor | None = None
+        path_kl_normalizer: float | None = None
+        if path_kl_evaluation_enabled:
+            path_generator = torch.Generator(device=device)
+            path_generator.manual_seed(int(path_kl_seed))
+            path_t, path_kl_normalizer = sample_cosine_vp_path_kl_timesteps(
+                count,
+                local_B,
+                total_strata=acc_steps,
+                stratum_offset=path_kl_stratum_offset,
+                device=device,
+                dtype=torch.float32,
+                logsnr_min=reference_trust_vp_logsnr_min,
+                logsnr_max=reference_trust_vp_logsnr_max,
+                generator=path_generator,
+            )
+            path_nu = int(prepared_inputs.candidates_norm.shape[-2])
+            path_features = int(prepared_inputs.candidates_norm.shape[-1])
+            path_eps = torch.randn(
+                count,
+                local_B,
+                path_nu,
+                path_features,
+                device=device,
+                dtype=dtype,
+                generator=path_generator,
+            )
+            path_eps_rep = (
+                path_eps.unsqueeze(1)
+                .expand(count, K, local_B, path_nu, path_features)
+                .reshape(count * K * local_B, path_nu, path_features)
+            )
+            path_context = (
+                nullcontext()
+                if trust_objective == REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL
+                else torch.no_grad()
+            )
+            with path_context:
+                (
+                    _path_L_cur_all,
+                    path_L_ref_all,
+                    _path_t_out,
+                    path_model_v_all,
+                    path_ref_v_all,
+                    path_noise_mask_all,
+                    _path_x_t_all,
+                    _path_target_v,
+                    _path_t_rep_all,
+                    _path_batch_rep_all,
+                    _path_eps_rep,
+                ) = policy_evaluation_step(
+                    # The ordinary DGPO evaluation above is the single DDP
+                    # wrapper forward for this accumulated backward.  Evaluate
+                    # the second-time trust graph through the wrapped module so
+                    # DDP does not prepare its reducer twice before one backward;
+                    # the parameter hooks still reduce the combined gradient.
+                    core,
+                    ref_model,
+                    eval_batch,
+                    eval_candidates,
+                    K=K,
+                    shared_noise=shared_noise,
+                    device=device,
+                    dtype=dtype,
+                    t=path_t,
+                    eps_rep=path_eps_rep,
+                    t_min=0.0,
+                    t_max=1.0,
+                    num_timesteps=count,
+                    prepared_inputs=prepared_inputs,
+                )
+            if count == 1:
+                path_L_ref_all = path_L_ref_all.unsqueeze(0)
+            path_model_v_all = path_model_v_all.reshape(
+                count,
+                rows_per_timestep,
+                *path_model_v_all.shape[1:],
+            )
+            path_ref_v_all = path_ref_v_all.reshape(
+                count,
+                rows_per_timestep,
+                *path_ref_v_all.shape[1:],
+            )
+            path_noise_mask_all = path_noise_mask_all.reshape(
+                count,
+                rows_per_timestep,
+                *path_noise_mask_all.shape[1:],
+            )
         outcomes: list[tuple[Tensor, dict[str, Tensor]]] = []
         for timestep_index in range(count):
             L_cur = L_cur_all[timestep_index]
@@ -4046,6 +5121,43 @@ def train_step(
                 )
                 for key, value in batch_rep_all.items()
             }
+
+            if (
+                reference_trust_max_ratio is not None
+                and trust_probe is None
+                and trust_distance != "vp_path_kl"
+            ):
+                capture_x_t = x_t
+                capture_t_rep = t_rep
+                capture_noise_mask = noise_mask_rep
+                capture_ref_v = ref_v
+                capture_l_ref = L_ref
+                capture_batch_rep = batch_rep
+                capture_normalizer = None
+                captured_probe = _capture_reference_trust_probe(
+                    x_t=capture_x_t,
+                    t_rep=capture_t_rep,
+                    noise_mask_rep=capture_noise_mask,
+                    ref_v=capture_ref_v,
+                    batch_rep=capture_batch_rep,
+                    L_ref_2d=capture_l_ref,
+                    K=K,
+                    local_batch_size=local_B,
+                    max_events=reference_trust_probe_events_per_rank,
+                    path_kl_normalizer=capture_normalizer,
+                )
+                if reference_trust_fixed_probe_per_round:
+                    assert reference_trust_probe_cache is not None
+                    trust_probe, probe_payload = _gather_reference_trust_probe(
+                        captured_probe,
+                        device=device,
+                        world_size=world_size,
+                    )
+                    reference_trust_probe_cache["probe"] = trust_probe
+                    reference_trust_probe_cache["payload"] = probe_payload
+                    reference_trust_probe_cache["dirty"] = True
+                else:
+                    trust_probe = captured_probe
 
             _dgpo_assert_train_step_invariants(
                 L_ref,
@@ -4107,12 +5219,27 @@ def train_step(
                 + float(variance_reg_weight) * variance_loss
             )
             if reference_trust_coefficient > 0.0:
-                trust_loss, trust_diagnostics = build_reference_trust_loss(
-                    model_v,
-                    ref_v,
-                    noise_mask_rep,
-                    L_ref_2d=L_ref,
-                )
+                if trust_objective == REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL:
+                    assert path_model_v_all is not None
+                    assert path_ref_v_all is not None
+                    assert path_noise_mask_all is not None
+                    assert path_L_ref_all is not None
+                    assert path_kl_normalizer is not None
+                    trust_loss, trust_diagnostics = build_reference_trust_loss(
+                        path_model_v_all[timestep_index],
+                        path_ref_v_all[timestep_index],
+                        path_noise_mask_all[timestep_index],
+                        L_ref_2d=path_L_ref_all[timestep_index],
+                        objective=REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+                        path_kl_normalizer=path_kl_normalizer,
+                    )
+                else:
+                    trust_loss, trust_diagnostics = build_reference_trust_loss(
+                        model_v,
+                        ref_v,
+                        noise_mask_rep,
+                        L_ref_2d=L_ref,
+                    )
                 loss_backward = (
                     loss_backward
                     + float(reference_trust_coefficient)
@@ -4127,10 +5254,59 @@ def train_step(
                         trust_diagnostics[trust_key] * trust_weight_correction
                     )
                 dlast.update(trust_diagnostics)
+                if (
+                    reference_trust_vp_path_kl_diagnostic
+                    and trust_objective
+                    != REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL
+                ):
+                    assert path_model_v_all is not None
+                    assert path_ref_v_all is not None
+                    assert path_noise_mask_all is not None
+                    assert path_kl_normalizer is not None
+                    _, path_diagnostics = build_reference_trust_loss(
+                        path_model_v_all[timestep_index],
+                        path_ref_v_all[timestep_index],
+                        path_noise_mask_all[timestep_index],
+                        objective=REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL,
+                        path_kl_normalizer=path_kl_normalizer,
+                    )
+                    dlast["reference_trust/vp_path_kl"] = path_diagnostics[
+                        "reference_trust/vp_path_kl"
+                    ]
+                    dlast["reference_trust/vp_path_kl_normalizer"] = (
+                        path_diagnostics[
+                            "reference_trust/vp_path_kl_normalizer"
+                        ]
+                    )
+                if path_kl_evaluation_enabled:
+                    dlast["reference_trust/vp_path_kl_time_mean"] = (
+                        path_t[timestep_index].detach().mean()
+                    )
+                    dlast["reference_trust/vp_path_kl_time_min"] = (
+                        path_t[timestep_index].detach().min()
+                    )
+                    dlast["reference_trust/vp_path_kl_time_max"] = (
+                        path_t[timestep_index].detach().max()
+                    )
             dlast["reference_trust/coefficient"] = torch.tensor(
                 float(reference_trust_coefficient),
                 device=device,
                 dtype=torch.float64,
+            )
+            dlast["reference_trust/objective_vp_path_kl"] = torch.tensor(
+                float(
+                    trust_objective
+                    == REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL
+                ),
+                device=device,
+                dtype=torch.float64,
+            )
+            dlast["reference_trust/vp_path_kl_diagnostic_enabled"] = (
+                torch.tensor(
+                    float(reference_trust_vp_path_kl_diagnostic),
+                    device=device,
+                    dtype=torch.float64,
+                )
             )
             dlast["loss_velocity_training"] = loss_vel.detach()
             dlast["train/loss/kl"] = (beta_kl * kl_loss.detach()).to(
@@ -4182,7 +5358,11 @@ def train_step(
         local_B = event_stop - event_start
         event_weight = float(local_B) / float(B)
         trust_weight_correction = full_trust_mask_mass.new_ones(())
-        if reference_trust_coefficient > 0.0 and full_trust_mask_mass > 0.0:
+        if (
+            reference_trust_coefficient > 0.0
+            and trust_objective == REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE
+            and full_trust_mask_mass > 0.0
+        ):
             local_trust_mask_mass = (
                 eval_batch["x_invisible_mask"].detach().float().sum()
             )
@@ -4209,31 +5389,139 @@ def train_step(
             )
             for count in chunk_sizes
         }
+        if (
+            reference_trust_max_ratio is not None
+            and trust_distance == "vp_path_kl"
+            and trust_probe is None
+        ):
+            # The gradient estimator is stratified across all accumulated
+            # timesteps, but a single stratum is not a valid fixed estimate of
+            # the complete reverse-path KL.  Build the round probe once from
+            # the full importance distribution instead.  It is graph-free and
+            # is reused for every pre/post-commit check in the reward round.
+            probe_generator = torch.Generator(device=device)
+            probe_generator.manual_seed(
+                2_026_090_599
+                + int(global_step) * 1_000_003
+                + int(event_start) * 10_007
+                + (
+                    dist.get_rank()
+                    if dist.is_available() and dist.is_initialized()
+                    else 0
+                )
+            )
+            probe_t, probe_path_kl_normalizer = (
+                sample_cosine_vp_path_kl_timesteps(
+                    1,
+                    local_B,
+                    total_strata=1,
+                    stratum_offset=0,
+                    device=device,
+                    dtype=torch.float32,
+                    logsnr_min=reference_trust_vp_logsnr_min,
+                    logsnr_max=reference_trust_vp_logsnr_max,
+                    generator=probe_generator,
+                )
+            )
+            probe_nu = int(base_policy_inputs.candidates_norm.shape[-2])
+            probe_features = int(base_policy_inputs.candidates_norm.shape[-1])
+            probe_eps = torch.randn(
+                1,
+                local_B,
+                probe_nu,
+                probe_features,
+                device=device,
+                dtype=dtype,
+                generator=probe_generator,
+            )
+            probe_eps_rep = (
+                probe_eps.unsqueeze(1)
+                .expand(1, K, local_B, probe_nu, probe_features)
+                .reshape(K * local_B, probe_nu, probe_features)
+            )
+            with torch.no_grad():
+                (
+                    _probe_L_cur,
+                    probe_L_ref,
+                    _probe_t_out,
+                    _probe_model_v,
+                    probe_ref_v,
+                    probe_noise_mask,
+                    probe_x_t,
+                    _probe_target_v,
+                    probe_t_rep,
+                    probe_batch_rep,
+                    _probe_eps_rep,
+                ) = policy_evaluation_step(
+                    core,
+                    ref_model,
+                    eval_batch,
+                    eval_candidates,
+                    K=K,
+                    shared_noise=shared_noise,
+                    device=device,
+                    dtype=dtype,
+                    t=probe_t,
+                    eps_rep=probe_eps_rep,
+                    t_min=0.0,
+                    t_max=1.0,
+                    num_timesteps=1,
+                    prepared_inputs=base_policy_inputs,
+                )
+            captured_probe = _capture_reference_trust_probe(
+                x_t=probe_x_t,
+                t_rep=probe_t_rep,
+                noise_mask_rep=probe_noise_mask,
+                ref_v=probe_ref_v,
+                batch_rep=probe_batch_rep,
+                L_ref_2d=probe_L_ref,
+                K=K,
+                local_batch_size=local_B,
+                max_events=reference_trust_probe_events_per_rank,
+                path_kl_normalizer=probe_path_kl_normalizer,
+            )
+            if reference_trust_fixed_probe_per_round:
+                assert reference_trust_probe_cache is not None
+                trust_probe, probe_payload = _gather_reference_trust_probe(
+                    captured_probe,
+                    device=device,
+                    world_size=world_size,
+                )
+                reference_trust_probe_cache["probe"] = trust_probe
+                reference_trust_probe_cache["payload"] = probe_payload
+                reference_trust_probe_cache["dirty"] = True
+            else:
+                trust_probe = captured_probe
         del base_policy_inputs
 
         completed_substeps = 0
         while completed_substeps < acc_steps:
             chunk_size = min(parallel_eval_steps, acc_steps - completed_substeps)
-            is_last_backward = (
-                event_chunk_index + 1 == len(policy_event_ranges)
-                and completed_substeps + chunk_size == acc_steps
-            )
-            ctx = (
-                model.no_sync()
-                if isinstance(model, DDP) and not is_last_backward
-                else nullcontext()
-            )
-            with ctx:
-                chunk_outcomes = _dgpo_substeps(
-                    chunk_size,
+            if sequential_vp_trust_backward:
+                # The sequential path evaluates through ``core`` and performs
+                # both backwards here.  DDP reduction happens once after every
+                # event chunk and timestep has accumulated.
+                chunk_outcomes = _dgpo_sequential_vp_substep(
                     eval_batch=eval_batch,
                     eval_candidates=eval_candidates,
                     eval_advantages=eval_advantages,
                     eval_rewards=eval_rewards,
                     prepared_inputs=parallel_input_cache[chunk_size],
                     trust_weight_correction=trust_weight_correction,
+                    path_kl_stratum_offset=completed_substeps,
+                    path_kl_seed=(
+                        2_026_090_501
+                        + int(global_step) * 1_000_003
+                        + int(event_start) * 10_007
+                        + int(completed_substeps) * 101
+                        + (
+                            dist.get_rank()
+                            if dist.is_available() and dist.is_initialized()
+                            else 0
+                        )
+                    ),
+                    backward_weight=event_weight / float(acc_steps),
                 )
-                finite_losses: list[Tensor] = []
                 for chunk_offset, (loss, dlast) in enumerate(chunk_outcomes):
                     sub = completed_substeps + chunk_offset + 1
                     diags.append(dlast)
@@ -4250,22 +5538,228 @@ def train_step(
                             sub,
                             acc_steps,
                         )
-                        continue
-                    finite_losses.append(loss)
-                if finite_losses:
-                    (
-                        torch.stack(finite_losses).sum()
-                        * event_weight
-                        / float(acc_steps)
-                    ).backward()
+            else:
+                is_last_backward = (
+                    event_chunk_index + 1 == len(policy_event_ranges)
+                    and completed_substeps + chunk_size == acc_steps
+                )
+                ctx = (
+                    model.no_sync()
+                    if isinstance(model, DDP) and not is_last_backward
+                    else nullcontext()
+                )
+                with ctx:
+                    chunk_outcomes = _dgpo_substeps(
+                        chunk_size,
+                        eval_batch=eval_batch,
+                        eval_candidates=eval_candidates,
+                        eval_advantages=eval_advantages,
+                        eval_rewards=eval_rewards,
+                        prepared_inputs=parallel_input_cache[chunk_size],
+                        trust_weight_correction=trust_weight_correction,
+                        path_kl_stratum_offset=completed_substeps,
+                        path_kl_seed=(
+                            2_026_090_501
+                            + int(global_step) * 1_000_003
+                            + int(event_start) * 10_007
+                            + int(completed_substeps) * 101
+                            + (
+                                dist.get_rank()
+                                if dist.is_available() and dist.is_initialized()
+                                else 0
+                            )
+                        ),
+                    )
+                    finite_losses: list[Tensor] = []
+                    for chunk_offset, (loss, dlast) in enumerate(chunk_outcomes):
+                        sub = completed_substeps + chunk_offset + 1
+                        diags.append(dlast)
+                        diag_weights.append(event_weight)
+                        if not torch.isfinite(loss):
+                            skipped_substeps += 1
+                            _log.warning(
+                                "[DGPO] non-finite substep loss (%s); skipping backward "
+                                "(step=%s events=%s:%s sub=%s/%s).",
+                                float(loss.detach().float().cpu()),
+                                global_step,
+                                event_start,
+                                event_stop,
+                                sub,
+                                acc_steps,
+                            )
+                            continue
+                        finite_losses.append(loss)
+                    if finite_losses:
+                        (
+                            torch.stack(finite_losses).sum()
+                            * event_weight
+                            / float(acc_steps)
+                        ).backward()
             completed_substeps += chunk_size
         del parallel_input_cache
+    manually_reduced_gradient_tensors = 0
+    if sequential_vp_trust_backward:
+        manually_reduced_gradient_tensors = _all_reduce_accumulated_gradients(
+            core,
+            world_size=world_size,
+        )
+    diag_last = _weighted_mean_diag_dict(diags, diag_weights)
+    diag_last["reference_trust/sequential_backward"] = torch.tensor(
+        float(sequential_vp_trust_backward),
+        device=device,
+        dtype=torch.float64,
+    )
+    diag_last["train/gradient_sync/manual_parameter_tensors"] = torch.tensor(
+        float(manually_reduced_gradient_tensors),
+        device=device,
+        dtype=torch.float64,
+    )
+    extragradient_rebased_params = 0
+    if extragradient_optimizer_base_params is not None:
+        if reference_trust_max_ratio is not None:
+            raise ValueError(
+                "extragradient optimizer rebasing owns its post-step trust "
+                "audit; disable train_step strict trust for the corrector"
+            )
+        extragradient_rebased_params = (
+            rebase_trainable_params_for_extragradient_(
+                core,
+                extragradient_optimizer_base_params,
+            )
+        )
+    strict_trust_enabled = reference_trust_max_ratio is not None
+    trust_pre_distance = float("nan")
+    trust_candidate_distance = float("nan")
+    trust_post_distance = float("nan")
+    trust_probe_velocity_mse = float("nan")
+    trust_probe_reference_loss = float("nan")
+    trust_initial_scale = 1.0
+    trust_accepted_scale = 1.0
+    trust_backtrack_steps = 0
+    trust_boundary_hit = False
+    preexisting_trust_violation = False
+    trust_interior_saturated = False
+    trust_nominal_interior_limit = float("nan")
+    trust_acceptance_limit = float("nan")
+    trust_optimizer_state_advanced = False
+    trust_zero_step_adam_reset_count = 0
+    if strict_trust_enabled:
+        if trust_probe is None:
+            raise RuntimeError(
+                "strict adaptive trust requires at least one finite policy-evaluation probe"
+            )
+        (
+            trust_pre_distance,
+            trust_probe_velocity_mse,
+            trust_probe_reference_loss,
+        ) = _measure_reference_trust_probe(
+            model,
+            trust_probe,
+            world_size=world_size,
+            distance=trust_distance,
+        )
+        delta_f = float(reference_trust_max_ratio)
+        trust_nominal_interior_limit = (
+            float(reference_trust_interior_fraction) * delta_f
+        )
+        # A restored legacy checkpoint may begin outside the new interior target
+        # while still satisfying the hard radius. In that one case, require the
+        # candidate not to move farther out; fixed-probe steps then converge to
+        # the configured interior instead of making the run unrecoverable.
+        trust_acceptance_limit = min(
+            delta_f,
+            max(trust_nominal_interior_limit, trust_pre_distance),
+        )
+        preexisting_trust_violation = bool(
+            not math.isfinite(trust_pre_distance)
+            or trust_pre_distance >= delta_f
+        )
+        if preexisting_trust_violation:
+            trust_initial_scale = 0.0
+        else:
+            trust_initial_scale, trust_interior_saturated = (
+                adaptive_trust_update_scale(
+                    trust_pre_distance,
+                    delta=trust_acceptance_limit,
+                    warning_fraction=float(reference_trust_warning_fraction),
+                )
+            )
+        trust_accepted_scale = trust_initial_scale
+        ratio_for_diag = torch.tensor(
+            trust_pre_distance,
+            device=device,
+            dtype=torch.float64,
+        )
+        diag_last["reference_trust/pre_step_distance"] = ratio_for_diag
+        diag_last["reference_trust/probe_velocity_mse"] = ratio_for_diag.new_tensor(
+            trust_probe_velocity_mse
+        )
+        diag_last["reference_trust/probe_reference_loss"] = ratio_for_diag.new_tensor(
+            trust_probe_reference_loss
+        )
+        diag_last["reference_trust/delta"] = ratio_for_diag.new_tensor(
+            float(reference_trust_max_ratio)
+        )
+        diag_last["reference_trust/warning_ratio"] = ratio_for_diag.new_tensor(
+            float(reference_trust_warning_fraction)
+            * trust_acceptance_limit
+        )
+        diag_last["reference_trust/boundary_enabled"] = ratio_for_diag.new_tensor(1.0)
+        diag_last["reference_trust/interior_fraction"] = ratio_for_diag.new_tensor(
+            float(reference_trust_interior_fraction)
+        )
+        diag_last["reference_trust/nominal_interior_limit"] = (
+            ratio_for_diag.new_tensor(trust_nominal_interior_limit)
+        )
+        diag_last["reference_trust/acceptance_limit"] = ratio_for_diag.new_tensor(
+            trust_acceptance_limit
+        )
+        diag_last["reference_trust/fixed_probe_per_reward_round"] = (
+            ratio_for_diag.new_tensor(
+                float(reference_trust_fixed_probe_per_round)
+            )
+        )
+        diag_last["reference_trust/probe_reused"] = ratio_for_diag.new_tensor(
+            float(trust_probe_reused)
+        )
+
     gn, clip_on = _grad_norm_pre_clip_and_clip_active(
         model, float(grad_clip_norm)
     )
     grad_norm_pre_clip_max = gn
     grad_clip_active_any = clip_on > 0.5
-    if skipped_substeps == total_backward_units or not math.isfinite(gn):
+    theta_old_snap: dict[str, Tensor] | None = None
+    if preexisting_trust_violation or trust_interior_saturated:
+        trust_boundary_hit = True
+        trust_accepted_scale = 0.0
+        trust_post_distance = trust_pre_distance
+        if preexisting_trust_violation:
+            _log.info(
+                "[DGPO/trust] fixed probe is already outside the hard boundary at "
+                "epoch=%s global_step=%s: D_pre=%.6g delta=%.6g; rejecting step.",
+                epoch,
+                global_step,
+                trust_pre_distance,
+                float(reference_trust_max_ratio),
+            )
+        else:
+            _log.info(
+                "[DGPO/trust] fixed probe exhausted the interior budget at "
+                "epoch=%s global_step=%s: D_pre=%.6g target=%.6g delta=%.6g; "
+                "holding policy for the adaptive audit.",
+                epoch,
+                global_step,
+                trust_pre_distance,
+                trust_acceptance_limit,
+                float(reference_trust_max_ratio),
+            )
+        optimizer.zero_grad(set_to_none=True)
+        if reference_trust_reset_adam_first_moment_on_zero_step:
+            trust_zero_step_adam_reset_count = reset_adam_first_moment(optimizer)
+    elif skipped_substeps == total_backward_units or not math.isfinite(gn):
+        if strict_trust_enabled:
+            trust_accepted_scale = 0.0
+            trust_post_distance = trust_pre_distance
         _log.warning(
             "[DGPO] all substeps non-finite or grad-norm non-finite (%s); "
             "skipping optimizer.step at global_step=%s.",
@@ -4273,13 +5767,188 @@ def train_step(
         )
         optimizer.zero_grad(set_to_none=True)
     else:
-        # A full trainable-parameter clone is only needed by the optional CPO
-        # repair.  The normal DGPO path (projection type: none) otherwise paid
-        # this GPU-memory bandwidth and allocation cost on every optimizer step.
-        theta_old_snap = snapshot_params(model) if projection_active else None
-        optimizer.step()
+        # Strict trust needs theta_old so a rejected candidate can be replaced by
+        # a smaller point on the exact same AdamW direction. Adam moments do not
+        # depend on LR, and AdamW's parameter displacement is linear in LR, so
+        # this interpolation is equivalent to rerunning the step at the accepted
+        # smaller LR without copying the full optimizer state.
+        theta_old_snap = (
+            snapshot_params(model)
+            if strict_trust_enabled or projection_active
+            else None
+        )
+        original_group_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        if trust_policy_lr_scale * trust_initial_scale < 1.0:
+            for group, original_lr in zip(
+                optimizer.param_groups, original_group_lrs, strict=True
+            ):
+                group["lr"] = (
+                    original_lr * trust_policy_lr_scale * trust_initial_scale
+                )
+        try:
+            optimizer.step()
+            trust_optimizer_state_advanced = True
+        finally:
+            for group, original_lr in zip(
+                optimizer.param_groups, original_group_lrs, strict=True
+            ):
+                group["lr"] = original_lr
         optimizer_ran = True
-    diag_last = _weighted_mean_diag_dict(diags, diag_weights)
+        if strict_trust_enabled:
+            assert theta_old_snap is not None
+            (
+                trust_candidate_distance,
+                _,
+                _,
+            ) = _measure_reference_trust_probe(
+                model,
+                trust_probe,
+                world_size=world_size,
+                distance=trust_distance,
+            )
+            trust_post_distance = trust_candidate_distance
+            delta_f = float(reference_trust_max_ratio)
+            acceptance_tolerance = max(1.0e-12, 1.0e-6 * delta_f)
+            if (
+                not math.isfinite(trust_candidate_distance)
+                or trust_candidate_distance
+                > trust_acceptance_limit + acceptance_tolerance
+            ):
+                trust_boundary_hit = True
+                theta_candidate = snapshot_params(model)
+                accepted = False
+                for backtrack_index, absolute_scale in enumerate(
+                    adaptive_trust_backtracking_scales(
+                        trust_initial_scale,
+                        factor=reference_trust_backtrack_factor,
+                        max_backtracks=reference_trust_max_backtracks,
+                    ),
+                    start=1,
+                ):
+                    _assign_interpolated_trainable_params_(
+                        model,
+                        theta_old_snap,
+                        theta_candidate,
+                        absolute_scale / trust_initial_scale,
+                    )
+                    trial_distance, _, _ = _measure_reference_trust_probe(
+                        model,
+                        trust_probe,
+                        world_size=world_size,
+                        distance=trust_distance,
+                    )
+                    if (
+                        math.isfinite(trial_distance)
+                        and trial_distance
+                        <= trust_acceptance_limit + acceptance_tolerance
+                    ):
+                        trust_accepted_scale = float(absolute_scale)
+                        trust_backtrack_steps = int(backtrack_index)
+                        trust_post_distance = float(trial_distance)
+                        accepted = True
+                        break
+                if not accepted:
+                    assign_params_(model, theta_old_snap)
+                    optimizer.zero_grad(set_to_none=True)
+                    if reference_trust_reset_adam_first_moment_on_zero_step:
+                        trust_zero_step_adam_reset_count = (
+                            reset_adam_first_moment(optimizer)
+                        )
+                    # Zero displacement is always feasible. Treat failure to
+                    # find a positive line-search scale as a safely rejected
+                    # policy step instead of aborting the distributed job. AdamW
+                    # AdamW's variance/step state has observed this gradient;
+                    # the optional convergence controller clears its first
+                    # moment so rejected outward momentum is not carried into
+                    # the next batch. EMA and the LR scheduler must not advance
+                    # because no parameter update was committed.
+                    optimizer_ran = False
+                    trust_accepted_scale = 0.0
+                    trust_backtrack_steps = int(reference_trust_max_backtracks)
+                    trust_post_distance = trust_pre_distance
+                    _log.warning(
+                        "[DGPO/trust] no positive step satisfied the boundary at "
+                        "epoch=%s global_step=%s after %s trials; restored "
+                        "theta_old and committed alpha=0 (D_pre=%.6g target=%.6g "
+                        "delta=%.6g).",
+                        epoch,
+                        global_step,
+                        int(reference_trust_max_backtracks),
+                        trust_pre_distance,
+                        trust_acceptance_limit,
+                        delta_f,
+                    )
+                else:
+                    _log.info(
+                        "[DGPO/trust] candidate exceeded boundary at epoch=%s "
+                        "global_step=%s: D_candidate=%.6g delta=%.6g target=%.6g; "
+                        "accepted scale=%.6g after %s backtrack(s), D_post=%.6g.",
+                        epoch,
+                        global_step,
+                        trust_candidate_distance,
+                        delta_f,
+                        trust_acceptance_limit,
+                        trust_accepted_scale,
+                        trust_backtrack_steps,
+                        trust_post_distance,
+                    )
+
+    if strict_trust_enabled:
+        metric_device = device
+        metric_dtype = torch.float64
+        control_distance = (
+            trust_post_distance
+            if math.isfinite(trust_post_distance)
+            else trust_pre_distance
+        )
+        trust_metrics = {
+            "reference_trust/control_ratio_global": control_distance,
+            "reference_trust/candidate_distance": trust_candidate_distance,
+            "reference_trust/candidate_distance_over_delta": (
+                trust_candidate_distance / float(reference_trust_max_ratio)
+                if math.isfinite(trust_candidate_distance)
+                else float("nan")
+            ),
+            "reference_trust/candidate_excess": (
+                trust_candidate_distance - float(reference_trust_max_ratio)
+                if math.isfinite(trust_candidate_distance)
+                else float("nan")
+            ),
+            "reference_trust/post_step_distance": trust_post_distance,
+            "reference_trust/acceptance_limit": trust_acceptance_limit,
+            "reference_trust/post_step_distance_over_delta": (
+                trust_post_distance / float(reference_trust_max_ratio)
+                if math.isfinite(trust_post_distance)
+                else float("nan")
+            ),
+            "reference_trust/update_scale": trust_accepted_scale,
+            "reference_trust/accepted_step_scale": trust_accepted_scale,
+            "reference_trust/backtrack_steps": float(trust_backtrack_steps),
+            "reference_trust/boundary_hit": float(trust_boundary_hit),
+            "reference_trust/preexisting_violation": float(
+                preexisting_trust_violation
+            ),
+            "reference_trust/interior_saturated": float(
+                trust_interior_saturated
+            ),
+            "reference_trust/step_accepted": float(optimizer_ran),
+            "reference_trust/optimizer_state_advanced": float(
+                trust_optimizer_state_advanced
+            ),
+            "reference_trust/zero_step_adam_first_moments_reset": float(
+                trust_zero_step_adam_reset_count
+            ),
+            "reference_trust/policy_lr/scale": trust_policy_lr_scale,
+            "reference_trust/policy_lr/effective_step_scale": (
+                trust_policy_lr_scale * trust_accepted_scale
+            ),
+        }
+        for metric_name, metric_value in trust_metrics.items():
+            diag_last[metric_name] = torch.tensor(
+                metric_value,
+                device=metric_device,
+                dtype=metric_dtype,
+            )
     if optimizer_ran and theta_old_snap is not None and projection_active:
         _dgpo_projection_repair_after_adamw(
             model=model,
@@ -4304,7 +5973,7 @@ def train_step(
 
     if optimizer_ran and ema_rollout is not None:
         ema_rollout.update(core, decay_=_dgpo_rollout_ema_decay(global_step))
-    if ema_save is not None:
+    if optimizer_ran and ema_save is not None:
         ema_cfg = global_config.options.Training.get("EMA", None) or {}
         ema_every_n = max(1, int(ema_cfg.get("update_every_n_steps", 1)))
         if global_step % ema_every_n == 0:
@@ -4333,11 +6002,11 @@ def train_step(
             float(torch.cuda.get_device_properties(device).total_memory) / gib
         )
 
-    if log_reward_dist:
+    if log_reward_dist and not _wandb_critical_enabled():
         out.update(build_reward_distribution_histograms(rewards, valid_b))
     plot_names = diagnostic_plot_names or set()
     plot_every = max(1, int(diagnostic_plot_every))
-    log_diag_images = bool(log_diagnostic_dist) and (
+    log_diag_images = bool(log_diagnostic_dist) and not _wandb_critical_enabled() and (
         int(global_step) % plot_every == 0
     )
     collect_profile_accum = log_diag_images and ("pt_profile_accumulated" in plot_names)
@@ -4366,6 +6035,11 @@ def train_step(
         )
     out["train/grad/global_norm_pre_clip"] = float(grad_norm_pre_clip_max)
     out["train/grad/clip_active"] = 1.0 if grad_clip_active_any else 0.0
+    out["train/optimizer_step_ran"] = float(optimizer_ran)
+    if extragradient_optimizer_base_params is not None:
+        out["reference_trust/extragradient/rebased_optimizer_params"] = float(
+            extragradient_rebased_params
+        )
     out["projection/active"] = 1.0 if projection_active else 0.0
     out["projection/pure_dgpo_backward"] = 1.0
     _append_projection_summary_metrics(out)
@@ -4442,7 +6116,11 @@ def train_step(
             device=device,
         )
 
-    optimizer.scheduler_step()
+    # A hard trust-boundary stop is not an optimizer update and must not consume
+    # a scheduler step. Preserve the historical scheduler behavior for all
+    # non-boundary paths, including a non-finite skipped batch.
+    if optimizer_ran or not trust_boundary_hit:
+        optimizer.scheduler_step()
     return out
 
 
@@ -4453,8 +6131,9 @@ def build_optimizer(
     steps_per_epoch: int,
     warmup_steps: int,
     is_rank0: bool = True,
+    lr_schedule: Mapping[str, Any] | None = None,
 ) -> _DgpoOptimizerWithSchedule:
-    """AdamW with EveNet-style ``optimizer_group`` LR/WD (no world-size scaling) + linear warmup then constant LR.
+    """AdamW with grouped LR/WD and linear warmup, optionally followed by cosine decay.
 
     ``warmup_steps`` counts **batches** (one ``scheduler_step`` per call to :func:`train_step`;
     each ``train_step`` performs one accumulated ``optimizer.step()``).
@@ -4476,6 +6155,12 @@ def build_optimizer(
     components = train_opt.Components
     default_lr = float(train_opt.learning_rate)
     default_wd = float(train_opt.weight_decay)
+    schedule_cfg = dict(lr_schedule or {})
+    schedule_kind = str(schedule_cfg.get("type", "constant"))
+    if schedule_kind not in {"constant", "cosine"}:
+        raise ValueError("DGPO lr_schedule.type must be constant or cosine")
+    if not math.isfinite(default_wd) or default_wd < 0:
+        raise ValueError("DGPO weight_decay must be finite and nonnegative")
 
     group_meta: dict[str, dict[str, Any]] = {}
     group_modules: dict[str, list[str]] = defaultdict(list)
@@ -4494,6 +6179,8 @@ def build_optimizer(
         if gname not in group_meta:
             lr = float(cfg.get("learning_rate", default_lr))
             wd = float(cfg.get("weight_decay", default_wd))
+            if not math.isfinite(wd) or wd < 0:
+                raise ValueError(f"DGPO group {gname!r} weight_decay must be finite and nonnegative")
             warm_up = bool(cfg.get("warm_up", True))
             opt_type = str(cfg.get("optimizer_type", "AdamW"))
             group_meta[gname] = {
@@ -4584,10 +6271,11 @@ def build_optimizer(
 
     if is_rank0:
         _log.info(
-            "[DGPO] Optimizer: AdamW groups=%s steps/epoch≈%s warmup_batches=%s (linear→constant).",
+            "[DGPO] Optimizer: AdamW groups=%s steps/epoch≈%s warmup_batches=%s (linear→%s).",
             len(param_groups),
             int(steps_per_epoch),
             ws,
+            schedule_kind,
         )
         for i, gname in enumerate(nonempty_group_order):
             pg = optimizer.param_groups[i]
@@ -4608,13 +6296,31 @@ def build_optimizer(
                 warm,
             )
 
-    return _DgpoOptimizerWithSchedule(optimizer, scheduler)
+    wrapped = _DgpoOptimizerWithSchedule(
+        optimizer, scheduler,
+        cosine_config=schedule_cfg if schedule_kind == "cosine" else None,
+        warmup_steps=ws,
+        warmup_groups=[bool(group_meta[g]["warm_up"]) if g in group_meta else True
+                       for g in nonempty_group_order],
+    )
+    if is_rank0 and wrapped.cosine_state is not None:
+        _log.info("[DGPO] Cosine LR enabled: end_scheduler_step=%s min_lr_ratio=%s; resume preserves its anchor/clock.",
+                  wrapped.cosine_state["total_steps"], wrapped.cosine_state["min_lr_ratio"])
+    return wrapped
 
 
 def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
     """Explicit definitions for W&B Config → dgpo_metric_definitions (visible in the UI)."""
     return {
         "epoch": "Training epoch index (x-axis for most plots).",
+        "train/lr/scheduled_max": "Largest DGPO group LR before this update, before round warmup and trust backtracking. Cosine resumes its saved scheduler clock.",
+        "train/lr/scheduled_min": "Smallest DGPO group LR before this update, before round warmup and trust backtracking.",
+        "staleness/global_best/improved": "1 when a global-best policy is registered/replaced; candidate replacements require the configured effect-size and paired confirmation gate.",
+        "staleness/global_best/failed_rounds": "Consecutive completed plateau windows after refitting the same incumbent best; a confirmed new best resets this counter.",
+        "staleness/global_best/stop_requested": "1 when repeated global-best refits fail to improve; save the consistent latest state and stop, preserving the separate best checkpoint. Not convergence.",
+        "staleness/global_best/confirmation_delta": "Candidate minus incumbent raw |AUC-.5| in paired equal-start confirmation fits; negative favors candidate. Not a significance statistic.",
+        "staleness/global_best/confirmation_valid": "1 only when both confirmation fits are saturated and finite.",
+        "staleness/global_best/confirmation_accepted": "1 when paired confirmation favors candidate beyond raw_improvement_min_delta.",
         # --- reward/dist (overlaid figure, every log_reward_dist_every steps) ---
         "reward/dist/overlap": "Matplotlib figure: three overlapped 1D density histograms (best / worst / median per valid event). wandb.Image — use the media step slider to compare across training steps.",
         # --- reward/monitor (scalars, every step) ---
@@ -4639,15 +6345,63 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "projection/pure_dgpo_backward": "1 when the main policy objective stays DGPO-style in backward. Optional soft regularizers may be added, while any latent-SWD CPO repair still happens only post-AdamW.",
         # --- train/loss ---
         "train/loss/total": "Scalar passed to backward(): DGPO main term plus any enabled supervised diffusion anchor and soft regularizers. Post-step latent-SWD CPO repair is after AdamW only.",
+        "train/round_warmup/lr_scale": "DGPO-only multiplier relative to scheduled group LRs after each accepted reward install; applied together with trust scaling/backtracking. Not classifier LR.",
+        "train/round_warmup/completed_updates": "Accepted DGPO optimizer updates completed before this step in the installed round's warmup. Rejected/nonfinite updates do not advance it; resumes preserve it.",
         "train/loss/dgpo": "DGPO main term (detached gate × advantage × L_cur). Lower is better.",
         "train/loss/L_cur": "Mean velocity MSE for the trainable policy (DDIM target). Lower is better.",
         "train/loss/L_ref": "Mean velocity MSE for the frozen reference policy. Lower is better.",
         "train/loss/delta": "mean(|L_cur - L_ref|): average absolute gap between current and reference velocity MSE. Shows how far the policy has moved from frozen ref_model (not rollout EMA).",
         "train/loss/velocity": "Detached velocity objective slice: pure DGPO main term used for backward.",
         "train/loss/kl": "Weighted supervised diffusion anchor beta_kl * mean_row |v_pred - v_truth|^2 on the same noisy inputs. Keeps the original diffusion preference toward the denoising target while DGPO adds physics steering.",
-        "reference_trust/loss": "Shared-noise velocity-MSE trust loss against the policy snapshot paired with the installed OmniFold reward round.",
+        "reference_trust/loss": "Configured round-reference trust objective. It is legacy shared-noise velocity MSE for objective=velocity_mse and a full-time cosine-VP reverse-path KL estimate for objective=vp_path_kl.",
+        "reference_trust/vp_path_kl": "Separate full-time importance-sampled cosine-VP reverse-path KL estimate: 0.5*Z times the mean active-dimension sum of squared current/reference velocity differences.",
+        "reference_trust/objective_vp_path_kl": "1 when VP path-KL, rather than legacy dimension-mean velocity MSE, is used in backward.",
+        "reference_trust/round_decay/step": "Installed-reference schedule index since enabling round_decay: delta=max(floor, initial*factor**step). Unchanged by monitors, failed refits, policy-only rollback, and resume.",
+        "reference_trust/sequential_backward": "1 when the DGPO and VP path-KL graphs are constructed and backpropagated sequentially to reduce activation-memory peak; their gradients still sum before the one AdamW update.",
+        "reference_trust/vp_path_kl_diagnostic_enabled": "1 when a separate no-gradient VP path-KL forward is logged while the legacy velocity-MSE objective remains active.",
         "reference_trust/velocity_mse_ratio": "Round-reference trust velocity MSE divided by the frozen reference policy's own velocity loss.",
         "reference_trust/coefficient": "Configured multiplier for the paired round-reference trust loss.",
+        "reference_trust/control_ratio_global": "Accepted post-step fixed-probe functional distance enforced by strict backtracking: velocity-MSE ratio or VP path-KL according to adaptive_boundary.distance.",
+        "reference_trust/delta": "Effective hard radius: fixed, AUC-scaled, per-reference round_decay, or feasibility-protected new-raw-best best_decay, according to radius_mode.",
+        "reference_trust/best_decay/count": "Number of saturated GLOBAL-best raw-AUC improvements, excluding first baseline registration. Preserved across policy rollback and reference refits.",
+        "reference_trust/best_decay/global_best_auc_gap": "Lowest saturated raw abs(AUC-0.5) observed in this experiment; never reset by reward refits or policy-only rollback.",
+        "reference_trust/best_decay/target": "Requested radius max(floor, initial*best_decay_factor**count). The effective delta may be larger to keep the current policy feasible.",
+        "reference_trust/best_decay/feasibility_limited": "1 when shrinking fully to the target would consume the fixed-probe safety headroom; deferred contraction is applied after recentering.",
+        "reference_trust/warning_ratio": "Pre-step distance at which the candidate AdamW update begins with a linearly damped LR.",
+        "reference_trust/interior_fraction": "Configured fraction of delta targeted by strict backtracking; values below one preserve room for later updates.",
+        "reference_trust/nominal_interior_limit": "interior_fraction times the active hard trust radius.",
+        "reference_trust/acceptance_limit": "Effective per-step backtracking limit. Normally the nominal interior limit; legacy resumes already outside that target may hold but not increase their distance.",
+        "reference_trust/fixed_probe_per_reward_round": "1 when event conditions, diffusion timesteps, noise, and round-reference outputs are fixed until the reward/reference pair changes.",
+        "reference_trust/probe_reused": "1 after the first optimizer attempt in a reward round, when the same fixed probe is reused.",
+        "reference_trust/pre_step_distance": "Fixed shared-noise functional distance before the candidate AdamW update.",
+        "reference_trust/candidate_distance": "Fixed-probe distance after the initial candidate AdamW update and before any backtracking.",
+        "reference_trust/candidate_distance_over_delta": "Candidate fixed-probe distance divided by the active radius; values above one are trust-boundary exceedances.",
+        "reference_trust/candidate_excess": "Candidate fixed-probe distance minus the active radius; positive values exceed the trust region.",
+        "reference_trust/post_step_distance": "Fixed-probe distance of the accepted policy; strict mode requires it to remain at or below the active acceptance_limit.",
+        "reference_trust/post_step_distance_over_delta": "Accepted fixed-probe distance divided by the active radius; strict mode requires this to be at most one.",
+        "reference_trust/update_scale": "Accepted absolute multiplier of the scheduled AdamW parameter displacement; alias of accepted_step_scale.",
+        "reference_trust/accepted_step_scale": "Final AdamW displacement scale after warning-band damping and strict backtracking.",
+        "reference_trust/backtrack_steps": "Number of multiplicative backtracking trials needed to satisfy the current trust radius.",
+        "reference_trust/boundary_hit": "1 when the initial candidate exceeded delta or the pre-step probe was already outside; this no longer forces an OmniFold refit.",
+        "reference_trust/preexisting_violation": "1 when the fixed pre-step probe was already outside delta, so no optimizer update was attempted.",
+        "reference_trust/interior_saturated": "1 when the fixed probe remains inside hard delta but has exhausted the configured interior update budget; the policy is held until a later audit decision.",
+        "reference_trust/step_accepted": "1 only when a feasible AdamW update was committed and the scheduler/EMA were advanced.",
+        "reference_trust/optimizer_state_advanced": "1 when AdamW state incorporated the current gradient; this can remain 1 for a safely rejected alpha=0 policy step while scheduler/EMA stay fixed, even if the convergence controller then clears first moments.",
+        "reference_trust/zero_step_adam_first_moments_reset": "Number of Adam first-moment tensors cleared after a trust-boundary alpha=0 rejection; second moments and optimizer step counters remain intact.",
+        "reference_trust/policy_lr/scale": "Per-round DGPO LR multiplier sqrt(delta_r/delta_0), clipped by the configured floor; classifier LRs are unaffected.",
+        "reference_trust/policy_lr/effective_step_scale": "Product of the per-round policy LR scale and the within-round trust/backtracking scale.",
+        "reference_trust/cross_round/cap_active": "1 when a newly installed reward round was prevented from using a radius larger than its predecessor.",
+        "reference_trust/probe_velocity_mse": "Fixed-probe masked velocity MSE between policy and paired round reference.",
+        "reference_trust/probe_reference_loss": "Round-reference denoising loss used to normalize the fixed-probe velocity MSE.",
+        "reference_trust/raw_auc": "Unweighted truth-vs-current-generation AUC from the first cross-fit classifier of the installed OmniFold round.",
+        "reference_trust/statistically_closed": "1 when the installed round raw-AUC gap is within the configured closure/statistical-uncertainty band.",
+        "reference_trust/adam_first_moments_reset": "Number of AdamW exp_avg buffers zeroed after an accepted reward/reference replacement.",
+        "reference_trust/empirical/acceptance_rate": "Fraction of recent optimizer attempts that committed a feasible update on the fixed round probe.",
+        "reference_trust/empirical/mean_update_scale": "Mean final AdamW displacement scale across the recent attempt window; rejected attempts contribute zero.",
+        "reference_trust/empirical/throughput_starved": "1 when recent acceptance rate or mean update scale is below its configured target.",
+        "reference_trust/empirical/radius_action": "Adaptive v2 audit action: -1 contracts the future-round cap, 0 holds, +1 expands the live radius.",
+        "reference_trust/empirical/delta_before": "Active trust radius immediately before an adaptive audit decision.",
+        "reference_trust/empirical/delta_after": "Active trust radius immediately after an adaptive audit decision.",
         "train/loss/variance_regularization": "Weighted anti-shrink soft penalty added to backward: lambda_var * mean(relu((std_truth - std_pred) / std_truth)^2) over the selected event_info-driven angular features.",
         "train/regularization/variance/active": "1 when batch-level variance anti-shrink regularization found at least one selected feature in the current feature layout.",
         "train/regularization/variance/active_features": "How many selected features contributed to the anti-shrink regularizer on this batch.",
@@ -4752,6 +6506,7 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         # --- train/grad (one accumulated optimizer step per batch) ---
         "train/grad/global_norm_pre_clip": "Total L2 norm of trainable gradients before clip_grad_norm_ (max over sub-steps in the batch). Compare to dgpo.grad_clip_norm in run config.",
         "train/grad/clip_active": "1.0 if any sub-step had pre-clip norm > dgpo.grad_clip_norm (clipping applied); else 0.0.",
+        "train/gradient_sync/manual_parameter_tensors": "Number of globally active trainable parameter tensors averaged across workers after sequential DGPO plus VP-trust gradient accumulation. Zero means the ordinary DDP reducer path was used.",
         "train/candidate_nonfinite_fraction": "Fraction of generated candidate tensor elements that were non-finite before zeroing (DDIM / kinematics blow-up).",
         "train/reward_nonfinite_fraction": "Fraction of (K,B) total rewards that were non-finite before zeroing.",
         "train/reward_nonfinite_fraction/*": "Per reward-source non-finite fraction before zeroing.",
@@ -4812,6 +6567,20 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "staleness/audit_minimum_detectable_auc_gap": "Smallest |AUC-0.5| detectable at the configured target power under the null-Mann-Whitney approximation. Lower is better.",
         "staleness/audit_power_sufficient": "1 when audit_power_at_retrain_margin reaches the configured target power; monitoring only, not a retraining gate.",
         "staleness/weighted_auc_gap": "Fresh classifier held-out |weighted AUC-0.5|. A threshold crossing may trigger early after final-split confirmation; a non-crossing healthy decision requires saturation.",
+        "staleness/raw_auc": "Validation truth-vs-unweighted-current-policy classifier AUC; may be warm-started. Interpret changes with classifier saturation and accumulated training in mind.",
+        "staleness/raw_classifier_warm_started": "1 when the raw monitor fine-tunes its previous saved weights. Optimizer/early stopping reset; trust monitor is always fresh.",
+        "staleness/raw_auc_gap": "Absolute raw classifier gap |AUC-0.5|; lower is better and this is the primary stationary-run progress metric.",
+        "staleness/raw_best_auc_gap": "Lowest saturated raw |AUC-0.5| observed in the current reward round.",
+        "staleness/raw_no_improvement_streak": "Consecutive saturated raw monitors that did not improve the reward-round best by raw_improvement_min_delta.",
+        "staleness/raw_no_improvement_patience": "Number of consecutive non-improving raw monitors required before forward OmniFold recentering.",
+        "classifier_trust/balanced_accuracy": "Fresh held-out balanced accuracy for distinguishing the current policy from the installed round reference.",
+        "classifier_trust/balanced_accuracy_upper": "Normal-approximation upper confidence bound used by the conservative classifier trust trigger.",
+        "classifier_trust/max_balanced_accuracy": "Configured classifier trust ceiling; ideal equal-prior BA 0.525 corresponds to total variation 0.05.",
+        "classifier_trust/estimated_total_variation": "Classifier-implied total variation proxy max(0, 2*oriented_balanced_accuracy-1).",
+        "classifier_trust/trigger_recalibration": "1 when the current/reference classifier requests a forward reward/reference recenter.",
+        "staleness/monitor_mode_raw_only": "1 when the routine epoch audit skips reward scoring, weighted staleness fitting, controller updates, and refits, and trains only the raw truth-vs-policy judge.",
+        "staleness/monitor_mode_raw_plateau_refit": "1 when raw-AUC plateau detection and optional classifier trust can trigger OmniFold refitting; raw plateaus may first restore the best fixed-panel raw-AUC checkpoint.",
+        "omnifold/incumbent_probe_skipped": "1 when a versioned forced startup refit skips the weighted classifier on the reward that is about to be replaced. The epoch-54 raw baseline plus candidate acceptance and installed-baseline certification still run.",
         "staleness/trigger_threshold": "Fixed installed-round threshold: baseline_auc_gap + retrain_auc_margin.",
         "staleness/previous_audit_auc_gap": "Weighted |AUC-0.5| from the immediately preceding routine audit. Diagnostic only; it is not the trigger anchor.",
         "staleness/next_trigger_threshold": "Current installed-baseline threshold; it remains fixed until a new reward round is installed.",
@@ -4836,8 +6605,39 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "omnifold/baseline/probe_events": "Event count used to certify the cheap staleness baseline for the newly installed reward round.",
         "omnifold/acceptance_audit_enabled": "1 when a second fresh classifier gates candidate installation; 0 when saturated cross-fit residual closure installs the stack directly.",
         "omnifold/acceptance_max_balanced_accuracy": "Configured strict upper bound when the optional candidate acceptance audit is enabled.",
+        "omnifold/topology_acceptance_repeats": "Number of independently seeded same-architecture EveNet+adapter+Fourier audit fits aggregated before candidate acceptance.",
+        "reference_trust/round_acceptance/action": "Round raw-AUC decision: +1 significant improvement, 0 statistical plateau, -1 significant regression, +2 bypass/bootstrap.",
+        "reference_trust/round_acceptance/improvement": "Previous installed raw |AUC-0.5| minus candidate raw |AUC-0.5|; positive is better.",
+        "reference_trust/round_acceptance/required_improvement": "Uncertainty dead-band width: configured z times the combined previous/candidate raw-AUC standard error.",
+        "reference_trust/round_acceptance/rollback_required": "1 when the live policy must be restored to the incumbent round_ref anchor before another optimizer step.",
+        "reference_trust/round_acceptance/stop_requested": "1 after the configured failed-direction patience; the rolled-back incumbent checkpoint is saved before clean termination.",
+        "reference_trust/trajectory/best_raw_auc_gap": "Lowest fixed-panel unweighted |AUC-0.5| observed among routine-audit policy checkpoints in the current trust-region direction.",
+        "reference_trust/trajectory/best_updated": "1 when the current routine-audit policy replaces the best-on-trajectory checkpoint.",
+        "reference_trust/trajectory/selected_raw_auc_gap": "Cheap fixed-panel raw-AUC gap of the trajectory checkpoint selected for the independent full refit/acceptance gate.",
+        "reference_trust/trajectory/rewound": "1 when exhaustion restored an earlier best-on-trajectory checkpoint instead of evaluating the live endpoint.",
+        "reference_trust/round_acceptance/failed_direction_streak": "Number of independently trained directions rejected by the statistical round-AUC gate since the last accepted improvement.",
+        "reference_trust/signed_probe/decision_code": "Signed-direction result: +1 only the trained sign significantly improves raw AUC, -1 only the reverse sign improves, +2 both improve, and 0 neither improves.",
+        "reference_trust/signed_probe/best_overall_scale": "Scale alpha with the smallest raw |AUC-0.5| among theta_ref +/- alpha*(theta-theta_ref); no probed point is installed.",
+        "reference_trust/signed_probe/reward_raw_misaligned": "1 when the probed point with the largest installed-reward mean exceeds the anchor reward while significantly worsening raw |AUC-0.5|.",
+        "reference_trust/signed_probe/smaller_positive_step_improves": "1 when a positive scale below one significantly improves raw AUC but the trained +1 endpoint does not, indicating directionally useful overshoot.",
+        "reference_trust/signed_probe/all_raw_audits_saturated": "1 when the anchor and every signed candidate classifier reached the configured validation-loss saturation criterion.",
+        "reference_trust/signed_probe/candidate/*/raw_auc_gap": "Unweighted truth-vs-policy |AUC-0.5| at one signed parameter scale on the fixed 100k event/noise/classifier-seed panel; lower is better.",
+        "reference_trust/signed_probe/recovery_triggered": "1 when an enabled, fully saturated reverse-only result rejects the local direction, restores round_ref, clears optimizer state, and requests a fresh reward fit.",
+        "reference_trust/signed_probe/recovery_attempt": "Consecutive independently trained reverse-only directions since the last genuinely improved policy round.",
+        "reference_trust/signed_probe/recovery_reward_installed": "1 when the fresh reward trained at the restored incumbent passed all classifier closure, acceptance, and topology gates.",
+        "reference_trust/signed_probe/recovery_stop_requested": "1 when repeated reverse-only recoveries reach failed_direction_patience; training stops at the restored incumbent.",
+        "reference_trust/extragradient/triggered": "1 when trust exhaustion launches the opt-in predictive-corrective block instead of directly committing the selected trajectory point.",
+        "reference_trust/extragradient/lookahead_scale": "Fraction of the selected incumbent-to-trajectory displacement used for the virtual policy that trains the response classifier.",
+        "reference_trust/extragradient/lookahead_reward_installed": "1 when the transient look-ahead reward passes residual closure, acceptance, and topology gates; it is not yet a committed policy point.",
+        "reference_trust/extragradient/rebased_optimizer_params": "Number of trainable tensors restored to the incumbent after evaluating the corrector gradient at the look-ahead pair and before optimizer.step.",
+        "reference_trust/extragradient/corrector_distance": "Functional distance of the corrected policy from the original incumbent on its fixed trust probe.",
+        "reference_trust/extragradient/corrector_scale": "Post-gradient interpolation scale accepted by the original incumbent trust region.",
+        "reference_trust/extragradient/final_reward_installed": "1 only when the corrected policy passes a new reward fit plus the original-incumbent paired round-AUC gate and becomes the committed pair.",
+        "reference_trust/extragradient/final_optimizer_states_cleared": "Number of transient corrector AdamW states discarded after the corrected policy and final reward/reference pair are committed.",
+        "reference_trust/extragradient/rejected": "1 when either classifier gate fails, the corrector is zero/non-finite, or trust backtracking fails; the complete incumbent pair is restored.",
         "omnifold/fit/iter*/saturated": "1 when that residual classifier fit reached its configured validation saturation/early-stop condition.",
         "omnifold/fit/iter*/stored_in_reward": "1 when that saturated classifier snapshot was stored as a cumulative log-ratio increment; 0 for the final closure-only classifier.",
+        "omnifold/fit/iter*/warm_started_folds": "Number of fold classifiers initialized from the previous installed round's matching iteration. 0 means fresh initialization; 2 means both folds were reused.",
         "omnifold/fit/iter*/validation_balanced_accuracy": "Held-out balanced accuracy for this residual fit. The next iteration begins only after saturation; closure is assessed against the configured chance band.",
         "val_ztautau/target/*": "Truth/current/reference 1D density overlays for the four diffusion targets. Current and reference use candidate 0, never reward-best selection.",
         "val_ztautau/reco/*": "Truth/current/reference 1D density overlays for reconstructed tau theta/phi directions, using the shared Ztautau direction reconstruction.",
@@ -4882,6 +6682,7 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.validation_num_ddim_steps": "Number of DDIM denoising steps used for candidate generation during **validation** only (independent of training num_ddim_steps). If null, falls back to num_ddim_steps. Lets you validate at higher fidelity than the training rollout without slowing training.",
         "dgpo.policy_eval_parallel_timesteps": "Independent policy-evaluation (t, eps) draws batched into one current/reference forward. Keeps dgpo.num_train_timesteps and the one-AdamW-step objective unchanged; higher values reduce launches but increase activation memory roughly proportionally.",
         "dgpo.policy_eval_event_microbatch_size": "Event rows per gradient-bearing current/reference policy-evaluation forward. Gradients are weighted and accumulated into the same one-AdamW-step full-batch objective, preserving K and num_train_timesteps while reducing activation memory. Null uses the full DGPO batch.",
+        "dgpo.sequential_vp_trust_backward": "When true with a VP path-KL reference trust objective, backward the DGPO graph before constructing the independent trust graph, then average the fully accumulated gradients once across workers. This preserves the summed objective while avoiding simultaneous activation graphs.",
         "dgpo.activation_checkpointing": "Recompute trainable PET transformer blocks during backward instead of retaining their intermediate activations. Reduces current-policy K*B peak memory while preserving FP32 parameters and loss computation.",
         "dgpo.diagnostic_profile_accumulate_steps": "Number of train batches to concatenate before logging accumulated diagnostics/reward_hacking/profile/*_delta_vs_truth_* images. Larger values stabilize sparse bins but update the W&B images less often.",
         "dgpo.log_every": "Log Python INFO messages (loss, reward, etc.) to the console every N optimizer steps. Does not affect wandb logging frequency (wandb logs every step when enabled). Typical: 1-10.",
@@ -4902,21 +6703,50 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.validation_tqdm_k_chains": "If true: show a tqdm progress bar over the K DDIM chains per validation batch. Typical: true (helps see validation progress).",
         "dgpo.validation_tqdm_ddim": "If true: show a tqdm progress bar for every DDIM step within each chain (very verbose). Typical: false (too much output).",
         "dgpo.adaptive_omnifold.enabled": "Run K=1 fresh EveNet audits during DGPO and refit/install a new ratio stack plus its paired round-reference policy when stale.",
+        "dgpo.adaptive_omnifold.monitor_mode": "Use weighted_and_raw for the legacy staleness controller, or raw_only to fit only the truth-vs-unweighted-policy classifier during stationary log-only monitoring.",
         "dgpo.adaptive_omnifold.staleness_every_n_epochs": "Independent cadence for the fresh K=1 audit; it does not change validation_K or dgpo.K.",
         "dgpo.adaptive_omnifold.pool_generation_batch_size": "Per-worker Ray batch used only to generate no-grad K=1 live-policy populations for OmniFold fit and stale probes. Independent of platform.batch_size and classifier fit.batch_size.",
         "dgpo.adaptive_omnifold.audit_fit.train_microbatch_size_per_rank": "Per-GPU gradient-bearing audit classifier rows per class and forward. Multiple microbatches reconstruct one configured global optimizer batch without retaining their activation graphs.",
         "dgpo.adaptive_omnifold.trigger.probe_max_events": "Event cap for the frequent K=1 staleness audit. This may be smaller than recalibration.score_pool_events; it does not reduce the residual-validation population.",
+        "dgpo.adaptive_omnifold.trigger.rollback_to_best_on_plateau": "When the raw-AUC plateau patience fires, restore the lowest fixed-panel raw-AUC epoch checkpoint in the current reward round, clear stale optimizer state, refresh EMA, and fit the next OmniFold reward from that restored policy.",
+        "dgpo.adaptive_omnifold.classifier_trust.every_n_epochs": "Cadence for the fresh current-vs-round-reference classifier. It must be a multiple of staleness_every_n_epochs, so trust checks can reuse the raw-monitor event pass.",
+        "dgpo.adaptive_omnifold.classifier_trust.probe_max_events": "Global event cap for the paired current/reference classifier-trust prefix. Reference DDIM generation stops at this cap even when the raw monitor uses a larger population.",
+        "dgpo.adaptive_omnifold.classifier_trust.audit_fit": "Optional fit-setting overrides used only by the classifier-trust monitor, such as a shorter validation_patience_epochs; the raw monitor retains adaptive_omnifold.audit_fit.",
+        "dgpo.adaptive_omnifold.classifier_trust.unsafe_early_stop": "Optional one-sided classifier-trust early exit. It stops an otherwise unsaturated trust classifier only after the oriented validation balanced-accuracy lower confidence bound exceeds max_balanced_accuracy for the configured number of consecutive validations; that positive unsafe witness immediately triggers recalibration.",
         "dgpo.adaptive_omnifold.trigger.retrain_auc_margin": "AUC-based retraining threshold. Refit when weighted |AUC-0.5| is strictly greater than installed baseline_auc_gap plus this margin.",
         "dgpo.adaptive_omnifold.trigger.max_reward_age_epochs": "Optional maximum installed reward age. At the next regular audit, reaching this age forces a fresh cross-fit candidate; configured residual closure is still required before installation.",
         "dgpo.adaptive_omnifold.trigger.required_consecutive_epochs": "Number of consecutive eligible routine audits that must exceed the installed-round threshold before AUC-based refitting.",
         "dgpo.adaptive_omnifold.trigger.retrain_cooldown_epochs": "Minimum epochs after an accepted reward installation before another routine AUC- or age-triggered refit is allowed; audits continue during cooldown.",
+        "dgpo.adaptive_omnifold.fixed_audit_panel": "Reuse the same event-selection, rollout, and classifier seeds at every raw audit so epoch-to-epoch AUC changes are paired rather than panel noise.",
+        "dgpo.adaptive_omnifold.recalibration.reset_adam_first_moment_on_install": "After an accepted atomic reward/reference install, clear AdamW exp_avg only; preserve exp_avg_sq, step counters, scheduler, and LR.",
+        "dgpo.adaptive_omnifold.recalibration.reset_optimizer_state_on_install": "After each accepted reward/reference install, clear all AdamW parameter state (first/second moments and step counters) and gradients; preserve weights, LR/scheduler and weight decay. Takes precedence over first-moment-only reset.",
+        "dgpo.reference_trust.objective": "Round-reference trust objective: legacy dimension-mean velocity_mse or the separately sampled full-time cosine-VP reverse-path estimator vp_path_kl.",
+        "dgpo.reference_trust.vp_path_kl.diagnostic": "When objective=velocity_mse, run an additional graph-free full-time VP path-KL measurement without changing backward. Ignored as a backward switch when objective=vp_path_kl.",
+        "dgpo.reference_trust.adaptive_boundary.reset_adam_first_moment_on_zero_step": "Clear AdamW first moments after an alpha=0 trust rejection so outward momentum is not carried across rejected policy steps.",
+        "dgpo.reference_trust.adaptive_boundary.round_decay_factor": "With radius_mode=round_decay, multiply the hard radius by this factor only after a successful new reward/reference installation, down to delta_floor. The KL coefficient and policy weight decay are independent.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.cross_round_nonexpanding": "Cap each newly installed reward round radius by the previous installed radius.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.scale_policy_lr": "Multiply only the DGPO policy LR by sqrt(delta_r/delta_0); OmniFold classifier LRs are unchanged.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.policy_lr_scale_floor": "Minimum DGPO policy LR multiplier used by trust-radius scaling.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.exhaustion_scale_window_steps": "Trailing optimizer-step window used only to decide trust-boundary exhaustion; the longer empirical-controller history remains unchanged.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.round_acceptance_enabled": "Require a same-protocol candidate round to reduce raw |AUC-0.5| beyond statistical uncertainty; regressions roll back to round_ref.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.round_acceptance_confidence_z": "Normal-approximation z multiplier for the cross-round raw-AUC improvement dead band.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.round_plateau_patience": "Consecutive statistically indistinguishable candidate rounds required before anchor rollback and clean early stop.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.trajectory_search_enabled": "Use one fixed event/noise/classifier-seed panel to rank routine-audit checkpoints, then evaluate the best actual trajectory point instead of only the exhausted endpoint.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.failed_direction_patience": "Number of statistically non-improving best-on-trajectory attempts allowed; each failure rolls back immediately, contracts the radius, clears optimizer state, and starts a new direction.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.signed_direction_probe.enabled": "Once per independently trained direction, audit theta_ref +/- alpha*(theta-theta_ref) on the fixed raw-AUC panel, then restore the live policy after the probe itself.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.signed_direction_probe.scales": "Positive alpha magnitudes used for both signs of the diagnostic direction probe; must be unique in (0,1] and include 1.0.",
+        "dgpo.reference_trust.adaptive_boundary.radius_calibration.signed_direction_probe.recover_reverse_only": "When true, a fully saturated reverse-only result rejects the local direction, restores round_ref, clears AdamW state, and refits the reward on a fresh training population while preserving the paired audit panel.",
         "dgpo.adaptive_omnifold.trigger.require_audit_saturation": "If true, an unsaturated audit is diagnostic only: it resets the exceedance streak and cannot trigger retraining.",
-        "dgpo.adaptive_omnifold.recalibration.pool_events": "Global event count in the fixed current-policy K=1 fit population. When set, the driver creates one seeded subset and bootstrap/refits reuse the same identities; null drains the ordinary train shards.",
+        "dgpo.adaptive_omnifold.recalibration.train_parquet_dir": "Optional independent training directory for OmniFold bootstrap/refits. When set, DGPO continues to use platform.data_parquet_dir while the driver registers this complete directory as the dedicated OmniFold shard.",
+        "dgpo.adaptive_omnifold.recalibration.pool_events": "Optional cap on the current-policy K=1 fit population. When set, the driver creates one seeded subset and bootstrap/refits reuse the same identities; null drains the complete recalibration.train_parquet_dir when configured, otherwise the ordinary train shards.",
         "dgpo.adaptive_omnifold.recalibration.score_pool_events": "Held-out K=1 population used for cross-fit residual gating. Kept separate from the routine staleness probe.",
         "dgpo.adaptive_omnifold.recalibration.fit.train_microbatch_size_per_rank": "Per-GPU gradient-bearing residual-classifier rows per class and forward. Gradients accumulate across these chunks before one optimizer step and one distributed gradient average.",
+        "dgpo.adaptive_omnifold.recalibration.fit.gradient_clip_norm": "Optional global-norm clip applied to the distributed residual-classifier gradient before AdamW. Non-finite local loss/gradients and post-step parameters always fail before they can propagate further.",
+        "dgpo.adaptive_omnifold.recalibration.warm_start_iterations": "One-based residual iterations to fine-tune from previous-round fold weights. Uses stable condition-hash folds, fresh AdamW state and recomputed log weights. Legacy checkpoints without fold provenance fit fresh once. Raw and trust monitors remain fresh.",
         "dgpo.adaptive_omnifold.recalibration.residual_min_auc_gain": "The sole outer-iteration usefulness gate: a residual classifier is stored only when held-out AUC is strictly greater than 0.5 plus this value. Held-out BCE remains diagnostic. Larger values widen the closure band and stop residual iterations earlier.",
         "dgpo.adaptive_omnifold.recalibration.acceptance_audit_enabled": "Enable a second fresh-classifier candidate gate after cross-fit residual closure. Disable it to install directly at residual closure.",
         "dgpo.adaptive_omnifold.recalibration.acceptance_max_balanced_accuracy": "When the optional candidate acceptance audit is enabled, require its fresh held-out weighted balanced accuracy to be strictly below this value.",
+        "dgpo.adaptive_omnifold.recalibration.topology_acceptance_repeats": "Independent classifier seeds for the repeated acceptance audit. Each fit uses the exact OmniFold EveNet+adapter+Fourier architecture and trainable scope; canonical topology-named metrics are their means.",
         "dgpo.adaptive_omnifold.recalibration.pool_selection_seed": "Seed used once by the driver to choose the fixed global OmniFold fit identities. It does not control K=1 DDIM noise or classifier optimization.",
         # --- reward_config ---
         "reward_config.type": "Reward backend. 'omnifold' uses the frozen truth-free conditional log-density-ratio bundle; 'component_normalized_truth_distance' uses truth matching; 'calibration_magnitude' uses tau direction-change magnitude.",
@@ -4943,7 +6773,8 @@ def _dgpo_wandb_publish_metric_docs() -> None:
         # The compact profile deliberately keeps W&B Config and Artifacts free
         # of a second, very large copy of documentation already tracked in git.
         try:
-            run.summary["dgpo_logging_profile"] = "simplified"
+            run.summary["dgpo_logging_profile"] = "critical" if _wandb_critical_enabled() else "simplified"
+            run.summary["dgpo_clock_schema"] = "completed-policy-steps-v2"
         except Exception as e:
             _log.warning("[DGPO] wandb simplified-profile summary failed: %s", e)
         return
@@ -4958,7 +6789,8 @@ def _dgpo_wandb_publish_metric_docs() -> None:
                     "RL/DGPO_neutrino/diagnostics/metrics_reference.md"
                 ),
                 "dgpo_dynamic_reward_keys_note": (
-                    "Training metrics use W&B step=global_step; val/* and train_dist/* use epoch as x-axis. "
+                    "Training/controller metrics use completed DGPO global_step; validation uses epoch. "
+                    "W&B _step is a separate committed event-row index, not a training counter. "
                     "Groups: reward/dist, reward/monitor, train/loss, train/grad, parameter/*, "
                     "components/*, diagnostics/reward_hacking/* (including all/ vs best/), "
                     "diagnostics/reference_bias/*; projection/* + swd/* (latent-SWD CPO repair, x-axis global_step); "
@@ -5013,7 +6845,88 @@ def _wandb_simplified_enabled() -> bool:
     """Whether the configured W&B run uses the compact, decision-focused profile."""
 
     section, _ = _dgpo_wandb_yaml_section()
-    return bool(_dgpo_cfg_get(section, "simplified", False))
+    return bool(_dgpo_cfg_get(section, "simplified", False)) or _wandb_critical_enabled()
+
+
+def _wandb_critical_enabled() -> bool:
+    section, _ = _dgpo_wandb_yaml_section()
+    return str(_dgpo_cfg_get(section, "profile", "")) == "critical"
+
+
+# An explicit allowlist avoids hundreds of automatic panels from dormant
+# ablations, duplicate residual statistics and per-process response matrices.
+_WANDB_CRITICAL_CHARTS = frozenset({
+    "train/loss/total", "train/loss/dgpo", "train/grad/global_norm_pre_clip",
+    "train/grad/clip_active", "train/memory/peak_allocated_gib",
+    "train/round_warmup/lr_scale", "train/round_warmup/completed_updates",
+    "train/lr/scheduled_max", "train/lr/scheduled_min",
+    "reference_trust/policy_lr/effective_step_scale",
+    "reference_trust/vp_path_kl", "reference_trust/velocity_mse",
+    "reference_trust/velocity_mse_ratio", "reference_trust/delta",
+    "reference_trust/post_step_distance", "reference_trust/accepted_step_scale",
+    "reference_trust/step_accepted",
+    "reference_trust/best_decay/count", "reference_trust/best_decay/target",
+    "reference_trust/best_decay/feasibility_limited",
+    "reference_trust/best_decay/global_best_auc_gap",
+    "reference_trust/adam_full_state_reset", "reference_trust/adam_states_cleared",
+    "staleness/raw_auc", "staleness/raw_balanced_accuracy",
+    "staleness/raw_best_auc_gap", "staleness/raw_no_improvement_streak",
+    "staleness/patience_paused_for_warmup",
+    "staleness/global_best/candidate_gap", "staleness/global_best/incumbent_gap",
+    "staleness/global_best/improved", "staleness/global_best/failed_rounds",
+    "staleness/global_best/stop_requested", "staleness/global_best/confirmation_delta",
+    "staleness/global_best/confirmation_valid", "staleness/global_best/confirmation_accepted",
+    "staleness/raw_audit_saturated", "staleness/trigger_recalibration",
+    "staleness/age_trigger_recalibration",
+    "staleness/raw_best_rollback_applied", "staleness/reward_round_id",
+    "classifier_trust/balanced_accuracy", "classifier_trust/balanced_accuracy_lower",
+    "classifier_trust/balanced_accuracy_upper", "classifier_trust/max_balanced_accuracy",
+    "classifier_trust/trigger_recalibration", "classifier_trust/saturated",
+    "omnifold/accepted", "omnifold/iterations_fitted",
+    "omnifold/candidate/residual_closure_auc",
+    "omnifold/fit/iter01/validation_auc",
+    "val_ztautau/jsd/current/topology/cos_opening",
+    "val_ztautau/jsd/current/topology/delta_phi_to_pi",
+    "val_ztautau/jsd/current/target/tau_a_delta_theta",
+    "val_ztautau/jsd/current/target/tau_b_delta_theta",
+    "val_ztautau/jsd/current/target/tau_a_delta_phi",
+    "val_ztautau/jsd/current/target/tau_b_delta_phi",
+    "val_ztautau/topology/cos_opening", "val_ztautau/topology/delta_phi_to_pi",
+    "val_tarp/tarp_binned_min_holm_pvalue", "val_tarp/coverage",
+})
+_WANDB_CLOCK_KEYS = frozenset({"global_step", "epoch", "omnifold_live/log_index"})
+_WANDB_EPOCH_PREFIXES = (
+    "val/", "val_cheap/", "val_diagnostics/", "val_neutrino/", "val_mass/",
+    "val_ztautau/", "val_tarp/", "train_dist/", "train_dist_k1/",
+)
+
+
+def _wandb_critical_keep(key: str) -> bool:
+    # Keep fit diagnostics searchable but hidden, not connected into a fake
+    # training curve across independent folds/refits. Console progress remains.
+    return (
+        key in _WANDB_CRITICAL_CHARTS or key in _WANDB_CLOCK_KEYS
+        or key.startswith("omnifold_live/meta/")
+        or (key.startswith("omnifold_live/") and key.rsplit("/", 1)[-1] in {
+            "training_loss", "validation_loss", "validation_auc",
+            "validation_balanced_accuracy", "saturated",
+        })
+        or key in {
+            "staleness/global_step", "staleness/epoch",
+            "staleness/reward_age_epochs", "staleness/max_reward_age_epochs",
+            "staleness/age_refit_due", "staleness/trigger_reason",
+            "staleness/raw_best_global_step", "staleness/raw_best_epoch",
+            "staleness/raw_best_rollback_global_step", "classifier_trust/epoch",
+            "omnifold/reward_round_id", "omnifold/all_fits_saturated",
+            "staleness/raw_audit_fit_events", "staleness/raw_audit_test_events",
+            "staleness/raw_classifier_warm_started", "staleness/raw_audit_training_ready",
+            "staleness/raw_audit_training_min_steps", "staleness/raw_audit_training_steps",
+            "staleness/raw_audit_training_epochs",
+            "classifier_trust/reference_trust_fit_events", "classifier_trust/reference_trust_test_events",
+        }
+        or "nonfinite" in key
+        or (key.startswith("val_tarp/") and "/skipped_" in key)
+    )
 
 
 _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
@@ -5039,6 +6952,8 @@ _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
         "parameter/w_e/mean",
         "parameter/w_e/std",
         "reference_trust/loss",
+        "reference_trust/vp_path_kl",
+        "reference_trust/objective_vp_path_kl",
         "reference_trust/velocity_mse_ratio",
         "val/reward/mean",
         "val/reward/median",
@@ -5053,13 +6968,35 @@ _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
         "omnifold/iterations_fitted",
         "omnifold/all_fits_saturated",
         "omnifold/bootstrap_on_start",
+        "omnifold/resume_refit_once_completed",
+        "omnifold/resume_refit_once_accepted",
+        "omnifold/resume_refit_kept_incumbent",
+        "omnifold/topology_acceptance_audit_enabled",
+        "omnifold/topology_acceptance_max_auc_gap",
+        "omnifold/topology_acceptance_repeats",
         "omnifold/candidate/audit_balanced_accuracy",
         "omnifold/baseline/audit_observed_auc_gap",
         "omnifold/baseline/probe_events",
         "omnifold/baseline/audit_saturated",
         "omnifold/reward_round_id",
         "omnifold/recalibration_count",
+        "omnifold/incumbent_probe_skipped",
         "staleness/weighted_auc_gap",
+        "staleness/raw_auc",
+        "staleness/raw_auc_gap",
+        "staleness/raw_balanced_accuracy",
+        "staleness/raw_classifier_warm_started",
+        "staleness/raw_audit_training_ready",
+        "staleness/raw_audit_training_min_steps",
+        "staleness/raw_audit_training_steps",
+        "staleness/raw_audit_training_epochs",
+        "staleness/raw_audit_saturated",
+        "staleness/raw_audit_validation_loss",
+        "staleness/raw_audit_validation_auc",
+        "staleness/raw_auc_null_se_approx",
+        "staleness/raw_auc_gap_z_approx",
+        "staleness/raw_auc_gap_pvalue_approx",
+        "staleness/monitor_mode_raw_only",
         "staleness/audit_saturated",
         "staleness/audit_threshold_reached",
         "staleness/trigger_threshold",
@@ -5074,6 +7011,10 @@ def _wandb_simplified_keep(key: str, value: Any) -> bool:
 
     if key in _WANDB_SIMPLIFIED_EXACT_KEYS:
         return True
+    if key.startswith("reference_trust/"):
+        return True
+    if key.startswith("classifier_trust/"):
+        return True
     if "nonfinite" in key:
         return True
     if key in _PROJECTION_WANDB_SCALAR_KEYS or key in _SWD_WANDB_SCALAR_KEYS:
@@ -5087,6 +7028,7 @@ def _wandb_simplified_keep(key: str, value: Any) -> bool:
             "crossfit_fold",
             "dgpo_epoch",
             "global_step",
+            "signed_scale",
         }
     if key.startswith("omnifold_live/"):
         return key.rsplit("/", 1)[-1] in {
@@ -5095,20 +7037,36 @@ def _wandb_simplified_keep(key: str, value: Any) -> bool:
             "accepted",
             "saturated",
             "threshold_reached",
+            "warm_started",
+            "warm_started_folds",
         }
     if key.startswith("omnifold/fit/iter"):
         return key.rsplit("/", 1)[-1] in {
             "saturated",
             "stored_in_reward",
+            "warm_started_folds",
             "validation_auc",
             "validation_balanced_accuracy",
         }
     if key.startswith("omnifold/candidate/"):
-        return key.rsplit("/", 1)[-1] in {
+        suffix = key.rsplit("/", 1)[-1]
+        if suffix.startswith("topology_audit_repeat_"):
+            return True
+        return suffix in {
             "weighted_auc_gap",
             "audit_validation_auc",
             "audit_balanced_accuracy",
             "audit_saturated",
+            "topology_audit_auc",
+            "topology_audit_auc_gap",
+            "topology_audit_balanced_accuracy",
+            "topology_audit_saturated",
+            "topology_audit_same_architecture",
+            "topology_audit_fit_events",
+            "topology_audit_test_events",
+            "topology_audit_repeats",
+            "topology_audit_auc_gap_stdev",
+            "topology_audit_auc_gap_se",
         }
     if key.startswith("omnifold/baseline/"):
         return key.rsplit("/", 1)[-1] in {
@@ -5145,6 +7103,8 @@ def _wandb_simplified_keep(key: str, value: Any) -> bool:
 def _wandb_apply_simplified_profile(data: Mapping[str, Any]) -> dict[str, Any]:
     """Apply the compact W&B allowlist when ``logger.wandb.simplified`` is true."""
 
+    if _wandb_critical_enabled():
+        return {str(key): value for key, value in data.items() if _wandb_critical_keep(str(key))}
     if not _wandb_simplified_enabled():
         return dict(data)
     return {
@@ -5210,6 +7170,7 @@ def _wandb_train_payload(metrics: dict[str, Any]) -> dict[str, Any]:
             "components/",
             "diagnostics/",
             "dgpo/",
+            "reference_trust/",
         )):
             out[k] = v
         elif _wandb_is_media_value(v):
@@ -5366,46 +7327,49 @@ def _wandb_sanitize_log_dict(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _wandb_reset_step_tracker() -> None:
-    """Reset monotonic W&B step tracking (call once after ``wandb.init``)."""
-    global _wandb_committed_step, _wandb_step_offset
-    _wandb_committed_step = -1
-    _wandb_step_offset = 0
+def _wandb_reset_step_tracker(*, next_row: int = 0) -> None:
+    """Reset transport tracking, separately from checkpoint training counters."""
+    global _wandb_committed_step
+    _wandb_committed_step = int(next_row) - 1
 
 
 def _wandb_train_step(global_step: int) -> int:
-    """Internal W&B row for DGPO metrics after auxiliary fit rows."""
-    return int(global_step) + int(_wandb_step_offset)
+    """Completed DGPO steps, not W&B's internal row counter."""
+    return int(global_step)
 
 
 def _wandb_epoch_end_step(global_step: int) -> int:
-    """W&B ``step`` for epoch-end panels tied to the last training step of the epoch."""
-    return _wandb_train_step(max(int(global_step) - 1, 0))
+    """Same completed-step count as the epoch-end checkpoint and monitor."""
+    return int(global_step)
 
 
 def _wandb_log_with_step(wandb_mod: Any, payload: dict[str, Any], *, step: int) -> None:
-    """``wandb.log`` with an explicit monotonic ``step=`` (required for all DGPO logging)."""
+    """One committed row per event; ``step`` is the completed DGPO step count.
+
+    Explicit commit prevents a baseline/monitor row from being merged with the
+    next training row and having its epoch overwritten. Scientific coordinates
+    travel in every row; the W&B transport index advances independently.
+    """
     global _wandb_committed_step
     clean = _wandb_sanitize_log_dict(_wandb_apply_simplified_profile(payload))
     if not clean:
         return
-    s = int(step)
-    if _wandb_committed_step >= 0 and s < _wandb_committed_step:
-        _log.warning(
-            "[DGPO] wandb step=%s < committed=%s; skipping to avoid step regression.",
-            s,
-            _wandb_committed_step,
-        )
-        return
+    clean["global_step"] = int(step)
+    if "epoch" not in clean:
+        for key in ("staleness/epoch", "classifier_trust/epoch", "omnifold_live/meta/dgpo_epoch"):
+            if key in payload:
+                clean["epoch"] = int(payload[key])
+                break
+    s = _wandb_committed_step + 1
     try:
-        wandb_mod.log(clean, step=s)
-        _wandb_committed_step = max(_wandb_committed_step, s)
+        wandb_mod.log(clean, step=s, commit=True)
+        _wandb_committed_step = s
     except Exception as e:
         _log.warning("[DGPO] wandb.log failed at step=%s: %s", s, e)
 
 
 def _wandb_log_step(wandb_mod: Any, payload: dict[str, Any], *, step: int) -> None:
-    """Training / projection metrics: W&B Step axis tracks ``global_step`` (LinearPostAdam style)."""
+    """Log a training/controller event at its completed DGPO step."""
     _wandb_log_with_step(wandb_mod, payload, step=_wandb_train_step(step))
 
 
@@ -5415,17 +7379,8 @@ def _wandb_log_auxiliary(
     *,
     current_global_step: int,
 ) -> None:
-    """Commit one live fit row without regressing later DGPO W&B steps."""
-    global _wandb_step_offset
-    internal_step = max(
-        _wandb_train_step(current_global_step),
-        int(_wandb_committed_step) + 1,
-    )
-    _wandb_log_with_step(wandb_mod, payload, step=internal_step)
-    _wandb_step_offset = max(
-        int(_wandb_step_offset),
-        int(internal_step) + 1 - int(current_global_step),
-    )
+    """A fit row advances transport/log_index, never the DGPO clock."""
+    _wandb_log_with_step(wandb_mod, payload, step=current_global_step)
 
 
 def _wandb_log_validation(
@@ -5435,17 +7390,29 @@ def _wandb_log_validation(
     epoch: int,
     wandb_step: int,
 ) -> None:
-    """Log ``val/*`` with ``epoch`` as the chart x-axis (``define_metric``) and explicit ``step=``.
-
-    ``wandb_step`` is the last training step of the epoch (or 0 for the epoch=-1 baseline).
-    Charts still use **epoch** as x-axis; ``step=`` only keeps W&B's internal counter aligned
-    with training ``global_step``.
-    """
+    """Log validation at explicit epoch and completed DGPO step coordinates."""
     clean = _wandb_sanitize_log_dict(dict(val_metrics))
     if not clean:
         return
     clean["epoch"] = float(epoch)
     _wandb_log_with_step(wandb_mod, clean, step=wandb_step)
+
+
+def _wandb_define_axes(wandb_mod: Any, *, critical: bool) -> None:
+    """Never fall back to the classifier-inflated internal W&B Step axis."""
+    wandb_mod.define_metric("*", step_metric="global_step", step_sync=False, hidden=critical)
+    for key in _WANDB_CLOCK_KEYS:
+        wandb_mod.define_metric(key, hidden=True)
+    for prefix in _WANDB_EPOCH_PREFIXES:
+        wandb_mod.define_metric(prefix + "*", step_metric="epoch", step_sync=False, hidden=critical)
+    wandb_mod.define_metric("omnifold_live/*", step_metric="omnifold_live/log_index",
+                          step_sync=False, hidden=critical)
+    # Exact definitions override the hidden default; no auto-plots for control
+    # metadata or unrelated diagnostics. Users can still query hidden fit rows.
+    if critical:
+        for key in sorted(_WANDB_CRITICAL_CHARTS):
+            axis = "epoch" if key.startswith(_WANDB_EPOCH_PREFIXES) else "global_step"
+            wandb_mod.define_metric(key, step_metric=axis, step_sync=False, hidden=False)
 
 
 def _start_wandb_run(*, disable: bool = False) -> bool:
@@ -5482,6 +7449,12 @@ def _start_wandb_run(*, disable: bool = False) -> bool:
         tags = list(tags)
     run_id = wb.get("id")
     resume = wb.get("resume")
+    if bool(wb.get("fresh_run", False)):
+        # Training state can resume while logging starts in a new run. An
+        # explicit fresh ID also overrides inherited WANDB_RUN_ID settings.
+        from uuid import uuid4
+        run_id = uuid4().hex[:8]
+        resume = "never"
     init_kw: dict[str, Any] = {
         "project": str(project),
         "entity": wb.get("entity"),
@@ -5504,33 +7477,10 @@ def _start_wandb_run(*, disable: bool = False) -> bool:
         wb_source or "unknown",
     )
     try:
-        # Train / projection: W&B Step = ``global_step``.
-        # Val / train_dist: chart x-axis is ``epoch`` (not global_step).
-        wandb.define_metric("epoch")
-        wandb.define_metric("global_step", hidden=True)
-        wandb.define_metric("val/*", step_metric="epoch")
-        wandb.define_metric("val_cheap/*", step_metric="epoch")
-        wandb.define_metric("val_diagnostics/*", step_metric="epoch")
-        wandb.define_metric("val_neutrino/*", step_metric="epoch")
-        wandb.define_metric("val_mass/*", step_metric="epoch")
-        wandb.define_metric("val_ztautau/*", step_metric="epoch")
-        wandb.define_metric("val_tarp/*", step_metric="epoch")
-        wandb.define_metric("train_dist/*", step_metric="epoch")
-        wandb.define_metric("train_dist_k1/*", step_metric="epoch")
-        wandb.define_metric("omnifold_live/log_index")
-        wandb.define_metric(
-            "omnifold_live/meta/*", step_metric="omnifold_live/log_index"
-        )
-        for phase_name in _OMNIFOLD_LIVE_PHASE_IDS:
-            wandb.define_metric(
-                f"omnifold_live/{phase_name}/*",
-                step_metric="omnifold_live/log_index",
-            )
-        wandb.define_metric("projection/*", step_metric="global_step")
-        wandb.define_metric("swd/*", step_metric="global_step")
+        _wandb_define_axes(wandb, critical=_wandb_critical_enabled())
     except Exception as e:
         _log.warning("[DGPO] wandb.define_metric(val/*) failed (val may share step with train): %s", e)
-    _wandb_reset_step_tracker()
+    _wandb_reset_step_tracker(next_row=int(wandb.run.step))
     _dgpo_wandb_publish_metric_docs()
     return True
 
@@ -5567,6 +7517,7 @@ def _dgpo_save_last_ckpt(
     last_completed_epoch: int,
     dgpo_next_epoch: int,
     global_step: int,
+    dgpo_epoch_step: int = 0,
     ema_rollout: Any | None = None,
     round_ref_model: torch.nn.Module | None = None,
     reward_round_id: int = 0,
@@ -5608,6 +7559,7 @@ def _dgpo_save_last_ckpt(
         dgpo_next_epoch=dgpo_next_epoch,
         global_step=global_step,
         optimizer=optimizer,
+        dgpo_epoch_step=dgpo_epoch_step,
         ref_model=ref_model,
         round_ref_model=round_ref_model,
         reward_round_id=reward_round_id,
@@ -6618,25 +8570,259 @@ def _snapshot_policy_state_dict(model: torch.nn.Module) -> dict[str, Tensor]:
     }
 
 
+def _restore_policy_from_dgpo_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: Path | str,
+) -> int:
+    """Restore the live policy from one unpruned trajectory checkpoint.
+
+    Only the live ``state_dict`` is restored.  Optimizer and EMA state are
+    intentionally handled by the caller because an older trajectory point must
+    start a new search direction rather than resume its stale Adam momentum.
+    Returns the number of model tensors loaded.
+    """
+
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"trajectory checkpoint does not exist: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    raw_state = payload.get("state_dict")
+    if not isinstance(raw_state, Mapping):
+        raise ValueError(f"trajectory checkpoint has no state_dict: {path}")
+    core = unwrap_for_state_dict(model)
+    target_state = core.state_dict()
+    clean_state = {
+        key.removeprefix("model."): value
+        for key, value in raw_state.items()
+        if key.removeprefix("model.") in target_state
+    }
+    missing = sorted(set(target_state) - set(clean_state))
+    mismatched = sorted(
+        key
+        for key, value in clean_state.items()
+        if tuple(value.shape) != tuple(target_state[key].shape)
+    )
+    if missing or mismatched:
+        raise ValueError(
+            "trajectory checkpoint is incompatible with the live policy: "
+            f"missing={missing[:5]} mismatched={mismatched[:5]}"
+        )
+    core.load_state_dict(clean_state, strict=True)
+    return len(clean_state)
+
+
+def _reset_optimizer_after_reward_install(
+    optimizer: torch.optim.Optimizer,
+    *,
+    cfg: Any,
+    accepted: bool,
+    adaptive_state: Any = None,
+) -> dict[str, float]:
+    """Reset only on committed rounds; preserve parameters, groups and LR clock."""
+    if not accepted:
+        return {}
+    diagnostics = {}
+    if getattr(cfg, "policy_warmup_steps", 0):
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import start_policy_round_warmup
+        if adaptive_state is None:
+            raise ValueError("policy round warmup requires checkpointed adaptive state")
+        diagnostics.update(start_policy_round_warmup(adaptive_state, cfg=cfg))
+    if cfg.reset_optimizer_state_on_install:
+        count = len(optimizer.state)
+        optimizer.state.clear()
+        optimizer.zero_grad(set_to_none=True)
+        _log.info(
+            "[DGPO/omnifold] new reward round: reset complete AdamW state "
+            "for %s parameters (first/second moments and per-parameter steps); "
+            "preserved LR, scheduler and weight decay", count,
+        )
+        return {
+            **diagnostics,
+            "reference_trust/adam_full_state_reset": 1.0,
+            "reference_trust/adam_states_cleared": float(count),
+        }
+    if cfg.trust_reset_adam_first_moment:
+        return {**diagnostics, "reference_trust/adam_first_moments_reset":
+                float(reset_adam_first_moment(optimizer))}
+    return diagnostics
+
+
+def _resolve_raw_best_policy_checkpoint(
+    adaptive_state: Any,
+    save_dir: Path | str | None,
+    *,
+    global_scope: bool = False,
+    source_dirs: Sequence[Path | str] = (),
+) -> Path:
+    """Resolve the unpruned checkpoint for this reward round's best raw AUC.
+
+    New checkpoints store the exact path.  For v16 checkpoints written before
+    best-point rollback was added, fall back to the best epoch reconstructed
+    from the saved raw-audit history and locate its snapshot in ``save_dir``.
+    """
+
+    if save_dir is None or not str(save_dir).strip():
+        raise RuntimeError(
+            "raw-AUC best-point rollback requires model_checkpoint_save_path"
+        )
+    save_root = Path(str(save_dir)).expanduser().resolve()
+    recorded = str(getattr(adaptive_state, "raw_best_checkpoint", "") or "")
+    if global_scope:
+        from RL.DGPO_neutrino.model_utils import _load_checkpoint_metadata, _completed_raw_monitor_records
+        epoch, step, next_epoch = (int(adaptive_state.raw_best_epoch),
+                                  int(adaptive_state.raw_best_global_step),
+                                  int(adaptive_state.raw_best_next_epoch))
+        if step < 0 or next_epoch not in (epoch, epoch + 1):
+            raise ValueError("global-best checkpoint requires exact epoch/step/next_epoch metadata")
+        name = dgpo_snapshot_checkpoint_name(last_completed_epoch=epoch, dgpo_next_epoch=next_epoch, global_step=step)
+        candidates = ([Path(recorded).expanduser()] if recorded else []) + [
+            Path(root).expanduser() / name for root in (save_root, *source_dirs)
+        ]
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            payload = _load_checkpoint_metadata(candidate)
+            expected = (float(adaptive_state.raw_best_auc_gap), epoch, step, next_epoch)
+            records = _completed_raw_monitor_records(payload.get("dgpo_adaptive_omnifold_state", {}))
+            if ("state_dict" not in payload or payload.get("epoch") != epoch
+                    or payload.get("global_step") != step or payload.get("dgpo_next_epoch") != next_epoch
+                    or not any(r[1:] == expected[1:] and abs(r[0] - expected[0]) < 1e-10 for r in records)):
+                raise ValueError(f"global-best checkpoint metadata/raw AUC mismatch: {candidate}")
+            adaptive_state.raw_best_checkpoint = str(candidate.resolve())
+            return candidate.resolve()
+        raise FileNotFoundError(f"exact global-best checkpoint unavailable: {name}; searched {candidates}")
+    candidates: list[Path] = []
+    if recorded:
+        recorded_path = Path(recorded).expanduser()
+        candidates.append(recorded_path)
+        candidates.append(save_root / recorded_path.name)
+    best_epoch = int(getattr(adaptive_state, "raw_best_epoch", -1))
+    if best_epoch >= 0 and save_root.is_dir():
+        candidates.extend(
+            sorted(
+                save_root.glob(
+                    f"dgpo-epoch={best_epoch}-next_ep={best_epoch + 1}-step=*.ckpt"
+                ),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )
+        )
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        token = str(resolved)
+        if token in seen:
+            continue
+        seen.add(token)
+        if resolved.is_file():
+            adaptive_state.raw_best_checkpoint = token
+            return resolved
+    raise FileNotFoundError(
+        "raw-AUC plateau reached but the best-policy checkpoint is unavailable: "
+        f"best_epoch={best_epoch} recorded={recorded or '<none>'} "
+        f"save_dir={save_root}"
+    )
+
+
+def _rewind_policy_for_raw_best_refit(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: Path | str,
+    *,
+    ema_save: Any | None = None,
+    ema_rollout: Any | None = None,
+    clear_optimizer: bool = True,
+) -> tuple[int, int, bool]:
+    """Restore a raw-AUC best policy and discard the stale Adam direction."""
+
+    loaded_tensors = _restore_policy_from_dgpo_checkpoint(
+        model,
+        checkpoint_path,
+    )
+    policy_core = unwrap_for_state_dict(model)
+    cleared_optimizer_states = len(optimizer.state) if clear_optimizer else 0
+    if clear_optimizer:
+        optimizer.state.clear()
+        optimizer.zero_grad(set_to_none=True)
+    if ema_save is not None:
+        ema_save.update(policy_core, decay_=0.0)
+    if ema_rollout is not None:
+        ema_rollout.update(policy_core, decay_=0.0)
+    return (
+        loaded_tensors,
+        cleared_optimizer_states,
+        bool(ema_save is not None or ema_rollout is not None),
+    )
+
+
+def _confirm_global_raw_candidate(
+    *, model: torch.nn.Module, comparison_model: torch.nn.Module,
+    best_checkpoint: Path, materialize_pair: Any, fit_judge: Any,
+    min_delta: float,
+    initial_judge_cache: dict[str, Any] | None = None,
+) -> tuple[bool | None, dict[str, float]]:
+    """Compare two raw policies with common events/noise and independent equal-start judges.
+
+    The caller's reference model is borrowed only during sample generation;
+    its exact state is restored before fitting. No optimizer or monitor cache is
+    touched. This is an engineering confirmation, not a significance test.
+    """
+    reference_snapshot = _snapshot_policy_state_dict(comparison_model)
+    try:
+        _restore_policy_from_dgpo_checkpoint(comparison_model, best_checkpoint)
+        _, candidate_pool, incumbent_pool = materialize_pair(model, comparison_model)
+    finally:
+        unwrap_for_state_dict(comparison_model).load_state_dict(reference_snapshot, strict=True)
+    def fit_one(pool: Any, phase: str) -> Any:
+        if initial_judge_cache is None:
+            return fit_judge(pool, phase)
+        # Each fit may mutate its cache; never pass the first fitted judge to the
+        # second, and never install either confirmation judge into the monitor.
+        return fit_judge(pool, phase, warm_start_cache=copy.deepcopy(initial_judge_cache))
+    candidate = fit_one(candidate_pool, "global_best_candidate")
+    incumbent = fit_one(incumbent_pool, "global_best_incumbent")
+    gaps = [float(p.get("raw_auc_gap", float("nan"))) for p in (candidate, incumbent)]
+    valid = all(math.isfinite(g) and 0 <= g <= .5 for g in gaps) and all(
+        float(p.get("raw_audit_saturated", 0.)) >= .5 for p in (candidate, incumbent)
+    )
+    accepted = bool(gaps[0] < gaps[1] - min_delta) if valid else None
+    return accepted, {
+        "staleness/global_best/confirmation_valid": float(valid),
+        "staleness/global_best/confirmation_accepted": float(accepted is True),
+        "staleness/global_best/candidate_gap": gaps[0],
+        "staleness/global_best/incumbent_gap": gaps[1],
+        "staleness/global_best/confirmation_delta": gaps[0] - gaps[1],
+    }
+
+
 @torch.no_grad()
 def _materialize_adaptive_omnifold_pool(
     data_shard: Any,
     loader_config: dict[str, Any],
     *,
     model: torch.nn.Module,
+    paired_reference_model: torch.nn.Module | None = None,
     sampler: DDIMSampler,
     device: torch.device,
     world_size: int,
     rank: int,
     quota_events: int | None,
+    paired_reference_quota_events: int | None = None,
     num_ddim_steps: int,
     seed: int,
+    include_pairwise_context: bool = False,
 ) -> Any:
-    """Generate and all-gather a truth/visible-event/current-policy K=1 pool.
+    """Generate and all-gather one or a paired pair of K=1 pools.
 
     This deliberately samples the live policy, not either EMA. The caller takes
     its round-reference snapshot at the same point, so an accepted ratio's Gen
-    denominator and DGPO velocity anchor are the same policy.
+    denominator and DGPO velocity anchor are the same policy.  When
+    ``paired_reference_model`` is provided, both policies consume the same data
+    iterator and the same DDIM noise. ``paired_reference_quota_events`` may cap
+    that paired prefix below the larger current-policy audit population. Ray
+    Data does not promise that two new iterators traverse blocks in the same
+    order, so materializing the trust pair in one pass is required to preserve
+    exact event identities.
     """
     from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
         AdaptiveOmniFoldPool,
@@ -6648,17 +8834,59 @@ def _materialize_adaptive_omnifold_pool(
     )
 
     core = _unwrap_core_evenet(model)
+    paired_core = (
+        None
+        if paired_reference_model is None
+        else _unwrap_core_evenet(paired_reference_model)
+    )
     was_training = core.training
+    paired_was_training = (
+        None if paired_core is None else bool(paired_core.training)
+    )
     core.eval()
+    if paired_core is not None:
+        paired_core.eval()
     packed_chunks: list[Tensor] = []
     truth_chunks: list[Tensor] = []
     candidate_chunks: list[Tensor] = []
+    paired_packed_chunks: list[Tensor] = []
+    paired_truth_chunks: list[Tensor] = []
+    paired_current_candidate_chunks: list[Tensor] = []
+    paired_candidate_chunks: list[Tensor] = []
     packing_spec: EventPackingSpec | None = None
     collected = 0
+    paired_collected = 0
     per_rank_quota = (
         None
         if quota_events is None
         else max(1, int(math.ceil(int(quota_events) / max(1, int(world_size)))))
+    )
+    if paired_reference_model is None and paired_reference_quota_events is not None:
+        raise ValueError(
+            "paired_reference_quota_events requires paired_reference_model"
+        )
+    if (
+        quota_events is not None
+        and paired_reference_quota_events is not None
+        and int(paired_reference_quota_events) > int(quota_events)
+    ):
+        raise ValueError(
+            "paired reference quota cannot exceed the current-policy quota"
+        )
+    per_rank_paired_quota = (
+        per_rank_quota
+        if paired_core is not None and paired_reference_quota_events is None
+        else None
+        if paired_core is None or paired_reference_quota_events is None
+        else max(
+            1,
+            int(
+                math.ceil(
+                    int(paired_reference_quota_events)
+                    / max(1, int(world_size))
+                )
+            ),
+        )
     )
     data_iter = iter(data_shard.iter_torch_batches(**loader_config))
     cuda_devices: list[int] = []
@@ -6674,11 +8902,13 @@ def _materialize_adaptive_omnifold_pool(
                     data_iter,
                     world_size=world_size,
                     device=device,
+                    require_all_ranks=quota_events is not None,
                 )
-                if not has_more or batch_cpu is None:
+                if not has_more:
                     break
                 already_full = (
-                    per_rank_quota is not None and collected >= per_rank_quota
+                    batch_cpu is None
+                    or (per_rank_quota is not None and collected >= per_rank_quota)
                 )
                 if not already_full:
                     batch = batch_to_device(batch_cpu, device)
@@ -6690,6 +8920,16 @@ def _materialize_adaptive_omnifold_pool(
                         torch.float32,
                     ) > 0
                     if bool(valid.any().item()):
+                        # Snapshot the process-local RNG immediately before
+                        # current-policy DDIM. Restoring it for the paired
+                        # reference gives common random numbers without
+                        # changing the RNG stream seen by the next batch.
+                        cpu_rng_state = torch.random.get_rng_state()
+                        cuda_rng_state = (
+                            torch.cuda.get_rng_state(device)
+                            if device.type == "cuda"
+                            else None
+                        )
                         generated = generate_neutrino_candidates(
                             core,
                             batch,
@@ -6701,6 +8941,30 @@ def _materialize_adaptive_omnifold_pool(
                             tqdm_k_chains=False,
                             use_tqdm_ddim=False,
                         )
+                        paired_generated: Tensor | None = None
+                        paired_needed = bool(
+                            paired_core is not None
+                            and (
+                                per_rank_paired_quota is None
+                                or paired_collected < per_rank_paired_quota
+                            )
+                        )
+                        if paired_needed:
+                            assert paired_core is not None
+                            torch.random.set_rng_state(cpu_rng_state)
+                            if cuda_rng_state is not None:
+                                torch.cuda.set_rng_state(cuda_rng_state, device)
+                            paired_generated = generate_neutrino_candidates(
+                                paired_core,
+                                batch,
+                                sampler,
+                                K=1,
+                                num_ddim_steps=int(num_ddim_steps),
+                                device=device,
+                                parallel_chains=1,
+                                tqdm_k_chains=False,
+                                use_tqdm_ddim=False,
+                            )
                         invisible = batch.get("x_invisible")
                         if not isinstance(invisible, Tensor):
                             raise KeyError("adaptive OmniFold fit needs x_invisible truth")
@@ -6709,9 +8973,22 @@ def _materialize_adaptive_omnifold_pool(
                                 "Ztautau adaptive OmniFold requires generated "
                                 f"(K,B,2,2), got {tuple(generated.shape)}"
                             )
+                        if paired_generated is not None and (
+                            tuple(paired_generated.shape) != tuple(generated.shape)
+                        ):
+                            raise ValueError(
+                                "paired current/reference adaptive generations "
+                                "must have identical shapes; "
+                                f"current={tuple(generated.shape)} "
+                                f"reference={tuple(paired_generated.shape)}"
+                            )
                         if int(invisible.shape[1]) < 2 or int(invisible.shape[2]) < 2:
                             raise ValueError("adaptive OmniFold truth needs two 2D slots")
-                        packed, packing_spec = pack_event_inputs(batch, packing_spec)
+                        packed, packing_spec = pack_event_inputs(
+                            batch,
+                            packing_spec,
+                            include_pairwise_context=include_pairwise_context,
+                        )
                         keep = valid.nonzero(as_tuple=True)[0]
                         if per_rank_quota is not None:
                             remaining = max(0, per_rank_quota - collected)
@@ -6733,6 +9010,41 @@ def _materialize_adaptive_omnifold_pool(
                                 .float()
                                 .cpu()
                             )
+                            if paired_generated is not None:
+                                paired_keep = keep
+                                if per_rank_paired_quota is not None:
+                                    paired_remaining = max(
+                                        0,
+                                        per_rank_paired_quota - paired_collected,
+                                    )
+                                    paired_keep = paired_keep[:paired_remaining]
+                                paired_packed_chunks.append(
+                                    packed[paired_keep].detach().cpu()
+                                )
+                                paired_truth_chunks.append(
+                                    invisible[paired_keep, :2, :2]
+                                    .reshape(len(paired_keep), 4)
+                                    .detach()
+                                    .float()
+                                    .cpu()
+                                )
+                                paired_current_candidate_chunks.append(
+                                    generated[:, paired_keep, :2, :2]
+                                    .permute(1, 0, 2, 3)
+                                    .reshape(len(paired_keep), 1, 4)
+                                    .detach()
+                                    .float()
+                                    .cpu()
+                                )
+                                paired_candidate_chunks.append(
+                                    paired_generated[:, paired_keep, :2, :2]
+                                    .permute(1, 0, 2, 3)
+                                    .reshape(len(paired_keep), 1, 4)
+                                    .detach()
+                                    .float()
+                                    .cpu()
+                                )
+                                paired_collected += int(paired_keep.numel())
                             collected += int(keep.numel())
                 if per_rank_quota is not None:
                     done = torch.tensor(
@@ -6746,6 +9058,8 @@ def _materialize_adaptive_omnifold_pool(
                         break
     finally:
         core.train(was_training)
+        if paired_core is not None and paired_was_training is not None:
+            paired_core.train(paired_was_training)
 
     if not packed_chunks or packing_spec is None:
         raise RuntimeError("adaptive OmniFold pool collected no valid events")
@@ -6755,11 +9069,52 @@ def _materialize_adaptive_omnifold_pool(
         "candidates": torch.cat(candidate_chunks, dim=0),
         "packing_spec": packing_spec.to_dict(),
     }
+    if paired_core is not None:
+        if not paired_candidate_chunks:
+            raise RuntimeError(
+                "paired adaptive pool collected no reference candidates"
+            )
+        local["paired_packed_event"] = torch.cat(
+            paired_packed_chunks,
+            dim=0,
+        )
+        local["paired_truth"] = torch.cat(paired_truth_chunks, dim=0)
+        local["paired_current_candidates"] = torch.cat(
+            paired_current_candidate_chunks,
+            dim=0,
+        )
+        local["paired_candidates"] = torch.cat(
+            paired_candidate_chunks,
+            dim=0,
+        )
     gathered = gather_pool_across_ranks(local, world_size=world_size)
     if quota_events is not None:
         stop = min(int(quota_events), int(gathered["truth"].shape[0]))
-        for key in ("packed_event", "truth", "candidates"):
+        for key in (
+            "packed_event",
+            "truth",
+            "candidates",
+        ):
+            if key not in gathered:
+                continue
             gathered[key] = gathered[key][:stop]
+    paired_global_quota = (
+        paired_reference_quota_events
+        if paired_reference_quota_events is not None
+        else quota_events
+    )
+    if paired_core is not None and paired_global_quota is not None:
+        paired_stop = min(
+            int(paired_global_quota),
+            int(gathered["paired_truth"].shape[0]),
+        )
+        for key in (
+            "paired_packed_event",
+            "paired_truth",
+            "paired_current_candidates",
+            "paired_candidates",
+        ):
+            gathered[key] = gathered[key][:paired_stop]
     pool = AdaptiveOmniFoldPool(
         packed_event=gathered["packed_event"],
         truth=gathered["truth"],
@@ -6770,7 +9125,27 @@ def _materialize_adaptive_omnifold_pool(
         raise RuntimeError(
             f"adaptive OmniFold pool needs at least 30 valid events, got {pool.n_events}"
         )
-    return pool
+    if paired_core is None:
+        return pool
+    paired_current_pool = AdaptiveOmniFoldPool(
+        packed_event=gathered["paired_packed_event"],
+        truth=gathered["paired_truth"],
+        candidates=gathered["paired_current_candidates"],
+        packing_spec=EventPackingSpec.from_dict(gathered["packing_spec"]),
+    )
+    reference_pool = AdaptiveOmniFoldPool(
+        # Share the exact one-pass paired identities and common-noise draws.
+        packed_event=gathered["paired_packed_event"],
+        truth=gathered["paired_truth"],
+        candidates=gathered["paired_candidates"],
+        packing_spec=EventPackingSpec.from_dict(gathered["packing_spec"]),
+    )
+    if paired_current_pool.n_events < 30:
+        raise RuntimeError(
+            "classifier-trust pool needs at least 30 valid events, got "
+            f"{paired_current_pool.n_events}"
+        )
+    return pool, paired_current_pool, reference_pool
 
 
 @torch.no_grad()
@@ -6950,15 +9325,17 @@ def run_validation_epoch(
     if val_iter is None:
         if is_rank0 and val_log_batches:
             _log.warning("[DGPO] val: rank=%s has no val shard; returning empty metrics.", rank)
-        return {
+        empty_metrics = {
             f"{metric_prefix}/reward/mean": float("nan"),
             f"{metric_prefix}/reward/median": float("nan"),
             f"{metric_prefix}/reward/p10": float("nan"),
             f"{metric_prefix}/reward/p30": float("nan"),
             f"{metric_prefix}/reward/p70": float("nan"),
             f"{metric_prefix}/reward/p90": float("nan"),
-            f"{metric_prefix}/winrate": float("nan"),
         }
+        if winrate_enabled:
+            empty_metrics[f"{metric_prefix}/winrate"] = float("nan")
+        return empty_metrics
 
     batch_round = 0
     while True:
@@ -7474,12 +9851,13 @@ def run_validation_epoch(
         f"{metric_prefix}/reward/p30": p30,
         f"{metric_prefix}/reward/p70": p70,
         f"{metric_prefix}/reward/p90": p90,
-        f"{metric_prefix}/winrate": win_metric,
         f"{metric_prefix}/meta/K": float(val_K),
         f"{metric_prefix}/meta/batches_per_rank": float(n_val_batches),
         f"{metric_prefix}/meta/full_diagnostics": float(full_diagnostics),
         "_val_initial_state": local_state,
     }
+    if winrate_enabled:
+        out[f"{metric_prefix}/winrate"] = win_metric
 
     _val_kin_suffix = f"val: {val_K} candidate{'s' if val_K != 1 else ''} vs truth"
     _pred_lbl = "Pred (val)" if val_K == 1 else f"Pred (val, best-of-{val_K})"
@@ -7508,7 +9886,7 @@ def run_validation_epoch(
                     truth_initial=profile_merged.get(f"initial_{truth_key}"),
                     delta_initial=profile_merged.get(f"initial_{delta_key}"),
                 )
-        if response_initial_state is not None:
+        if response_initial_state is not None and not _wandb_critical_enabled():
             reward_initial = response_merged.get(
                 "reward_initial", np.array([], dtype=np.float64)
             )
@@ -7598,6 +9976,8 @@ def run_validation_epoch(
             truth_pred_all_merged,
             all_plot_feature_names,
         )
+        if _wandb_critical_enabled():
+            available_truth_pred_features = []
         for feature_name in available_truth_pred_features:
             truth_key = f"{feature_name}_truth"
             pred_key = f"{feature_name}_pred"
@@ -7792,6 +10172,123 @@ def run_validation_epoch(
     return out
 
 
+def _prepare_single_pool_datasets(
+    *, base_dir: Path, base_val_dir: Path | None, process_fn: Any,
+    platform_info: Any, dataset_options: Any,
+) -> tuple[Any, Any, int, int]:
+    """Read one complete budgeted pool; classifiers split it after generation.
+
+    Policy fitting uses all rows. Physics 'validation' is explicitly in-pool
+    monitoring, not an independent test set. Classifier validation is disjoint
+    from classifier fitting via a fixed condition hash inside the fit helpers.
+    """
+    if base_val_dir is not None and base_val_dir.resolve() != base_dir.resolve():
+        raise ValueError("single-pool mode forbids an external validation directory")
+    if float(_dgpo_cfg_get(dataset_options, "dataset_limit", 1.0)) != 1.0 or float(
+        _dgpo_cfg_get(dataset_options, "val_dataset_limit", 1.0)
+    ) != 1.0:
+        raise ValueError("single-pool mode requires dataset_limit=val_dataset_limit=1.0")
+    files = sorted(map(str, base_dir.glob("*.parquet")))
+    if not files:
+        raise ValueError(f"No parquet files found in the budgeted pool: {base_dir}")
+    pool, count = register_dataset(files, process_fn, platform_info, dataset_limit=1.0, file_shuffling=True)
+    _log.warning(
+        "[DGPO/scaling] SINGLE POOL: %s (%s events); policy/OmniFold/monitors "
+        "use only these identities. Classifiers use internal 80/20 splits; "
+        "physics validation panels are in-pool diagnostics, NOT external generalization.",
+        base_dir, count,
+    )
+    return pool, pool, int(count), int(count)
+
+
+def _should_log_pretraining_baseline(start_epoch: int, global_step: int) -> bool:
+    """A mid-epoch-0 resume is not the untrained step-zero policy."""
+    return int(start_epoch) == 0 and int(global_step) == 0
+
+
+def _resume_logical_epoch_step(checkpoint: dict[str, Any] | None, budget: int | None) -> int:
+    """Restore progress inside a logical epoch without replaying its step budget."""
+    progress = int((checkpoint or {}).get("dgpo_epoch_step", 0))
+    if progress == 0:
+        return 0
+    if budget is None or not 0 < progress < budget:
+        raise ValueError("mid-epoch resume has invalid dgpo_epoch_step or changed epoch budget")
+    if checkpoint.get("dgpo_next_epoch") != checkpoint.get("epoch"):
+        raise ValueError("mid-epoch resume must continue the recorded current epoch")
+    return progress
+
+
+
+
+def _prepare_best_point_restart(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Keep the best policy/reward/reference pairing, reset this experiment's clock."""
+    from RL.DGPO_neutrino.omnifold_ztautau.adaptive import AdaptiveOmniFoldState
+
+    previous = AdaptiveOmniFoldState.from_dict(checkpoint["dgpo_adaptive_omnifold_state"])
+    if not previous.calibrated:
+        raise ValueError("best-point restart requires an installed calibrated OmniFold round")
+    state = AdaptiveOmniFoldState(
+        reward_round_id=previous.reward_round_id,
+        baseline_auc_gap=previous.baseline_auc_gap,
+        previous_audit_auc_gap=previous.previous_audit_auc_gap,
+        trigger_threshold=previous.trigger_threshold,
+        resume_refit_once_completed=previous.resume_refit_once_completed,
+        resume_refit_once_id=previous.resume_refit_once_id,
+        raw_monitor_state=previous.raw_monitor_state,
+        raw_monitor_baseline_pending=True,
+        last_decision="new_experiment_from_best",
+    )
+    result = dict(checkpoint)
+    for key in ("dgpo_optimizer_state_dict", "ema_state_dict",
+                "dgpo_ema_rollout_state_dict", "dgpo_projection_constraint_state"):
+        result.pop(key, None)
+    result.update(epoch=-1, global_step=0, dgpo_next_epoch=0, dgpo_epoch_step=0,
+                  dgpo_adaptive_omnifold_state=state.to_dict())
+    return result
+
+
+def _resolve_distributed_auto_resume_checkpoint(
+    checkpoint_save_path: str | Path | None,
+    *,
+    enabled: bool,
+    fallback_checkpoint_path: str | Path | None,
+    best_source_checkpoint_dir: str | Path | None,
+    world_size: int,
+    device: torch.device,
+) -> Path | None:
+    """Select once on rank zero, then require the same snapshot on every rank."""
+    kwargs = dict(
+        enabled=enabled,
+        fallback_checkpoint_path=fallback_checkpoint_path,
+        best_source_checkpoint_dir=best_source_checkpoint_dir,
+    )
+    if world_size <= 1:
+        return resolve_dgpo_auto_resume_checkpoint(checkpoint_save_path, **kwargs)
+    if not dist.is_initialized():
+        raise RuntimeError("distributed DGPO auto-resume requires an initialized process group")
+    message = [None, None]  # canonical path, resolution error
+    if dist.get_rank() == 0:
+        try:
+            selected = resolve_dgpo_auto_resume_checkpoint(checkpoint_save_path, **kwargs)
+            message[0] = str(selected) if selected is not None else None
+        except Exception as exc:
+            # Broadcast failures too; peers must not hang waiting for rank zero.
+            message[1] = f"{type(exc).__name__}: {exc}"
+    dist.broadcast_object_list(message, src=0, device=device)
+    if message[1] is not None:
+        raise RuntimeError(f"DGPO auto-resume selection failed: {message[1]}")
+    if message[0] is None:
+        return None
+    selected = Path(message[0])
+    visible = torch.tensor(int(selected.is_file()), device=device, dtype=torch.int32)
+    dist.all_reduce(visible, op=dist.ReduceOp.MIN)
+    if not int(visible.item()):
+        raise RuntimeError(
+            f"DGPO resume checkpoint is not visible on every worker: {selected}"
+        )
+    return selected
+
+
 def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     """Per-worker DGPO training loop launched by ``ray.train.torch.TorchTrainer``.
 
@@ -7826,6 +10323,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     max_steps: int | None = cfg.get("max_steps")
     wandb_flag = bool(cfg.get("wandb", True))
     total_events = int(cfg["total_events"])
+    omnifold_train_events = int(cfg.get("omnifold_train_events", total_events))
     val_events_in = cfg.get("val_events", 0)
     val_events: int | None = int(val_events_in) if val_events_in else None
     config_yaml_text = cfg.get("config_yaml", None)
@@ -7896,10 +10394,53 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         "prefetch_batches": prefetch,
     }
 
+    configured_checkpoint_load_mode = str(
+        _dgpo_cfg_get(global_config.dgpo, "checkpoint_load_mode", "resume")
+    ).strip().lower()
+    # Validate the fallback mode even when a recovery snapshot is present, so
+    # an invalid config cannot silently become valid only on resume machines.
+    select_dgpo_training_state(None, load_mode=configured_checkpoint_load_mode)
+    auto_resume_enabled = bool(
+        _dgpo_cfg_get(global_config.dgpo, "auto_resume_from_last", False)
+    )
+    auto_resume_checkpoint = _resolve_distributed_auto_resume_checkpoint(
+        global_config.options.Training.get("model_checkpoint_save_path", None),
+        enabled=auto_resume_enabled,
+        fallback_checkpoint_path=_dgpo_cfg_get(
+            global_config.dgpo, "auto_resume_fallback_checkpoint_path", None
+        ),
+        best_source_checkpoint_dir=_dgpo_cfg_get(
+            global_config.dgpo, "auto_resume_best_source_checkpoint_dir", None
+        ),
+        world_size=world_size,
+        device=device,
+    )
+    if auto_resume_checkpoint is not None:
+        startup_checkpoint_path: Path | None = auto_resume_checkpoint
+        checkpoint_load_mode = "resume"
+        if is_rank0:
+            _log.info(
+                "[DGPO] Auto-resume found %s; restoring the complete DGPO + "
+                "OmniFold state instead of fitting the initial classifiers again.",
+                auto_resume_checkpoint,
+            )
+    else:
+        startup_checkpoint_path = None
+        checkpoint_load_mode = configured_checkpoint_load_mode
+        if is_rank0 and auto_resume_enabled:
+            _log.info(
+                "[DGPO] No last.ckpt in %s; starting from the configured %s "
+                "checkpoint and saving the installed OmniFold round before training.",
+                global_config.options.Training.get(
+                    "model_checkpoint_save_path", None
+                ),
+                checkpoint_load_mode,
+            )
+
     bundle = load_evenet_model_for_dgpo(
         None,
         device,
-        checkpoint_path=None,
+        checkpoint_path=startup_checkpoint_path,
         config=global_config,
     )
     eve_net = bundle.model
@@ -7909,13 +10450,41 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         loaded_ckpt_dict = torch.load(
             str(bundle.checkpoint_path), map_location=device, weights_only=False
         )
-    checkpoint_load_mode = str(
-        _dgpo_cfg_get(global_config.dgpo, "checkpoint_load_mode", "resume")
-    ).strip().lower()
+    if auto_resume_checkpoint is not None:
+        required_recovery_keys = {
+            "dgpo_checkpoint_version",
+            "dgpo_next_epoch",
+            "dgpo_optimizer_state_dict",
+            "dgpo_round_ref_state_dict",
+            "dgpo_adaptive_omnifold_state",
+            "dgpo_omnifold_reward_stack",
+        }
+        missing_recovery_keys = sorted(
+            required_recovery_keys.difference(loaded_ckpt_dict or {})
+        )
+        if missing_recovery_keys:
+            raise RuntimeError(
+                "automatic DGPO resume checkpoint is incomplete and cannot "
+                "safely skip OmniFold training; missing keys: "
+                + ", ".join(missing_recovery_keys)
+            )
     ckpt_dict = select_dgpo_training_state(
         loaded_ckpt_dict,
         load_mode=checkpoint_load_mode,
     )
+    best_source_dir = _dgpo_cfg_get(global_config.dgpo, "auto_resume_best_source_checkpoint_dir", None)
+    best_point_restart = bool(
+        _dgpo_cfg_get(global_config.dgpo, "best_source_start_new_experiment", False)
+        and best_source_dir and auto_resume_checkpoint is not None
+        and auto_resume_checkpoint.parent == Path(str(best_source_dir)).expanduser().resolve()
+    )
+    if best_point_restart:
+        ckpt_dict = _prepare_best_point_restart(ckpt_dict)
+        if is_rank0:
+            _log.info(
+                "[DGPO] New experiment from best point: epoch/step=0, fresh AdamW/scheduler/EMA, "
+                "trust schedule age=0; preserve installed OmniFold + matching reference."
+            )
     if is_rank0:
         if checkpoint_load_mode == "weights_only" and loaded_ckpt_dict is not None:
             _log.info(
@@ -7928,6 +10497,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
 
     eve_net.train()
     apply_component_freezes(eve_net, global_config)
+    if bool(
+        _dgpo_cfg_get(global_config.dgpo, "require_deterministic_policy", False)
+    ):
+        assert_dgpo_neutrino_policy_deterministic(eve_net)
     activation_checkpointing = bool(
         _dgpo_cfg_get(global_config.dgpo, "activation_checkpointing", False)
     )
@@ -7974,8 +10547,18 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
         AdaptiveOmniFoldState,
         adaptive_audit_protocol_signature,
+        adaptive_trust_policy_lr_scale,
+        policy_round_warmup_metrics,
+        migrate_unstarted_policy_warmup_after_resume,
+        advance_policy_round_warmup,
+        clamp_fixed_trust_radius_after_resume,
+        record_reference_trust_attempt,
         resolve_adaptive_config,
+        should_probe_training_boundary,
+        trust_region_exhausted,
+        update_empirical_trust_radius_from_audit,
         validate_adaptive_pairing,
+        initialize_global_raw_best,
     )
     from RL.DGPO_neutrino.omnifold_ztautau.dgpo_reward import (
         REWARD_STACK_CHECKPOINT_KEY,
@@ -8005,6 +10588,65 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             batch_size,
             int(adaptive_cfg.fit.get("batch_size", 8192)),
         )
+        if adaptive_cfg.trust_boundary_enabled:
+            _log.info(
+                "[DGPO/trust] adaptive boundary enabled: delta_max=%.6g "
+                "delta_floor=%.6g warning=%.3g power=%.3g AUC_z=%.3g; "
+                "enforcement=%s backtrack_factor=%.3g max_backtracks=%s "
+                "probe_events/rank=%s fixed_probe/round=%s interior=%.3g.",
+                adaptive_cfg.trust_delta_max,
+                adaptive_cfg.trust_delta_floor,
+                adaptive_cfg.trust_warning_fraction,
+                adaptive_cfg.trust_adaptive_power,
+                adaptive_cfg.trust_auc_confidence_z,
+                adaptive_cfg.trust_enforcement,
+                adaptive_cfg.trust_backtrack_factor,
+                adaptive_cfg.trust_max_backtracks,
+                adaptive_cfg.trust_probe_events_per_rank,
+                adaptive_cfg.trust_fixed_probe_per_reward_round,
+                adaptive_cfg.trust_interior_fraction,
+            )
+            if adaptive_cfg.trust_empirical_radius_enabled:
+                _log.info(
+                    "[DGPO/trust] empirical audit-envelope calibration enabled: "
+                    "bidirectional=%s safety_factor=%.3g expand=%.3g shrink=%.3g "
+                    "target_accept=%.3g target_scale=%.3g safe_audits=%s "
+                    "attempt_window=%s exhaustion_window=%s distance_window=%s "
+                    "min_samples=%s "
+                    "confidence_z=%.3g cross_round_nonexpanding=%s "
+                    "policy_lr_scaling=%s policy_lr_floor=%.3g; "
+                    "round_AUC_guard=%s round_z=%.3g plateau_patience=%s; "
+                    "trajectory_search=%s failed_direction_patience=%s; "
+                    "signed_direction_probe=%s signed_scales=%s "
+                    "recover_reverse_only=%s; "
+                    "lookahead_extragradient=%s lookahead_scale=%.3g; "
+                    "dgpo.beta is locked to 1.0.",
+                    adaptive_cfg.trust_empirical_bidirectional,
+                    adaptive_cfg.trust_empirical_safety_factor,
+                    adaptive_cfg.trust_empirical_expand_factor,
+                    adaptive_cfg.trust_empirical_shrink_factor,
+                    adaptive_cfg.trust_empirical_target_acceptance_rate,
+                    adaptive_cfg.trust_empirical_target_update_scale,
+                    adaptive_cfg.trust_empirical_safe_audits_required,
+                    adaptive_cfg.trust_empirical_attempt_window_steps,
+                    adaptive_cfg.trust_exhaustion_scale_window_steps,
+                    adaptive_cfg.trust_empirical_distance_window_steps,
+                    adaptive_cfg.trust_empirical_min_distance_samples,
+                    adaptive_cfg.trust_empirical_confidence_z,
+                    adaptive_cfg.trust_cross_round_nonexpanding,
+                    adaptive_cfg.trust_policy_lr_scaling_enabled,
+                    adaptive_cfg.trust_policy_lr_scale_floor,
+                    adaptive_cfg.trust_round_acceptance_enabled,
+                    adaptive_cfg.trust_round_acceptance_confidence_z,
+                    adaptive_cfg.trust_round_plateau_patience,
+                    adaptive_cfg.trust_trajectory_search_enabled,
+                    adaptive_cfg.trust_failed_direction_patience,
+                    adaptive_cfg.trust_signed_direction_probe_enabled,
+                    adaptive_cfg.trust_signed_direction_probe_scales,
+                    adaptive_cfg.trust_signed_direction_recovery_enabled,
+                    adaptive_cfg.trust_extragradient_enabled,
+                    adaptive_cfg.trust_extragradient_lookahead_scale,
+                )
     omnifold_source = reward_agg.omnifold_source
     if adaptive_cfg.enabled and omnifold_source is None:
         raise ValueError(
@@ -8016,6 +10658,38 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     adaptive_state = AdaptiveOmniFoldState.from_dict(
         None if ckpt_dict is None else ckpt_dict.get("dgpo_adaptive_omnifold_state")
     )
+    if saved_stack is not None and adaptive_cfg.enabled:
+        old_warmup_protocol = adaptive_state.policy_warmup_protocol
+        if migrate_unstarted_policy_warmup_after_resume(adaptive_state, cfg=adaptive_cfg) and is_rank0:
+            _log.info("[DGPO/resume] Unstarted round warmup changed: %s -> %s; saved clocks and reward stack preserved.",
+                      old_warmup_protocol, adaptive_state.policy_warmup_protocol)
+    pending_resume_trust_diagnostics = clamp_fixed_trust_radius_after_resume(
+        adaptive_state,
+        cfg=adaptive_cfg,
+        initialize_round_decay=saved_stack is not None,
+    )
+    if (
+        is_rank0
+        and float(
+            pending_resume_trust_diagnostics.get(
+                "reference_trust/resume_radius_clamp_applied", 0.0
+            )
+        )
+        >= 0.5
+    ):
+        _log.info(
+            "[DGPO/trust] resume synchronized trust delta %.6g -> %.6g ",
+            float(
+                pending_resume_trust_diagnostics[
+                    "reference_trust/resume_radius_before"
+                ]
+            ),
+            float(
+                pending_resume_trust_diagnostics[
+                    "reference_trust/resume_radius_after"
+                ]
+            ),
+        )
     resume_refit_version_completed_at_load = bool(
         adaptive_state.resume_refit_once_completed
         and (
@@ -8059,6 +10733,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     if adaptive_cfg.enabled:
         current_audit_signature = adaptive_audit_protocol_signature(adaptive_cfg)
         restored_audit_signature = str(adaptive_state.audit_protocol_signature or "")
+        if (adaptive_cfg.raw_best_scope == "global" and restored_audit_signature
+                and restored_audit_signature != current_audit_signature):
+            raise ValueError("global-best rollback requires the checkpoint's matching raw audit protocol")
         if not restored_audit_signature:
             adaptive_state.audit_protocol_signature = current_audit_signature
         elif restored_audit_signature != current_audit_signature:
@@ -8091,6 +10768,48 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         if adaptive_cfg.enabled
         else ref_model
     )
+    reference_trust_probe_cache: dict[str, Any] = {}
+    restore_fixed_probe = bool(
+        adaptive_cfg.trust_boundary_enabled
+        and adaptive_cfg.trust_fixed_probe_per_reward_round
+        and adaptive_state.trust_probe_payload is not None
+        and int(adaptive_state.trust_probe_round_id)
+        == int(adaptive_state.reward_round_id)
+    )
+    if restore_fixed_probe and (
+        adaptive_state.trust_probe_payload.get("format")
+        != _PER_RANK_TRUST_PROBE_FORMAT
+    ):
+        # A legacy payload contains only rank 0's rows.  Preserve the complete
+        # training/reward state but rebuild the probe so every rank contributes
+        # distinct conditions under the corrected protocol.
+        adaptive_state.trust_probe_payload = None
+        adaptive_state.trust_probe_round_id = -1
+        restore_fixed_probe = False
+        if is_rank0:
+            _log.info(
+                "[DGPO/trust] discarded legacy rank-0-only fixed probe; "
+                "a distinct per-rank probe will be captured on the next step."
+            )
+    if restore_fixed_probe:
+        assert adaptive_state.trust_probe_payload is not None
+        reference_trust_probe_cache.update(
+            {
+                "probe": _restore_reference_trust_probe(
+                    adaptive_state.trust_probe_payload,
+                    device=device,
+                    world_size=world_size,
+                ),
+                "payload": adaptive_state.trust_probe_payload,
+                "round_id": int(adaptive_state.reward_round_id),
+                "dirty": False,
+            }
+        )
+        if is_rank0:
+            _log.info(
+                "[DGPO/trust] restored fixed probe for reward round=%s from checkpoint.",
+                adaptive_state.reward_round_id,
+            )
     if (
         omnifold_source is not None
         and int(omnifold_source.reward_round_id) > 0
@@ -8126,6 +10845,14 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 f"or null, got {configured_steps_per_epoch!r}"
             )
     train_opt_lr = global_config.options.Training
+    if adaptive_cfg.staleness_every_n_steps is not None and (
+        configured_steps_per_epoch is None
+        or steps_per_epoch % adaptive_cfg.staleness_every_n_steps != 0
+    ):
+        raise ValueError(
+            "step-based staleness requires a fixed steps_per_epoch divisible by "
+            "staleness_every_n_steps, so epoch-end trust monitoring stays aligned"
+        )
     warm_up_factor = float(train_opt_lr.get("learning_rate_warm_up_factor", 1.0))
     warmup_steps = max(1, math.ceil(warm_up_factor * steps_per_epoch))
     optimizer = build_optimizer(
@@ -8133,15 +10860,38 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         steps_per_epoch=steps_per_epoch,
         warmup_steps=warmup_steps,
         is_rank0=is_rank0,
+        lr_schedule=dg.get("lr_schedule"),
     )
 
     start_epoch, global_step = parse_dgpo_resume_from_checkpoint(ckpt_dict)
+    if checkpoint_load_mode == "resume" and optimizer.cosine_state is not None and (
+        ckpt_dict is None or "dgpo_optimizer_state_dict" not in ckpt_dict
+    ):
+        raise ValueError("cosine full resume requires checkpointed DGPO optimizer/scheduler state")
+    if is_rank0 and wandb_active:
+        import wandb
+        try:
+            wandb.run.summary.update({
+                "resume/start_epoch": int(start_epoch),
+                "resume/completed_dgpo_steps": int(global_step),
+                "resume/epoch_step": int((ckpt_dict or {}).get("dgpo_epoch_step", 0)),
+                "resume/checkpoint_load_mode": checkpoint_load_mode,
+                "resume/source_checkpoint": str(bundle.checkpoint_path or ""),
+            })
+        except Exception as exc:
+            _log.warning("[DGPO] W&B resume metadata could not be published: %s", exc)
     if ckpt_dict is not None and "dgpo_optimizer_state_dict" in ckpt_dict:
         try:
             optimizer.load_state_dict(ckpt_dict["dgpo_optimizer_state_dict"])
             if is_rank0:
-                _log.info("[DGPO] Restored optimizer state from checkpoint.")
+                _log.info(
+                    "[DGPO] Restored optimizer state from checkpoint; effective "
+                    "AdamW weight_decay per group (current config): %s",
+                    [pg["weight_decay"] for pg in optimizer.param_groups],
+                )
         except (ValueError, RuntimeError) as ex:
+            if optimizer.cosine_state is not None or ckpt_dict["dgpo_optimizer_state_dict"].get("lr_schedule") is not None:
+                raise RuntimeError("Cannot safely resume DGPO cosine optimizer/scheduler state") from ex
             if is_rank0:
                 _log.warning(
                     "[DGPO] Could not load optimizer state (continuing fresh optimizer): %s", ex
@@ -8326,6 +11076,47 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         if bool(_dgpo_cfg_get(trust_cfg, "enabled", False))
         else 0.0
     )
+    reference_trust_objective = str(
+        _dgpo_cfg_get(
+            trust_cfg,
+            "objective",
+            REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE,
+        )
+    ).strip().lower()
+    if reference_trust_objective not in VALID_REFERENCE_TRUST_OBJECTIVES:
+        raise ValueError(
+            "dgpo.reference_trust.objective must be one of "
+            f"{sorted(VALID_REFERENCE_TRUST_OBJECTIVES)}, got "
+            f"{reference_trust_objective!r}"
+        )
+    vp_path_kl_cfg = _dgpo_cfg_get(trust_cfg, "vp_path_kl", None) or {}
+    reference_trust_vp_path_kl_diagnostic = bool(
+        _dgpo_cfg_get(vp_path_kl_cfg, "diagnostic", False)
+    )
+    reference_trust_vp_logsnr_min = float(
+        _dgpo_cfg_get(vp_path_kl_cfg, "logsnr_min", -20.0)
+    )
+    reference_trust_vp_logsnr_max = float(
+        _dgpo_cfg_get(vp_path_kl_cfg, "logsnr_max", 20.0)
+    )
+    if (
+        not math.isfinite(reference_trust_vp_logsnr_min)
+        or not math.isfinite(reference_trust_vp_logsnr_max)
+        or reference_trust_vp_logsnr_min
+        >= reference_trust_vp_logsnr_max
+    ):
+        raise ValueError(
+            "dgpo.reference_trust.vp_path_kl requires finite "
+            "logsnr_min < logsnr_max"
+        )
+    if not (
+        math.isclose(reference_trust_vp_logsnr_min, -20.0)
+        and math.isclose(reference_trust_vp_logsnr_max, 20.0)
+    ):
+        raise ValueError(
+            "dgpo.reference_trust.vp_path_kl log-SNR endpoints must match "
+            "EveNet's fixed cosine schedule (-20, 20)"
+        )
     if reference_trust_coefficient < 0.0 or not math.isfinite(
         reference_trust_coefficient
     ):
@@ -8335,12 +11126,16 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         )
     if is_rank0:
         _log.info(
-            "[DGPO] round-reference shared-noise trust coefficient=%.4g (%s)",
+            "[DGPO] round-reference trust coefficient=%.4g (%s), "
+            "objective=%s, separate VP path-KL diagnostic=%s",
             reference_trust_coefficient,
             "active" if reference_trust_coefficient > 0.0 else "disabled",
+            reference_trust_objective,
+            reference_trust_vp_path_kl_diagnostic,
         )
-    # Frozen DGPO method: configured per-event advantages, shared noise,
-    # accumulated sub-step gradients into one AdamW update, rollout EMA always on.
+    # Frozen DGPO method: configured per-event advantages, shared noise, and
+    # accumulated sub-step gradients into one AdamW update. Candidate rollout
+    # follows EMA.use_for_generation (live policy in the memory ablation).
 
     proj_cfg_startup = resolve_projection_constraint_config(dg)
     constraint_ckpt_blob = (
@@ -8425,6 +11220,29 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         dist.barrier()
 
     save_dir_raw = global_config.options.Training.get("model_checkpoint_save_path", None)
+    if adaptive_cfg.raw_rollback_to_best_on_plateau and not save_dir_raw:
+        raise ValueError(
+            "raw-AUC best-point rollback requires "
+            "options.Training.model_checkpoint_save_path"
+        )
+    global_best_source_dirs = [Path(bundle.checkpoint_path).parent] if bundle.checkpoint_path else []
+    global_best_source_dirs.extend(dg.get("global_best_checkpoint_search_dirs", []) or [])
+    if adaptive_state.raw_global_initialized and adaptive_cfg.raw_best_scope != "global":
+        raise ValueError("checkpoint uses global-best rollback; preserve best_scope=global on full resume")
+    if adaptive_cfg.raw_best_scope == "global":
+        initialize_global_raw_best(adaptive_state)
+        if math.isfinite(adaptive_state.raw_best_auc_gap):
+            best_path = _resolve_raw_best_policy_checkpoint(
+                adaptive_state, save_dir_raw, global_scope=True, source_dirs=global_best_source_dirs,
+            )
+            if is_rank0:
+                _log.info("[DGPO/global-best] restored gap=%.8g epoch=%s step=%s checkpoint=%s",
+                          adaptive_state.raw_best_auc_gap, adaptive_state.raw_best_epoch,
+                          adaptive_state.raw_best_global_step, best_path)
+        if adaptive_state.raw_global_stop_requested:
+            if adaptive_state.raw_global_failed_rounds >= adaptive_cfg.raw_global_max_failed_rounds:
+                raise ValueError("global-best stagnation stop is checkpointed; review results and explicitly raise global_max_failed_rounds to continue")
+            adaptive_state.raw_global_stop_requested = False
     top_k_ckpt = int(global_config.options.Training.get("model_checkpoint_save_top_k", 5))
     top_k_metric = str(
         global_config.options.Training.get(
@@ -8499,7 +11317,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
 
     if is_rank0:
         _log.info(
-            "[DGPO] rank=%s/%s device=%s train_events≈%s val_events≈%s batch=%s train_K=%s val_K=%s "
+            "[DGPO] rank=%s/%s device=%s train_events≈%s "
+            "omnifold_train_events≈%s val_events≈%s batch=%s train_K=%s val_K=%s "
             "val_every_n_epochs=%s ddim=%s train_timesteps=%s steps/logical_epoch=%s "
             "steps/data_pass≈%s epochs=%s "
             "(advantage=%s, adaptive_omnifold=%s, staleness_every=%s)",
@@ -8507,6 +11326,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             world_size,
             device,
             total_events,
+            omnifold_train_events,
             val_events if val_events is not None else 0,
             batch_size,
             K,
@@ -8546,6 +11366,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         fit_step = int(float(row.get("step", 0.0)))
         iteration = int(float(row.get("iteration", 1.0)))
         crossfit_fold = int(float(row.get("fold", 0.0)))
+        repeat_index = int(float(row.get("repeat", 1.0)))
+        signed_scale = float(row.get("signed_scale", float("nan")))
         accepted_value = row.get("accepted")
         prefix = f"omnifold_live/{phase_name}"
         payload: dict[str, Any] = {
@@ -8554,12 +11376,17 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             "omnifold_live/meta/fit_step": fit_step,
             "omnifold_live/meta/iteration": iteration,
             "omnifold_live/meta/crossfit_fold": crossfit_fold,
+            "omnifold_live/meta/repeat": repeat_index,
             "omnifold_live/meta/dgpo_epoch": int(epoch_value),
             "omnifold_live/meta/global_step": int(global_step),
         }
+        if math.isfinite(signed_scale):
+            payload["omnifold_live/meta/signed_scale"] = signed_scale
         for metric_name in (
             "training_loss",
             "training_balanced_accuracy",
+            "gradient_norm",
+            "gradient_clipped",
             "validation_loss",
             "validation_balanced_accuracy",
             "best_validation_loss",
@@ -8569,19 +11396,27 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             "accepted",
             "saturated",
             "threshold_reached",
+            "warm_started",
+            "warm_started_folds",
         ):
             if metric_name in row:
                 payload[f"{prefix}/{metric_name}"] = row[metric_name]
         _log.info(
-            "[DGPO/omnifold/live] phase=%s epoch=%s iteration=%s fold=%s "
-            "step=%s train_loss=%.6g val_loss=%.6g val_bal_acc=%.6g "
+            "[DGPO/omnifold/live] phase=%s repeat=%s epoch=%s iteration=%s fold=%s "
+            "signed_scale=%s "
+            "step=%s train_loss=%.6g grad_norm=%.6g grad_clipped=%s "
+            "val_loss=%.6g val_bal_acc=%.6g "
             "val_auc=%.6g accepted=%s saturated=%s",
             phase_name,
+            repeat_index,
             epoch_value,
             iteration,
             crossfit_fold,
+            "n/a" if not math.isfinite(signed_scale) else f"{signed_scale:+.6g}",
             fit_step,
             float(row.get("training_loss", float("nan"))),
+            float(row.get("gradient_norm", float("nan"))),
+            bool(float(row.get("gradient_clipped", 0.0))),
             float(row.get("validation_loss", float("nan"))),
             float(row.get("validation_balanced_accuracy", float("nan"))),
             float(row.get("validation_auc", float("nan"))),
@@ -8773,59 +11608,953 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             where=where,
         )
 
+    def _restore_live_policy_to_round_reference() -> tuple[int, bool]:
+        """Restore the incumbent policy and discard optimizer direction state."""
+
+        policy_core = unwrap_for_state_dict(model)
+        policy_core.load_state_dict(round_ref_model.state_dict(), strict=True)
+        cleared_optimizer_states = len(optimizer.state)
+        optimizer.state.clear()
+        optimizer.zero_grad(set_to_none=True)
+        if ema_save is not None:
+            ema_save.update(policy_core, decay_=0.0)
+        if ema_rollout is not None:
+            ema_rollout.update(policy_core, decay_=0.0)
+        return cleared_optimizer_states, bool(
+            ema_save is not None or ema_rollout is not None
+        )
+
+    def _run_signed_direction_probe(
+        *,
+        epoch: int,
+        probe_panel_seed: int,
+        current_probe: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Audit both signs of the accumulated DGPO direction, then restore it."""
+
+        enabled = bool(adaptive_cfg.trust_signed_direction_probe_enabled)
+        direction_index = int(adaptive_state.trust_failed_direction_streak)
+        diagnostics: dict[str, Any] = {
+            "reference_trust/signed_probe/enabled": float(enabled),
+            "reference_trust/signed_probe/completed": 0.0,
+            "reference_trust/signed_probe/reward_round_id": float(
+                adaptive_state.reward_round_id
+            ),
+            "reference_trust/signed_probe/direction_index": float(
+                direction_index
+            ),
+            "reference_trust/signed_probe/global_step": float(global_step),
+        }
+        if not enabled:
+            return diagnostics
+        if (
+            int(adaptive_state.trust_signed_probe_round_id)
+            == int(adaptive_state.reward_round_id)
+            and int(adaptive_state.trust_signed_probe_direction_index)
+            == direction_index
+        ):
+            diagnostics[
+                "reference_trust/signed_probe/skipped_already_completed"
+            ] = 1.0
+            return diagnostics
+
+        required_current_keys = (
+            "raw_auc",
+            "raw_auc_gap",
+            "raw_auc_null_se_approx",
+            "reward_mean",
+        )
+        missing_current = [
+            key for key in required_current_keys if key not in current_probe
+        ]
+        if missing_current:
+            raise KeyError(
+                "signed-direction probe requires current raw audit metrics: "
+                + ", ".join(missing_current)
+            )
+
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+            evaluate_signed_direction_probe,
+            fit_raw_policy_audit,
+            score_reward_on_pool,
+        )
+
+        policy_core, anchor_snapshot, current_snapshot = (
+            _snapshot_signed_trainable_direction(model, round_ref_model)
+        )
+        direction_rms = _trainable_direction_rms(
+            anchor_snapshot,
+            current_snapshot,
+        )
+        diagnostics["reference_trust/signed_probe/direction_rms"] = direction_rms
+        if not math.isfinite(direction_rms):
+            raise FloatingPointError(
+                "signed-direction probe found non-finite policy displacement"
+            )
+        if direction_rms == 0.0:
+            diagnostics["reference_trust/signed_probe/skipped_zero_direction"] = 1.0
+            return diagnostics
+
+        signed_candidates: list[dict[str, float]] = [
+            {
+                "signed_scale": 1.0,
+                "raw_auc": float(current_probe["raw_auc"]),
+                "raw_auc_gap": float(current_probe["raw_auc_gap"]),
+                "raw_auc_se": float(current_probe["raw_auc_null_se_approx"]),
+                "reward_mean": float(current_probe["reward_mean"]),
+            }
+        ]
+        current_raw_saturated = float(
+            current_probe.get("raw_audit_saturated", 0.0)
+        )
+        candidate_saturation: list[float] = [current_raw_saturated]
+        anchor_audit: dict[str, float] | None = None
+        anchor_reward_mean = float("nan")
+        positive_scales = sorted(
+            float(scale)
+            for scale in adaptive_cfg.trust_signed_direction_probe_scales
+        )
+        evaluation_scales = [0.0]
+        evaluation_scales.extend(
+            scale
+            for scale in positive_scales
+            if not math.isclose(scale, 1.0, rel_tol=0.0, abs_tol=1.0e-12)
+        )
+        evaluation_scales.extend(-scale for scale in positive_scales)
+        if is_rank0:
+            _log.info(
+                "[DGPO/trust/signed] round=%s direction=%s step=%s "
+                "parameter_rms=%.6g scales=%s",
+                adaptive_state.reward_round_id,
+                direction_index,
+                global_step,
+                direction_rms,
+                [*evaluation_scales, 1.0],
+            )
+        try:
+            for signed_scale in evaluation_scales:
+                _assign_signed_trainable_direction_(
+                    policy_core,
+                    anchor_snapshot,
+                    current_snapshot,
+                    signed_scale,
+                )
+                candidate_pool = _materialize_adaptive_omnifold_pool(
+                    val_shard,
+                    omnifold_val_loader_cfg,
+                    model=model,
+                    sampler=sampler,
+                    device=device,
+                    world_size=world_size,
+                    rank=rank,
+                    quota_events=adaptive_cfg.probe_max_events,
+                    num_ddim_steps=num_ddim_val,
+                    seed=int(probe_panel_seed),
+                    include_pairwise_context=(
+                        adaptive_cfg.periodic_pair_features_enabled
+                    ),
+                )
+                log_reward = score_reward_on_pool(
+                    omnifold_source.frozen_reward,
+                    candidate_pool,
+                    row_budget=adaptive_cfg.score_row_budget,
+                )
+                reward_mean = float(log_reward.mean().detach().cpu())
+                raw_audit = fit_raw_policy_audit(
+                    pool=candidate_pool,
+                    model_builder=omnifold_source.model_builder,
+                    cfg=adaptive_cfg,
+                    device=device,
+                    seed=int(adaptive_cfg.probe_seed),
+                    progress_callback=lambda row, scale=signed_scale: (
+                        _log_omnifold_fit_progress(
+                            "signed_direction_audit",
+                            {"signed_scale": float(scale), **dict(row)},
+                            epoch_value=int(epoch),
+                        )
+                    ),
+                )
+                if signed_scale == 0.0:
+                    anchor_audit = raw_audit
+                    anchor_reward_mean = reward_mean
+                else:
+                    signed_candidates.append(
+                        {
+                            "signed_scale": float(signed_scale),
+                            "raw_auc": float(raw_audit["raw_auc"]),
+                            "raw_auc_gap": float(raw_audit["raw_auc_gap"]),
+                            "raw_auc_se": float(
+                                raw_audit["raw_auc_null_se_approx"]
+                            ),
+                            "reward_mean": reward_mean,
+                        }
+                    )
+                    candidate_saturation.append(
+                        float(raw_audit["raw_audit_saturated"])
+                    )
+                del log_reward, candidate_pool
+        finally:
+            # This probe must not change the optimizer, EMA, scheduler, or live
+            # policy. Only trainable tensors were perturbed above.
+            assign_params_(policy_core, current_snapshot)
+
+        if anchor_audit is None or not math.isfinite(anchor_reward_mean):
+            raise RuntimeError("signed-direction probe did not evaluate its anchor")
+        signed_metrics = evaluate_signed_direction_probe(
+            signed_candidates,
+            anchor_raw_auc_gap=float(anchor_audit["raw_auc_gap"]),
+            anchor_raw_auc_se=float(anchor_audit["raw_auc_null_se_approx"]),
+            anchor_reward_mean=anchor_reward_mean,
+            confidence_z=float(
+                adaptive_cfg.trust_round_acceptance_confidence_z
+            ),
+        )
+        signed_metrics.update(
+            {
+                "reference_trust/signed_probe/anchor_raw_auc": float(
+                    anchor_audit["raw_auc"]
+                ),
+                "reference_trust/signed_probe/anchor_raw_balanced_accuracy": float(
+                    anchor_audit["raw_balanced_accuracy"]
+                ),
+                "reference_trust/signed_probe/anchor_raw_audit_saturated": float(
+                    anchor_audit["raw_audit_saturated"]
+                ),
+                "reference_trust/signed_probe/all_raw_audits_saturated": float(
+                    float(anchor_audit["raw_audit_saturated"]) >= 0.5
+                    and all(value >= 0.5 for value in candidate_saturation)
+                ),
+                "reference_trust/signed_probe/direction_rms": direction_rms,
+                "reference_trust/signed_probe/reward_round_id": float(
+                    adaptive_state.reward_round_id
+                ),
+                "reference_trust/signed_probe/direction_index": float(
+                    direction_index
+                ),
+                "reference_trust/signed_probe/global_step": float(global_step),
+            }
+        )
+        adaptive_state.trust_signed_probe_round_id = int(
+            adaptive_state.reward_round_id
+        )
+        adaptive_state.trust_signed_probe_direction_index = direction_index
+        adaptive_state.trust_signed_probe_global_step = int(global_step)
+        if is_rank0:
+            _log.info(
+                "[DGPO/trust/signed] decision=%+.0f best_scale=%+.6g "
+                "anchor_gap=%.6g best_gap=%.6g reward_misaligned=%s",
+                signed_metrics["reference_trust/signed_probe/decision_code"],
+                signed_metrics[
+                    "reference_trust/signed_probe/best_overall_scale"
+                ],
+                signed_metrics[
+                    "reference_trust/signed_probe/anchor_raw_auc_gap"
+                ],
+                signed_metrics[
+                    "reference_trust/signed_probe/best_overall_raw_auc_gap"
+                ],
+                bool(
+                    signed_metrics[
+                        "reference_trust/signed_probe/reward_raw_misaligned"
+                    ]
+                ),
+            )
+        diagnostics.update(signed_metrics)
+        return diagnostics
+
     def _run_adaptive_cycle(
         *,
         epoch: int,
         baseline_only: bool = False,
+        raw_baseline_only: bool = False,
+        checkpoint_next_epoch: int | None = None,
+        allow_classifier_trust: bool = True,
         force_refit: bool = False,
+        force_reason: str | None = None,
+        extragradient_batch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        nonlocal reward_checkpoint_metadata
+        nonlocal global_step, reward_checkpoint_metadata
+        nonlocal pending_resume_trust_diagnostics
         if not adaptive_cfg.enabled or omnifold_source is None:
             return {}
         from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+            build_reference_trust_pool,
+            evaluate_signed_direction_recovery,
+            fit_reference_trust_audit,
+            fit_raw_policy_audit,
             probe_installed_reward,
+            record_extragradient_rejection,
             reward_refit_due_to_age,
             run_adaptive_refit,
+            scheduled_raw_refit_due,
+            should_probe_epoch,
+            should_skip_incumbent_probe,
+            should_run_raw_only_monitor,
+            update_classifier_trust_controller,
             update_controller,
+            update_raw_plateau_controller,
+            shrink_trust_radius_on_raw_best,
+            raw_best_trust_shrink_due,
+            global_raw_candidate_due,
+            update_trust_trajectory_candidate,
         )
 
         if is_rank0:
             _log.info(
-                "[DGPO/omnifold] K=1 fresh adapter audit at epoch=%s (cap=%s)",
+                "[DGPO/omnifold] K=1 adapter monitor at epoch=%s "
+                "(raw_cap=%s trust_cap=%s)",
                 epoch,
                 adaptive_cfg.probe_max_events,
+                adaptive_cfg.classifier_trust_probe_max_events,
             )
-        score_pool = _materialize_adaptive_omnifold_pool(
+        # A fixed event/noise/classifier-seed panel makes successive raw-AUC
+        # measurements comparable.  Legacy controllers retain epoch-varying
+        # probes unless trajectory search is explicitly enabled.
+        fixed_audit_panel = bool(
+            adaptive_cfg.fixed_audit_panel
+            or adaptive_cfg.trust_trajectory_search_enabled
+        )
+        probe_panel_seed = (
+            int(adaptive_cfg.probe_seed)
+            if fixed_audit_panel
+            else int(adaptive_cfg.probe_seed) + 10000 * max(int(epoch), 0)
+        )
+        raw_plateau_cycle = bool(
+            adaptive_cfg.monitor_mode == "raw_plateau_refit"
+            and adaptive_state.calibrated
+            and not baseline_only
+            and not force_refit
+        )
+        classifier_trust_due = bool(
+            raw_plateau_cycle
+            and not raw_baseline_only
+            and allow_classifier_trust
+            and adaptive_cfg.classifier_trust_enabled
+            and should_probe_epoch(
+                int(epoch),
+                adaptive_cfg.classifier_trust_every_n_epochs,
+            )
+        )
+        paired_classifier_trust_pool = bool(
+            classifier_trust_due
+        )
+        if paired_classifier_trust_pool and is_rank0:
+            _log.info(
+                "[DGPO/omnifold] materializing current/reference classifier-trust "
+                "pool from one event pass with common DDIM noise."
+            )
+        materialized_score_pool = _materialize_adaptive_omnifold_pool(
             val_shard,
             omnifold_val_loader_cfg,
             model=model,
+            paired_reference_model=(
+                round_ref_model if paired_classifier_trust_pool else None
+            ),
             sampler=sampler,
             device=device,
             world_size=world_size,
             rank=rank,
             quota_events=adaptive_cfg.probe_max_events,
-            num_ddim_steps=num_ddim_val,
-            seed=adaptive_cfg.probe_seed + 10000 * max(int(epoch), 0),
-        )
-        probe = probe_installed_reward(
-            omnifold_source,
-            score_pool,
-            cfg=adaptive_cfg,
-            device=device,
-            seed=adaptive_cfg.probe_seed + max(int(epoch), 0),
-            early_stop_auc_gap=(
-                float(adaptive_state.trigger_threshold)
-                if adaptive_state.calibrated and not baseline_only
+            paired_reference_quota_events=(
+                adaptive_cfg.classifier_trust_probe_max_events
+                if paired_classifier_trust_pool
                 else None
             ),
-            progress_callback=lambda phase, row: _log_omnifold_fit_progress(
-                phase,
-                row,
-                epoch_value=int(epoch),
-            ),
+            num_ddim_steps=num_ddim_val,
+            seed=probe_panel_seed,
+            include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
         )
+        reference_pool = None
+        classifier_trust_current_pool = None
+        if paired_classifier_trust_pool:
+            if not isinstance(materialized_score_pool, tuple):
+                raise RuntimeError(
+                    "classifier trust requested a paired adaptive pool"
+                )
+            (
+                score_pool,
+                classifier_trust_current_pool,
+                reference_pool,
+            ) = materialized_score_pool
+        else:
+            score_pool = materialized_score_pool
+        if raw_plateau_cycle:
+            # Capture before the routine monitor adapts to the current candidate.
+            confirmation_start_cache = (
+                copy.deepcopy(adaptive_state.raw_monitor_state)
+                if adaptive_cfg.raw_global_confirmation_warm_start else None
+            )
+            raw_probe = fit_raw_policy_audit(
+                pool=score_pool,
+                model_builder=omnifold_source.model_builder,
+                cfg=adaptive_cfg,
+                device=device,
+                seed=int(adaptive_cfg.probe_seed),
+                warm_start_cache=(adaptive_state.raw_monitor_state
+                                  if adaptive_cfg.raw_monitor_warm_start else None),
+                progress_callback=lambda row: _log_omnifold_fit_progress(
+                    "raw_staleness_monitor",
+                    row,
+                    epoch_value=int(epoch),
+                ),
+            )
+            raw_checkpoint_path = ""
+            if adaptive_cfg.raw_rollback_to_best_on_plateau:
+                assert save_dir_raw
+                raw_checkpoint_path = str(
+                    Path(str(save_dir_raw)).expanduser().resolve()
+                    / dgpo_snapshot_checkpoint_name(
+                        last_completed_epoch=int(epoch),
+                        dgpo_next_epoch=(int(epoch) + 1 if checkpoint_next_epoch is None else checkpoint_next_epoch),
+                        global_step=int(global_step),
+                    )
+                )
+            confirmation = None
+            confirmation_metrics = {}
+            if global_raw_candidate_due(adaptive_state, raw_probe, cfg=adaptive_cfg):
+                best_path = _resolve_raw_best_policy_checkpoint(
+                    adaptive_state, save_dir_raw, global_scope=True, source_dirs=global_best_source_dirs,
+                )
+                confirmation, confirmation_metrics = _confirm_global_raw_candidate(
+                    model=model, comparison_model=round_ref_model, best_checkpoint=best_path,
+                    min_delta=adaptive_cfg.raw_improvement_min_delta,
+                    initial_judge_cache=confirmation_start_cache,
+                    materialize_pair=lambda candidate, incumbent: _materialize_adaptive_omnifold_pool(
+                        val_shard, omnifold_val_loader_cfg, model=candidate,
+                        paired_reference_model=incumbent, sampler=sampler, device=device,
+                        world_size=world_size, rank=rank, quota_events=adaptive_cfg.probe_max_events,
+                        num_ddim_steps=num_ddim_val, seed=probe_panel_seed,
+                        include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+                    ),
+                    fit_judge=lambda pool, phase, warm_start_cache=None: fit_raw_policy_audit(
+                        pool=pool, model_builder=omnifold_source.model_builder,
+                        cfg=adaptive_cfg, device=device, seed=int(adaptive_cfg.probe_seed),
+                        warm_start_cache=warm_start_cache,
+                        fit_overrides=adaptive_cfg.raw_global_confirmation_fit,
+                        progress_callback=lambda row: _log_omnifold_fit_progress(phase, row, epoch_value=int(epoch)),
+                    ),
+                )
+            raw_trigger, diagnostics = update_raw_plateau_controller(
+                adaptive_state,
+                raw_probe,
+                cfg=adaptive_cfg,
+                epoch=int(epoch),
+                global_step=int(global_step),
+                checkpoint_path=raw_checkpoint_path,
+                checkpoint_next_epoch=checkpoint_next_epoch,
+                global_confirmation=confirmation,
+            )
+            diagnostics.update(confirmation_metrics)
+            if adaptive_state.raw_global_stop_requested:
+                # Keep the latest policy/reward/reference consistent; the best
+                # policy remains in its separate immutable checkpoint. Caller
+                # saves this terminal state before leaving the training loop.
+                _assert_current_reward_reference_pairing("global_best_stagnation_stop")
+                return diagnostics
+            if adaptive_cfg.trust_boundary_enabled and adaptive_cfg.trust_radius_mode == "best_decay":
+                probe_distance = float("nan")
+                # Only a global record needs a new fixed-probe evaluation.
+                if raw_best_trust_shrink_due(
+                    adaptive_state, cfg=adaptive_cfg, diagnostics=diagnostics,
+                    global_step=int(global_step),
+                ):
+                    fixed_probe = reference_trust_probe_cache.get("probe")
+                    if fixed_probe is None:
+                        raise RuntimeError("new-best trust shrink requires the active fixed reference probe")
+                    probe_distance, _, _ = _measure_reference_trust_probe(
+                        model, fixed_probe, world_size=world_size,
+                        distance=adaptive_cfg.trust_distance,
+                    )
+                decay_metrics = shrink_trust_radius_on_raw_best(
+                    adaptive_state, cfg=adaptive_cfg, diagnostics=diagnostics,
+                    current_distance=probe_distance, global_step=int(global_step),
+                )
+                diagnostics.update(decay_metrics)
+                if is_rank0 and decay_metrics.get("reference_trust/best_decay/new_best", 0.0):
+                    _log.info(
+                        "[DGPO/trust] new global raw best step=%s: target=%.6g effective=%.6g "
+                        "probe_distance=%.6g feasibility_limited=%s",
+                        global_step, decay_metrics["reference_trust/best_decay/target"],
+                        adaptive_state.trust_current_delta, probe_distance,
+                        bool(decay_metrics["reference_trust/best_decay/feasibility_limited"]),
+                    )
+            classifier_trust_trigger = False
+            if classifier_trust_due:
+                if (
+                    classifier_trust_current_pool is None
+                    or reference_pool is None
+                ):
+                    raise RuntimeError(
+                        "classifier trust paired reference pool is unavailable"
+                    )
+                classifier_trust_pool = build_reference_trust_pool(
+                    classifier_trust_current_pool,
+                    reference_pool,
+                )
+                classifier_trust_probe = fit_reference_trust_audit(
+                    pool=classifier_trust_pool,
+                    model_builder=omnifold_source.model_builder,
+                    cfg=adaptive_cfg,
+                    device=device,
+                    seed=int(adaptive_cfg.probe_seed),
+                    progress_callback=lambda row: _log_omnifold_fit_progress(
+                        "reference_trust_monitor",
+                        row,
+                        epoch_value=int(epoch),
+                    ),
+                )
+                classifier_trust_trigger, classifier_trust_diagnostics = (
+                    update_classifier_trust_controller(
+                        adaptive_state,
+                        classifier_trust_probe,
+                        cfg=adaptive_cfg,
+                        epoch=int(epoch),
+                    )
+                )
+                diagnostics.update(
+                    {
+                        **{
+                            f"classifier_trust/{key}": float(value)
+                            for key, value in classifier_trust_probe.items()
+                        },
+                        **classifier_trust_diagnostics,
+                    }
+                )
+                del (
+                    classifier_trust_pool,
+                    classifier_trust_current_pool,
+                    reference_pool,
+                )
+            elif adaptive_cfg.classifier_trust_enabled:
+                diagnostics.update(
+                    {
+                        "classifier_trust/skipped_cadence": 1.0,
+                        "classifier_trust/every_n_epochs": float(
+                            adaptive_cfg.classifier_trust_every_n_epochs
+                        ),
+                    }
+                )
+            age_trigger, age_diagnostics = scheduled_raw_refit_due(
+                adaptive_state, cfg=adaptive_cfg, epoch=int(epoch),
+                baseline_only=raw_baseline_only,
+            )
+            diagnostics.update(age_diagnostics)
+            trigger_refit = bool(raw_trigger or classifier_trust_trigger or age_trigger)
+            if age_trigger:
+                adaptive_state.last_decision = "max_reward_age_recalibrate"
+                diagnostics.update({
+                    "staleness/decision": adaptive_state.last_decision,
+                    "staleness/trigger_recalibration": 1.0,
+                    "staleness/trigger_reason": "max_reward_age",
+                })
+                if is_rank0:
+                    _log.info(
+                        "[DGPO/omnifold] scheduled refit at epoch=%s step=%s "
+                        "reward_age=%s; rollback_to_best=%s",
+                        epoch, global_step, age_diagnostics["staleness/reward_age_epochs"],
+                        adaptive_cfg.raw_rollback_to_best_on_plateau,
+                    )
+            if classifier_trust_trigger:
+                diagnostics.update(
+                    {
+                        "staleness/decision": "classifier_trust_recalibrate",
+                        "staleness/trigger_recalibration": 1.0,
+                        "staleness/trigger_reason": "classifier_trust",
+                    }
+                )
+                adaptive_state.last_decision = "classifier_trust_recalibrate"
+            if not trigger_refit:
+                if pending_resume_trust_diagnostics:
+                    diagnostics.update(pending_resume_trust_diagnostics)
+                    pending_resume_trust_diagnostics = {}
+                _assert_current_reward_reference_pairing(
+                    "adaptive_cycle_raw_plateau_monitor"
+                )
+                if is_rank0:
+                    _log.info(
+                        "[DGPO/omnifold] epoch=%s raw_gap=%.6f best=%.6f "
+                        "plateau=%s/%s trust_trigger=%s round=%s",
+                        epoch,
+                        float(raw_probe["raw_auc_gap"]),
+                        float(adaptive_state.raw_best_auc_gap),
+                        adaptive_state.raw_no_improvement_streak,
+                        adaptive_cfg.required_consecutive_epochs,
+                        classifier_trust_trigger,
+                        adaptive_state.reward_round_id,
+                    )
+                return diagnostics
+
+            if raw_trigger and adaptive_cfg.raw_rollback_to_best_on_plateau:
+                selected_checkpoint = _resolve_raw_best_policy_checkpoint(
+                    adaptive_state,
+                    save_dir_raw,
+                    global_scope=adaptive_cfg.raw_best_scope == "global",
+                    source_dirs=global_best_source_dirs,
+                )
+                (
+                    loaded_tensors,
+                    cleared_optimizer_states,
+                    ema_restored,
+                ) = _rewind_policy_for_raw_best_refit(
+                    model,
+                    optimizer,
+                    selected_checkpoint,
+                    ema_save=ema_save,
+                    ema_rollout=ema_rollout,
+                    clear_optimizer=adaptive_cfg.raw_best_scope != "global",
+                )
+                adaptive_state.raw_plateau_rollbacks += 1
+                # The routine score pool belongs to the plateau endpoint. It
+                # cannot certify an OmniFold ratio whose denominator is the
+                # restored best policy, so release it before regenerating the
+                # configured residual-closure panel below.
+                del score_pool
+                score_pool = None
+                diagnostics.update(
+                    {
+                        "staleness/raw_best_rollback_applied": 1.0,
+                        "staleness/raw_best_rollback_epoch": float(
+                            adaptive_state.raw_best_epoch
+                        ),
+                        "staleness/raw_best_rollback_global_step": float(
+                            adaptive_state.raw_best_global_step
+                        ),
+                        "staleness/raw_best_rollback_auc_gap": float(
+                            adaptive_state.raw_best_auc_gap
+                        ),
+                        "staleness/raw_best_rollback_loaded_tensors": float(
+                            loaded_tensors
+                        ),
+                        "staleness/raw_best_rollback_optimizer_states_cleared": float(
+                            cleared_optimizer_states
+                        ),
+                        "staleness/raw_best_rollback_ema_restored": float(
+                            ema_restored
+                        ),
+                        "staleness/raw_plateau_rollbacks": float(
+                            adaptive_state.raw_plateau_rollbacks
+                        ),
+                    }
+                )
+                if is_rank0:
+                    _log.info(
+                        "[DGPO/omnifold] raw plateau rewound to best epoch=%s "
+                        "step=%s raw_gap=%.6g checkpoint=%s; cleared %s "
+                        "optimizer states before fresh reward fitting",
+                        adaptive_state.raw_best_epoch,
+                        adaptive_state.raw_best_global_step,
+                        adaptive_state.raw_best_auc_gap,
+                        selected_checkpoint,
+                        cleared_optimizer_states,
+                    )
+            else:
+                diagnostics["staleness/raw_best_rollback_applied"] = 0.0
+
+            # The restored best policy (or current policy when rollback is
+            # disabled) is the new forward anchor. Fit a fresh q/policy ratio,
+            # require residual closure, then atomically install the paired
+            # reward/reference state.
+            policy_snapshot = _snapshot_policy_state_dict(model)
+            fit_pool_seed = int(adaptive_cfg.seed) + int(
+                adaptive_state.recalibration_count
+            )
+            fit_pool = _materialize_adaptive_omnifold_pool(
+                omnifold_train_shard,
+                omnifold_train_loader_cfg,
+                model=model,
+                sampler=sampler,
+                device=device,
+                world_size=world_size,
+                rank=rank,
+                quota_events=(
+                    None if fixed_omnifold_pool else adaptive_cfg.pool_events
+                ),
+                num_ddim_steps=num_ddim,
+                seed=fit_pool_seed,
+                include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+            )
+            if adaptive_cfg.single_pool_train_validation:
+                score_pool = fit_pool  # run_adaptive_refit performs the disjoint 80/20 split
+            if adaptive_cfg.refit_score_events == adaptive_cfg.probe_max_events:
+                if score_pool is None:
+                    score_pool = _materialize_adaptive_omnifold_pool(
+                        val_shard,
+                        omnifold_val_loader_cfg,
+                        model=model,
+                        sampler=sampler,
+                        device=device,
+                        world_size=world_size,
+                        rank=rank,
+                        quota_events=adaptive_cfg.probe_max_events,
+                        num_ddim_steps=num_ddim_val,
+                        seed=int(probe_panel_seed),
+                        include_pairwise_context=(
+                            adaptive_cfg.periodic_pair_features_enabled
+                        ),
+                    )
+                refit_score_pool = score_pool
+            else:
+                refit_score_pool = _materialize_adaptive_omnifold_pool(
+                    val_shard,
+                    omnifold_val_loader_cfg,
+                    model=model,
+                    sampler=sampler,
+                    device=device,
+                    world_size=world_size,
+                    rank=rank,
+                    quota_events=adaptive_cfg.refit_score_events,
+                    num_ddim_steps=num_ddim_val,
+                    seed=int(probe_panel_seed) + 1_000_003,
+                    include_pairwise_context=(
+                        adaptive_cfg.periodic_pair_features_enabled
+                    ),
+                )
+            refit_diagnostics = run_adaptive_refit(
+                state=adaptive_state,
+                cfg=adaptive_cfg,
+                reward_source=omnifold_source,
+                round_ref_model=round_ref_model,
+                policy_snapshot_state_dict=policy_snapshot,
+                fit_pool=fit_pool,
+                score_pool=refit_score_pool,
+                # This controller intentionally has no acceptance/baseline
+                # audit.  The held-out residual AUC <= 0.505 is the sole gate.
+                baseline_pool=None,
+                epoch=int(epoch),
+                device=device,
+                world_size=world_size,
+                enforce_round_acceptance=False,
+                progress_callback=lambda phase, row: _log_omnifold_fit_progress(
+                    phase,
+                    row,
+                    epoch_value=int(epoch),
+                ),
+            )
+            diagnostics.update(refit_diagnostics)
+            refit_accepted = bool(
+                float(refit_diagnostics.get("omnifold/accepted", 0.0)) >= 0.5
+            )
+            if refit_accepted:
+                if adaptive_cfg.raw_best_scope == "global":
+                    adaptive_state.raw_global_refit_pending = True
+                reference_trust_probe_cache.clear()
+                adaptive_state.trust_probe_payload = None
+                adaptive_state.trust_probe_round_id = -1
+                diagnostics.update(_reset_optimizer_after_reward_install(
+                    optimizer, cfg=adaptive_cfg, accepted=True, adaptive_state=adaptive_state,
+                ))
+                adaptive_state.audit_protocol_signature = current_audit_signature
+                diagnostics["staleness/decision"] = "forward_recenter_installed"
+            else:
+                if adaptive_cfg.raw_best_scope == "global":
+                    raise RuntimeError("global-best OmniFold refit was not accepted; refusing to train the rolled-back policy with the old reward/reference. Resume the last complete checkpoint.")
+                diagnostics["staleness/decision"] = "forward_recenter_deferred"
+            reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+            if pending_resume_trust_diagnostics:
+                diagnostics.update(pending_resume_trust_diagnostics)
+                pending_resume_trust_diagnostics = {}
+            _assert_current_reward_reference_pairing(
+                "adaptive_cycle_raw_plateau_refit"
+            )
+            return diagnostics
+        routine_raw_only = should_run_raw_only_monitor(
+            adaptive_state,
+            cfg=adaptive_cfg,
+            baseline_only=baseline_only,
+            force_refit=force_refit,
+        )
+        if routine_raw_only:
+            raw_probe = fit_raw_policy_audit(
+                pool=score_pool,
+                model_builder=omnifold_source.model_builder,
+                cfg=adaptive_cfg,
+                device=device,
+                seed=(
+                    adaptive_cfg.probe_seed
+                    if fixed_audit_panel
+                    else adaptive_cfg.probe_seed + max(int(epoch), 0)
+                ),
+                progress_callback=lambda row: _log_omnifold_fit_progress(
+                    "raw_staleness_audit",
+                    row,
+                    epoch_value=int(epoch),
+                ),
+            )
+            diagnostics: dict[str, Any] = {
+                **{
+                    f"staleness/{key}": float(value)
+                    for key, value in raw_probe.items()
+                },
+                "staleness/epoch": float(epoch),
+                "staleness/reward_round_id": float(
+                    adaptive_state.reward_round_id
+                ),
+                "staleness/decision": "raw_monitor_only",
+                "staleness/trigger_recalibration": 0.0,
+                "staleness/monitor_mode_raw_only": 1.0,
+                "staleness/log_only": 1.0,
+            }
+            if pending_resume_trust_diagnostics:
+                diagnostics.update(pending_resume_trust_diagnostics)
+                pending_resume_trust_diagnostics = {}
+            _assert_current_reward_reference_pairing("adaptive_cycle_raw_only")
+            if is_rank0:
+                _log.info(
+                    "[DGPO/omnifold] epoch=%s raw-only monitor AUC=%.6f "
+                    "gap=%.6f round=%s",
+                    epoch,
+                    float(raw_probe["raw_auc"]),
+                    float(raw_probe["raw_auc_gap"]),
+                    adaptive_state.reward_round_id,
+                )
+            return diagnostics
+        skip_incumbent_probe = should_skip_incumbent_probe(
+            cfg=adaptive_cfg,
+            force_refit=force_refit,
+        )
+        probe = (
+            fit_raw_policy_audit(
+                pool=score_pool,
+                model_builder=omnifold_source.model_builder,
+                cfg=adaptive_cfg,
+                device=device,
+                seed=(
+                    adaptive_cfg.probe_seed
+                    if fixed_audit_panel
+                    else adaptive_cfg.probe_seed + max(int(epoch), 0)
+                ),
+                progress_callback=lambda row: _log_omnifold_fit_progress(
+                    "raw_staleness_audit",
+                    row,
+                    epoch_value=int(epoch),
+                ),
+            )
+            if skip_incumbent_probe
+            else probe_installed_reward(
+                omnifold_source,
+                score_pool,
+                cfg=adaptive_cfg,
+                device=device,
+                seed=(
+                    adaptive_cfg.probe_seed
+                    if fixed_audit_panel
+                    else adaptive_cfg.probe_seed + max(int(epoch), 0)
+                ),
+                early_stop_auc_gap=(
+                    float(adaptive_state.trigger_threshold)
+                    if adaptive_state.calibrated and not baseline_only
+                    else None
+                ),
+                progress_callback=lambda phase, row: _log_omnifold_fit_progress(
+                    phase,
+                    row,
+                    epoch_value=int(epoch),
+                ),
+            )
+        )
+        signed_probe_diagnostics: dict[str, Any] = {}
+        if (
+            adaptive_cfg.trust_signed_direction_probe_enabled
+            and not baseline_only
+            and not force_refit
+        ):
+            signed_probe_diagnostics = _run_signed_direction_probe(
+                epoch=int(epoch),
+                probe_panel_seed=int(probe_panel_seed),
+                current_probe=probe,
+            )
+        signed_recovery_diagnostics = (
+            evaluate_signed_direction_recovery(
+                adaptive_state,
+                cfg=adaptive_cfg,
+                signed_probe=signed_probe_diagnostics,
+            )
+            if adaptive_cfg.trust_signed_direction_recovery_enabled
+            else {}
+        )
+        signed_recovery_triggered = bool(
+            float(
+                signed_recovery_diagnostics.get(
+                    "reference_trust/signed_probe/recovery_triggered",
+                    0.0,
+                )
+            )
+            >= 0.5
+        )
+        signed_recovery_stop_requested = bool(
+            float(
+                signed_recovery_diagnostics.get(
+                    "reference_trust/signed_probe/recovery_stop_requested",
+                    0.0,
+                )
+            )
+            >= 0.5
+        )
+        trajectory_diagnostics: dict[str, float] = {}
+        if (
+            adaptive_cfg.trust_trajectory_search_enabled
+            and not baseline_only
+            and not force_refit
+            and not signed_recovery_triggered
+        ):
+            expected_checkpoint = ""
+            if save_dir_raw:
+                expected_checkpoint = str(
+                    Path(str(save_dir_raw)).expanduser().resolve()
+                    / dgpo_snapshot_checkpoint_name(
+                        last_completed_epoch=int(epoch),
+                        dgpo_next_epoch=int(epoch) + 1,
+                        global_step=int(global_step),
+                    )
+                )
+            trajectory_diagnostics = update_trust_trajectory_candidate(
+                adaptive_state,
+                cfg=adaptive_cfg,
+                raw_auc_gap=float(probe.get("raw_auc_gap", float("nan"))),
+                raw_auc_se=float(
+                    probe.get("raw_auc_null_se_approx", float("nan"))
+                ),
+                epoch=int(epoch),
+                global_step=int(global_step),
+                checkpoint_path=expected_checkpoint,
+                audit_saturated=bool(
+                    float(probe.get("raw_audit_saturated", 0.0)) >= 0.5
+                ),
+            )
+        empirical_radius_diagnostics: dict[str, float] = {}
+        if (
+            not baseline_only
+            and not force_refit
+            and adaptive_state.calibrated
+            and not signed_recovery_triggered
+            and adaptive_cfg.trust_empirical_radius_enabled
+        ):
+            empirical_radius_diagnostics = (
+                update_empirical_trust_radius_from_audit(
+                    adaptive_state,
+                    probe,
+                    cfg=adaptive_cfg,
+                )
+            )
         trigger_refit = bool(force_refit)
-        if baseline_only or not adaptive_state.calibrated:
+        if force_refit and force_reason:
+            diagnostics_force_reason = str(force_reason)
+        else:
+            diagnostics_force_reason = ""
+        if force_refit and skip_incumbent_probe:
+            diagnostics = {
+                **{
+                    f"staleness/{key}": float(value)
+                    for key, value in probe.items()
+                },
+                "staleness/decision": "forced_refit",
+                "staleness/trigger_recalibration": 1.0,
+                "staleness/reward_round_id": float(
+                    adaptive_state.reward_round_id
+                ),
+                "omnifold/incumbent_probe_skipped": 1.0,
+            }
+        elif baseline_only or not adaptive_state.calibrated:
             if (
                 adaptive_cfg.require_audit_saturation
                 and float(probe.get("audit_saturated", 0.0)) < 0.5
@@ -8869,6 +12598,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 "staleness/reward_round_id": float(
                     adaptive_state.reward_round_id
                 ),
+                **trajectory_diagnostics,
             }
         else:
             controller_trigger, diagnostics = update_controller(
@@ -8877,7 +12607,19 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 cfg=adaptive_cfg,
                 epoch=int(epoch),
             )
+            diagnostics.update(empirical_radius_diagnostics)
+            diagnostics.update(trajectory_diagnostics)
             trigger_refit = bool(trigger_refit or controller_trigger)
+            if adaptive_cfg.trust_boundary_enabled:
+                trust_exhausted, trust_exhaustion_diagnostics = (
+                    trust_region_exhausted(
+                        adaptive_state,
+                        cfg=adaptive_cfg,
+                    )
+                )
+            else:
+                trust_exhausted, trust_exhaustion_diagnostics = False, {}
+            diagnostics.update(trust_exhaustion_diagnostics)
             age_refit_due, reward_age = reward_refit_due_to_age(
                 adaptive_state,
                 epoch=int(epoch),
@@ -8891,6 +12633,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 and not adaptive_cfg.log_only
                 and not cooldown_active
             )
+            exhaustion_trigger = bool(
+                trust_exhausted
+                and not adaptive_cfg.log_only
+                and not cooldown_active
+            )
             diagnostics.update(
                 {
                     "staleness/reward_age_epochs": float(reward_age),
@@ -8901,9 +12648,22 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     ),
                     "staleness/age_refit_due": float(age_refit_due),
                     "staleness/age_trigger_recalibration": float(age_trigger),
+                    "staleness/trust_exhausted": float(trust_exhausted),
+                    "staleness/trust_exhaustion_trigger_recalibration": float(
+                        exhaustion_trigger
+                    ),
                 }
             )
-            if age_trigger and not trigger_refit:
+            if exhaustion_trigger:
+                trigger_refit = True
+                adaptive_state.last_decision = "trust_exhausted_recalibrate"
+                diagnostics["staleness/decision"] = adaptive_state.last_decision
+                diagnostics["staleness/trigger_recalibration"] = 1.0
+                # Exhaustion takes priority when the weighted-AUC controller
+                # crosses on the same audit.  It is the condition that enables
+                # best-on-trajectory selection instead of accepting the endpoint.
+                diagnostics["staleness/trigger_reason"] = "trust_exhausted"
+            elif age_trigger and not trigger_refit:
                 trigger_refit = True
                 adaptive_state.last_decision = "max_reward_age_recalibrate"
                 diagnostics["staleness/decision"] = (
@@ -8913,19 +12673,353 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 diagnostics["staleness/trigger_reason"] = "max_reward_age"
             elif controller_trigger:
                 diagnostics["staleness/trigger_reason"] = "auc_gap"
+            elif trust_exhausted and cooldown_active:
+                diagnostics["staleness/trigger_reason"] = (
+                    "trust_exhausted_cooldown"
+                )
+            elif trust_exhausted and adaptive_cfg.log_only:
+                diagnostics["staleness/trigger_reason"] = (
+                    "trust_exhausted_log_only"
+                )
             elif age_refit_due and cooldown_active:
                 diagnostics["staleness/trigger_reason"] = (
                     "max_reward_age_cooldown"
                 )
             elif age_refit_due and adaptive_cfg.log_only:
                 diagnostics["staleness/trigger_reason"] = "max_reward_age_log_only"
+        if adaptive_cfg.trust_extragradient_enabled:
+            diagnostics["reference_trust/extragradient/enabled"] = 1.0
+        diagnostics.update(signed_probe_diagnostics)
+        diagnostics.update(signed_recovery_diagnostics)
+        if signed_recovery_triggered:
+            # A statistically saturated reverse-only direction is evidence
+            # against this *local* surrogate update, not evidence that the
+            # global DGPO sign should be flipped. Return to the reward's exact
+            # denominator, discard momentum, and train a fresh classifier on a
+            # newly generated fit population. The fixed audit panel remains
+            # unchanged, preserving the paired raw-AUC comparison.
+            adaptive_state.trust_failed_direction_streak = int(
+                signed_recovery_diagnostics[
+                    "reference_trust/signed_probe/recovery_attempt"
+                ]
+            )
+            adaptive_state.trust_round_rollbacks += 1
+            adaptive_state.trust_round_stop_requested = bool(
+                signed_recovery_stop_requested
+            )
+            adaptive_state.probe_exceedance_streak = 0
+            adaptive_state.trust_distance_window.clear()
+            adaptive_state.trust_step_acceptance_window.clear()
+            adaptive_state.trust_step_scale_window.clear()
+            adaptive_state.reset_trust_trajectory(
+                reset_failed_directions=False
+            )
+            cleared_optimizer_states, ema_restored = (
+                _restore_live_policy_to_round_reference()
+            )
+            recovery_metrics = {
+                "reference_trust/signed_probe/recovery_policy_restored": 1.0,
+                "reference_trust/signed_probe/recovery_optimizer_states_cleared": float(
+                    cleared_optimizer_states
+                ),
+                "reference_trust/signed_probe/recovery_ema_restored": float(
+                    ema_restored
+                ),
+                "reference_trust/round_acceptance/rollback_required": 1.0,
+                "reference_trust/round_acceptance/rollbacks": float(
+                    adaptive_state.trust_round_rollbacks
+                ),
+                "reference_trust/round_acceptance/failed_direction_streak": float(
+                    adaptive_state.trust_failed_direction_streak
+                ),
+                "reference_trust/round_acceptance/stop_requested": float(
+                    signed_recovery_stop_requested
+                ),
+            }
+            diagnostics.update(recovery_metrics)
+            if signed_recovery_stop_requested:
+                trigger_refit = False
+                adaptive_state.last_decision = (
+                    "signed_reverse_only_patience_stop"
+                )
+                diagnostics.update(
+                    {
+                        "staleness/decision": adaptive_state.last_decision,
+                        "staleness/trigger_recalibration": 0.0,
+                        "staleness/trigger_reason": (
+                            "signed_reverse_only_patience"
+                        ),
+                    }
+                )
+            else:
+                trigger_refit = True
+                adaptive_state.last_decision = (
+                    "signed_reverse_only_fresh_reward"
+                )
+                diagnostics.update(
+                    {
+                        "staleness/decision": adaptive_state.last_decision,
+                        "staleness/trigger_recalibration": 1.0,
+                        "staleness/trigger_reason": "signed_reverse_only",
+                    }
+                )
+                # The old score pool was generated at the rejected endpoint.
+                # Recreate the same fixed identities/noise at the restored
+                # incumbent before fitting or auditing the replacement reward.
+                del score_pool
+                score_pool = _materialize_adaptive_omnifold_pool(
+                    val_shard,
+                    omnifold_val_loader_cfg,
+                    model=model,
+                    sampler=sampler,
+                    device=device,
+                    world_size=world_size,
+                    rank=rank,
+                    quota_events=adaptive_cfg.probe_max_events,
+                    num_ddim_steps=num_ddim_val,
+                    seed=int(probe_panel_seed),
+                    include_pairwise_context=(
+                        adaptive_cfg.periodic_pair_features_enabled
+                    ),
+                )
+            if is_rank0:
+                _log.warning(
+                    "[DGPO/trust/signed] reverse-only direction rejected; "
+                    "restored round_ref=%s, cleared=%s optimizer states, "
+                    "recovery=%s/%s stop=%s",
+                    adaptive_state.reward_round_id,
+                    cleared_optimizer_states,
+                    adaptive_state.trust_failed_direction_streak,
+                    adaptive_cfg.trust_failed_direction_patience,
+                    signed_recovery_stop_requested,
+                )
         if trigger_refit:
+            if diagnostics_force_reason:
+                diagnostics["staleness/trigger_reason"] = diagnostics_force_reason
+                diagnostics["staleness/trigger_recalibration"] = 1.0
+            extragradient_requested = bool(
+                adaptive_cfg.trust_extragradient_enabled
+                and not baseline_only
+                and not force_refit
+                and not signed_recovery_triggered
+                and diagnostics.get("staleness/trigger_reason")
+                == "trust_exhausted"
+            )
+            if extragradient_requested and extragradient_batch is None:
+                raise RuntimeError(
+                    "look-ahead extragradient needs the most recent DGPO batch "
+                    "for its synchronous corrector step"
+                )
+            extragradient_anchor_policy: dict[str, Tensor] | None = None
+            extragradient_anchor_params: dict[str, Tensor] | None = None
+            extragradient_anchor_reward: dict[str, Any] | None = None
+            extragradient_anchor_state: dict[str, Any] | None = None
+            extragradient_anchor_probe: _ReferenceTrustProbe | None = None
+            extragradient_anchor_probe_cache: dict[str, Any] | None = None
+            extragradient_anchor_delta = float("nan")
+            if extragradient_requested:
+                cached_anchor_probe = reference_trust_probe_cache.get("probe")
+                if not isinstance(cached_anchor_probe, _ReferenceTrustProbe):
+                    raise RuntimeError(
+                        "look-ahead extragradient requires the incumbent's "
+                        "fixed functional trust probe"
+                    )
+                extragradient_anchor_policy = _snapshot_policy_state_dict(
+                    round_ref_model
+                )
+                extragradient_anchor_reward = omnifold_source.stack_payload()
+                extragradient_anchor_state = adaptive_state.to_dict()
+                extragradient_anchor_probe = cached_anchor_probe
+                extragradient_anchor_probe_cache = dict(
+                    reference_trust_probe_cache
+                )
+                extragradient_anchor_delta = float(
+                    adaptive_state.trust_current_delta
+                )
+            trajectory_rewound = False
+            selected_checkpoint = ""
+            if (
+                adaptive_cfg.trust_trajectory_search_enabled
+                and diagnostics.get("staleness/trigger_reason")
+                == "trust_exhausted"
+                and adaptive_state.trust_trajectory_best_checkpoint
+            ):
+                selected_checkpoint = str(
+                    adaptive_state.trust_trajectory_best_checkpoint
+                )
+                best_is_current = bool(
+                    int(adaptive_state.trust_trajectory_best_epoch) == int(epoch)
+                    and int(adaptive_state.trust_trajectory_best_global_step)
+                    == int(global_step)
+                )
+                if not best_is_current:
+                    loaded_tensors = _restore_policy_from_dgpo_checkpoint(
+                        model,
+                        selected_checkpoint,
+                    )
+                    trajectory_rewound = True
+                    policy_core = unwrap_for_state_dict(model)
+                    cleared_optimizer_states = len(optimizer.state)
+                    optimizer.state.clear()
+                    optimizer.zero_grad(set_to_none=True)
+                    if ema_save is not None:
+                        ema_save.update(policy_core, decay_=0.0)
+                    if ema_rollout is not None:
+                        ema_rollout.update(policy_core, decay_=0.0)
+                    # The cheap endpoint probe was generated before rewinding.
+                    # Rebuild the candidate population on the identical fixed
+                    # panel so every later classifier sees the selected policy.
+                    score_pool = _materialize_adaptive_omnifold_pool(
+                        val_shard,
+                        omnifold_val_loader_cfg,
+                        model=model,
+                        sampler=sampler,
+                        device=device,
+                        world_size=world_size,
+                        rank=rank,
+                        quota_events=adaptive_cfg.probe_max_events,
+                        num_ddim_steps=num_ddim_val,
+                        seed=probe_panel_seed,
+                        include_pairwise_context=(
+                            adaptive_cfg.periodic_pair_features_enabled
+                        ),
+                    )
+                    diagnostics.update(
+                        {
+                            "reference_trust/trajectory/rewound": 1.0,
+                            "reference_trust/trajectory/loaded_tensors": float(
+                                loaded_tensors
+                            ),
+                            "reference_trust/trajectory/optimizer_states_cleared": float(
+                                cleared_optimizer_states
+                            ),
+                            "reference_trust/trajectory/ema_restored": float(
+                                ema_save is not None or ema_rollout is not None
+                            ),
+                        }
+                    )
+                else:
+                    diagnostics["reference_trust/trajectory/rewound"] = 0.0
+                diagnostics.update(
+                    {
+                        "reference_trust/trajectory/selected": 1.0,
+                        "reference_trust/trajectory/selected_epoch": float(
+                            adaptive_state.trust_trajectory_best_epoch
+                        ),
+                        "reference_trust/trajectory/selected_global_step": float(
+                            adaptive_state.trust_trajectory_best_global_step
+                        ),
+                        "reference_trust/trajectory/selected_raw_auc_gap": float(
+                            adaptive_state.trust_trajectory_best_raw_auc_gap
+                        ),
+                    }
+                )
+                if is_rank0:
+                    _log.info(
+                        "[DGPO/trust] trajectory search selected epoch=%s "
+                        "step=%s raw_gap=%.6g rewound=%s checkpoint=%s",
+                        adaptive_state.trust_trajectory_best_epoch,
+                        adaptive_state.trust_trajectory_best_global_step,
+                        adaptive_state.trust_trajectory_best_raw_auc_gap,
+                        trajectory_rewound,
+                        selected_checkpoint,
+                    )
+            if extragradient_requested:
+                (
+                    policy_core,
+                    extragradient_anchor_params,
+                    selected_trainable_params,
+                ) = _snapshot_signed_trainable_direction(
+                    model,
+                    round_ref_model,
+                )
+                selected_direction_rms = _trainable_direction_rms(
+                    extragradient_anchor_params,
+                    selected_trainable_params,
+                )
+                lookahead_scale = float(
+                    adaptive_cfg.trust_extragradient_lookahead_scale
+                )
+                _assign_signed_trainable_direction_(
+                    policy_core,
+                    extragradient_anchor_params,
+                    selected_trainable_params,
+                    lookahead_scale,
+                )
+                lookahead_direction_rms = _trainable_direction_rms(
+                    extragradient_anchor_params,
+                    snapshot_params(policy_core),
+                )
+                # The endpoint probe was generated before interpolation.  The
+                # transient classifier must see the actual virtual look-ahead
+                # distribution on the identical event/noise panel.
+                del score_pool
+                score_pool = _materialize_adaptive_omnifold_pool(
+                    val_shard,
+                    omnifold_val_loader_cfg,
+                    model=model,
+                    sampler=sampler,
+                    device=device,
+                    world_size=world_size,
+                    rank=rank,
+                    quota_events=adaptive_cfg.probe_max_events,
+                    num_ddim_steps=num_ddim_val,
+                    seed=int(probe_panel_seed),
+                    include_pairwise_context=(
+                        adaptive_cfg.periodic_pair_features_enabled
+                    ),
+                )
+                diagnostics.update(
+                    {
+                        "reference_trust/extragradient/enabled": 1.0,
+                        "reference_trust/extragradient/triggered": 1.0,
+                        "reference_trust/extragradient/lookahead_scale": (
+                            lookahead_scale
+                        ),
+                        "reference_trust/extragradient/selected_direction_rms": (
+                            selected_direction_rms
+                        ),
+                        "reference_trust/extragradient/lookahead_direction_rms": (
+                            lookahead_direction_rms
+                        ),
+                    }
+                )
+                if is_rank0:
+                    _log.info(
+                        "[DGPO/trust/extragradient] virtual look-ahead "
+                        "scale=%.6g selected_rms=%.6g lookahead_rms=%.6g",
+                        lookahead_scale,
+                        selected_direction_rms,
+                        lookahead_direction_rms,
+                    )
             # No optimizer step occurs between this snapshot and any refit
             # population. They therefore share this exact policy denominator.
             policy_snapshot = _snapshot_policy_state_dict(model)
+            if signed_recovery_triggered:
+                # Change only the reward-fit population. The fixed validation
+                # panel and classifier seeds stay paired across comparisons.
+                fit_pool_seed = (
+                    int(adaptive_cfg.seed)
+                    + 1_000_003
+                    * (int(adaptive_state.recalibration_count) + 1)
+                    + 10_007
+                    * int(adaptive_state.trust_failed_direction_streak)
+                )
+            elif adaptive_cfg.trust_trajectory_search_enabled:
+                fit_pool_seed = int(adaptive_cfg.seed)
+            else:
+                fit_pool_seed = int(adaptive_cfg.seed) + int(
+                    adaptive_state.recalibration_count
+                )
+            if signed_recovery_triggered:
+                diagnostics[
+                    "reference_trust/signed_probe/recovery_fit_pool_seed"
+                ] = float(fit_pool_seed)
             if is_rank0:
                 if force_refit:
                     refit_label = "one-shot resume adapter refit"
+                elif signed_recovery_triggered:
+                    refit_label = "signed reverse-only fresh-reward recovery"
                 elif (
                     diagnostics.get("staleness/trigger_reason")
                     == "max_reward_age"
@@ -8951,7 +13045,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     None if fixed_omnifold_pool else adaptive_cfg.pool_events
                 ),
                 num_ddim_steps=num_ddim,
-                seed=adaptive_cfg.seed + int(adaptive_state.recalibration_count),
+                seed=fit_pool_seed,
+                include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
             )
             refit_score_pool = score_pool
             if adaptive_cfg.refit_score_events != adaptive_cfg.probe_max_events:
@@ -8972,11 +13067,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     rank=rank,
                     quota_events=adaptive_cfg.refit_score_events,
                     num_ddim_steps=num_ddim_val,
-                    seed=(
-                        adaptive_cfg.probe_seed
-                        + 10000 * max(int(epoch), 0)
-                        + 1_000_003
-                    ),
+                    seed=(probe_panel_seed + 1_000_003),
+                    include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
                 )
             refit_diagnostics = run_adaptive_refit(
                 state=adaptive_state,
@@ -8992,6 +13084,16 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 epoch=int(epoch),
                 device=device,
                 world_size=world_size,
+                # Resume protocol changes and signed recovery both establish a
+                # reward estimator at a fixed policy. They bypass only the
+                # cross-round policy-improvement comparison; classifier
+                # saturation, residual closure, acceptance, and topology gates
+                # remain mandatory.
+                enforce_round_acceptance=not (
+                    force_refit
+                    or signed_recovery_triggered
+                    or extragradient_requested
+                ),
                 progress_callback=lambda phase, row: _log_omnifold_fit_progress(
                     phase,
                     row,
@@ -9002,7 +13104,694 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             refit_accepted = (
                 float(refit_diagnostics.get("omnifold/accepted", 0.0)) >= 0.5
             )
+            if extragradient_requested:
+                diagnostics.update(
+                    {
+                        "reference_trust/extragradient/lookahead_reward_installed": float(
+                            refit_accepted
+                        ),
+                        "reference_trust/extragradient/lookahead_reward_round_id": float(
+                            refit_diagnostics.get(
+                                "omnifold/reward_round_id",
+                                adaptive_state.reward_round_id,
+                            )
+                        ),
+                        "reference_trust/extragradient/lookahead_raw_auc_gap": float(
+                            refit_diagnostics.get(
+                                "reference_trust/round_acceptance/current_auc_gap",
+                                float("nan"),
+                            )
+                        ),
+                        "reference_trust/extragradient/lookahead_acceptance_auc": float(
+                            refit_diagnostics.get(
+                                "omnifold/candidate/audit_validation_auc",
+                                float("nan"),
+                            )
+                        ),
+                        "reference_trust/extragradient/lookahead_topology_auc": float(
+                            refit_diagnostics.get(
+                                "omnifold/candidate/topology_audit_auc",
+                                float("nan"),
+                            )
+                        ),
+                    }
+                )
+            if extragradient_requested and not refit_accepted:
+                # The first refit is only a transient look-ahead estimator.
+                # A failed classifier gate must not leave its virtual policy
+                # (or any refit bookkeeping) installed as live state.
+                assert extragradient_anchor_policy is not None
+                assert extragradient_anchor_reward is not None
+                assert extragradient_anchor_state is not None
+                assert extragradient_anchor_probe_cache is not None
+                policy_core = unwrap_for_state_dict(model)
+                policy_core.load_state_dict(
+                    extragradient_anchor_policy,
+                    strict=True,
+                )
+                round_ref_model.load_state_dict(
+                    extragradient_anchor_policy,
+                    strict=True,
+                )
+                freeze_reference_model(round_ref_model)
+                omnifold_source.load_stack_payload(
+                    extragradient_anchor_reward
+                )
+                restored_state = type(adaptive_state).from_dict(
+                    extragradient_anchor_state
+                )
+                adaptive_state.__dict__.clear()
+                adaptive_state.__dict__.update(restored_state.__dict__)
+                optimizer.state.clear()
+                optimizer.zero_grad(set_to_none=True)
+                if ema_save is not None:
+                    ema_save.update(policy_core, decay_=0.0)
+                if ema_rollout is not None:
+                    ema_rollout.update(policy_core, decay_=0.0)
+                reference_trust_probe_cache.clear()
+                reference_trust_probe_cache.update(
+                    extragradient_anchor_probe_cache
+                )
+                diagnostics.update(
+                    record_extragradient_rejection(
+                        adaptive_state,
+                        cfg=adaptive_cfg,
+                        reason="lookahead_classifier_gate_failed",
+                    )
+                )
+                diagnostics.update(
+                    {
+                        "omnifold/accepted": 0.0,
+                        "omnifold/reward_round_id": float(
+                            adaptive_state.reward_round_id
+                        ),
+                        "reference_trust/extragradient/final_reward_installed": 0.0,
+                        "staleness/decision": adaptive_state.last_decision,
+                    }
+                )
+                reward_checkpoint_metadata = (
+                    omnifold_source.checkpoint_metadata()
+                )
+                _assert_current_reward_reference_pairing(
+                    "extragradient_lookahead_rejection"
+                )
+                if is_rank0:
+                    _log.warning(
+                        "[DGPO/trust/extragradient] rejected look-ahead "
+                        "classifier; restored incumbent round=%s",
+                        adaptive_state.reward_round_id,
+                    )
+                return diagnostics
+            if extragradient_requested and refit_accepted:
+                assert extragradient_batch is not None
+                assert extragradient_anchor_policy is not None
+                assert extragradient_anchor_params is not None
+                assert extragradient_anchor_reward is not None
+                assert extragradient_anchor_state is not None
+                assert extragradient_anchor_probe is not None
+                assert extragradient_anchor_probe_cache is not None
+
+                lookahead_round_id = int(adaptive_state.reward_round_id)
+                policy_core = unwrap_for_state_dict(model)
+                scheduler_state = copy.deepcopy(optimizer.scheduler.state_dict())
+                cleared_optimizer_states = len(optimizer.state)
+                optimizer.state.clear()
+                optimizer.zero_grad(set_to_none=True)
+                if ema_save is not None:
+                    ema_save.update(policy_core, decay_=0.0)
+                if ema_rollout is not None:
+                    ema_rollout.update(policy_core, decay_=0.0)
+
+                corrector_lr_diagnostics = adaptive_trust_policy_lr_scale(
+                    type(adaptive_state).from_dict(
+                        extragradient_anchor_state
+                    ),
+                    cfg=adaptive_cfg,
+                )
+                corrector_global_step = int(global_step)
+                corrector_metrics = train_step(
+                    model,
+                    round_ref_model,
+                    ema_rollout,
+                    ema_save,
+                    extragradient_batch,
+                    optimizer,
+                    sampler,
+                    reward_agg,
+                    beta=beta,
+                    K=K,
+                    advantage_estimator=advantage_estimator,
+                    num_ddim_steps=num_ddim,
+                    rollout_parallel_chains=rollout_parallel_chains,
+                    global_step=corrector_global_step,
+                    epoch=epoch,
+                    device=device,
+                    dtype=dtype,
+                    reference_trust_coefficient=reference_trust_coefficient,
+                    reference_trust_objective=reference_trust_objective,
+                    reference_trust_vp_path_kl_diagnostic=(
+                        reference_trust_vp_path_kl_diagnostic
+                    ),
+                    reference_trust_vp_logsnr_min=(
+                        reference_trust_vp_logsnr_min
+                    ),
+                    reference_trust_vp_logsnr_max=(
+                        reference_trust_vp_logsnr_max
+                    ),
+                    # The corrector evaluates F at the look-ahead pair and is
+                    # applied from the original incumbent. Its trust audit is
+                    # performed below on the incumbent's fixed probe.
+                    reference_trust_max_ratio=None,
+                    reference_trust_distance=adaptive_cfg.trust_distance,
+                    reference_trust_warning_fraction=(
+                        adaptive_cfg.trust_warning_fraction
+                    ),
+                    reference_trust_backtrack_factor=(
+                        adaptive_cfg.trust_backtrack_factor
+                    ),
+                    reference_trust_max_backtracks=(
+                        adaptive_cfg.trust_max_backtracks
+                    ),
+                    reference_trust_probe_events_per_rank=(
+                        adaptive_cfg.trust_probe_events_per_rank
+                    ),
+                    reference_trust_fixed_probe_per_round=False,
+                    reference_trust_interior_fraction=(
+                        adaptive_cfg.trust_interior_fraction
+                    ),
+                    reference_trust_policy_lr_scale=float(
+                        corrector_lr_diagnostics[
+                            "reference_trust/policy_lr/scale"
+                        ]
+                    ),
+                    reference_trust_reset_adam_first_moment_on_zero_step=False,
+                    reference_trust_probe_cache=None,
+                    log_reward_dist=False,
+                    log_diagnostic_dist=False,
+                    collect_train_dist=False,
+                    diagnostic_plot_names=set(),
+                    diagnostic_plot_every=1,
+                    num_train_timesteps=num_train_timesteps,
+                    policy_eval_parallel_timesteps=(
+                        policy_eval_parallel_timesteps
+                    ),
+                    policy_eval_event_microbatch_size=(
+                        policy_eval_event_microbatch_size
+                    ),
+                    adv_clip_max=adv_clip_max_cfg,
+                    grad_clip_norm=grad_clip_norm_cfg,
+                    policy_eval_t_min=policy_eval_t_min_cfg,
+                    policy_eval_t_max=policy_eval_t_max_cfg,
+                    constraint_state=constraint_state,
+                    world_size=world_size,
+                    extragradient_optimizer_base_params=(
+                        extragradient_anchor_params
+                    ),
+                )
+                global_step += 1
+                corrector_step_ran = bool(
+                    float(corrector_metrics.get("train/optimizer_step_ran", 0.0))
+                    >= 0.5
+                )
+                corrected_params = snapshot_params(policy_core)
+                corrected_direction_rms = _trainable_direction_rms(
+                    extragradient_anchor_params,
+                    corrected_params,
+                )
+                corrector_distance = float("nan")
+                corrector_scale = 0.0
+                corrector_backtracks = 0
+                correction_failure_reason = ""
+                if corrector_step_ran and corrected_direction_rms > 0.0:
+                    corrector_distance, _, _ = _measure_reference_trust_probe(
+                        model,
+                        extragradient_anchor_probe,
+                        world_size=world_size,
+                        distance=adaptive_cfg.trust_distance,
+                    )
+                    correction_limit = (
+                        float(adaptive_cfg.trust_interior_fraction)
+                        * extragradient_anchor_delta
+                    )
+                    correction_tolerance = max(
+                        1.0e-12,
+                        1.0e-6 * extragradient_anchor_delta,
+                    )
+                    if (
+                        math.isfinite(corrector_distance)
+                        and corrector_distance
+                        <= correction_limit + correction_tolerance
+                    ):
+                        corrector_scale = 1.0
+                    else:
+                        corrector_candidate = corrected_params
+                        for backtrack_index, scale in enumerate(
+                            adaptive_trust_backtracking_scales(
+                                1.0,
+                                factor=adaptive_cfg.trust_backtrack_factor,
+                                max_backtracks=adaptive_cfg.trust_max_backtracks,
+                            ),
+                            start=1,
+                        ):
+                            _assign_interpolated_trainable_params_(
+                                policy_core,
+                                extragradient_anchor_params,
+                                corrector_candidate,
+                                scale,
+                            )
+                            trial_distance, _, _ = (
+                                _measure_reference_trust_probe(
+                                    model,
+                                    extragradient_anchor_probe,
+                                    world_size=world_size,
+                                    distance=adaptive_cfg.trust_distance,
+                                )
+                            )
+                            if (
+                                math.isfinite(trial_distance)
+                                and trial_distance
+                                <= correction_limit + correction_tolerance
+                            ):
+                                corrector_scale = float(scale)
+                                corrector_backtracks = int(backtrack_index)
+                                corrector_distance = float(trial_distance)
+                                break
+                        if corrector_scale == 0.0:
+                            correction_failure_reason = (
+                                "trust_backtracking_failed"
+                            )
+                else:
+                    correction_failure_reason = "nonfinite_or_zero_corrector"
+
+                diagnostics.update(
+                    {
+                        "reference_trust/extragradient/corrector_global_step": float(
+                            corrector_global_step
+                        ),
+                        "reference_trust/extragradient/corrector_step_ran": float(
+                            corrector_step_ran
+                        ),
+                        "reference_trust/extragradient/rebased_optimizer_params": float(
+                            corrector_metrics.get(
+                                "reference_trust/extragradient/rebased_optimizer_params",
+                                0.0,
+                            )
+                        ),
+                        "reference_trust/extragradient/corrector_grad_norm_pre_clip": float(
+                            corrector_metrics.get(
+                                "train/grad/global_norm_pre_clip",
+                                float("nan"),
+                            )
+                        ),
+                        "reference_trust/extragradient/corrector_lr_scale": float(
+                            corrector_lr_diagnostics[
+                                "reference_trust/policy_lr/scale"
+                            ]
+                        ),
+                        "reference_trust/extragradient/corrector_direction_rms": (
+                            corrected_direction_rms
+                        ),
+                        "reference_trust/extragradient/corrector_distance": (
+                            corrector_distance
+                        ),
+                        "reference_trust/extragradient/corrector_scale": (
+                            corrector_scale
+                        ),
+                        "reference_trust/extragradient/corrector_backtracks": float(
+                            corrector_backtracks
+                        ),
+                        "reference_trust/extragradient/optimizer_states_cleared": float(
+                            cleared_optimizer_states
+                        ),
+                        "reference_trust/extragradient/lookahead_round_id": float(
+                            lookahead_round_id
+                        ),
+                        "reference_trust/extragradient/corrector_reward_mean": float(
+                            corrector_metrics.get(
+                                "reward/monitor/mean",
+                                float("nan"),
+                            )
+                        ),
+                    }
+                )
+
+                final_refit_diagnostics: dict[str, Any] = {}
+                if not correction_failure_reason:
+                    if ema_save is not None:
+                        ema_save.update(policy_core, decay_=0.0)
+                    if ema_rollout is not None:
+                        ema_rollout.update(policy_core, decay_=0.0)
+                    # The look-ahead reward/reference/state existed only long
+                    # enough to evaluate the corrector field. Reinstall the
+                    # original certified pair before fitting the corrected
+                    # point so a successful block consumes exactly one public
+                    # reward round and compares against the original paired
+                    # raw-AUC baseline.
+                    round_ref_model.load_state_dict(
+                        extragradient_anchor_policy,
+                        strict=True,
+                    )
+                    freeze_reference_model(round_ref_model)
+                    omnifold_source.load_stack_payload(
+                        extragradient_anchor_reward
+                    )
+                    restored_state = type(adaptive_state).from_dict(
+                        extragradient_anchor_state
+                    )
+                    adaptive_state.__dict__.clear()
+                    adaptive_state.__dict__.update(restored_state.__dict__)
+                    reference_trust_probe_cache.clear()
+                    reference_trust_probe_cache.update(
+                        extragradient_anchor_probe_cache
+                    )
+                    _assert_current_reward_reference_pairing(
+                        "extragradient_final_refit_anchor"
+                    )
+                    corrected_policy_snapshot = _snapshot_policy_state_dict(model)
+                    corrected_pool_seed = (
+                        int(adaptive_cfg.seed)
+                        + 30_000_091
+                        + 1009 * int(lookahead_round_id)
+                    )
+                    corrected_baseline_pool = _materialize_adaptive_omnifold_pool(
+                        val_shard,
+                        omnifold_val_loader_cfg,
+                        model=model,
+                        sampler=sampler,
+                        device=device,
+                        world_size=world_size,
+                        rank=rank,
+                        quota_events=adaptive_cfg.probe_max_events,
+                        num_ddim_steps=num_ddim_val,
+                        seed=int(probe_panel_seed),
+                        include_pairwise_context=(
+                            adaptive_cfg.periodic_pair_features_enabled
+                        ),
+                    )
+                    corrected_fit_pool = _materialize_adaptive_omnifold_pool(
+                        omnifold_train_shard,
+                        omnifold_train_loader_cfg,
+                        model=model,
+                        sampler=sampler,
+                        device=device,
+                        world_size=world_size,
+                        rank=rank,
+                        quota_events=(
+                            None
+                            if fixed_omnifold_pool
+                            else adaptive_cfg.pool_events
+                        ),
+                        num_ddim_steps=num_ddim,
+                        seed=corrected_pool_seed,
+                        include_pairwise_context=(
+                            adaptive_cfg.periodic_pair_features_enabled
+                        ),
+                    )
+                    corrected_score_pool = corrected_baseline_pool
+                    if (
+                        adaptive_cfg.refit_score_events
+                        != adaptive_cfg.probe_max_events
+                    ):
+                        corrected_score_pool = (
+                            _materialize_adaptive_omnifold_pool(
+                                val_shard,
+                                omnifold_val_loader_cfg,
+                                model=model,
+                                sampler=sampler,
+                                device=device,
+                                world_size=world_size,
+                                rank=rank,
+                                quota_events=adaptive_cfg.refit_score_events,
+                                num_ddim_steps=num_ddim_val,
+                                seed=(probe_panel_seed + 1_000_003),
+                                include_pairwise_context=(
+                                    adaptive_cfg.periodic_pair_features_enabled
+                                ),
+                            )
+                        )
+                    final_refit_diagnostics = run_adaptive_refit(
+                        state=adaptive_state,
+                        cfg=adaptive_cfg,
+                        reward_source=omnifold_source,
+                        round_ref_model=round_ref_model,
+                        policy_snapshot_state_dict=corrected_policy_snapshot,
+                        fit_pool=corrected_fit_pool,
+                        score_pool=corrected_score_pool,
+                        baseline_pool=corrected_baseline_pool,
+                        epoch=int(epoch),
+                        device=device,
+                        world_size=world_size,
+                        enforce_round_acceptance=True,
+                        progress_callback=lambda phase, row: (
+                            _log_omnifold_fit_progress(
+                                phase,
+                                row,
+                                epoch_value=int(epoch),
+                            )
+                        ),
+                    )
+                    if not bool(
+                        float(
+                            final_refit_diagnostics.get(
+                                "omnifold/accepted",
+                                0.0,
+                            )
+                        )
+                        >= 0.5
+                    ):
+                        correction_failure_reason = (
+                            "final_classifier_gate_failed"
+                        )
+
+                if correction_failure_reason:
+                    policy_core.load_state_dict(
+                        extragradient_anchor_policy,
+                        strict=True,
+                    )
+                    round_ref_model.load_state_dict(
+                        extragradient_anchor_policy,
+                        strict=True,
+                    )
+                    freeze_reference_model(round_ref_model)
+                    omnifold_source.load_stack_payload(
+                        extragradient_anchor_reward
+                    )
+                    restored_state = type(adaptive_state).from_dict(
+                        extragradient_anchor_state
+                    )
+                    adaptive_state.__dict__.clear()
+                    adaptive_state.__dict__.update(restored_state.__dict__)
+                    optimizer.state.clear()
+                    optimizer.zero_grad(set_to_none=True)
+                    optimizer.scheduler.load_state_dict(scheduler_state)
+                    if ema_save is not None:
+                        ema_save.update(policy_core, decay_=0.0)
+                    if ema_rollout is not None:
+                        ema_rollout.update(policy_core, decay_=0.0)
+                    reference_trust_probe_cache.clear()
+                    reference_trust_probe_cache.update(
+                        extragradient_anchor_probe_cache
+                    )
+                    diagnostics.update(final_refit_diagnostics)
+                    diagnostics.update(
+                        record_extragradient_rejection(
+                            adaptive_state,
+                            cfg=adaptive_cfg,
+                            reason=correction_failure_reason,
+                        )
+                    )
+                    diagnostics.update(
+                        {
+                            "omnifold/accepted": 0.0,
+                            "omnifold/reward_round_id": float(
+                                adaptive_state.reward_round_id
+                            ),
+                            "reference_trust/extragradient/final_reward_installed": 0.0,
+                            "staleness/decision": adaptive_state.last_decision,
+                        }
+                    )
+                    reward_checkpoint_metadata = (
+                        omnifold_source.checkpoint_metadata()
+                    )
+                    _assert_current_reward_reference_pairing(
+                        "extragradient_rejection"
+                    )
+                    if is_rank0:
+                        _log.warning(
+                            "[DGPO/trust/extragradient] rejected corrector "
+                            "reason=%s; restored incumbent round=%s",
+                            correction_failure_reason,
+                            adaptive_state.reward_round_id,
+                        )
+                    return diagnostics
+
+                refit_diagnostics = final_refit_diagnostics
+                # The one-step Adam state was estimated with the transient
+                # look-ahead reward. The corrected parameters are committed,
+                # but that estimator state must not leak into the new final
+                # reward round.
+                final_corrector_optimizer_states = len(optimizer.state)
+                optimizer.state.clear()
+                optimizer.zero_grad(set_to_none=True)
+                diagnostics.update(final_refit_diagnostics)
+                diagnostics.update(
+                    {
+                        "reference_trust/extragradient/final_reward_installed": 1.0,
+                        "reference_trust/extragradient/final_reward_round_id": float(
+                            adaptive_state.reward_round_id
+                        ),
+                        "reference_trust/extragradient/final_raw_auc_gap": float(
+                            final_refit_diagnostics.get(
+                                "reference_trust/round_acceptance/current_auc_gap",
+                                float("nan"),
+                            )
+                        ),
+                        "reference_trust/extragradient/final_optimizer_states_cleared": float(
+                            final_corrector_optimizer_states
+                        ),
+                    }
+                )
+                refit_accepted = True
+                policy_snapshot = _snapshot_policy_state_dict(model)
+                if is_rank0:
+                    _log.info(
+                        "[DGPO/trust/extragradient] accepted corrected point "
+                        "round=%s scale=%.6g D=%.6g",
+                        adaptive_state.reward_round_id,
+                        corrector_scale,
+                        corrector_distance,
+                    )
+            if signed_recovery_triggered:
+                refit_diagnostics[
+                    "reference_trust/signed_probe/recovery_reward_installed"
+                ] = float(refit_accepted)
+                diagnostics[
+                    "reference_trust/signed_probe/recovery_reward_installed"
+                ] = float(refit_accepted)
+                if refit_accepted:
+                    # Installing a new reward round resets ordinary trajectory
+                    # state. Keep the recovery streak across estimator refreshes
+                    # so repeated reverse-only rounds stop at the configured
+                    # failed-direction patience instead of looping forever.
+                    adaptive_state.trust_failed_direction_streak = int(
+                        signed_recovery_diagnostics[
+                            "reference_trust/signed_probe/recovery_attempt"
+                        ]
+                    )
+                    adaptive_state.last_decision = (
+                        "signed_reverse_only_fresh_reward_installed"
+                    )
+                else:
+                    adaptive_state.last_decision = (
+                        "signed_reverse_only_fresh_reward_rejected"
+                    )
+                    diagnostics["staleness/decision"] = (
+                        adaptive_state.last_decision
+                    )
+            rollback_required = bool(
+                float(
+                    refit_diagnostics.get(
+                        "reference_trust/round_acceptance/rollback_required",
+                        0.0,
+                    )
+                )
+                >= 0.5
+            )
+            if (
+                selected_checkpoint
+                and not refit_accepted
+                and not rollback_required
+            ):
+                # Residual-closure or acceptance/topology failure is also a
+                # failed trajectory proposal.  Do not continue training from
+                # an uncertified rewound checkpoint under the old reward.
+                delta_before = float(adaptive_state.trust_current_delta)
+                adaptive_state.trust_failed_direction_streak += 1
+                adaptive_state.trust_round_rollbacks += 1
+                if math.isfinite(delta_before) and delta_before > 0.0:
+                    adaptive_state.trust_current_delta = max(
+                        float(adaptive_cfg.trust_delta_floor),
+                        delta_before
+                        * float(adaptive_cfg.trust_empirical_shrink_factor),
+                    )
+                adaptive_state.trust_distance_window.clear()
+                adaptive_state.trust_step_acceptance_window.clear()
+                adaptive_state.trust_step_scale_window.clear()
+                adaptive_state.reset_trust_trajectory(
+                    reset_failed_directions=False
+                )
+                stop_after_rejection = bool(
+                    adaptive_state.trust_failed_direction_streak
+                    >= int(adaptive_cfg.trust_failed_direction_patience)
+                )
+                adaptive_state.trust_round_stop_requested = (
+                    stop_after_rejection
+                )
+                adaptive_state.last_decision = (
+                    "trajectory_candidate_rejected_stop"
+                    if stop_after_rejection
+                    else "trajectory_candidate_rejected_rollback"
+                )
+                diagnostics["staleness/decision"] = (
+                    adaptive_state.last_decision
+                )
+                rejection_metrics = {
+                    "reference_trust/round_acceptance/rollback_required": 1.0,
+                    "reference_trust/round_acceptance/stop_requested": float(
+                        stop_after_rejection
+                    ),
+                    "reference_trust/round_acceptance/failed_direction_streak": float(
+                        adaptive_state.trust_failed_direction_streak
+                    ),
+                    "reference_trust/round_acceptance/failed_direction_patience": float(
+                        adaptive_cfg.trust_failed_direction_patience
+                    ),
+                    "reference_trust/round_acceptance/delta_before": delta_before,
+                    "reference_trust/round_acceptance/delta_after": float(
+                        adaptive_state.trust_current_delta
+                    ),
+                    "reference_trust/trajectory/candidate_gate_failed": 1.0,
+                }
+                refit_diagnostics.update(rejection_metrics)
+                diagnostics.update(rejection_metrics)
+                rollback_required = True
+            if rollback_required:
+                # The installed reward remains paired with round_ref. Restore
+                # the live policy to that incumbent anchor and discard AdamW's
+                # stale direction before any further optimizer step.
+                cleared_optimizer_states, ema_restored = (
+                    _restore_live_policy_to_round_reference()
+                )
+                rollback_metrics = {
+                    "reference_trust/round_acceptance/policy_restored": 1.0,
+                    "reference_trust/round_acceptance/optimizer_states_cleared": float(
+                        cleared_optimizer_states
+                    ),
+                    "reference_trust/round_acceptance/ema_restored": float(
+                        ema_restored
+                    ),
+                }
+                refit_diagnostics.update(rollback_metrics)
+                diagnostics.update(rollback_metrics)
+                if is_rank0:
+                    _log.warning(
+                        "[DGPO/trust] round-AUC guard restored policy to "
+                        "round_ref=%s and cleared %s optimizer states",
+                        adaptive_state.reward_round_id,
+                        cleared_optimizer_states,
+                    )
             if refit_accepted:
+                if adaptive_cfg.trust_fixed_probe_per_reward_round:
+                    # The probe contains outputs from the previous round_ref.
+                    # Rebuild it on the first optimizer step of the new pair.
+                    reference_trust_probe_cache.clear()
+                    adaptive_state.trust_probe_payload = None
+                    adaptive_state.trust_probe_round_id = -1
+                reset_metrics = _reset_optimizer_after_reward_install(
+                    optimizer, cfg=adaptive_cfg, accepted=True, adaptive_state=adaptive_state,
+                )
+                refit_diagnostics.update(reset_metrics)
+                diagnostics.update(reset_metrics)
                 # A newly installed reward round gets the protocol provenance
                 # of the audit that certified its new fixed baseline.
                 adaptive_state.audit_protocol_signature = current_audit_signature
@@ -9044,13 +13833,21 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     }
                 )
             reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+        if pending_resume_trust_diagnostics:
+            diagnostics.update(pending_resume_trust_diagnostics)
+            pending_resume_trust_diagnostics = {}
         _assert_current_reward_reference_pairing("adaptive_cycle")
         if is_rank0:
             _log.info(
                 "[DGPO/omnifold] epoch=%s decision=%s gap=%.5g threshold=%.5g round=%s",
                 epoch,
                 diagnostics.get("staleness/decision", adaptive_state.last_decision),
-                float(probe.get("weighted_auc_gap", float("nan"))),
+                float(
+                    probe.get(
+                        "weighted_auc_gap",
+                        probe.get("raw_auc_gap", float("nan")),
+                    )
+                ),
                 float(
                     diagnostics.get(
                         "staleness/trigger_threshold",
@@ -9082,7 +13879,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 "saturate before its weights are snapshotted"
             )
         policy_snapshot = _snapshot_policy_state_dict(model)
-        score_pool = _materialize_adaptive_omnifold_pool(
+        score_pool = None if adaptive_cfg.single_pool_train_validation else _materialize_adaptive_omnifold_pool(
             val_shard,
             omnifold_val_loader_cfg,
             model=model,
@@ -9093,6 +13890,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             quota_events=adaptive_cfg.refit_score_events,
             num_ddim_steps=num_ddim_val,
             seed=adaptive_cfg.probe_seed,
+            include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
         )
         fit_pool = _materialize_adaptive_omnifold_pool(
             omnifold_train_shard,
@@ -9105,7 +13903,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             quota_events=(None if fixed_omnifold_pool else adaptive_cfg.pool_events),
             num_ddim_steps=num_ddim,
             seed=adaptive_cfg.seed,
+            include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
         )
+        if adaptive_cfg.single_pool_train_validation:
+            score_pool = fit_pool
         bootstrap_metrics = run_adaptive_refit(
             state=adaptive_state,
             cfg=adaptive_cfg,
@@ -9116,10 +13917,15 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             score_pool=score_pool,
             # Residual closure uses the full score pool; establish the trigger
             # baseline with the same cheap population used by routine audits.
-            baseline_pool=score_pool.prefix(adaptive_cfg.probe_max_events),
+            baseline_pool=(
+                None
+                if adaptive_cfg.monitor_mode == "raw_plateau_refit"
+                else score_pool.prefix(adaptive_cfg.probe_max_events)
+            ),
             epoch=-1,
             device=device,
             world_size=world_size,
+            enforce_round_acceptance=False,
             progress_callback=lambda phase, row: _log_omnifold_fit_progress(
                 phase,
                 row,
@@ -9140,8 +13946,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             raise RuntimeError(
                 "DGPO cannot start without an installed OmniFold reward: " + str(reason)
             )
-        adaptive_state.resume_refit_once_completed = True
-        adaptive_state.resume_refit_once_id = adaptive_cfg.refit_once_id
+        bootstrap_metrics.update(_reset_optimizer_after_reward_install(
+            optimizer, cfg=adaptive_cfg, accepted=True, adaptive_state=adaptive_state,
+        ))
+        # Save the installed reward before the first raw-monitor fit. If that
+        # long fit is interrupted, resume it without repeating OmniFold.
+        adaptive_state.mark_bootstrap_complete(cfg=adaptive_cfg)
         _assert_current_reward_reference_pairing("initial_omnifold_bootstrap")
         if is_rank0:
             _log.info(
@@ -9181,6 +13991,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             )
         _barrier()
 
+        # Bootstrap used the full train/validation pools. Release them before
+        # allocating the configured raw-monitor panel.
+        del fit_pool, score_pool, policy_snapshot
+
     resume_refit_version_completed = bool(
         adaptive_state.resume_refit_once_completed
         and (
@@ -9209,6 +14023,27 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             epoch=startup_refit_epoch,
             force_refit=True,
         )
+        startup_refit_accepted = float(
+            startup_refit_metrics.get("omnifold/accepted", 0.0)
+        )
+        if adaptive_cfg.refit_once_fail_closed and startup_refit_accepted < 0.5:
+            startup_refit_metrics.update(
+                {
+                    "omnifold/resume_refit_once_completed": 0.0,
+                    "omnifold/resume_refit_once_accepted": 0.0,
+                }
+            )
+            if is_rank0 and wandb_mod is not None:
+                _wandb_log_step(
+                    wandb_mod,
+                    {"epoch": startup_refit_epoch, **startup_refit_metrics},
+                    step=int(global_step),
+                )
+            _barrier()
+            raise RuntimeError(
+                "one-shot resume OmniFold refit failed its acceptance gate; "
+                "refusing to continue an ablation with the incumbent reward"
+            )
         # Set this only after the complete distributed audit/refit returns. A
         # timeout during fitting leaves the old checkpoint marker false, while
         # the successful recovery checkpoint below makes every later resume a
@@ -9218,9 +14053,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         startup_refit_metrics.update(
             {
                 "omnifold/resume_refit_once_completed": 1.0,
-                "omnifold/resume_refit_once_accepted": float(
-                    startup_refit_metrics.get("omnifold/accepted", 0.0)
-                ),
+                "omnifold/resume_refit_once_accepted": startup_refit_accepted,
             }
         )
         _assert_current_reward_reference_pairing("resume_adapter_refit_once")
@@ -9257,12 +14090,52 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             )
         _barrier()
 
+    if adaptive_state.raw_monitor_baseline_pending:
+        if adaptive_cfg.monitor_mode != "raw_plateau_refit":
+            raise ValueError("new best-point experiment requires raw_plateau_refit monitoring")
+        baseline_metrics = _run_adaptive_cycle(epoch=-1, raw_baseline_only=True)
+        if float(baseline_metrics.get("staleness/raw_audit_saturated", 0.0)) < 0.5:
+            raise RuntimeError("best-point raw monitor baseline did not saturate; refusing policy updates")
+        adaptive_state.raw_monitor_baseline_pending = False
+        if is_rank0:
+            if wandb_mod is not None:
+                _wandb_log_step(wandb_mod, {"epoch": -1, **baseline_metrics}, step=int(global_step))
+            _dgpo_save_last_ckpt(
+                model, ema_save, optimizer, ref_model,
+                last_completed_epoch=-1, dgpo_next_epoch=0, global_step=int(global_step),
+                ema_rollout=ema_rollout, round_ref_model=round_ref_model,
+                reward_round_id=int(adaptive_state.reward_round_id),
+                dgpo_projection_constraint_state=_dgpo_constraint_checkpoint_payload(constraint_state),
+                dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                dgpo_omnifold_reward_stack=_adaptive_stack_payload(),
+            )
+        _barrier()
+
+    if adaptive_cfg.trust_boundary_enabled:
+        if (
+            not math.isfinite(adaptive_state.trust_current_delta)
+            or adaptive_state.trust_current_delta <= 0.0
+        ):
+            raise RuntimeError(
+                "adaptive trust boundary has no calibrated round radius; "
+                "enable a successful bootstrap/refit_once_on_resume for this ablation"
+            )
+        if is_rank0:
+            _log.info(
+                "[DGPO/trust] round=%s raw_auc=%.6g delta=%.6g closed=%s.",
+                adaptive_state.reward_round_id,
+                adaptive_state.trust_current_raw_auc,
+                adaptive_state.trust_current_delta,
+                adaptive_state.trust_statistically_closed,
+            )
+
     # Following the EveNet ``train.py`` pattern: no rank-0-only synchronous setup
     # before the training loop.  All ranks proceed straight into ``fit``-style
     # iteration and hit the data pipeline simultaneously, avoiding NCCL barriers
     # that would otherwise busy-wait the GPU while rank 0 does cold-start work.
     ve_initial = int(val_events) if val_events is not None else 0
-    if start_epoch == 0 and ve_initial > 0 and val_shard is not None:
+    if _should_log_pretraining_baseline(start_epoch, global_step) and ve_initial > 0 and val_shard is not None:
         if is_rank0:
             _log.info(
                 "[DGPO] val: running pre-DGPO baseline validation (epoch=-1) for response diagnostics."
@@ -9325,7 +14198,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     wandb_step=_wandb_train_step(global_step),
                 )
         _barrier()
-    elif start_epoch > 0 and ve_initial > 0 and is_rank0:
+    elif (start_epoch > 0 or global_step > 0) and ve_initial > 0 and is_rank0:
         _log.warning(
             "[DGPO] Response matrices need the pre-DGPO validation baseline; "
             "this run is resuming at start_epoch=%s, so val/response/* will be skipped.",
@@ -9353,6 +14226,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     def constraint_ckpt_payload_for_save() -> dict[str, Any] | None:
         return _dgpo_constraint_checkpoint_payload(constraint_state)
 
+    adaptive_early_stop = False
     try:
         legacy_train_kinematics = _supports_legacy_invisible_kinematics(
             cartesian=_truth_generation_cartesian(),
@@ -9410,7 +14284,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     for feature_name in td_all_feature_names
                     for suffix in ("truth", "pred")
                 }
-            steps_this_epoch = 0
+            steps_this_epoch = (
+                _resume_logical_epoch_step(ckpt_dict, logical_epoch_step_budget)
+                if epoch == start_epoch else 0
+            )
             while True:
                 if (
                     logical_epoch_step_budget is not None
@@ -9418,7 +14295,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 ):
                     break
                 if max_steps is not None and global_step >= max_steps:
-                    last_done = epoch - 1 if epoch > 0 else 0
+                    last_done = epoch
                     if is_rank0:
                         _dgpo_save_last_ckpt(
                             model,
@@ -9428,6 +14305,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             last_completed_epoch=last_done,
                             dgpo_next_epoch=epoch,
                             global_step=global_step,
+                            dgpo_epoch_step=steps_this_epoch,
                             ema_rollout=ema_rollout,
                             round_ref_model=(
                                 round_ref_model if adaptive_cfg.enabled else None
@@ -9476,6 +14354,29 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     and global_step % log_reward_dist_every == 0
                 )
                 diagnostic_dist_step = wandb_active
+                if (
+                    adaptive_cfg.trust_fixed_probe_per_reward_round
+                    and reference_trust_probe_cache.get("round_id")
+                    not in (None, int(adaptive_state.reward_round_id))
+                ):
+                    reference_trust_probe_cache.clear()
+                trust_lr_diagnostics = (
+                    adaptive_trust_policy_lr_scale(
+                        adaptive_state,
+                        cfg=adaptive_cfg,
+                    )
+                    if adaptive_cfg.trust_boundary_enabled
+                    else {}
+                )
+                trust_policy_lr_scale = float(
+                    trust_lr_diagnostics.get(
+                        "reference_trust/policy_lr/scale",
+                        1.0,
+                    )
+                )
+                round_warmup_metrics = policy_round_warmup_metrics(adaptive_state, cfg=adaptive_cfg)
+                round_warmup_scale = round_warmup_metrics.get("train/round_warmup/lr_scale", 1.0)
+                scheduled_lrs = [float(pg["lr"]) for pg in optimizer.param_groups]
                 metrics = train_step(
                     model,
                     round_ref_model if adaptive_cfg.enabled else ref_model,
@@ -9495,6 +14396,49 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     device=device,
                     dtype=dtype,
                     reference_trust_coefficient=reference_trust_coefficient,
+                    reference_trust_objective=reference_trust_objective,
+                    reference_trust_vp_path_kl_diagnostic=(
+                        reference_trust_vp_path_kl_diagnostic
+                    ),
+                    reference_trust_vp_logsnr_min=(
+                        reference_trust_vp_logsnr_min
+                    ),
+                    reference_trust_vp_logsnr_max=(
+                        reference_trust_vp_logsnr_max
+                    ),
+                    reference_trust_max_ratio=(
+                        float(adaptive_state.trust_current_delta)
+                        if adaptive_cfg.trust_boundary_enabled
+                        else None
+                    ),
+                    reference_trust_distance=adaptive_cfg.trust_distance,
+                    reference_trust_warning_fraction=(
+                        adaptive_cfg.trust_warning_fraction
+                    ),
+                    reference_trust_backtrack_factor=(
+                        adaptive_cfg.trust_backtrack_factor
+                    ),
+                    reference_trust_max_backtracks=(
+                        adaptive_cfg.trust_max_backtracks
+                    ),
+                    reference_trust_probe_events_per_rank=(
+                        adaptive_cfg.trust_probe_events_per_rank
+                    ),
+                    reference_trust_fixed_probe_per_round=(
+                        adaptive_cfg.trust_fixed_probe_per_reward_round
+                    ),
+                    reference_trust_interior_fraction=(
+                        adaptive_cfg.trust_interior_fraction
+                    ),
+                    reference_trust_policy_lr_scale=trust_policy_lr_scale * round_warmup_scale,
+                    reference_trust_reset_adam_first_moment_on_zero_step=(
+                        adaptive_cfg.trust_reset_adam_first_moment_on_zero_step
+                    ),
+                    reference_trust_probe_cache=(
+                        reference_trust_probe_cache
+                        if adaptive_cfg.trust_fixed_probe_per_reward_round
+                        else None
+                    ),
                     log_reward_dist=reward_dist_step,
                     log_diagnostic_dist=diagnostic_dist_step,
                     collect_train_dist=collect_train_dist_epoch,
@@ -9512,13 +14456,102 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     constraint_state=constraint_state,
                     world_size=world_size,
                 )
+                metrics.update(trust_lr_diagnostics)
+                metrics.update(round_warmup_metrics)
+                metrics["train/lr/scheduled_max"] = max(scheduled_lrs)
+                metrics["train/lr/scheduled_min"] = min(scheduled_lrs)
+                advance_policy_round_warmup(
+                    adaptive_state, cfg=adaptive_cfg,
+                    accepted=bool(metrics.get("train/optimizer_step_ran", 0.0) >= .5),
+                )
+                if (
+                    adaptive_cfg.trust_fixed_probe_per_reward_round
+                    and reference_trust_probe_cache.get("dirty", False)
+                ):
+                    adaptive_state.trust_probe_payload = dict(
+                        reference_trust_probe_cache["payload"]
+                    )
+                    adaptive_state.trust_probe_round_id = int(
+                        adaptive_state.reward_round_id
+                    )
+                    reference_trust_probe_cache["round_id"] = int(
+                        adaptive_state.reward_round_id
+                    )
+                    reference_trust_probe_cache["dirty"] = False
+                if adaptive_cfg.trust_empirical_radius_enabled:
+                    metrics.update(
+                        record_reference_trust_attempt(
+                            adaptive_state,
+                            cfg=adaptive_cfg,
+                            accepted=(
+                                float(
+                                    metrics.get(
+                                        "reference_trust/step_accepted",
+                                        0.0,
+                                    )
+                                )
+                                >= 0.5
+                            ),
+                            update_scale=float(
+                                metrics.get(
+                                    "reference_trust/accepted_step_scale",
+                                    0.0,
+                                )
+                            ),
+                            distance=float(
+                                metrics.get(
+                                    "reference_trust/post_step_distance",
+                                    float("nan"),
+                                )
+                            ),
+                        )
+                    )
+                trust_boundary_this_step = bool(
+                    adaptive_cfg.trust_boundary_enabled
+                    and float(
+                        metrics.get("reference_trust/boundary_hit", 0.0)
+                    )
+                    >= 0.5
+                )
+                if trust_boundary_this_step:
+                    adaptive_state.trust_boundary_count += 1
+                    if is_rank0:
+                        _log.info(
+                            "[DGPO/trust] strict boundary handled in-step without "
+                            "forcing a reward refit (boundary_count=%s, scale=%.6g, "
+                            "D_post=%.6g).",
+                            adaptive_state.trust_boundary_count,
+                            float(
+                                metrics.get(
+                                    "reference_trust/accepted_step_scale",
+                                    0.0,
+                                )
+                            ),
+                            float(
+                                metrics.get(
+                                    "reference_trust/post_step_distance",
+                                    float("nan"),
+                                )
+                            ),
+                        )
+                if adaptive_cfg.trust_boundary_enabled:
+                    metrics["reference_trust/boundary_count"] = float(
+                        adaptive_state.trust_boundary_count
+                    )
+                    if adaptive_cfg.trust_radius_mode == "round_decay":
+                        metrics["reference_trust/round_decay/step"] = float(
+                            adaptive_state.trust_radius_decay_step
+                        )
+                        metrics["reference_trust/radius_mode_round_decay"] = 1.0
                 if wandb_mod is not None:
                     payload = _wandb_train_payload(metrics)
                     payload["epoch"] = float(epoch)
-                    payload["global_step"] = float(global_step)
-                    _wandb_log_step(wandb_mod, payload, step=global_step)
+                    # This update has finished; use the same count that will
+                    # be saved in the checkpoint and used by the next monitor.
+                    payload["global_step"] = int(global_step) + 1
+                    _wandb_log_step(wandb_mod, payload, step=global_step + 1)
                     _append_profile_accum(metrics)
-                    _flush_profile_accum(step=global_step)
+                    _flush_profile_accum(step=global_step + 1)
 
                 if collect_train_dist_epoch and legacy_train_kinematics:
                     td_pt_p += metrics["_kin_h_pt_p"]
@@ -9550,7 +14583,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         "L_cur=%.4f L_ref=%.4f delta=%.4f "
                         "r_best=%.4f r_med=%.4f gap=%.4f",
                         epoch,
-                        global_step,
+                        global_step + 1,
                         metrics["train/loss/total"],
                         metrics["train/loss/dgpo"],
                         metrics["train/loss/L_cur"],
@@ -9563,9 +14596,53 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 global_step += 1
                 steps_this_epoch += 1
 
+                # Check the raw policy midway through the logical epoch without
+                # changing epoch length, LR schedule or epoch-end validation.
+                # The last step is handled below, with the independent trust fit.
+                if (
+                    adaptive_cfg.enabled
+                    and logical_epoch_step_budget is not None
+                    and steps_this_epoch < logical_epoch_step_budget
+                    and should_probe_training_boundary(
+                        adaptive_state, cfg=adaptive_cfg, epoch=epoch,
+                        global_step=global_step, epoch_end=False,
+                    )
+                ):
+                    step_monitor_metrics = _run_adaptive_cycle(
+                        epoch=epoch, checkpoint_next_epoch=epoch,
+                        allow_classifier_trust=False,
+                    )
+                    if is_rank0:
+                        if wandb_mod is not None:
+                            _wandb_log_with_step(
+                                wandb_mod, step_monitor_metrics,
+                                step=_wandb_epoch_end_step(global_step),
+                            )
+                        _dgpo_save_last_ckpt(
+                            model, ema_save, optimizer, ref_model,
+                            last_completed_epoch=epoch, dgpo_next_epoch=epoch,
+                            global_step=global_step, dgpo_epoch_step=steps_this_epoch,
+                            ema_rollout=ema_rollout, round_ref_model=round_ref_model,
+                            reward_round_id=int(adaptive_state.reward_round_id),
+                            dgpo_projection_constraint_state=constraint_ckpt_payload_for_save(),
+                            dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                            dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                            dgpo_omnifold_reward_stack=_adaptive_stack_payload(),
+                        )
+                    _barrier()
+
+                    if adaptive_state.raw_global_stop_requested:
+                        adaptive_early_stop = True
+                        if is_rank0:
+                            _log.info("[DGPO/global-best] saved terminal mid-epoch state at step=%s; stopping after %s failed refit rounds. Best checkpoint remains %s",
+                                      global_step, adaptive_state.raw_global_failed_rounds, adaptive_state.raw_best_checkpoint)
+                        break
+
             # --- Epoch-end: build training-distribution figures from accumulated histograms ---
+            if adaptive_state.raw_global_stop_requested:
+                break  # Already saved with correct within-epoch progress above.
             if wandb_mod is not None:
-                _flush_profile_accum(step=max(global_step - 1, 0), force=True)
+                _flush_profile_accum(step=global_step, force=True)
 
             if collect_train_dist_epoch and legacy_train_kinematics and world_size > 1:
                 td_stack = np.stack([
@@ -9854,17 +14931,34 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             _barrier()
 
             adaptive_cycle_ran = False
+            adaptive_stop_requested = False
             if adaptive_cfg.enabled:
-                from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
-                    should_probe_epoch,
-                )
-
-                if should_probe_epoch(
-                    epoch,
-                    adaptive_cfg.staleness_every_n_epochs,
+                if should_probe_training_boundary(
+                    adaptive_state, cfg=adaptive_cfg, epoch=epoch,
+                    global_step=global_step, epoch_end=True,
                 ):
                     adaptive_cycle_ran = True
-                    adaptive_metrics = _run_adaptive_cycle(epoch=epoch)
+                    adaptive_metrics = _run_adaptive_cycle(
+                        epoch=epoch,
+                        extragradient_batch=(
+                            batch_d
+                            if adaptive_cfg.trust_extragradient_enabled
+                            else None
+                        ),
+                    )
+                    adaptive_stop_requested = bool(
+                        float(
+                            adaptive_metrics.get(
+                                "reference_trust/round_acceptance/stop_requested",
+                                0.0,
+                            )
+                        )
+                        >= 0.5
+                    ) or adaptive_state.raw_global_stop_requested
+                    if adaptive_cfg.trust_boundary_enabled:
+                        adaptive_metrics[
+                            "reference_trust/boundary_count"
+                        ] = float(adaptive_state.trust_boundary_count)
                     if is_rank0:
                         if wandb_mod is not None:
                             _wandb_log_with_step(
@@ -9958,8 +15052,53 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     )
                 _barrier()
 
+            if adaptive_stop_requested:
+                adaptive_early_stop = True
+                if is_rank0:
+                    if adaptive_state.raw_global_stop_requested:
+                        _log.info("[DGPO/global-best] stagnation: saved terminal state after %s failed refit rounds; best checkpoint=%s",
+                                  adaptive_state.raw_global_failed_rounds, adaptive_state.raw_best_checkpoint)
+                    elif bool(
+                        float(
+                            adaptive_metrics.get(
+                                "reference_trust/signed_probe/recovery_stop_requested",
+                                0.0,
+                            )
+                        )
+                        >= 0.5
+                    ):
+                        _log.info(
+                            "[DGPO/trust/signed] repeated reverse-only "
+                            "directions reached patience; saved the restored "
+                            "incumbent and stopped at epoch=%s global_step=%s.",
+                            epoch,
+                            global_step,
+                        )
+                    else:
+                        _log.info(
+                            "[DGPO/trust] statistically confirmed round-AUC "
+                            "plateau; saved the rolled-back anchor checkpoint "
+                            "and stopped at epoch=%s global_step=%s.",
+                            epoch,
+                            global_step,
+                        )
+                break
+
         if is_rank0:
-            _log.info("[DGPO] finished %s epochs (%s optimizer steps).", epochs, global_step)
+            if adaptive_state.raw_global_stop_requested:
+                _log.info("[DGPO] stopped for global-best stagnation, not convergence; epoch=%s step=%s", epoch, global_step)
+            elif adaptive_early_stop:
+                _log.info(
+                    "[DGPO] converged early after epoch=%s (%s optimizer steps).",
+                    epoch,
+                    global_step,
+                )
+            else:
+                _log.info(
+                    "[DGPO] finished %s epochs (%s optimizer steps).",
+                    epochs,
+                    global_step,
+                )
     finally:
         _finish_wandb_run(wandb_active)
 
@@ -10025,6 +15164,11 @@ def main() -> None:
         runtime_env["env_vars"][ray_cuda_opt_out_key] = ray_cuda_opt_out
     if "WANDB_API_KEY" in os.environ:
         runtime_env["env_vars"]["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
+    # Ray workers do not automatically inherit driver-side diagnostic flags.
+    from RL.DGPO_neutrino.omnifold_ztautau.attention_diagnostic import ENV_KEYS
+    for key in ENV_KEYS:
+        if key in os.environ:
+            runtime_env["env_vars"][key] = os.environ[key]
 
     # ``address="auto"`` forces a connection to the Ray cluster already started by
     # ``NERSC/start-head.sh`` / ``start-worker.sh`` instead of silently spinning up a
@@ -10083,23 +15227,74 @@ def main() -> None:
         else None
     )
     process_fn = make_process_fn(base_dir)
-    train_ds, val_ds, total_events, val_events = prepare_datasets(
-        base_dir=base_dir,
-        process_event_batch_partial=process_fn,
-        platform_info=platform_info,
-        load_all_in_ram=False,
-        base_val_dir=base_val_dir,
-        predict=False,
-    )
+    from RL.DGPO_neutrino.omnifold_ztautau.adaptive import resolve_adaptive_config
+    launch_adaptive_cfg = resolve_adaptive_config(global_config.dgpo)
+    if launch_adaptive_cfg.single_pool_train_validation:
+        train_ds, val_ds, total_events, val_events = _prepare_single_pool_datasets(
+            base_dir=base_dir, base_val_dir=base_val_dir, process_fn=process_fn,
+            platform_info=platform_info, dataset_options=global_config.options.Dataset,
+        )
+    else:
+        train_ds, val_ds, total_events, val_events = prepare_datasets(
+            base_dir=base_dir,
+            process_event_batch_partial=process_fn,
+            platform_info=platform_info,
+            load_all_in_ram=False,
+            base_val_dir=base_val_dir,
+            predict=False,
+        )
 
     datasets: dict[str, Any] = {"train": train_ds}
-    from RL.DGPO_neutrino.omnifold_ztautau.adaptive import resolve_adaptive_config
-
-    launch_adaptive_cfg = resolve_adaptive_config(global_config.dgpo)
-    fixed_omnifold_pool = bool(
-        launch_adaptive_cfg.enabled and launch_adaptive_cfg.pool_events is not None
+    separate_omnifold_source = bool(
+        launch_adaptive_cfg.enabled
+        and launch_adaptive_cfg.pool_data_parquet_dir is not None
     )
-    if fixed_omnifold_pool:
+    fixed_omnifold_pool = bool(
+        launch_adaptive_cfg.enabled
+        and (
+            separate_omnifold_source
+            or launch_adaptive_cfg.pool_events is not None
+        )
+    )
+    omnifold_train_events = int(total_events)
+    if separate_omnifold_source:
+        omnifold_base_dir = Path(
+            str(launch_adaptive_cfg.pool_data_parquet_dir)
+        )
+        omnifold_parquet_files = sorted(
+            map(str, omnifold_base_dir.glob("*.parquet"))
+        )
+        if not omnifold_parquet_files:
+            raise ValueError(
+                "No parquet files found in the dedicated OmniFold training "
+                f"directory: {omnifold_base_dir}"
+            )
+        omnifold_process_fn = make_process_fn(omnifold_base_dir)
+        omnifold_train_ds, omnifold_train_events = register_dataset(
+            omnifold_parquet_files,
+            omnifold_process_fn,
+            platform_info,
+            dataset_limit=1.0,
+            file_shuffling=True,
+        )
+        if launch_adaptive_cfg.pool_events is not None:
+            requested_pool_events = int(launch_adaptive_cfg.pool_events)
+            omnifold_train_ds = omnifold_train_ds.random_shuffle(
+                seed=int(launch_adaptive_cfg.pool_selection_seed)
+            ).limit(requested_pool_events)
+            omnifold_train_events = min(
+                requested_pool_events, int(omnifold_train_events)
+            )
+        datasets["omnifold_train"] = omnifold_train_ds
+        _log.info(
+            "[DGPO/launch] dedicated OmniFold fit population: path=%s "
+            "events=%s cap=%s seed=%s",
+            omnifold_base_dir,
+            omnifold_train_events,
+            launch_adaptive_cfg.pool_events,
+            launch_adaptive_cfg.pool_selection_seed,
+        )
+    elif fixed_omnifold_pool:
         # Choose the identities globally before Ray Train shards the dataset.
         # This immutable, seeded Dataset is reused by the bootstrap and every
         # adaptive refit; only the live-policy K=1 candidates are regenerated.
@@ -10147,6 +15342,7 @@ def main() -> None:
         "wandb": not args.no_wandb,
         "total_events": int(total_events),
         "val_events": int(val_events) if val_events else 0,
+        "omnifold_train_events": int(omnifold_train_events),
         "fixed_omnifold_pool": fixed_omnifold_pool,
     }
 

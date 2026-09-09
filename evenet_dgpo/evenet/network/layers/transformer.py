@@ -62,9 +62,17 @@ class TransformerBlockModule(nn.Module):
                 attn_mask = attn_mask.expand(batch_size, self.num_heads, tgt_len, src_len)
                 attn_mask = attn_mask.reshape(batch_size * self.num_heads, tgt_len, src_len)
 
-            updates, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x),
-                                   key_padding_mask=padding_mask,
-                                   attn_mask=attn_mask)
+            updates, _ = self.attn(
+                self.norm1(x),
+                self.norm1(x),
+                self.norm1(x),
+                key_padding_mask=padding_mask,
+                attn_mask=attn_mask,
+                # Every caller discards the attention matrix.  Suppressing it
+                # avoids materializing the large B x H x L x L tensor and lets
+                # PyTorch select its memory-efficient attention kernels.
+                need_weights=False,
+            )
 
         if self.layer_scale_flag:
             # Input updates: torch.Size([B, P, 128]), mask: torch.Size([B, P])
@@ -263,7 +271,13 @@ class ClassifierTransformerBlockModule(nn.Module):
         query = class_token.unsqueeze(1)  # Only use the class token as query
 
         padding_mask = ~(mask.squeeze(2).bool()) if mask is not None else None
-        updates, _ = self.attn(query, x1, x1, key_padding_mask=padding_mask)  # [batch_size, 1, projection_dim]
+        updates, _ = self.attn(
+            query,
+            x1,
+            x1,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )  # [batch_size, 1, projection_dim]
         updates = self.norm2(updates)
 
         x2 = updates + query
@@ -318,7 +332,15 @@ class GeneratorTransformerBlockModule(nn.Module):
             attn_mask = attn_mask.expand(batch_size, self.num_heads, tgt_len, src_len)
             attn_mask = attn_mask.reshape(batch_size * self.num_heads, tgt_len, src_len)
 
-        updates, _ = self.attn(x1, x1, x1, key_padding_mask=padding_mask, attn_mask=attn_mask)
+        updates, _ = self.attn(
+            x1,
+            x1,
+            x1,
+            key_padding_mask=padding_mask,
+            attn_mask=attn_mask,
+            # EventGenerationHead never consumes attention weights.
+            need_weights=False,
+        )
 
         if self.layer_scale_flag:
             updates = self.layer_scale1(updates, mask)
@@ -381,18 +403,26 @@ class SegmentationTransformerBlockModule(nn.Module):
         """
 
         q = k = self.with_pos_embed(tgt, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
+        tgt2 = self.self_attn(
+            q,
+            k,
+            value=tgt,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False,
+        )[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         tgt2 = self.multihead_attn(
             query=self.with_pos_embed(tgt, query_pos),
             key=self.with_pos_embed(memory, pos),
             value=memory, attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask)[0]
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.mlp(tgt)
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
-

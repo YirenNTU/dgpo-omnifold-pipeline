@@ -73,6 +73,41 @@ class TestResolveCheckpointPath(unittest.TestCase):
             self.assertEqual(mu.resolve_checkpoint_path(cfg, None), checkpoint.resolve())
 
 
+class TestCheckpointWeightSource(unittest.TestCase):
+    def _load(self, *, replace, dgpo_checkpoint=False, training=True, live=True):
+        config = types.SimpleNamespace(options=types.SimpleNamespace(
+            Training={"EMA": {"enable": True, "replace_model_after_load": replace}},
+        ))
+        model = torch.nn.Linear(1, 1, bias=False)
+        checkpoint = {"ema_state_dict": {"model.weight": torch.tensor([[9.0]])}}
+        if live:
+            checkpoint["state_dict"] = {"model.weight": torch.tensor([[2.0]])}
+        if dgpo_checkpoint:
+            checkpoint["dgpo_checkpoint_version"] = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pretrain.ckpt"
+            torch.save(checkpoint, path)
+            mu.load_weights_like_configure_model(
+                model, path, torch.device("cpu"), config, for_dgpo_training=training,
+            )
+        return model.weight.detach().item()
+
+    def test_live_pretrain_selected_for_policy_and_classifier(self):
+        for training in (True, False):
+            with self.subTest(training=training):
+                self.assertEqual(self._load(replace=False, training=training), 2.0)
+
+    def test_dgpo_resume_always_restores_live_state(self):
+        self.assertEqual(self._load(replace=True, dgpo_checkpoint=True), 2.0)
+
+    def test_other_configs_can_still_explicitly_select_ema(self):
+        self.assertEqual(self._load(replace=True), 9.0)
+
+    def test_missing_live_state_does_not_silently_fall_back_to_ema(self):
+        with self.assertRaises(KeyError):
+            self._load(replace=False, live=False)
+
+
 class TestSelectDgpoTrainingState(unittest.TestCase):
     def test_resume_preserves_full_checkpoint_state(self) -> None:
         checkpoint = {"global_step": 100, "dgpo_optimizer_state_dict": {}}
@@ -90,6 +125,237 @@ class TestSelectDgpoTrainingState(unittest.TestCase):
     def test_unknown_mode_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "checkpoint_load_mode"):
             mu.select_dgpo_training_state({}, load_mode="freshish")
+
+
+class TestResolveDgpoAutoResumeCheckpoint(unittest.TestCase):
+    def test_disabled_does_not_require_save_directory(self) -> None:
+        self.assertIsNone(
+            mu.resolve_dgpo_auto_resume_checkpoint(None, enabled=False)
+        )
+
+    def test_enabled_requires_save_directory(self) -> None:
+        with self.assertRaisesRegex(ValueError, "model_checkpoint_save_path"):
+            mu.resolve_dgpo_auto_resume_checkpoint(None, enabled=True)
+
+    def test_fresh_run_has_no_auto_resume_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                mu.resolve_dgpo_auto_resume_checkpoint(tmp, enabled=True)
+            )
+
+    def test_saved_last_checkpoint_is_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = root / "dgpo-epoch=-1-next_ep=0-step=0.ckpt"
+            snapshot.write_bytes(b"complete omnifold state")
+            (root / "last.ckpt").symlink_to(snapshot.name)
+            self.assertEqual(
+                mu.resolve_dgpo_auto_resume_checkpoint(root, enabled=True),
+                snapshot.resolve(),
+            )
+
+    def test_fallback_bootstrap_checkpoint_starts_a_new_output_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            new_output = root / "trust05"
+            bootstrap = root / "trust01" / "dgpo-epoch=-1-next_ep=0-step=0.ckpt"
+            bootstrap.parent.mkdir()
+            bootstrap.write_bytes(b"omnifold bootstrap")
+            self.assertEqual(
+                mu.resolve_dgpo_auto_resume_checkpoint(
+                    new_output,
+                    enabled=True,
+                    fallback_checkpoint_path=bootstrap,
+                ),
+                bootstrap.resolve(),
+            )
+
+    def test_new_branch_last_takes_precedence_over_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            new_output = root / "trust05"
+            new_output.mkdir()
+            new_last = new_output / "last.ckpt"
+            new_last.write_bytes(b"new branch")
+            fallback = root / "trust01.ckpt"
+            fallback.write_bytes(b"old branch")
+            self.assertEqual(
+                mu.resolve_dgpo_auto_resume_checkpoint(
+                    new_output,
+                    enabled=True,
+                    fallback_checkpoint_path=fallback,
+                ),
+                new_last.resolve(),
+            )
+
+    def test_missing_explicit_fallback_fails_instead_of_retraining(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(FileNotFoundError, "fallback checkpoint"):
+                mu.resolve_dgpo_auto_resume_checkpoint(
+                    Path(tmp) / "new-output",
+                    enabled=True,
+                    fallback_checkpoint_path=Path(tmp) / "missing.ckpt",
+                )
+
+
+class TestBestRawAucResume(unittest.TestCase):
+    @staticmethod
+    def _row(epoch, gap, *, saturated=1.0):
+        return dict(epoch=float(epoch), global_step=float((epoch + 1) * 10),
+                    raw_auc_gap=gap, raw_audit_saturated=saturated)
+
+    def _snapshot(self, root, epoch, history, *, legacy=False, step=None, next_epoch=None):
+        step = (epoch + 1) * 10 if step is None else step
+        next_epoch = epoch + 1 if next_epoch is None else next_epoch
+        path = root / mu.dgpo_snapshot_checkpoint_name(
+            last_completed_epoch=epoch, dgpo_next_epoch=next_epoch, global_step=step,
+        )
+        payload = dict(
+            state_dict={"policy": torch.tensor([float(epoch)])},
+            epoch=epoch, global_step=step, dgpo_next_epoch=next_epoch,
+            dgpo_epoch_step=step % 10 if next_epoch == epoch else 0,
+            dgpo_checkpoint_version=1, dgpo_optimizer_state_dict={},
+            dgpo_ref_state_dict={}, dgpo_round_ref_state_dict={},
+            dgpo_round_ref_sha256="test", dgpo_omnifold_reward_metadata={},
+            dgpo_omnifold_reward_stack={},
+            dgpo_adaptive_omnifold_state={"probe_history": history},
+        )
+        torch.save(payload, path, _use_new_zipfile_serialization=not legacy)
+        return path
+
+    def test_best_from_history_not_last_or_current_round_best(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            best = self._snapshot(root, 0, [self._row(0, 0.12)])
+            history = [self._row(0, 0.12), self._row(1, 0.2), self._row(2, 0.18)]
+            last = self._snapshot(root, 2, history)
+            (root / "last.ckpt").symlink_to(last.name)
+            before = {p.name: p.read_bytes() for p in root.iterdir()}
+            result = mu.resolve_dgpo_auto_resume_checkpoint(
+                root / "new", enabled=True, best_source_checkpoint_dir=root,
+            )
+            self.assertEqual(result, best.resolve())
+            self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, before)
+            restored = torch.load(result, weights_only=False)
+            self.assertEqual(restored["dgpo_next_epoch"], 1)
+
+    def test_invalid_unsaturated_and_tied_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            best = self._snapshot(root, 1, [self._row(1, 0.15)])
+            history = [self._row(1, 0.15), self._row(2, 0.15),
+                       self._row(3, 0.01, saturated=0.0),
+                       self._row(4, float("nan")), self._row(5, -0.01),
+                       self._row(6, 0.7), {}, None]
+            last = self._snapshot(root, 6, history)
+            (root / "last.ckpt").symlink_to(last.name)
+            self.assertEqual(mu.resolve_best_raw_auc_checkpoint(root), best.resolve())
+
+    def test_own_last_has_priority_without_parent_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            last = root / "last.ckpt"
+            last.touch()
+            self.assertEqual(mu.resolve_dgpo_auto_resume_checkpoint(
+                root, enabled=True, best_source_checkpoint_dir=root / "missing-parent",
+            ), last.resolve())
+
+    def test_missing_source_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(FileNotFoundError, "best-source last"):
+                mu.resolve_dgpo_auto_resume_checkpoint(
+                    root / "new", enabled=True, best_source_checkpoint_dir=root,
+                )
+
+    def test_missing_best_does_not_choose_runner_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            last = self._snapshot(root, 1, [self._row(0, 0.1), self._row(1, 0.2)])
+            (root / "last.ckpt").symlink_to(last.name)
+            with self.assertRaisesRegex(FileNotFoundError, "recorded best.*missing"):
+                mu.resolve_best_raw_auc_checkpoint(root)
+
+    def test_no_eligible_records_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            last = self._snapshot(root, 0, [self._row(0, 0.1, saturated=0)])
+            (root / "last.ckpt").symlink_to(last.name)
+            with self.assertRaisesRegex(ValueError, "no completed saturated"):
+                mu.resolve_best_raw_auc_checkpoint(root)
+
+    def test_incomplete_best_fails_closed(self):
+        for missing in ("dgpo_optimizer_state_dict", "dgpo_round_ref_state_dict",
+                        "dgpo_omnifold_reward_stack", "dgpo_omnifold_reward_metadata"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                best = self._snapshot(root, 0, [self._row(0, 0.1)])
+                (root / "last.ckpt").symlink_to(best.name)
+                payload = torch.load(best, weights_only=False)
+                del payload[missing]
+                torch.save(payload, best)
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    mu.resolve_best_raw_auc_checkpoint(root)
+
+    def test_epoch_step_and_score_must_match(self):
+        for kind in ("epoch", "global_step", "dgpo_next_epoch", "score"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                best = self._snapshot(root, 0, [self._row(0, 0.1)])
+                last = self._snapshot(root, 1, [self._row(0, 0.1), self._row(1, 0.2)])
+                (root / "last.ckpt").symlink_to(last.name)
+                payload = torch.load(best, weights_only=False)
+                if kind == "score":
+                    payload["dgpo_adaptive_omnifold_state"]["probe_history"][0]["raw_auc_gap"] = 0.3
+                else:
+                    payload[kind] = 123
+                torch.save(payload, best)
+                with self.assertRaisesRegex(ValueError, "mismatch|corroborate"):
+                    mu.resolve_best_raw_auc_checkpoint(root)
+
+    def test_legacy_non_mmap_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            best = self._snapshot(root, 0, [self._row(0, 0.1)], legacy=True)
+            (root / "last.ckpt").symlink_to(best.name)
+            self.assertEqual(mu.resolve_best_raw_auc_checkpoint(root), best.resolve())
+
+    def test_initial_baseline_is_a_recoverable_best_point(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            best = self._snapshot(root, -1, [self._row(-1, 0.1)])
+            last = self._snapshot(root, 0, [self._row(-1, 0.1), self._row(0, 0.2)])
+            (root / "last.ckpt").symlink_to(last.name)
+            self.assertEqual(mu.resolve_best_raw_auc_checkpoint(root), best.resolve())
+
+    def test_mid_epoch_best_is_selected_with_correct_resume_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            row = {"epoch": 0, "global_step": 5, "checkpoint_next_epoch": 0,
+                   "raw_auc_gap": 0.1, "raw_audit_saturated": 1}
+            best = self._snapshot(root, 0, [row], step=5, next_epoch=0)
+            last = self._snapshot(root, 0, [row, self._row(0, 0.2)])
+            (root / "last.ckpt").symlink_to(last.name)
+            self.assertEqual(mu.resolve_best_raw_auc_checkpoint(root), best.resolve())
+            payload = torch.load(best, weights_only=False)
+            self.assertEqual(payload["dgpo_epoch_step"], 5)
+            del payload["dgpo_epoch_step"]
+            torch.save(payload, best)
+            with self.assertRaisesRegex(ValueError, "within-epoch progress"):
+                mu.resolve_best_raw_auc_checkpoint(root)
+
+    def test_same_output_or_conflicting_fallback_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "separate output"):
+                mu.resolve_dgpo_auto_resume_checkpoint(
+                    root, enabled=True, best_source_checkpoint_dir=root,
+                )
+            with self.assertRaisesRegex(ValueError, "either best-source"):
+                mu.resolve_dgpo_auto_resume_checkpoint(
+                    root / "new", enabled=True, best_source_checkpoint_dir=root,
+                    fallback_checkpoint_path=root / "fallback.ckpt",
+                )
 
 
 class TestDgpoSnapshotCheckpoint(unittest.TestCase):
@@ -189,6 +455,40 @@ class TestGenerationUsesEmaShadow(unittest.TestCase):
             )
         )
         self.assertIsNotNone(mu.make_ema_rollout(torch.nn.Linear(2, 2), config))
+
+
+class _DummyNeutrinoPolicy(torch.nn.Module):
+    def __init__(self, *, dropout: float) -> None:
+        super().__init__()
+        self.GroupedSequentialEmbedding = torch.nn.Sequential(
+            torch.nn.Linear(2, 2), torch.nn.Dropout(dropout)
+        )
+        self.GlobalEmbedding = torch.nn.Sequential(
+            torch.nn.Linear(2, 2), torch.nn.Dropout(dropout)
+        )
+        self.PET = torch.nn.ModuleDict(
+            {
+                "attention": torch.nn.MultiheadAttention(
+                    2, 1, dropout=dropout, batch_first=True
+                )
+            }
+        )
+        self.TruthGeneration = torch.nn.Sequential(
+            torch.nn.Linear(2, 2), torch.nn.Dropout(dropout)
+        )
+
+
+class TestDeterministicDgpoPolicyGuard(unittest.TestCase):
+    def test_accepts_zero_dropout_policy(self) -> None:
+        mu.assert_dgpo_neutrino_policy_deterministic(
+            _DummyNeutrinoPolicy(dropout=0.0)
+        )
+
+    def test_rejects_train_mode_policy_dropout(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "stochastic layers remain"):
+            mu.assert_dgpo_neutrino_policy_deterministic(
+                _DummyNeutrinoPolicy(dropout=0.1)
+            )
 
 
 class TestFamoStateDictInjection(unittest.TestCase):

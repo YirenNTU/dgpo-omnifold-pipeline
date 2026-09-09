@@ -1,0 +1,92 @@
+# Clean V11 overlay for the stationary fixed-reference experiment.
+#
+# Apply this file on top of
+# config/dgpo_omnifold_ztautau_fourier_pair_nohardtrust_ablation.yaml with
+# scripts/train_neutrino_backend.py.  The merged runtime config keeps the V10
+# classifier architecture/data protocol and the exact V6 epoch-54 anchor, but
+# removes the retired hard-boundary / signed-probe experiment surface.
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_v11_fixedpair_vppathkl_momentumreset_audit100k/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend dgpo-evenet
+      --base-config config/dgpo_omnifold_ztautau_fourier_pair_nohardtrust_ablation.yaml
+      --overlay-config config/dgpo_omnifold_ztautau_fixed_pair_vp_path_kl.yaml
+      --
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_v11_fixedpair_vppathkl_momentumreset_audit100k/ray_results
+
+logger:
+  wandb:
+    run_name: dgpo_omnifold_5pct_epoch54_v11_fixedpair_vppathkl_momentumreset_audit100k
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - OmniFoldReward
+      - FixedRewardReferencePair
+      - VPPathKL
+      - Coefficient1
+      - AdamFirstMomentReset
+      - FixedRawAuditPanel
+      - EveryEpochRawAUCAudit
+      - FourierTopologyEmbedding
+      - TrainableGroupedSequentialEmbedding
+      - RawAudit100k
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_v11_fixedpair_vppathkl_momentumreset_audit100k/logs
+    name: dgpo_omnifold_5pct_epoch54_v11_fixedpair_vppathkl_momentumreset_audit100k
+    version: v11_fixedpair_vppathkl_momentumreset_audit100k
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_5pct_epoch54_v11_fixedpair_vppathkl_momentumreset_audit100k/checkpoints
+
+dgpo:
+  # DGPO and VP path-KL keep two current-policy graphs until the accumulated
+  # backward. Halving only the gradient-bearing event microbatch keeps peak
+  # memory near the prior one-forward 256-event setting; the full B=1024
+  # objective and one AdamW update per batch are unchanged.
+  policy_eval_event_microbatch_size: 128
+
+  reference_trust:
+    enabled: true
+    coefficient: 1.0
+    # The backward trust term is the cosine-VP reverse-path KL estimator.  It
+    # uses a separate full-range importance-sampled time/noise forward, so the
+    # DGPO velocity surrogate retains its original uniform t in [0, 0.7].
+    objective: vp_path_kl
+    vp_path_kl:
+      diagnostic: false
+      logsnr_min: -20.0
+      logsnr_max: 20.0
+    # Explicit null replaces V10's inert hard-boundary/radius/sign subtree in
+    # the materialized runtime YAML.
+    adaptive_boundary: null
+
+  adaptive_omnifold:
+    # One startup refit below installs a matched pair.  Routine audits only log;
+    # no weighted-staleness classifier/controller or refit runs afterward.
+    log_only: true
+    monitor_mode: raw_only
+    baseline_probe_on_start: false
+    fixed_audit_panel: true
+    staleness_every_n_epochs: 1
+    trigger:
+      raw_audit_enabled: true
+      max_reward_age_epochs: null
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: true
+      refit_once_fail_closed: true
+      refit_once_id: internal_adapter_groupseq_unfrozen_fourierpair_v11_fixedpair_vppathkl_momentumreset
+      # The reward is intended to estimate the untempered log(q/p_ref), matching
+      # the coefficient-one KL identity in the population limit.
+      tempering: 1.0
+      # A newly installed objective must not inherit the preceding round's
+      # Adam direction. Preserve exp_avg_sq, step count, scheduler, and LR.
+      reset_adam_first_moment_on_install: true
+
+  projection_constraint:
+    type: none

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from unittest import mock
 
 from RL.DGPO_neutrino.diagnostics.ztautau_validation import (
     build_ztautau_validation_metrics,
@@ -121,3 +122,21 @@ def test_metrics_are_explicitly_opt_in() -> None:
         metrics_config={},
         include_images=False,
     ) == {}
+
+
+def test_image_allowlist_avoids_rendering_unused_plots_without_changing_scalars():
+    from RL.DGPO_neutrino.diagnostics import ztautau_validation as module
+    arrays = {
+        f"{name}/{label}": np.linspace(-1, 1, 30)
+        for name in ("topology/cos_opening", "target/tau_a_delta_theta")
+        for label in ("truth", "current", "ref")
+    }
+    with mock.patch.object(module, "_overlay_image", return_value="image") as render:
+        metrics = build_ztautau_validation_metrics(
+            arrays, val_k=1, tarp_config={"enabled": False},
+            metrics_config={"enabled": True, "image_observables": ["topology/cos_opening"]},
+        )
+    render.assert_called_once()
+    assert "val_ztautau/topology/cos_opening" in metrics
+    assert "val_ztautau/target/tau_a_delta_theta" not in metrics
+    assert "val_ztautau/jsd/current/target/tau_a_delta_theta" in metrics

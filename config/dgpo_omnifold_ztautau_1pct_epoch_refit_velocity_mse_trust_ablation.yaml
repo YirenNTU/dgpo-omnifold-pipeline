@@ -1,0 +1,356 @@
+# 1% ablation versus o6z0z5ch. Merge with train_diffusion_nersc.yaml.
+# Load live epoch-172 diffusion pretrain weights directly; train a fresh stack.
+# Coefficient-one velocity-MSE penalty; shrink the hard radius on new global raw bests.
+# Monitor raw distribution every 5 updates; after 5 consecutive misses, refit
+# OmniFold on the restored round-best policy with warm-start iterations 1/2.
+# Warm-start the separate raw classifier too. Full 1% pool with internal 80/20 split.
+# Start at step zero; never restore the old Fourier stack into this changed architecture.
+
+nersc:
+  reproducibility:
+    diffusion_pretrain_fraction: 0.01
+    dgpo_training_fraction: 0.01
+    classifier_backbone_protocol: matched_1pct_pretrain
+    note: '1% ablation: live epoch-172 diffusion pretrain initialization, fresh classifier stack and clocks; velocity-MSE coefficient 1;
+      velocity-ratio radius starts at 0.1, target x0.9 per saturated new global raw best to floor 0.02, feasibility protected;
+      reward dropout 0.15; raw check every 5 steps, patience 5, restore round-best policy then refit; DGPO warmup 20 updates from 0.1;
+      warm-start OmniFold iterations 1/2 and raw monitor; no classifier trust.'
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_1pct_v26_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/ray_results
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_omnifold_ztautau_1pct_epoch_refit_velocity_mse_trust_ablation.yaml -- --ray-dir
+      /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_1pct_v26_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/ray_results
+platform:
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_1pct_seed42/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_1pct_seed42/train
+  batch_size: 512
+  number_of_workers: 16
+  resources_per_worker:
+    CPU: 15
+    GPU: 1
+logger:
+  wandb:
+    profile: critical
+    simplified: true
+    resume: never
+    project: nu2flow-RL
+    entity: ytchou97-university-of-washington
+    run_name: dgpo_omnifold_1pct_v26_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42
+    tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - OmniFoldReward
+    - ScalingLawAllData1pct
+    - PretrainLiveStateDict
+    - BootstrapPolicyWeightsOnly
+    - FreshCleanOmniFoldStack
+    - NoTopologyFeatures
+    - ClassifierDecoder128
+    - Control-o6z0z5ch
+    - RawPlateauPatience5
+    - HardVelocityRatioTrust50Decay08
+    - NoClassifierTrust
+    - RefitLatestPolicy
+    - NoBestPolicyRollback
+    - VelocityMSESurrogate
+    - Coefficient1
+    - OmniFoldWarmStartIterations12
+    - RawMonitorEvery5Steps
+    - RawMonitorWarmStart
+    - RawMonitorFull1pct
+    - NoAcceptanceAudit
+    - CheckpointEveryEpoch
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_1pct_v26_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/logs
+    name: dgpo_omnifold_1pct_v26_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42
+    version: v26_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_1pct_seed42
+options:
+  Dataset:
+    dataset_limit: 1.0
+    val_dataset_limit: 1.0
+  Training:
+    total_epochs: 150
+    epochs: 150
+    weight_decay: 0.001
+    decoupled_weight_decay: true
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_1pct_seed42/checkpoints/epoch=172_train=0.2060_val=0.1993.ckpt
+    pretrain_model_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_1pct_v26_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/checkpoints
+    model_checkpoint_save_top_k: 0
+    Components:
+      InvisibleInputProjector:
+        weight_decay: 0.001
+      GroupedSequentialEmbedding:
+        weight_decay: 0.001
+      GlobalEmbedding:
+        weight_decay: 0.001
+      PET:
+        weight_decay: 0.001
+      TruthGeneration:
+        weight_decay: 0.001
+      ObjectEncoder:
+        freeze:
+          type: full
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+    EMA:
+      replace_model_after_load: false
+      use_for_generation: false
+network:
+  Body:
+    GroupedSequentialEmbedding:
+      dropout: 0.0
+    GlobalEmbedding:
+      dropout: 0.0
+    PET:
+      feature_drop: 0.0
+      dropout: 0.0
+      drop_probability: 0.0
+  TruthGeneration:
+    feature_drop: 0.0
+    dropout: 0.0
+    drop_probability: 0.0
+rl:
+  enabled: true
+reward_config:
+  type: omnifold
+  weight: 1.0
+  omnifold:
+    bootstrap_in_dgpo: true
+    bundle_file: null
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_1pct_seed42/checkpoints/epoch=172_train=0.2060_val=0.1993.ckpt
+ztautau_domain:
+  enabled: true
+  feature_names:
+  - theta
+  - phi
+  token_sources:
+    event_token: event_token
+    object_token: object_token
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1.0
+    target_delta_phi_to_pi: 0.0
+dgpo:
+  auto_resume_from_last: false
+  auto_resume_best_source_checkpoint_dir: null
+  best_source_start_new_experiment: false
+  auto_resume_fallback_checkpoint_path: null
+  checkpoint_load_mode: weights_only
+  require_deterministic_policy: true
+  float32_matmul_precision: medium
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  beta: 1.0
+  beta_kl: 0.0
+  adv_clip_max: null
+  grad_clip_norm: 1.0
+  num_ddim_steps: 20
+  num_train_timesteps: 8
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  activation_checkpointing: true
+  policy_eval_event_microbatch_size: 128
+  policy_eval_parallel_timesteps: 1
+  rollout_parallel_chains: 4
+  # Match the original 5% velocity-MSE backward path; the split VP graph is incompatible.
+  sequential_vp_trust_backward: false
+  steps_per_epoch: 10
+  log_every: 1
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 1
+  reference_trust:
+    enabled: true
+    coefficient: 1.0
+    # Legacy loss = 0.5 * masked mean squared policy-reference velocity difference.
+    objective: velocity_mse
+    adaptive_boundary:
+      enabled: true
+      # Test radius in velocity-MSE / reference-denoising-loss units, NOT VP-KL.
+      radius_mode: best_decay
+      distance: velocity_mse_ratio
+      delta_max: 0.1
+      delta_floor: 0.02
+      best_decay_factor: 0.9
+      warning_fraction: 0.9
+      # Complete AdamW reset is selected in recalibration below.
+      reset_adam_first_moment_on_install: false
+      reset_adam_first_moment_on_zero_step: false
+      enforcement: post_step_backtracking
+      backtrack_factor: 0.5
+      max_backtracks: 8
+      probe_events_per_rank: 128
+      fixed_probe_per_reward_round: true
+      interior_fraction: 1.0
+      radius_calibration:
+        enabled: false
+        bidirectional: false
+        allow_expansion: false
+        cross_round_nonexpanding: false
+        scale_policy_lr: false
+        refit_on_exhaustion: false
+        round_acceptance_enabled: false
+        trajectory_search_enabled: false
+        signed_direction_probe:
+          enabled: false
+          recover_reverse_only: false
+        lookahead_extragradient:
+          enabled: false
+  variance_regularization:
+    enabled: false
+    weight: 0.0
+    features: null
+  projection_constraint:
+    type: none
+  validation_K: 16
+  validation_num_ddim_steps: 20
+  validation_batch_size: 512
+  validation_every_n_epochs: 1
+  validation_full_every_n_epochs: 1
+  validation_max_batches: 15
+  validation_compute_winrate: false
+  validation_log_batches: true
+  validation_rollout_parallel_chains: 8
+  train_dist_enabled: false
+  ztautau_metrics:
+    enabled: true
+    candidate_index: 0
+    bins: 60
+    log_images: true
+    image_observables:
+    - topology/cos_opening
+    - topology/delta_phi_to_pi
+  tarp:
+    enabled: true
+    profile: visible_acoplanarity
+    n_bins: 4
+    min_events: 500
+    arms:
+    - full
+    - rank_copula
+    n_null_assignments: 399
+    n_reference_trials: 8
+    seed: 20260820
+    alpha: 0.05
+    pooled_panel: true
+  adaptive_omnifold:
+    enabled: true
+    log_only: false
+    monitor_mode: raw_plateau_refit
+    single_pool_train_validation: true
+    single_pool_split_seed: 42
+    baseline_probe_on_start: false
+    fixed_audit_panel: true
+    pool_generation_batch_size: 1024
+    staleness_every_n_epochs: 1
+    staleness_every_n_steps: 5
+    trigger:
+      raw_audit_enabled: true
+      warm_start_classifier: true
+      raw_improvement_min_delta: 0.0
+      # Do not force an epoch refit before the five-check patience can fire.
+      max_reward_age_epochs: null
+      required_consecutive_checks: 5
+      rollback_to_best_on_plateau: true
+      retrain_cooldown_epochs: 0
+      require_audit_saturation: true
+      power_alpha: 0.05
+      power_target: 0.8
+      probe_seed: 20260905
+      probe_max_events: null
+    classifier_trust:
+      enabled: false
+      probe_max_events: null
+    audit_fit:
+      # Keep the raw monitor fixed while regularizing only the reward fit.
+      head_dropout: 0.15
+      batch_size: 8192
+      train_microbatch_size_per_rank: 512
+      drop_last_batch: true
+      learning_rate: 0.0002
+      weight_decay: 0.0005
+      gradient_clip_norm: 5.0
+      sampling: independent_epoch_shuffle
+      safety_max_epochs: null
+      min_steps: 0
+      min_epochs: 1
+      validation_interval_epochs: 1.0
+      validation_patience_epochs: 10.0
+      validation_min_delta: 0.0001
+      validation_batch_size: 2048
+      progress_every_n_steps: 10
+      restore_best: true
+      require_saturation: false
+    recalibration:
+      # Reset exp_avg, exp_avg_sq and Adam step counters after every accepted round.
+      # Keep policy weights, LR schedule and weight-decay settings unchanged.
+      reset_optimizer_state_on_install: true
+      # Multiply scheduled DGPO group LRs; never classifier LRs.
+      policy_warmup_steps: 20
+      policy_warmup_start_factor: 0.1
+      # Reuse matching folds from the last installed round; later iterations fit fresh.
+      # Transfer weights only, never DGPO or previous classifier optimizer state.
+      warm_start_iterations:
+      - 1
+      - 2
+      candidates_per_event: 1
+      bootstrap_on_start: true
+      bootstrap_fail_closed: true
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      refit_once_id: ''
+      pool_events: null
+      score_pool_events: null
+      pool_selection_seed: 42
+      min_iterations: 1
+      max_iterations: 10
+      acceptance_audit_enabled: false
+      acceptance_max_balanced_accuracy: 0.51
+      topology_acceptance_audit_enabled: false
+      topology_acceptance_max_auc_gap: 0.005
+      topology_acceptance_repeats: 1
+      periodic_pair_features: false
+      topology_fourier_embedding: false
+      tempering: 1.0
+      crossfit_folds: 2
+      # Saturated held-out residual AUC <= 0.52 is a closure/no-op.
+      residual_min_auc_gain: 0.02
+      seed: 20260906
+      score_row_budget: 2048
+      adapter_bottleneck: 16
+      train_layernorm: false
+      train_encoder: false
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+      train_backbone: false
+      asymmetric_attention: true
+      decoder_hidden_dim: 128
+      decoder_layers: 1
+      decoder_heads: 4
+      head_dropout: 0.15
+      fit:
+        # 256 events/rank on 16 GPUs, approximately one quarter of the
+        # previous small-pool-capped global batch of 16576.
+        batch_size: 4096
+        train_microbatch_size_per_rank: 256
+        drop_last_batch: true
+        learning_rate: 0.0002
+        backbone_learning_rate: 1.0e-05
+        weight_decay: 0.0005
+        gradient_clip_norm: 5.0
+        sampling: independent_epoch_shuffle
+        safety_max_epochs: null
+        min_steps: 1
+        min_epochs: 1
+        validation_interval_epochs: 1.0
+        validation_patience_epochs: 25.0
+        validation_min_delta: 0.0001
+        validation_batch_size: 2048
+        progress_every_n_steps: 10
+        restore_best: true
+        require_saturation: true

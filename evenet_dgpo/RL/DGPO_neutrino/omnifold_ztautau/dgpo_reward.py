@@ -296,6 +296,11 @@ class ZtautauOmniFoldReward(BaseReward):
                 adapter_bottleneck=int(
                     saved_classifier_config["adapter_bottleneck"]
                 ),
+                train_grouped_sequential_embedding=bool(
+                    saved_classifier_config.get(
+                        "train_grouped_sequential_embedding", False
+                    )
+                ),
                 # Legacy reward stacks did not train/save this projector. Keep
                 # their exact frozen-body semantics during restore so their
                 # integrity digest remains stable; newly fitted stacks persist
@@ -312,6 +317,31 @@ class ZtautauOmniFoldReward(BaseReward):
                 # New fits persist ``False`` and use full self-attention.
                 asymmetric_attention=bool(
                     saved_classifier_config.get("asymmetric_attention", True)
+                ),
+                periodic_pair_features=bool(
+                    saved_classifier_config.get("periodic_pair_features", False)
+                ),
+                topology_fourier_embedding=bool(
+                    saved_classifier_config.get("topology_fourier_embedding", False)
+                ),
+                topology_conditioning=bool(saved_classifier_config.get("topology_conditioning", False)),
+                topology_max_harmonic=int(
+                    saved_classifier_config.get("topology_max_harmonic", 1)
+                ),
+                topology_include_theta_pair=bool(
+                    saved_classifier_config.get("topology_include_theta_pair", False)
+                ),
+                topology_hidden_dim=int(
+                    saved_classifier_config.get("topology_hidden_dim", 64)
+                ),
+                topology_embedding_dim=int(
+                    saved_classifier_config.get("topology_embedding_dim", 32)
+                ),
+                topology_fusion_hidden_dim=int(
+                    saved_classifier_config.get("topology_fusion_hidden_dim", 64)
+                ),
+                topology_dropout=float(
+                    saved_classifier_config.get("topology_dropout", 0.15)
                 ),
             )
 
@@ -413,6 +443,11 @@ def build_uninstalled_ztautau_omnifold_reward(
         adapter_bottleneck=int(classifier_config.get("adapter_bottleneck", 16)),
         train_layernorm=bool(classifier_config.get("train_layernorm", False)),
         train_encoder=bool(classifier_config.get("train_encoder", False)),
+        train_grouped_sequential_embedding=bool(
+            classifier_config.get(
+                "train_grouped_sequential_embedding", False
+            )
+        ),
         train_invisible_projector=bool(
             classifier_config.get("train_invisible_projector", False)
         ),
@@ -420,6 +455,27 @@ def build_uninstalled_ztautau_omnifold_reward(
         asymmetric_attention=bool(
             classifier_config.get("asymmetric_attention", False)
         ),
+        periodic_pair_features=bool(
+            classifier_config.get("periodic_pair_features", False)
+        ),
+        topology_fourier_embedding=bool(
+            classifier_config.get("topology_fourier_embedding", False)
+        ),
+        topology_conditioning=bool(classifier_config.get("topology_conditioning", False)),
+        topology_max_harmonic=int(
+            classifier_config.get("topology_max_harmonic", 1)
+        ),
+        topology_include_theta_pair=bool(
+            classifier_config.get("topology_include_theta_pair", False)
+        ),
+        topology_hidden_dim=int(classifier_config.get("topology_hidden_dim", 64)),
+        topology_embedding_dim=int(
+            classifier_config.get("topology_embedding_dim", 32)
+        ),
+        topology_fusion_hidden_dim=int(
+            classifier_config.get("topology_fusion_hidden_dim", 64)
+        ),
+        topology_dropout=float(classifier_config.get("topology_dropout", 0.15)),
         head_dropout=float(classifier_config.get("head_dropout", 0.1)),
         decoder_hidden_dim=int(classifier_config.get("decoder_hidden_dim", 256)),
         decoder_layers=int(classifier_config.get("decoder_layers", 2)),
@@ -513,6 +569,11 @@ def load_ztautau_omnifold_reward(
         adapter_bottleneck=int(classifier_cfg["adapter_bottleneck"]),
         train_layernorm=bool(classifier_cfg.get("train_layernorm", False)),
         train_encoder=bool(classifier_cfg.get("train_encoder", False)),
+        train_grouped_sequential_embedding=bool(
+            classifier_cfg.get(
+                "train_grouped_sequential_embedding", False
+            )
+        ),
         train_invisible_projector=bool(
             classifier_cfg.get("train_invisible_projector", False)
         ),
@@ -521,6 +582,25 @@ def load_ztautau_omnifold_reward(
         asymmetric_attention=bool(
             classifier_cfg.get("asymmetric_attention", True)
         ),
+        periodic_pair_features=bool(
+            classifier_cfg.get("periodic_pair_features", False)
+        ),
+        topology_fourier_embedding=bool(
+            classifier_cfg.get("topology_fourier_embedding", False)
+        ),
+        topology_conditioning=bool(classifier_cfg.get("topology_conditioning", False)),
+        topology_max_harmonic=int(classifier_cfg.get("topology_max_harmonic", 1)),
+        topology_include_theta_pair=bool(
+            classifier_cfg.get("topology_include_theta_pair", False)
+        ),
+        topology_hidden_dim=int(classifier_cfg.get("topology_hidden_dim", 64)),
+        topology_embedding_dim=int(
+            classifier_cfg.get("topology_embedding_dim", 32)
+        ),
+        topology_fusion_hidden_dim=int(
+            classifier_cfg.get("topology_fusion_hidden_dim", 64)
+        ),
+        topology_dropout=float(classifier_cfg.get("topology_dropout", 0.15)),
         head_dropout=float(classifier_cfg["head_dropout"]),
         decoder_hidden_dim=int(classifier_cfg["decoder_hidden_dim"]),
         decoder_layers=int(classifier_cfg["decoder_layers"]),

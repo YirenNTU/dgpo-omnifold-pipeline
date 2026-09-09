@@ -1,0 +1,396 @@
+# Full-pretrain OmniFold-guided DGPO convergence experiment.
+#
+# Merge this overlay onto config/train_diffusion_nersc.yaml. Its first v15 launch
+# branches from v14's accepted OmniFold bootstrap at DGPO epoch 0; later launches
+# auto-resume v15's complete DGPO/OmniFold checkpoint. It reads the
+# pre-materialized seed-42 40% dataset for both DGPO and OmniFold fitting, while
+# leaving validation uncapped. There are
+# no candidate-acceptance or
+# topology-audit classifiers: only a fresh truth-vs-current raw monitor and a
+# current-vs-round-reference trust monitor are trained every five logical epochs.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fullpretrain_40pct_rawplateau_vpkl_v15_pairpool_b512_trust05_check5_val15/ray_results
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_omnifold_ztautau_fullpretrain_40pct_raw_plateau_vpkl.yaml
+      --
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fullpretrain_40pct_rawplateau_vpkl_v15_pairpool_b512_trust05_check5_val15/ray_results
+
+platform:
+  # This is already the materialized seed-42 40% training dataset. Do not
+  # apply another fractional limit below.
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_post_training_40pct/train
+  data_parquet_val_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/val-diffusion
+  # DGPO expands each event by K candidates and eight policy-evaluation
+  # timesteps.
+  batch_size: 512
+  number_of_workers: 16
+  resources_per_worker:
+    CPU: 15
+    GPU: 1
+
+logger:
+  wandb:
+    project: nu2flow-RL
+    entity: ytchou97-university-of-washington
+    run_name: dgpo_omnifold_fullpretrain_40pct_rawplateau_vpkl_v15_pairpool_b512_trust05_check5_val15
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - OmniFoldReward
+      - FullDatasetPretrain
+      - DGPOTrain40pct
+      - OmniFoldTrain40pct
+      - OmniFoldFullValidation
+      - AutoResumeOmniFoldCheckpoint
+      - RawAUCPlateau2
+      - ClassifierTrustTV05
+      - VPPathKL
+      - DeterministicDGPOPolicy
+      - NoPolicyDropout
+      - SequentialVPTrustBackward
+      - PairedCommonNoiseTrustPool
+      - NoAttentionWeights
+      - FrozenUnusedObjectEncoder
+      - LivePolicyRollout
+      - DGPOBatch512
+      - FixedTrustRadius05
+      - StalenessMonitorEvery5Epochs
+      - Coefficient1
+      - Tempering1
+      - FourierTopologyEmbedding
+      - TrainableGroupedSequentialEmbedding
+      - TrainableInvisibleProjector
+      - ClassifierLR2e4
+      - FoldLocalBatch2048
+      - ClassifierScoreBatch2048
+      - DGPOValidation15RoundsPerRank
+      - NoMicrobatchAccumulation
+      - ClassifierGradClip5
+      - ClassifierFiniteGuard
+      - NoAcceptanceAudit
+      - NoRollback
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fullpretrain_40pct_rawplateau_vpkl_v15_pairpool_b512_trust05_check5_val15/logs
+    name: dgpo_omnifold_fullpretrain_40pct_rawplateau_vpkl_v15_pairpool_b512_trust05_check5_val15
+    version: v15_pairpool_b512_trust05_check5_val15
+
+options:
+  Dataset:
+    # The input directory is already 40%; 1.0 prevents an accidental second
+    # cut that would leave only 16% of the original corpus.
+    dataset_limit: 1.0
+    # Do not cap the separate validation directory.
+    val_dataset_limit: 1.0
+  Training:
+    total_epochs: 150
+    epochs: 150
+    # Ultimate weights-only fallback for configurations without a recovery
+    # branch. This v15 overlay requires the explicit v14 bootstrap checkpoint
+    # below, then prefers its own last.ckpt after the first v15 save.
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
+    pretrain_model_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fullpretrain_40pct_rawplateau_vpkl_v15_pairpool_b512_trust05_check5_val15/checkpoints
+    model_checkpoint_save_top_k: 0
+    # The neutrino forward never calls ObjectEncoder. Freezing it keeps this
+    # unreachable 4.76M-parameter subtree out of EMA and trust snapshots.
+    Components:
+      ObjectEncoder:
+        freeze:
+          type: full
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+    EMA:
+      # Keep the checkpoint/save EMA, but DGPO rollouts must come from the live
+      # policy paired with the installed OmniFold reward. This also avoids a
+      # second GPU-resident EMA shadow.
+      use_for_generation: false
+
+# The current DGPO policy runs in train mode while its frozen reference runs in
+# eval mode. Keep every stochastic layer on the neutrino diffusion path off so
+# equal parameters give exactly equal shared-noise velocity predictions.
+network:
+  Body:
+    GroupedSequentialEmbedding:
+      dropout: 0.0
+    GlobalEmbedding:
+      dropout: 0.0
+    PET:
+      feature_drop: 0.0
+      dropout: 0.0
+      drop_probability: 0.0
+  TruthGeneration:
+    feature_drop: 0.0
+    dropout: 0.0
+    drop_probability: 0.0
+
+rl:
+  enabled: true
+
+reward_config:
+  type: omnifold
+  weight: 1.0
+  omnifold:
+    bootstrap_in_dgpo: true
+    bundle_file: null
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_v1/checkpoints/last.ckpt
+
+ztautau_domain:
+  enabled: true
+  feature_names: [theta, phi]
+  token_sources:
+    event_token: event_token
+    object_token: object_token
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1.0
+    target_delta_phi_to_pi: 0.0
+
+dgpo:
+  # First v15 launch branches from v14 immediately after the accepted OmniFold
+  # bootstrap (next_epoch=0), so DGPO restarts at its first epoch without
+  # fitting OmniFold again. Later v15 launches prefer their own last.ckpt.
+  auto_resume_from_last: true
+  auto_resume_fallback_checkpoint_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_fullpretrain_40pct_rawplateau_vpkl_v14_pairpool_b512_trust01_val15/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+  checkpoint_load_mode: weights_only
+  # Shared-noise DGPO and VP path-KL require the train-mode current policy to
+  # be deterministic. Startup fails closed if any policy-path dropout remains.
+  require_deterministic_policy: true
+  float32_matmul_precision: medium
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  beta: 1.0
+  beta_kl: 0.0
+  adv_clip_max: null
+  grad_clip_norm: 1.0
+  num_ddim_steps: 20
+  num_train_timesteps: 8
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  activation_checkpointing: true
+  # VP path-KL adds a second gradient-bearing policy graph.
+  policy_eval_event_microbatch_size: 128
+  policy_eval_parallel_timesteps: 1
+  # Keep the no-grad rollout peak at 4 * 512 = 2048 rows after doubling B.
+  rollout_parallel_chains: 4
+  sequential_vp_trust_backward: true
+  steps_per_epoch: 10
+  log_every: 1
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 5
+
+  reference_trust:
+    enabled: true
+    # Keep the coefficient-one DGPO/OmniFold objective identity.
+    coefficient: 1.0
+    objective: vp_path_kl
+    vp_path_kl:
+      diagnostic: false
+      logsnr_min: -20.0
+      logsnr_max: 20.0
+    adaptive_boundary:
+      enabled: true
+      # This radius never grows or shrinks with a classifier observation.
+      radius_mode: fixed
+      distance: vp_path_kl
+      # A true D_KL <= 0.05 nats/event would imply
+      # TV <= sqrt(0.05 / 2) ~= 0.158 by Pinsker. The enforced value is a
+      # finite fixed-probe VP path-KL estimate, so the epoch-level classifier
+      # gate remains the empirical distribution-level guard.
+      delta_max: 0.05
+      delta_floor: 0.05
+      initial_raw_auc_gap: null
+      warning_fraction: 0.9
+      adaptive_power: 2.0
+      auc_confidence_z: 1.96
+      auc_stop_gap: 0.005
+      reset_adam_first_moment_on_install: true
+      reset_adam_first_moment_on_zero_step: false
+      enforcement: post_step_backtracking
+      backtrack_factor: 0.5
+      max_backtracks: 16
+      probe_events_per_rank: 256
+      fixed_probe_per_reward_round: true
+      interior_fraction: 1.0
+      radius_calibration:
+        enabled: false
+        bidirectional: false
+        allow_expansion: false
+        cross_round_nonexpanding: false
+        scale_policy_lr: false
+        refit_on_exhaustion: false
+        round_acceptance_enabled: false
+        trajectory_search_enabled: false
+        signed_direction_probe:
+          enabled: false
+          recover_reverse_only: false
+          scales: [0.25, 0.5, 1.0]
+        lookahead_extragradient:
+          enabled: false
+          scale: 0.5
+
+  variance_regularization:
+    enabled: false
+    weight: 0.0
+    features: null
+  projection_constraint:
+    type: none
+
+  validation_K: 16
+  validation_num_ddim_steps: 20
+  validation_batch_size: 512
+  validation_every_n_epochs: 1
+  validation_full_every_n_epochs: 1
+  # Per rank: 15 * 16 GPUs * 512 events = 122,880 validation events.
+  validation_max_batches: 15
+  validation_compute_winrate: false
+  validation_log_batches: true
+  validation_rollout_parallel_chains: 8
+  train_dist_enabled: false
+  ztautau_metrics:
+    enabled: true
+    candidate_index: 0
+    bins: 60
+    log_images: true
+  tarp:
+    enabled: true
+    profile: visible_acoplanarity
+    n_bins: 4
+    min_events: 500
+    arms: [full, rank_copula]
+    n_null_assignments: 399
+    n_reference_trials: 8
+    seed: 20260820
+    alpha: 0.05
+    pooled_panel: true
+
+  adaptive_omnifold:
+    enabled: true
+    log_only: false
+    monitor_mode: raw_plateau_refit
+    baseline_probe_on_start: false
+    fixed_audit_panel: true
+    pool_generation_batch_size: 1024
+    # One logical epoch is ten optimizer updates; fit the two fresh monitors
+    # only every five epochs so policy training is not dominated by audits.
+    staleness_every_n_epochs: 5
+    trigger:
+      raw_audit_enabled: true
+      raw_improvement_min_delta: 0.0
+      max_reward_age_epochs: null
+      required_consecutive_epochs: 2
+      retrain_cooldown_epochs: 0
+      require_audit_saturation: true
+      power_alpha: 0.05
+      power_target: 0.8
+      probe_seed: 20260905
+      # null means the complete validation population.
+      probe_max_events: null
+    classifier_trust:
+      enabled: true
+      # Ideal equal-prior BA=0.525 corresponds to TV=0.05.
+      max_balanced_accuracy: 0.525
+      confidence_z: 1.96
+      required_consecutive_epochs: 1
+      require_saturation: true
+    audit_fit:
+      batch_size: 8192
+      train_microbatch_size_per_rank: 512
+      drop_last_batch: true
+      learning_rate: 0.0002
+      weight_decay: 0.0005
+      gradient_clip_norm: 5.0
+      sampling: independent_epoch_shuffle
+      safety_max_epochs: null
+      min_steps: 0
+      min_epochs: 1
+      validation_interval_epochs: 1.0
+      validation_patience_epochs: 10.0
+      validation_min_delta: 0.0001
+      # This is a per-rank row budget. Keep inference at the proven local
+      # training batch size so post-fit scoring cannot allocate a 65k PET pass.
+      validation_batch_size: 2048
+      progress_every_n_steps: 10
+      restore_best: true
+      require_saturation: false
+    recalibration:
+      candidates_per_event: 1
+      bootstrap_on_start: true
+      bootstrap_fail_closed: true
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      refit_once_id: fullpretrain_40pct_rawplateau_vpkl_v15_pairpool_b512_trust05_check5_val15
+      # No independent train_parquet_dir override: bootstrap/refits reuse the
+      # configured pre-materialized 40% DGPO training dataset.
+      pool_events: null
+      # Residual closure and raw monitoring both use full validation.
+      score_pool_events: null
+      pool_selection_seed: 42
+      min_iterations: 1
+      max_iterations: 10
+      # No independent acceptance/topology audit after residual closure.
+      acceptance_audit_enabled: false
+      acceptance_max_balanced_accuracy: 0.51
+      topology_acceptance_audit_enabled: false
+      topology_acceptance_max_auc_gap: 0.005
+      topology_acceptance_repeats: 1
+      periodic_pair_features: true
+      topology_fourier_embedding: true
+      topology_max_harmonic: 4
+      topology_include_theta_pair: true
+      topology_hidden_dim: 64
+      topology_embedding_dim: 32
+      topology_fusion_hidden_dim: 64
+      topology_dropout: 0.25
+      # Untempered density ratio: reward estimates log(q/p_round).
+      tempering: 1.0
+      crossfit_folds: 2
+      # Stop after the first saturated residual no-op with AUC <= 0.505.
+      residual_min_auc_gain: 0.005
+      seed: 20260906
+      # All installed-reward scoring is also chunked at 2048 rows per rank.
+      score_row_budget: 2048
+      adapter_bottleneck: 16
+      train_layernorm: false
+      train_encoder: false
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+      train_backbone: false
+      asymmetric_attention: true
+      decoder_hidden_dim: 192
+      decoder_layers: 2
+      decoder_heads: 4
+      head_dropout: 0.25
+      fit:
+        # One optimizer update per forward: 16 GPUs * 2048 events/GPU/class.
+        batch_size: 32768
+        train_microbatch_size_per_rank: 2048
+        drop_last_batch: true
+        # GroupedSequentialEmbedding and InvisibleInputProjector share this LR.
+        learning_rate: 0.0002
+        backbone_learning_rate: 0.00001
+        weight_decay: 0.0005
+        gradient_clip_norm: 5.0
+        sampling: independent_epoch_shuffle
+        safety_max_epochs: null
+        # Required-saturation fits must complete at least one optimizer step
+        # before validation-patience stopping can certify convergence.
+        min_steps: 1
+        min_epochs: 1
+        validation_interval_epochs: 1.0
+        validation_patience_epochs: 10.0
+        validation_min_delta: 0.0001
+        # OOF and validation scoring use this per rank; 65536 OOMs after fit.
+        validation_batch_size: 2048
+        progress_every_n_steps: 10
+        restore_best: true
+        require_saturation: true

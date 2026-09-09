@@ -1,0 +1,15 @@
+# Fixed seed-42 10% sample of the full Ztautau diffusion training population.
+# Validation uses the independent subset_ztautau_validation_20pct.yaml.
+source:
+  data_parquet_dir: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/train-diffusion
+
+output:
+  train_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_10pct_seed42/train
+  val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_10pct_seed42/_val_unused
+  copy_sidecars: true
+
+subset:
+  fraction: 0.10
+  val_split: [1.0, 1.0]
+  seed: 42
+  shuffle: true
