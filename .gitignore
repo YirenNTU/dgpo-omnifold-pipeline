@@ -5,3 +5,6 @@ __pycache__/
 wandb/
 ray_results/
 *.ckpt
+
+# Python virtual environment (Cloud Agent dev setup)
+.venv/
