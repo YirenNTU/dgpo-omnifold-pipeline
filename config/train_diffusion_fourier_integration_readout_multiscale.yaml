@@ -1,0 +1,11 @@
+extends_overlay: train_diffusion_fourier_integration_readout_k4.yaml
+experiment:
+  intervention: noisy_token_fourier_cross_attention_multiscale
+logger:
+  wandb:
+    run_name: "Multiscale Fourier readout | noisy tokens | harmonics 1,2,4,8"
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        harmonics: [1, 2, 4, 8]

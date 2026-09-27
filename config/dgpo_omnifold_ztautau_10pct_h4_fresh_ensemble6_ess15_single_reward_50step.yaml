@@ -1,0 +1,66 @@
+# Six-member reward-ensemble ablation paired to h4e50r01.
+#
+# This overlay preserves the single 50-update reward lifetime and changes only
+# the number of independent cross-fit repeats from two to three:
+# 3 repeats x 2 folds = 6 reward members.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_ess15_single_reward_50step.yaml
+
+experiment:
+  protocol: h4-fresh-ensemble6-ess15-single-reward-50step-v1
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4e50r01
+  single_experimental_change: reward_ensemble_members_4_to_6
+  ensemble_seeds: 3
+  crossfit_folds: 2
+
+nersc:
+  reproducibility:
+    note: >-
+      Paired ensemble-size ablation to h4e50r01 from the same c4a91e07
+      step-1110 weights. The single fifty-update reward lifetime, ESS15
+      adaptive tempering, policy LR, endpoint, validation cadence, and absence
+      of hard trust/rollback are unchanged. Only cross-fit repeats increase
+      from two to three, producing six fresh initial reward members.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble6_ess15_single_reward_50step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_fresh_ensemble_pilot.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble6_ess15_single_reward_50step.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_ensemble6_ess15_single_reward_50step_v1
+    version: h4_ensemble6_ess15_single_reward_50step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble6_ess15_single_reward_50step_v1/logs
+  wandb:
+    id: h4e50m6
+    run_name: c4a91e07_h4_ensemble6_ess15_single_reward_50step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - PairedControlH4e50r01
+      - Fixed50StepEndpoint
+      - SingleRewardRound
+      - FiftyUpdatesPerReward
+      - NoIntermediateRewardReset
+      - NoIntermediateAdamReset
+      - H4NonlinearFourier
+      - ThreeSeedsTwoFolds
+      - SixMemberRewardEnsemble
+      - AdaptiveTempering
+      - ESSTarget15pct
+      - SoftESSNoRejection
+      - NoHardTrust
+      - NoRollback
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble6_ess15_single_reward_50step_v1/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    recalibration:
+      crossfit_repeats: 3

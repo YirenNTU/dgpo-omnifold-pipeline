@@ -65,6 +65,22 @@ Logged every optimizer step: `reward/monitor/best_of_k`, `median`, `mean_gap`, `
 | `train/loss/kl` | Legacy supervised diffusion anchor. It is zero in the active OmniFold overlay (`beta_kl: 0`). |
 | `train/loss/L_cur` / `L_ref` / `delta` | Current vs reference velocity MSE diagnostics. |
 
+## `parameter_update_rms_calibration/` — exact global AdamW step scale
+
+| Key | Description |
+|-----|-------------|
+| `parameter_update_rms_calibration/enabled` | `1` when the native AdamW proposal is globally rescaled before EMA and scheduler advancement. |
+| `parameter_update_rms_calibration/target_rms` | Configured full-trainable-parameter RMS displacement. |
+| `parameter_update_rms_calibration/proposed_rms` | RMS displacement produced by native AdamW before calibration. |
+| `parameter_update_rms_calibration/applied_rms` | RMS displacement after applying the common scalar. |
+| `parameter_update_rms_calibration/scale` | `target_rms / proposed_rms`, equivalent to multiplying every optimizer-group LR by this value for the current proposal. |
+| `parameter_update_rms_calibration/relative_error` | Relative numerical error between applied and target RMS; the update fails closed when this exceeds the implementation tolerance. |
+
+The calibration preserves the AdamW direction, moments, weight-decay component,
+and relative parameter-group geometry. It is disabled when hard trust,
+post-AdamW projection, or extragradient is active so update ordering remains
+unambiguous.
+
 ## `reference_trust/` — paired round-reference anchor
 
 | Key | Description |
@@ -193,7 +209,7 @@ Logged per train step for both `all/*` rollout candidates and reward-selected `b
 
 ## `val/*` and `val_neutrino/*`
 
-End-of-epoch DDIM validation (`validation_K` candidates). `val/reward/mean` drives top-K checkpoint selection. `val_neutrino/*` overlays truth / current policy / frozen reference for neutrino kinematics (pT, η, φ, and p_x/p_y/p_z in GeV).
+End-of-epoch DDIM validation (`validation_K` candidates). The legacy `val/reward/mean` is the mean **best-of-K per event**, not an all-sample mean; it still drives top-K checkpoint selection. `val/reward/best_of_k_mean` is its explicit alias. Use `val/reward/all_sample_mean` for average reward uptake without candidate selection. All-sample sums/counts exclude padded events and are reduced across all ranks (not averages of rank means). The same keys exist under `val_cheap/`. Existing best-of-K quantiles/plots and checkpoint selection are unchanged; compare architecture arms at predeclared equal-step checkpoints, not reward-selected winners. `val_neutrino/*` overlays truth / current policy / frozen reference for neutrino kinematics (pT, η, φ, and p_x/p_y/p_z in GeV).
 
 When `dgpo.validation_compute_winrate: false`, no `val/winrate` scalar is
 computed or logged. The configured adaptive cadence reports a fresh raw
@@ -294,6 +310,27 @@ AUC/AUC gap when available, best validation loss, threshold-crossing state, and
 saturation state. The W&B chart step is
 `omnifold_live/log_index`; the physical classifier step remains
 `omnifold_live/meta/fit_step`.
+
+The raw `omnifold_live/*` series are hidden by default because they interleave
+independent folds, repeats, refits, and phases. With
+`logger.wandb.classifier_loss_curves: true`, the visible classifier view uses
+fixed custom charts:
+
+- `Classifier training/Reward/{Train loss, Validation loss, Validation AUC,
+  Validation accuracy, Learning rate}`
+- `Classifier training/Fresh audit/{Train loss, Validation loss, Validation AUC,
+  Validation accuracy, Learning rate}`
+
+Each chart overlays `Iteration 1`, `Iteration 2`, ... . Every line owns its
+local classifier optimizer-step vector; W&B `_step`, `global_step`,
+`omnifold_live/log_index`, and progress from other fits never enter its x-axis.
+Every iteration line uses only repeat 1 / fold 1, and its x values are the exact
+`step` values already published by that classifier callback. No synthetic
+counter or stage offset is added. Update steps from every other member are
+ignored by the visible chart. The chart title records the DGPO step, and a new
+refit replaces the in-memory chart contents under the same fixed W&B key. Set
+`logger.wandb.classifier_loss_curves_raw: true` only when every member needs its
+own legacy `classifier_fit/*` panel for debugging.
 
 ## Config knobs
 

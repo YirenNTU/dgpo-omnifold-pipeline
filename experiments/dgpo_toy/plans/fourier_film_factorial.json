@@ -1,0 +1,52 @@
+{
+  "round": 19,
+  "kind": "rl",
+  "question": "Does Fourier specifically amplify the reward-transfer benefit of multiplicative FiLM?",
+  "run_name": "Do Fourier and FiLM cooperate? | fixed H4 | missing raw shift control",
+  "conditioning": {
+    "raw_shift": {
+      "basis": "raw",
+      "modulation": "shift",
+      "nonlinear": true,
+      "normalization": true,
+      "layers": 3,
+      "width": 32
+    }
+  },
+  "external_control": {
+    "directory": "artifacts/dgpo_toy/conditioning_closed_loop_20260926/round04",
+    "arm": "raw",
+    "changed_factor": "modulation"
+  },
+  "initialization_seed": 451017,
+  "policy_seed": 17,
+  "monitor_seed": 284017,
+  "panel_seed": 630093,
+  "classifier_seed": 93,
+  "audit_features": ["both"],
+  "minimum_fit_steps": 8000,
+  "max_fit_steps": 32000,
+  "milestones": [25, 100, 300, 1000],
+  "bootstrap_repeats": 2000,
+  "primary_endpoint": "At1000, paired fixed-H4 reward interaction: (Fourier FiLM minus Fourier shift) minus (raw FiLM minus raw shift). Four simple effects accompany it in one simultaneous95 family. Re-score all four arms on the same16384 held-out IID contexts, one draw/context; no best-of-K.",
+  "decision_rule": "A material positive interaction requires simultaneous lower95>0.01; negative interaction upper95<-0.01. An interval wholly within[-0.01,0.01] supports only a small interaction at this margin. Otherwise unresolved, NOT no interaction. Simple effects use the same material margin. No AUC=.5 requirement; fresh audits and joint metrics diagnose what changed. Undertrained audits cannot establish closure. Stop after1000 and summarize before another experiment.",
+  "factorial": {
+    "output": "artifacts/dgpo_toy/fourier_film_factorial_v1",
+    "bootstrap_seed": 831093,
+    "material_reward_margin": 0.01,
+    "sources": {
+      "raw_film": {"directory": "artifacts/dgpo_toy/conditioning_closed_loop_20260926/round04", "arm": "raw"},
+      "fourier_shift": {"directory": "artifacts/dgpo_toy/conditioning_closed_loop_20260926/round07", "arm": "shift"},
+      "fourier_film": {"directory": "artifacts/dgpo_toy/conditioning_closed_loop_20260926/round04", "arm": "fourier"}
+    }
+  },
+  "fixed_conditions": {
+    "reward": "Same frozen full-truth H4 from reward_shape_failure_early1k_v1; no oracle, rescaling, refit or shape-matched target",
+    "reference": "Original uniform-cube pretrained diffusion; frozen",
+    "objective": "Unmodified native detached DGPO, unscaled LOO, coefficient1 times HALF velocity-MSE",
+    "optimizer": "AdamW1e-4 weight_decay.001 clip1; same sampling/RNG clocks across audit pauses; raw, never EMA",
+    "sampling": "Batch64 K8 M4 DDIM50, all1000 policy updates; one existing training seed",
+    "architecture": "Two-layer32-wide SiLU condition encoder, new-branch LayerNorm and three modulation sites. Raw repeats sqrt(3)*c in8 slots; Fourier uses1/2/4/8. Same nominal parameters, not equal active rank or capacity."
+  },
+  "scope": "Separately authorized follow-up19 to the completed18-round toy campaign; do not modify its ledger or paused automation. Train ONLY raw shift from step0, not by disabling heads on a trained FiLM endpoint. Reuse and verify three saved controls. Adaptive exploratory factorial completion: intervals condition on fitted models and reuse old evaluation data, not confirmation across seeds. Equal updates are not equal FLOPs or velocity distance. User launches locally; no production, remote jobs or uploads."
+}

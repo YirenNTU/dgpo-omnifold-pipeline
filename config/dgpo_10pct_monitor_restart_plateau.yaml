@@ -1,0 +1,32 @@
+# Reuse the verified old-architecture step260 pool; not latest-policy generation.
+replay_dir: /pscratch/sd/y/yiren/Ztautau/raw_monitor_replay_step260_old_vs_cold100_v1
+output_dir: /pscratch/sd/y/yiren/Ztautau/raw_monitor_restart_plateau_step260_v1
+workers: 16
+steps: 6000
+seed: 20268895
+seeds: [20268895, 20268896]
+minimum_updates: 1000
+validation_interval: 40
+patience_evaluations: 10
+batch_size: 32768
+microbatch_size: 2048
+score_batch_size: 2048
+learning_rate: 0.0002
+weight_decay: 0.0005
+gradient_clip_norm: 5.0
+evaluation_steps: [0, 6000]
+minimum_validation_events: 2000
+positive_control_auc_tolerance: 0.005
+wandb:
+  enabled: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: old_classifier_cold_vs_warm_plateau_step260
+  log_every_n_steps: 10
+limitations:
+  - Fixed step260 raw-monitor test; does not establish DGPO or scaling-law superiority.
+  - Same historical validation identities select checkpoints; not an untouched test.
+  - Plateau stopping is operational, not proof of a global optimum. Unsaturated caps are inconclusive.
+  - Reported wall time includes validation and logging, not pure compute time.
+  - Weight concentration alone does not establish ratio accuracy; no reward is installed.
+  - Cold resets trainable banks and input modules to pretrained initialization, not the frozen backbone.

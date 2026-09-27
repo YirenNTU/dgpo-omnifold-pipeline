@@ -1,0 +1,41 @@
+extends_overlay: dgpo_h4_classifier_path.yaml
+
+experiment:
+  protocol: h4-frozen-readout-capture-v1
+  diagnostic_parent_run: h4clfpath1
+  intervention: export_detached_fixed_panels_only
+  single_question: Can a linear BCE head quickly read the early frozen Fourier encoder representation?
+  primary_decision_rule: >-
+    Replay step-50 frozen encoder features with raw and fit-only-standardized
+    AdamW linear heads, against nested ridge on identical context splits.
+    Step 0 and 100 and raw Fourier are prespecified secondary controls.
+    Historical h4clf02 did not accelerate the plateau; do not repeat its raw
+    Fourier shortcut or infer a causal advantage from cross-run final AUC.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_capture/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_frozen_readout.py
+
+logger:
+  local:
+    name: h4_frozen_readout_capture
+    version: h4_frozen_readout_capture_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_capture/logs
+  wandb:
+    id: h4frzcap1
+    resume: never
+    run_name: Can early features be read directly? | H4 frozen panels | step-1110 capture
+    group: H4 frozen readout diagnosis
+    tags: [ClassifierOnly, NoPolicyUpdate, H4, SixteenGPU, FrozenReadout, CleanValidation]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_capture/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      representation_export_dir: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_capture/panels
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_capture/diagnostic_snapshots

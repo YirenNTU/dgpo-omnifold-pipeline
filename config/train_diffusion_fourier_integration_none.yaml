@@ -1,0 +1,11 @@
+extends_overlay: train_diffusion_fourier_integration_common.yaml
+experiment:
+  intervention: no_fourier
+logger:
+  wandb:
+    run_name: "No Fourier control | pretrained diffusion | full backbone tuning"
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        enabled: false

@@ -1,0 +1,99 @@
+# Joint intervention requested by user: policy angular conditioning + theta H4.
+# New weights-only run, not a resume of an endpoint-KL trajectory.
+extends_overlay: dgpo_endpoint_kl_10pct.yaml
+
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        enabled: true
+        theta_source: Part_eta
+        phi_source: Part_phi
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_angular_conditioning_1110/checkpoints
+    EMA:
+      use_for_generation: false
+      replace_model_after_load: false
+      use_ema_during_training_eval: false
+
+dgpo:
+  endpoint_kl:
+    enabled: false
+  reference_trust:
+    enabled: true
+    coefficient: 1.0
+    objective: velocity_mse
+    adaptive_boundary:
+      enabled: false
+  checkpoint_load_mode: weights_only
+  auto_resume_from_last: false
+  unbounded_training: true
+  validation_every_n_epochs: 10
+  validation_full_every_n_epochs: 10
+  adaptive_omnifold:
+    staleness_every_n_epochs: 5
+    audit_fit:
+      topology_theta_fourier: true
+      topology_include_theta_pair: false
+      topology_max_harmonic: 4
+    recalibration:
+      bootstrap_on_start: true
+      refit_once_on_resume: false
+      topology_theta_fourier: true
+      topology_include_theta_pair: false
+      topology_max_harmonic: 4
+
+logger:
+  local:
+    name: h4_angular_conditioning_1110
+    version: h4_angular_conditioning_1110_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_angular_conditioning_1110/logs
+  wandb:
+    id: h4angc1
+    resume: never
+    fresh_run: true
+    run_name: 'Can angular conditioning unlock DGPO? | theta-phi H4 | raw step 1110'
+    group: H4 angular conditioning
+    tags: [DGPO, VisibleAngularFourier, ThetaPhiH4, K4, RawWeights, VelocityMSE, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_angular_conditioning_1110/ray_results
+  reproducibility:
+    note: >-
+      Raw step1110 weights, fresh optimizer and newly fitted two-fold one-repeat
+      H4 reward. Zero-initialized observed-only angular projection in policy PET.
+      Classifier retains delta-phi Fourier and opening cosine, adds Fourier of
+      theta difference and sum at k=1..4. No truth-conditioned generator.
+      Velocity-MSE reference penalty coefficient 1; endpoint KL disabled.
+      No automatic total-step limit. Cold audits every five epochs; policy validation every ten epochs.
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_h4_angular_conditioning_1110.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_angular_conditioning_1110/ray_results
+
+experiment:
+  applied_reference_trust_coefficient: 1.0
+  protocol: h4-angular-conditioning-1110-v1
+  intervention: visible_policy_fourier_plus_candidate_theta_fourier
+  single_question: Does this combined representation change improve fixed-reward transfer?
+  primary_endpoint: frozen_classifier/ensemble/auc_gap
+  policy_updates_per_round: null
+  reward_lifetime_updates: null
+  cold_h4_audit_policy_steps: null
+  gradient_direction_policy_steps: null
+  endpoint_selection: unbounded_trajectory
+  stop_rule: No step or epoch limit; user stops manually or at walltime.
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_angular_conditioning_1110/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+  primary_decision_rule: >-
+    Track held-out fixed-reward improvement relative to this run's own step zero,
+    reward dispersion, gradient transfer, and separately cold-audit BCE/AUC and
+    ESS. Fits retain minimum 300 and cap 3000 updates with ten-epoch BCE patience
+    and min_delta 0.001. Underfit or cap-limited audits are not proof of closure.
+    This changes policy and classifier representations together; historical H4
+    AUC is not an identical judge and cannot establish a conditioning-only effect.

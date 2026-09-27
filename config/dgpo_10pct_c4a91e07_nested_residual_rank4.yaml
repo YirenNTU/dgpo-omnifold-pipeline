@@ -1,0 +1,152 @@
+base_config: config/train_diffusion_nersc.yaml
+overlay_config: config/dgpo_omnifold_ztautau_10pct_old_method_hard_dropout015.yaml
+source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+expected_policy_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/last.ckpt
+expected_policy_step: 1110
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_direct_rank4_h2_actionability_v1
+workers: 16
+cpus_per_worker: 2
+pool_events: null
+generation_batch_size: 1024
+score_batch_size: 32768
+generation_seed: 20260913
+partition_seed: 20260913
+partition_fractions:
+  reward_fit: 0.5
+  early_stop: 0.15
+  calibration: 0.1
+  judge_fit: 0.15
+  final_audit: 0.1
+training_seeds:
+- 20260913
+folds: 2
+fold_seed: 20260819
+classifier_fit:
+  steps: 3000
+  min_steps: 1000
+  batch_size: 16384
+  train_microbatch_size_per_rank: 1024
+  drop_last_batch: true
+  learning_rate: 0.0002
+  backbone_learning_rate: 0.0002
+  weight_decay: 0.0005
+  gradient_clip_norm: 5.0
+  sampling: independent_epoch_shuffle
+  validation_interval_steps: 25
+  validation_patience_evaluations: 40
+  validation_min_delta: 0.0001
+  validation_batch_size: 65536
+  progress_every_n_steps: 25
+  restore_best: true
+  checkpoint_selection_metric: loss
+  require_saturation: false
+  topology_warmup_steps: 0
+  topology_body_unfreeze_step: 0
+  topology_warmup_learning_rate: null
+classifier_trajectory:
+  balanced_accuracy_lcb_targets: []
+  confidence_z: 1.96
+  reward_arm: raw_loo
+conditional_residual_only: true
+judge_seed: 20261013
+K: 8
+raw_tempering: 0.75
+beta: 1.0
+candidate_seed: 20261113
+probe_selection_seed: 20261213
+signed_probe_events: 2048
+gradient_events: 1024
+gradient_blocks: 8
+gradient_timesteps: 4
+gradient_seed: 20261313
+event_gradient_events: 32
+policy_eval_t_min: 0.0
+policy_eval_t_max: 0.7
+signed_step_rms: 1.0e-05
+signed_rollout_seed: 20261413
+physics_bins: 60
+response_bins: 12
+response_bootstrap_replicates: 1000
+response_bootstrap_seed: 20261513
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h2r4direct
+  resume: never
+  name: Does rank-4 add useful signal? | direct H2 critic | fixed policy
+  group: Conditional H2 critic series
+  tags:
+  - NERSC
+  - Ztautau
+  - DGPO
+  - SourceC4a91e07Step1110
+  - NestedResidualCritic
+  - H2TopologyBasis
+  - H4Judge
+  - TwoFoldOneRepeat
+  - ExactRawLOO
+  - NoPolicyUpdate
+  - LiveWandb
+  - ConditionalResidualRank4
+  - ValidationLossSelection
+  - DirectResidualOnly
+  - FrozenZeroBase
+ray_run_name: c4a91e07-direct-rank4-h2-actionability-v1
+actionability_sweep:
+  stages:
+  - fully_trained
+  primary_stage: fully_trained
+  step_rms_values:
+  - 1.0e-06
+  - 3.0e-06
+  - 1.0e-05
+  - 3.0e-05
+  rollout_seeds:
+  - 20261701
+  - 20261702
+  - 20261703
+  - 20261704
+  - 20261705
+  - 20261706
+  - 20261707
+  - 20261708
+  minimum_plus_beats_zero_fraction: 0.75
+  minimum_plus_beats_minus_fraction: 1.0
+  bootstrap_seed: 20261801
+  bootstrap_replicates: 10000
+judge_classifier_overrides:
+  periodic_pair_features: true
+  topology_fourier_embedding: true
+  topology_conditioning: false
+  visible_pair_rest_frame: false
+  topology_max_harmonic: 4
+  topology_include_theta_pair: false
+  topology_direct_logit: false
+  conditional_residual_rank: 0
+reward_classifier_overrides:
+  periodic_pair_features: true
+  topology_fourier_embedding: false
+  topology_conditioning: false
+  visible_pair_rest_frame: false
+  topology_max_harmonic: 2
+  topology_include_theta_pair: false
+  topology_direct_logit: false
+  conditional_residual_rank: 4
+report_schema: c4a91e07-direct-conditional-h2-rank4-v1
+historical_actionability_reference:
+  source_policy_step: 1110
+  saturated_h4_runs:
+  - aqbszk1r
+  - qlhcslov
+  - h4grad01
+  ba55_h4_run: h4b55lr1
+  curriculum_gate_radius: 3.0e-05
+series_arm:
+  name: rank4
+  conditional_residual_rank: 4
+  matched_arms:
+  - old
+  - rank2
+  - rank4

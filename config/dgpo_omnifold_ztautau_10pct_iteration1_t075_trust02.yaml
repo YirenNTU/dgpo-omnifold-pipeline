@@ -1,0 +1,473 @@
+# Same as 9073ef9e except lambda=0.2, and reuse that run's installed OmniFold.
+# Source is 9073ef9e dgpo-epoch=-1-next_ep=0-step=0.ckpt (policy still f6b4ec46
+# step 260; round-1 Fourier stack at alpha=0.75). Do not load 9073ef9e last.ckpt
+# (step 30 drifted) and do not continue its origin-refit.
+# L = L_DGPO(alpha) + lambda ||v_theta - v_round_ref||^2. beta_kl stays 0.
+# Tempering 0.75; trust coefficient 0.2; min_delta 0.005; global-best rollback.
+# First launch pinned-inherits OmniFold and the raw monitor as-is.
+# Relaunch auto-resumes this last.ckpt.
+# Visible-pair rest-frame ablation; no tau-energy or tau-mass hypothesis.
+# Exact visible E,px,py,pz boost; compact 8-channel v3 context in BOTH classifiers.
+# Both classifiers use two width-128 decoder layers, four heads, dropout 0.15.
+# Staleness patience grows 8 -> 16 -> 16 -> 24 with persisted DGPO global_step.
+# Independent 10% Fourier ablation. f6b4ec46 verified step-260 live policy; clocks restart.
+# OmniFold and raw monitor come from 9073ef9e epoch=-1; later audits warm-start.
+nersc:
+  reproducibility:
+    diffusion_pretrain_fraction: 0.1
+    dgpo_training_fraction: 0.1
+    classifier_backbone_protocol: matched_10pct_pretrain
+    note: 'Architecture ablation Fourier plus visible-pair rest-frame conditioning:
+      exact visible-only boost, no tau energy/mass hypothesis; 8->64->32 independent encoder;
+      redundant boost/energy/beam-angle channels and validity flags removed, numerical guards retained;
+      raw-refit patience 8/16/16/24 at DGPO steps 0/100/300/600; classifier patience remains 10 data epochs;
+      iteration_one_only=true, no residual closure test; AUC>0.51 is the signal gate;
+      residual log-ratio coefficient 0.75 in both training weights and installed reward;
+      raw_improvement_min_delta=0.005; rollback_to_best_on_plateau=true;
+      reference_trust.coefficient=0.2; beta_kl=0; auto_resume_from_last on this output;
+      derived rest columns excluded from identity hashing to preserve Fourier-control folds;
+      live policy state_dict only from 9073ef9e dgpo-epoch=-1-next_ep=0-step=0.ckpt,
+      which is the f6b4ec46 step-260 policy plus the 9073ef9e installed OmniFold;
+      not 9073ef9e last.ckpt, not step 320 and not 122b9d84;
+      SHA256 matches the f6b4ec46_step260 replay backup;
+      pinned_classifier_restart reuses the installed OmniFold and raw monitor as-is;
+      bootstrap_on_start=false; no recertify or epoch-1 monitor baseline before DGPO;
+      fresh optimizer/clocks/global best; first policy update is step 1;
+      staleness uses the identical OmniFold architecture and packed inputs,
+      two width-128 decoder layers with four heads and dropout 0.15,
+      with separate weights/caches and certified cold167/warm5 epoch fitting
+      (cold >=1000 optimizer steps at 6 updates/epoch);
+      reward folds use cold minimum 1000 updates or warm minimum 10 actual fold data epochs;
+      both classifiers validate every 2 data epochs, with full final scoring;
+      only iteration 1 is fitted and inherits matching same-fold weights across refits;
+      trainable scope and learning rates remain unchanged: head, conditioning,
+      grouped sequential embedding, invisible projector and PET adapters at 2e-4,
+      conservative backbone parameter group at 1e-5; the pretrained main backbone stays frozen.
+      No staged fitting, output reset or extra residual freezing.
+      Each fit resets its classifier optimizer; each refit resets cumulative weights.
+      Raw monitor also inherits its
+      own complete same-architecture state after the first successful fit.
+      Fixed CPU event inputs with fixed identity splits; only training batches shuffle;
+      separate loss curves per classifier fit on local optimizer steps.
+      New t075_trust02_step260 output directory; imports 9073ef9e epoch=-1 OmniFold
+      stack and raw monitor, not its step-30 last.ckpt. Relaunch restores this run last.ckpt.'
+    source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/9073ef9e
+    source_dgpo_global_step: 260
+    source_epoch: 25
+    source_next_epoch: 26
+    source_classifier_wandb_run: ytchou97-university-of-washington/nu2flow-RL/9073ef9e
+    source_classifier_epoch: -1
+    source_classifier_next_epoch: 0
+    source_classifier_global_step: 0
+    control_overlay: config/dgpo_omnifold_ztautau_10pct_iteration1_only.yaml
+    diagnostic_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c3b347fe4eea
+    source_policy_sha256: dc66b775e474070c12aa9f3bc5f67436921fa1dd36d78202ac4f9ed75d376378
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_iteration1_t075_trust02_step260_seed42/ray_results
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: shifter python3 scripts/train_dgpo_iteration_one_tempered.py --config config/dgpo_omnifold_ztautau_10pct_iteration1_t075_trust02.yaml
+platform:
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  batch_size: 512
+  number_of_workers: 16
+  use_gpu: true
+  resources_per_worker:
+    CPU: 15
+    GPU: 1
+logger:
+  wandb:
+    profile: critical
+    classifier_loss_curves: true
+    simplified: true
+    resume: never
+    fresh_run: true
+    id: null
+    project: nu2flow-RL
+    entity: ytchou97-university-of-washington
+    run_name: dgpo_omnifold_10pct_iteration1_t075_trust02_step260_seed42
+    tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - ScalingLawAllData10pct
+    - ArchitectureAblation
+    - fourier_conditioning
+    - VisiblePairRestFrameV3Compact8
+    - RawPatienceSchedule8_16_16_24
+    - DGPOF6b4ec46Step260LiveStateDict
+    - FreshClockAndClassifiers
+    - FixedClassifierInputCache
+    - PerFitLossCurves
+    - OmniFoldWarmStartIteration1Base
+    - AllIterationsSameTrainableScopeAndLR
+    - IterationOneOnlyNoClosureClaim
+    - OOFAndValidationWeightConcentration
+    - ResidualTempering075
+    - ResidualFullIteration1WarmStart
+    - GlobalBestRollback
+    - TrustCoefficient02
+    - RawMinDelta005
+    - AutoResumeFromLast
+    - BetaKLZero
+    - GradientRefitLifecycle
+    - RawMonitorWarmStart
+    - RawMonitorSameArchitectureAndInputs
+    - Decoder128Layers2Heads4Dropout15
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_iteration1_t075_trust02_step260_seed42/logs
+    name: dgpo_omnifold_10pct_iteration1_t075_trust02_step260_seed42
+    version: i1_t075_trust02_d005_rollback_from_f6b4ec46_step260
+options:
+  Dataset:
+    dataset_limit: 1.0
+    val_dataset_limit: 1.0
+  Training:
+    total_epochs: 150
+    epochs: 150
+    weight_decay: 0.001
+    decoupled_weight_decay: true
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_iteration1_t075_trust05_step260_seed42/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+    pretrain_model_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_iteration1_t075_trust02_step260_seed42/checkpoints
+    model_checkpoint_save_top_k: 0
+    Components:
+      InvisibleInputProjector:
+        weight_decay: 0.001
+      GroupedSequentialEmbedding:
+        weight_decay: 0.001
+      GlobalEmbedding:
+        weight_decay: 0.001
+      PET:
+        weight_decay: 0.001
+      TruthGeneration:
+        weight_decay: 0.001
+      ObjectEncoder:
+        freeze:
+          type: full
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+    EMA:
+      replace_model_after_load: false
+      use_for_generation: false
+network:
+  Body:
+    GroupedSequentialEmbedding:
+      dropout: 0.0
+    GlobalEmbedding:
+      dropout: 0.0
+    PET:
+      feature_drop: 0.0
+      dropout: 0.0
+      drop_probability: 0.0
+  TruthGeneration:
+    feature_drop: 0.0
+    dropout: 0.0
+    drop_probability: 0.0
+rl:
+  enabled: true
+reward_config:
+  type: omnifold
+  weight: 1.0
+  omnifold:
+    bootstrap_in_dgpo: true
+    bundle_file: null
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+ztautau_domain:
+  enabled: true
+  feature_names:
+  - theta
+  - phi
+  token_sources:
+    event_token: event_token
+    object_token: object_token
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1.0
+    target_delta_phi_to_pi: 0.0
+dgpo:
+  auto_resume_from_last: true
+  auto_resume_best_source_checkpoint_dir: null
+  best_source_start_new_experiment: false
+  auto_resume_fallback_checkpoint_path: null
+  checkpoint_load_mode: resume
+  pinned_classifier_restart: true
+  global_best_checkpoint_search_dirs: []
+  lr_schedule:
+    type: cosine
+    total_steps: 1500
+    min_lr_ratio: 0.1
+  require_deterministic_policy: true
+  float32_matmul_precision: medium
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  beta: 1.0
+  beta_kl: 0.0
+  adv_clip_max: null
+  grad_clip_norm: 1.0
+  # Read-only policy-space gradients. Reuse the raw monitor validation split;
+  # no optimizer step, gradient surgery, rollback or refit decisions here.
+  gradient_conflict:
+    monitor_refit_lifecycle: true
+    enabled: true
+    every_n_steps: 10
+    blocks: 8
+    events_per_block: 512  # global: 32/GPU on 16 GPUs, 4096 total per check
+    event_microbatch_size: 32
+    seed: 20260910
+    confidence: 0.95
+    min_split_cosine: 0.1
+    norm_floor: 1.0e-12
+  num_ddim_steps: 20
+  num_train_timesteps: 8
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  activation_checkpointing: true
+  policy_eval_event_microbatch_size: 128
+  policy_eval_parallel_timesteps: 1
+  rollout_parallel_chains: 4
+  sequential_vp_trust_backward: false
+  steps_per_epoch: 10
+  log_every: 1
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 1
+  reference_trust:
+    enabled: true
+    coefficient: 0.2
+    objective: velocity_mse
+    adaptive_boundary:
+      enabled: true
+      radius_mode: best_decay
+      distance: velocity_mse_ratio
+      delta_max: 0.1
+      delta_floor: 0.02
+      best_decay_factor: 0.9
+      warning_fraction: 0.9
+      reset_adam_first_moment_on_install: false
+      reset_adam_first_moment_on_zero_step: false
+      enforcement: post_step_backtracking
+      backtrack_factor: 0.5
+      max_backtracks: 8
+      probe_events_per_rank: 128
+      fixed_probe_per_reward_round: true
+      interior_fraction: 1.0
+      radius_calibration:
+        enabled: false
+        bidirectional: false
+        allow_expansion: false
+        cross_round_nonexpanding: false
+        scale_policy_lr: false
+        refit_on_exhaustion: false
+        round_acceptance_enabled: false
+        trajectory_search_enabled: false
+        signed_direction_probe:
+          enabled: false
+          recover_reverse_only: false
+        lookahead_extragradient:
+          enabled: false
+  variance_regularization:
+    enabled: false
+    weight: 0.0
+    features: null
+  projection_constraint:
+    type: none
+  validation_K: 16
+  validation_num_ddim_steps: 20
+  validation_batch_size: 512
+  validation_every_n_epochs: 5
+  validation_full_every_n_epochs: 5
+  validation_max_batches: 15
+  validation_compute_winrate: false
+  validation_log_batches: true
+  validation_rollout_parallel_chains: 8
+  train_dist_enabled: false
+  ztautau_metrics:
+    enabled: true
+    candidate_index: 0
+    bins: 60
+    log_images: false
+    image_observables:
+    - topology/cos_opening
+    - topology/delta_phi_to_pi
+  tarp:
+    enabled: false
+    profile: visible_acoplanarity
+    n_bins: 4
+    min_events: 500
+    arms:
+    - full
+    - rank_copula
+    n_null_assignments: 399
+    n_reference_trials: 8
+    seed: 20260820
+    alpha: 0.05
+    pooled_panel: true
+  adaptive_omnifold:
+    enabled: true
+    log_only: false
+    monitor_mode: raw_plateau_refit
+    single_pool_train_validation: true
+    single_pool_split_seed: 42
+    baseline_probe_on_start: true
+    fixed_audit_panel: true
+    # Pin each rank's source event inputs/order once in CPU memory. Generated
+    # candidates still refresh with the policy; train/val IDs never swap roles.
+    cache_event_inputs: true
+    pool_generation_batch_size: 1024
+    staleness_every_n_epochs: 1
+    staleness_every_n_steps: 5
+    trigger:
+      raw_audit_enabled: true
+      warm_start_classifier: true
+      raw_improvement_min_delta: 0.005
+      best_scope: global
+      global_confirm_candidates: false
+      global_max_failed_rounds: 0  # Disabled: keep moving forward until training budget ends.
+      pause_patience_during_warmup: true
+      max_reward_age_epochs: null
+      required_consecutive_checks: 8
+      # Overrides the fixed fallback above. Counts valid non-improving checks,
+      # not classifier updates; every check is five DGPO training steps apart.
+      # Global step never rewinds. On plateau, restore the recorded global-best
+      # policy, then refit the reward on that restored policy.
+      patience_schedule:
+      - start_step: 0
+        required_consecutive_checks: 8
+      - start_step: 100
+        required_consecutive_checks: 16
+      - start_step: 300
+        required_consecutive_checks: 16
+      - start_step: 600
+        required_consecutive_checks: 24
+      rollback_to_best_on_plateau: true
+      retrain_cooldown_epochs: 0
+      require_audit_saturation: true
+      power_alpha: 0.05
+      power_target: 0.8
+      probe_seed: 20260905
+      probe_max_events: 250000
+    classifier_trust:
+      enabled: false
+      probe_max_events: null
+    audit_fit:
+      # Architecture lives ONLY in recalibration below: no audit architecture
+      # overrides. reset_audit_bank uses the SAME model builder/packing spec,
+      # including Fourier11 + visible-rest8 and every trainable component.
+      # Weights/caches remain separate. Batch sizes/training budgets may differ.
+      # Floors use actual training-fold events / global batch.
+      # Only a cache certified under this policy gets the shorter warm-start fit.
+      training_readiness:
+        # ~200k training events / 32768 global batch => 6 updates per epoch:
+        # later cold fits >=1002 updates; certified warm fits >=30 updates.
+        # Pinned inherit keeps 9073ef9e's already-fit monitor and does not
+        # recertify before the first DGPO update.
+        cold_start_min_epochs: 167
+        warm_start_min_epochs: 5
+      batch_size: 32768
+      train_microbatch_size_per_rank: 2048
+      drop_last_batch: true
+      # Drop only TRAIN tails after shuffling; validation evaluates every row.
+      learning_rate: 0.0002
+      weight_decay: 0.0005
+      gradient_clip_norm: 5.0
+      sampling: independent_epoch_shuffle
+      safety_max_epochs: null
+      min_steps: 0
+      min_epochs: 1
+      validation_interval_epochs: 2.0
+      validation_patience_epochs: 10.0
+      validation_min_delta: 0.0001
+      validation_batch_size: 2048
+      progress_every_n_steps: 10
+      restore_best: true
+      require_saturation: false
+    recalibration:
+      reset_optimizer_state_on_install: true
+      policy_warmup_steps: 10
+      policy_warmup_start_factor: 0.1
+      # Only iteration 1 inherits its same-fold checkpoint across refits.
+      # No iteration 2+. First stack starts fresh; subsequent refits inherit
+      # only the matching iteration-1 fold from this experiment.
+      # Only weights transfer; AdamW and cumulative log weights start fresh.
+      warm_start_iterations: [1]
+      warm_start_from_iteration_one: true
+      # Keep event identities in the same folds across warm-started refits.
+      crossfit_partition: identity
+      # Outer 80/20 uses single_pool_split_seed=42; crossfit seed is the fixed
+      # recalibration.seed below, never the changing refit initialization seed.
+      candidates_per_event: 1
+      bootstrap_on_start: false
+      bootstrap_fail_closed: true
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      refit_once_id: ''
+      pool_events: null
+      score_pool_events: null
+      pool_selection_seed: 42
+      min_iterations: 1
+      max_iterations: 1
+      iteration_one_only: true
+      acceptance_audit_enabled: false
+      acceptance_max_balanced_accuracy: 0.51
+      topology_acceptance_audit_enabled: false
+      topology_acceptance_max_auc_gap: 0.005
+      topology_acceptance_repeats: 1
+      periodic_pair_features: true
+      topology_fourier_embedding: true
+      tempering: 0.75
+      crossfit_folds: 2
+      residual_min_auc_gain: 0.01
+      # Signal gate only; no iteration-2 classifier and no closure schedule.
+      residual_closure_schedule: []
+      seed: 20260906
+      score_row_budget: 2048
+      adapter_bottleneck: 16
+      train_layernorm: false
+      train_encoder: false
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+      train_backbone: false
+      asymmetric_attention: true
+      decoder_hidden_dim: 128
+      decoder_layers: 2
+      decoder_heads: 4
+      head_dropout: 0.15
+      fit:
+        anomaly_detection_steps: 0
+        batch_size: 16384
+        train_microbatch_size_per_rank: 1024
+        drop_last_batch: true
+        learning_rate: 0.0002
+        # All iterations use the factory's iteration-1 trainable scope and LR.
+        # Later iterations inherit complete current iteration-1 same-fold weights,
+        # including output; no staged fit, extra freezing or lower residual LR.
+        later_iteration_train_mode: full
+        backbone_learning_rate: 1.0e-05
+        weight_decay: 0.0005
+        gradient_clip_norm: 5.0
+        sampling: independent_epoch_shuffle
+        safety_max_epochs: null
+        min_steps: 1
+        # Cold iteration-1 folds keep 1000 updates. Successful cross-round
+        # or current iteration-1 warm starts use 10 actual data epochs.
+        # These are minimum budgets, never hard caps; saturation is required.
+        min_steps_per_fold: 1000
+        warm_start_min_epochs_per_fold: 10
+        min_epochs: 1
+        validation_interval_epochs: 2.0
+        validation_patience_epochs: 10.0
+        validation_min_delta: 0.0001
+        validation_batch_size: 2048
+        progress_every_n_steps: 10
+        restore_best: true
+        require_saturation: true
+      topology_conditioning: true
+      visible_pair_rest_frame: true
+      topology_max_harmonic: 4
+      topology_include_theta_pair: true
+      topology_hidden_dim: 64
+      topology_embedding_dim: 32
+      topology_dropout: 0.15

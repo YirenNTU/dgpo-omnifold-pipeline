@@ -1,0 +1,63 @@
+# Angle + momentum/energy Fourier, complementary to the existing nonlinear FiLM.
+# The angle-only comparison remains dgpo_h4_visible_adaln.yaml.
+extends_overlay: dgpo_h4_visible_adaln.yaml
+
+network:
+  VisibleConditioning:
+    feature_mode: kinematics
+    numerical_features: [Part_energy, Part_pt]
+    # Radians per existing normalized unit, not applied to unscaled GeV.
+    numerical_frequencies: [0.25, 0.5, 1.0, 2.0]
+    # Inherited: observed eta -> theta, phi in radians, harmonics [1,2,3,4],
+    # nonlinear width64, and the same FiLM/AdaLN sites in both model heads.
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln/checkpoints
+
+logger:
+  local:
+    name: h4-kinematic-adaln
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln/logs
+  wandb:
+    id: h4kfilm1
+    run_name: "Do angle and momentum features help? | nonlinear FiLM | diffusion and H4 | raw weights"
+    group: H4 nonlinear visible conditioning
+    tags: [DGPO, VisibleKinematics, NumericalFourier, NonlinearAdaLN, RawWeights, VelocityMSE, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln/ray_results
+  reproducibility:
+    note: >-
+      Alternate to h4vadaln1: same raw diffang10lr5e4 checkpoint, depth, nonlinear
+      encoder width, FiLM sites, optimizer, loss and fit schedule. Add only
+      pre-projection normalized visible energy and pT values/Fourier to existing
+      observed theta/phi Fourier and pre-PET tokens. No auxiliary shower, ID,
+      count, global, truth or candidate Fourier in this new conditioning branch.
+      Original full conditioning and H4 candidate-pair features are retained.
+      Both diffusion and fresh reward/audit classifiers change, so this is a
+      combined representation test, not a diffusion-only causal attribution.
+      Raw weights only, never EMA; existing normalization remains unchanged.
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_h4_kinematic_adaln.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln/ray_results
+
+experiment:
+  protocol: h4-angle-momentum-nonlinear-film-v1
+  intervention: observed_angle_momentum_fourier_plus_existing_nonlinear_film
+  matched_configuration: config/dgpo_h4_visible_adaln.yaml
+  single_question: Does adding observed energy and pT encoding to angle Fourier improve DGPO transfer with nonlinear FiLM held fixed?
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+  primary_decision_rule: >-
+    Compare independently fitted held-out audit BCE and abs(AUC-0.5) at matched
+    policy epochs after best-validation-BCE selection with the same fit budget.
+    Check saturation rather than interpreting early chance AUC as closure.
+    Track installed-reward gain only within each fixed reward round alongside
+    reference velocity MSE, ESS and cheap conditioning RMS/gradient metrics.
+    Both policy and reward representations change; absolute reward across arms
+    is not a common ruler. More input columns add parameters, so improvement
+    supports this package, not isolated Fourier/nonlinearity/FiLM synergy.

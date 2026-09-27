@@ -1,0 +1,76 @@
+# Target-preserving decomposition of the existing production time expectation.
+reward_source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_reward_interface_v5
+gradient_source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_production_gradient_reproducibility_v1
+geometry_source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_block_natural_gradient_v1
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_low_noise_time_alignment_v1
+
+expected_reward_schema: c4a91e07-h4-reward-interface-v2
+expected_gradient_schema: c4a91e07-h4-production-gradient-reproducibility-v1
+expected_direction_schema: c4a91e07-h4-production-gradient-directions-v1
+expected_geometry_schema: c4a91e07-h4-block-natural-gradient-v1
+expected_source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+expected_gradient_wandb_id: h4grad01
+expected_policy_step: 1110
+
+workers: 16
+cpus_per_worker: 2
+events_per_worker: 512
+event_microbatch_size: 128
+K: 8
+beta: 1.0
+timesteps_per_band: 8
+time_bands:
+  - {name: low, min: 0.000, max: 0.175}
+  - {name: mid_low, min: 0.175, max: 0.350}
+  - {name: mid_high, min: 0.350, max: 0.525}
+  - {name: high, min: 0.525, max: 0.700}
+
+# Same events/candidates across time bands; two disjoint event halves per band.
+candidate_seed: 2026091521
+gradient_seed: 2026091522
+minimum_split_cosine: 0.80
+
+# Reuse h4natg01 curvature-only identities for functional distance.
+distance_candidate_seed: 2026091523
+distance_timesteps: 8
+distance_path_seed: 2026091524
+full_parameter_rms: 1.0e-6
+distance_match_tolerance: 0.05
+distance_match_iterations: 3
+minimum_parameter_rms: 1.0e-8
+maximum_parameter_rms: 3.0e-5
+
+# Fresh identities exclude every h4grad01 and h4natg01 panel.
+judge_events: 2048
+judge_selection_seed: 2026091525
+judge_rollout_seed: 2026091526
+score_batch_size: 32768
+minimum_decisive_efficiency_gain: 2.0
+
+save_direction_vectors: true
+upload_direction_vectors: false
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h4time01
+  resume: never
+  name: c4a91e07_h4_low_noise_time_alignment_v1
+  group: c4a91e07_h4_projection_diagnostics
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - H4Ensemble
+    - SourceH4grad01
+    - SourceH4natg01
+    - LowNoise
+    - TimeStratumDecomposition
+    - MatchedVPPathDistance
+    - TargetPreserving
+    - CommonNoiseSignedProbe
+    - NoClassifierFit
+    - NoOptimizerStep
+    - LiveWandb

@@ -1,0 +1,47 @@
+extends_overlay: dgpo_h4_pair_token.yaml
+experiment:
+  protocol: h4-candidate-only-v1
+  single_question: Can the original direct candidate path learn a generalizable residual without engineered pair-angle features?
+  intervention: two_candidate_tokens_one_block_direct_flatten_readout_no_pair_features
+  diagnostic_parent_run: h4pair01
+  baseline_measurement: h4pair01_and_h4rel01
+  primary_endpoint: held_out_test_bce_at_best_validation_bce
+  primary_decision_rule: Report best-validation checkpoint test BCE/AUC, calibration, ratio concentration and training stability; lower AUC alone is not success.
+  inference_scope: Single-seed candidate-only ablation against h4pair01; comparison with h4rel01 also changes depth, readout and initialization. No physics closure or DGPO claim.
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_candidate_only/ray_results
+  execution:
+    command: python3 scripts/train_h4_candidate_only.py
+logger:
+  local:
+    name: h4_candidate_only
+    version: h4_candidate_only_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_candidate_only/logs
+  wandb:
+    id: h4cand01
+    resume: never
+    run_name: Can candidates learn without Fourier? | H4 direct readout | step-1110 samples
+    group: H4 structural classification
+    tags: [ClassifierOnly, NoPolicyUpdate, CandidateOnly, NoFourier, CleanValidation, SixteenGPU]
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_candidate_only/checkpoints
+dgpo:
+  adaptive_omnifold:
+    recalibration:
+      periodic_pair_features: false
+      topology_pair_token: false
+      topology_fourier_embedding: false
+      topology_max_harmonic: 1
+      relation_token_count: 0
+      decoder_layers: 1
+    audit_fit:
+      periodic_pair_features: false
+      topology_pair_token: false
+      topology_fourier_embedding: false
+      topology_max_harmonic: 1
+      relation_token_count: 0
+      decoder_layers: 1
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_candidate_only/diagnostic_snapshots
+      ratio_audit_export_dir: /pscratch/sd/y/yiren/Ztautau/h4_candidate_only/ratio_audit

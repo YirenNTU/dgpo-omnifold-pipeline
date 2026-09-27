@@ -1,0 +1,114 @@
+# Continue 227e4975 from its latest saved state, not raw step1110 weights-only.
+# Keep the original fresh-start overlay intact.
+extends_overlay: dgpo_h4_kinematic_adaln_depth3.yaml
+
+options:
+  Training:
+    pretrain_model_load_path: null
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/checkpoints/last.ckpt
+    # Keep the original absolute training/scheduler horizon; do not restart it.
+    epochs: 1500
+    total_epochs: 1500
+    learning_rate: 5.0e-5
+    learning_rate_body: 5.0e-5
+    # Shared optimizer groups take their LR from the first member. Set every
+    # trained parent explicitly, including both members of the body group.
+    Components:
+      GlobalEmbedding:
+        learning_rate: 5.0e-5
+      PET:
+        learning_rate: 5.0e-5
+      TruthGeneration:
+        learning_rate: 5.0e-5
+      InvisibleInputProjector:
+        learning_rate: 5.0e-5
+      GroupedSequentialEmbedding:
+        learning_rate: 5.0e-5
+
+dgpo:
+  checkpoint_load_mode: resume
+  auto_resume_from_last: true
+  unbounded_training: false
+  conditioning_learning_rates:
+    angular_conditioning: 1.0e-4
+    visible_conditioning: 1.0e-4
+  lr_schedule:
+    type: cosine
+    total_epochs: 1500
+    total_steps: null
+    min_lr_ratio: 0.1
+    groups: [body, generation, projector, angular_conditioning, visible_conditioning]
+    # Keep saved Adam moments and scheduler step, but use the above base LRs
+    # and decay scope. Otherwise checkpoint loading restores the old 1e-6 LR.
+    resume_use_config: true
+  adaptive_omnifold:
+    # Required to restore/use/checkpoint the installed reward's round reference.
+    # Disabling this whole block would instead select the original reference.
+    enabled: true
+    log_only: true
+    monitor_mode: weighted_and_raw
+    baseline_probe_on_start: false
+    staleness_every_n_steps: null
+    # Existing cadence parser clamps zero to one. Beyond the bounded 1500-epoch
+    # run, this prevents ALL scheduled monitor fits, including weighted audits.
+    # Do not make training unbounded without adding an explicit monitor switch.
+    staleness_every_n_epochs: 1501
+    trigger:
+      raw_audit_enabled: false
+      max_reward_age_epochs: null
+      fixed_schedule_skip_staleness_audit: false
+      fixed_schedule_log_raw_audit: false
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: false
+      scheduled_refit_fail_closed: false
+    audit_fit:
+      # Unused: the omnifold_fold schema requires enabled fixed-schedule audits.
+      # This does NOT change the policy validation data or validation settings.
+      training_population: probe_split
+
+logger:
+  wandb:
+    id: 227e4975
+    resume: must
+    fresh_run: false
+
+nersc:
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/checkpoints/last.ckpt
+    note: >-
+      Full saved-state continuation of 227e4975: raw policy, AdamW moments,
+      cosine clock, installed OmniFold stack and its matching round reference.
+      No bootstrap, audit, refit or reference recentering. Keep original model,
+      data, 16 GPUs and velocity-MSE coefficient 1. Raise pretrained policy
+      body/generation/projector base LRs to 5e-5; keep new branches at 1e-4.
+      All five groups cosine-decay to 10% at absolute policy epoch 1500.
+      Explicitly use configured base LRs and decay scope on resume, preserving
+      AdamW moments and the saved scheduler clock (no warm restart).
+      Policy validation is unchanged: every 10 epochs, K16, DDIM20, max4 batches.
+      No EMA. This fixed-reward continuation changes the old refit schedule;
+      without fresh audits it cannot establish fresh-classifier closure.
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_227e4975_fixed_reward_resume.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/ray_results
+
+experiment:
+  protocol: h4-227e4975-fixed-reward-full-resume
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/227e4975
+  source_run: 227e4975
+  source_policy_step: null  # Read the actual saved counter from last.ckpt.
+  intervention: fixed_reward_no_audits_no_refits_policy_lr5e5_all_groups_cosine1500
+  single_question: Does higher-policy-LR DGPO improve the same fixed reward and unchanged validation?
+  stop_rule: Continue to the original absolute 1500-epoch horizon or job walltime.
+  endpoint_selection: original_absolute_training_horizon
+  cold_h4_audit_policy_steps: []
+  gradient_direction_policy_steps: []
+  matched_configuration: null
+  primary_decision_rule: >-
+    Follow fixed-reward and unchanged policy-validation trajectories within the
+    inherited reward round. No newly fitted classifier AUC is measured, so this
+    continuation alone does not test fresh best-response closure. The policy
+    LR changes at resume, so this is not an unchanged-LR longer-training control.

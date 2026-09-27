@@ -321,14 +321,20 @@ def build_fit_config(
             if safety_max_epochs is None
             else max(1, math.ceil(float(safety_max_epochs) * steps_per_epoch))
         )
-    min_steps = int(
-        block.get(
-            "min_steps",
-            max(1, math.ceil(float(block.get("min_epochs", 1)) * steps_per_epoch)),
-        )
-    )
-    if block.get("enforce_min_epochs", False):
-        min_steps = max(min_steps, math.ceil(float(block.get("min_epochs", 1)) * steps_per_epoch))
+    min_epochs = float(block.get("min_epochs", 1))
+    epoch_floor = max(1, math.ceil(min_epochs * steps_per_epoch))
+    # Prefer an omitted min_steps (defaults to the epoch floor). An explicit
+    # min_steps: 1 with min_epochs>1 is a common footgun that arms patience
+    # immediately; treat that as "use the epoch floor" even if
+    # enforce_min_epochs was forgotten in an older overlay.
+    if "min_steps" in block and block["min_steps"] is not None:
+        min_steps = int(block["min_steps"])
+    else:
+        min_steps = epoch_floor
+    if block.get("enforce_min_epochs", False) or (
+        min_epochs > 1.0 and min_steps <= 1
+    ):
+        min_steps = max(min_steps, epoch_floor)
     return RatioFitConfig(
         steps=steps,
         batch_size=global_batch,
@@ -339,12 +345,35 @@ def build_fit_config(
         ),
         drop_last_batch=drop_last_batch,
         learning_rate=float(block.get("learning_rate", 1.0e-3)),
+        lr_scheduler=str(block.get("lr_scheduler", "constant")),
+        lr_warmup_epochs=float(block.get("lr_warmup_epochs", 1.0)),
+        lr_cosine_epochs=float(block.get("lr_cosine_epochs", 250.0)),
+        lr_min_ratio=float(block.get("lr_min_ratio", 0.1)),
         backbone_learning_rate=(
             None
             if block.get("backbone_learning_rate") is None
             else float(block["backbone_learning_rate"])
         ),
         weight_decay=float(block.get("weight_decay", 1.0e-4)),
+        adapter_learning_rate=(None if block.get("adapter_learning_rate") is None else float(block["adapter_learning_rate"])),
+        decoder_learning_rate=(None if block.get("decoder_learning_rate") is None else float(block["decoder_learning_rate"])),
+        decoder_learning_rate_scope=str(block.get("decoder_learning_rate_scope", "blocks")),
+        log_parameter_updates=bool(block.get("log_parameter_updates", False)),
+        diagnostic_enabled=bool(block.get("diagnostic_enabled", False)),
+        representation_diagnostic_enabled=bool(block.get("representation_diagnostic_enabled", False)),
+        representation_path_enabled=bool(block.get("representation_path_enabled", False)),
+        representation_export_dir=block.get("representation_export_dir"),
+        ratio_audit_export_dir=block.get("ratio_audit_export_dir"),
+        fourier_output_standardization=bool(block.get("fourier_output_standardization", False)),
+        representation_probe_rows=int(block.get("representation_probe_rows", 128)),
+        representation_probe_interval_steps=int(block.get("representation_probe_interval_steps", 100)),
+        diagnostic_interval_steps=int(block.get("diagnostic_interval_steps", 10)),
+        diagnostic_probe_rows=int(block.get("diagnostic_probe_rows", 16)),
+        diagnostic_snapshot_dir=block.get("diagnostic_snapshot_dir"),
+        diagnostic_max_snapshots=int(block.get("diagnostic_max_snapshots", 2)),
+        diagnostic_gradient_threshold=float(block.get("diagnostic_gradient_threshold", 1000.0)),
+        diagnostic_spike_factor=float(block.get("diagnostic_spike_factor", 20.0)),
+        diagnostic_probe_bce_jump=float(block.get("diagnostic_probe_bce_jump", 0.02)),
         gradient_clip_norm=(
             None
             if block.get("gradient_clip_norm") is None
@@ -353,10 +382,9 @@ def build_fit_config(
         sampling=str(block.get("sampling", "independent_epoch_shuffle")),
         min_steps=min_steps,
         validation_interval_steps=int(
-            block.get(
-                "validation_interval_steps",
-                max(1, math.ceil(interval_epochs * steps_per_epoch)),
-            )
+            block["validation_interval_steps"]
+            if block.get("validation_interval_steps") is not None
+            else max(1, math.ceil(interval_epochs * steps_per_epoch))
         ),
         validation_patience_evaluations=int(
             block.get(
@@ -369,12 +397,24 @@ def build_fit_config(
             1, min(int(block.get("validation_batch_size", 8192)), int(n_validation))
         ),
         restore_best=bool(block.get("restore_best", True)),
+        checkpoint_selection_metric=str(
+            block.get("checkpoint_selection_metric", "loss")
+        ),
         progress_interval_steps=max(
             0, int(block.get("progress_every_n_steps", 0))
         ),
         require_saturation=bool(block.get("require_saturation", True)),
         train_candidates_per_event=1,
         anomaly_detection_steps=int(block.get("anomaly_detection_steps", 0)),
+        topology_warmup_steps=int(block.get("topology_warmup_steps", 0)),
+        topology_body_unfreeze_step=int(
+            block.get("topology_body_unfreeze_step", 0)
+        ),
+        topology_warmup_learning_rate=(
+            None
+            if block.get("topology_warmup_learning_rate") is None
+            else float(block["topology_warmup_learning_rate"])
+        ),
     )
 
 
@@ -434,8 +474,40 @@ def fit_omnifold(
         train_invisible_projector=bool(
             config.get("train_invisible_projector", False)
         ),
+        train_angular_conditioning=bool(config.get("train_angular_conditioning", False)),
         train_backbone=bool(config.get("train_backbone", False)),
+        train_last_pet_block=bool(config.get("train_last_pet_block", False)),
         asymmetric_attention=bool(config.get("asymmetric_attention", False)),
+        periodic_pair_features=bool(config.get("periodic_pair_features", False)),
+        topology_fourier_embedding=bool(
+            config.get("topology_fourier_embedding", False)
+        ),
+        topology_conditioning=bool(config.get("topology_conditioning", False)),
+        topology_pair_token=bool(config.get("topology_pair_token", False)),
+        relation_token_count=int(config.get("relation_token_count", 0)),
+        visible_pair_rest_frame=bool(
+            config.get("visible_pair_rest_frame", False)
+        ),
+        topology_max_harmonic=int(config.get("topology_max_harmonic", 1)),
+        topology_include_theta_pair=bool(
+            config.get("topology_include_theta_pair", False)
+        ),
+        topology_theta_fourier=bool(
+            config.get("topology_theta_fourier", False)
+        ),
+        topology_hidden_dim=int(config.get("topology_hidden_dim", 64)),
+        topology_embedding_dim=int(config.get("topology_embedding_dim", 32)),
+        topology_fusion_hidden_dim=int(
+            config.get("topology_fusion_hidden_dim", 64)
+        ),
+        topology_dropout=float(config.get("topology_dropout", 0.15)),
+        topology_direct_logit=bool(config.get("topology_direct_logit", False)),
+        topology_context_residual_scale=float(
+            config.get("topology_context_residual_scale", 1.0)
+        ),
+        conditional_residual_rank=int(
+            config.get("conditional_residual_rank", 0)
+        ),
         head_dropout=float(config.get("head_dropout", 0.1)),
         decoder_hidden_dim=int(config.get("decoder_hidden_dim", 256)),
         decoder_layers=int(config.get("decoder_layers", 2)),
@@ -452,6 +524,19 @@ def fit_omnifold(
     val_condition = validation_pool["packed_event"].to(device=device, dtype=torch.float32)
     val_truth = validation_pool["truth"].to(device=device, dtype=torch.float32)
     val_candidate = validation_pool["candidate"].to(device=device, dtype=torch.float32)
+    ess_aware_checkpoint_selection = config.get(
+        "ess_aware_checkpoint_selection"
+    )
+    if isinstance(ess_aware_checkpoint_selection, dict):
+        ess_aware_enabled = bool(
+            ess_aware_checkpoint_selection.get("enabled", False)
+        )
+        ess_aware_max_checkpoints = int(
+            ess_aware_checkpoint_selection.get("max_checkpoints", 16)
+        )
+    else:
+        ess_aware_enabled = bool(ess_aware_checkpoint_selection or False)
+        ess_aware_max_checkpoints = 16
     result = fit_residual_ratio_stack(
         model_factory=peft_bank_factory(model_builder, spec, "reward", reset=True),
         data_condition=train_condition,
@@ -464,6 +549,7 @@ def fit_omnifold(
         fit_config=fit_cfg,
         tempering=float(config.get("tempering", 1.0)),
         crossfit_folds=int(config.get("crossfit_folds", 2)),
+        crossfit_repeats=int(config.get("crossfit_repeats", 1)),
         residual_min_auc_gain=float(
             config.get("residual_min_auc_gain", 1.0e-3)
         ),
@@ -472,9 +558,74 @@ def fit_omnifold(
         validation_data_sample=val_truth,
         validation_gen_condition=val_condition,
         validation_gen_sample=val_candidate,
+        log_ratio_clip=(
+            None
+            if config.get("log_ratio_clip") is None
+            else float(config["log_ratio_clip"])
+        ),
+        minimum_ess_fraction=float(
+            config.get("minimum_ess_fraction", 0.0)
+        ),
+        adaptive_tempering=bool(
+            (config.get("adaptive_tempering") or {}).get("enabled", False)
+        ),
+        target_ess_fraction=float(
+            (config.get("adaptive_tempering") or {}).get(
+                "target_ess_fraction", 0.2
+            )
+        ),
+        minimum_tempering=float(
+            (config.get("adaptive_tempering") or {}).get("minimum", 0.1)
+        ),
+        tempering_grid_steps=int(
+            (config.get("adaptive_tempering") or {}).get("grid_steps", 14)
+        ),
+        inherit_previous_tempering=bool(
+            (config.get("adaptive_tempering") or {}).get(
+                "inherit_previous", False
+            )
+        ),
+        ess_aware_checkpoint_selection=ess_aware_enabled,
+        ess_aware_max_checkpoints=ess_aware_max_checkpoints,
+        ess_aware_first_residual_only=bool(
+            (
+                ess_aware_checkpoint_selection.get(
+                    "first_residual_only", False
+                )
+                if isinstance(ess_aware_checkpoint_selection, dict)
+                else False
+            )
+        ),
+        minimum_sufficient_balanced_accuracy=(
+            None
+            if (config.get("fit") or {}).get(
+                "minimum_sufficient_balanced_accuracy"
+            ) is None
+            else float(
+                (config.get("fit") or {})[
+                    "minimum_sufficient_balanced_accuracy"
+                ]
+            )
+        ),
+        minimum_sufficient_confidence_z=float(
+            (config.get("fit") or {}).get(
+                "minimum_sufficient_confidence_z", 0.0
+            )
+        ),
+        minimum_sufficient_required_consecutive=int(
+            (config.get("fit") or {}).get(
+                "minimum_sufficient_required_consecutive", 1
+            )
+        ),
     )
     frozen = FrozenResidualRatioReward.from_fit_result(
-        result, tempering=float(config.get("tempering", 1.0))
+        result,
+        tempering=float(config.get("tempering", 1.0)),
+        log_ratio_clip=(
+            None
+            if config.get("log_ratio_clip") is None
+            else float(config["log_ratio_clip"])
+        ),
     )
     payload = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
@@ -486,6 +637,7 @@ def fit_omnifold(
         "fit": {
             "iterations": int(result.iterations),
             "crossfit_folds": int(config.get("crossfit_folds", 2)),
+            "crossfit_repeats": int(config.get("crossfit_repeats", 1)),
             "residual_min_auc_gain": float(
                 config.get("residual_min_auc_gain", 1.0e-3)
             ),
@@ -502,7 +654,9 @@ def fit_omnifold(
             "train_invisible_projector": bool(
                 config.get("train_invisible_projector", False)
             ),
+            "train_angular_conditioning": bool(config.get("train_angular_conditioning", False)),
             "train_backbone": bool(config.get("train_backbone", False)),
+            "train_last_pet_block": bool(config.get("train_last_pet_block", False)),
             "asymmetric_attention": bool(
                 config.get("asymmetric_attention", False)
             ),

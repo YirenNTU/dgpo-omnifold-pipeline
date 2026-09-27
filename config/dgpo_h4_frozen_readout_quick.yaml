@@ -1,0 +1,35 @@
+extends_overlay: dgpo_h4_frozen_readout_capture.yaml
+
+experiment:
+  protocol: h4-frozen-readout-quick300-v1
+  intervention: detached_panel_export_and_300_update_plateau_screen
+  inference_scope: Early plateau only; not saturation, final generalization or DGPO closure.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_quick300/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_frozen_readout.py --quick
+
+logger:
+  local:
+    name: h4_frozen_readout_quick300
+    version: h4_frozen_readout_quick300_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_quick300/logs
+  wandb:
+    id: h4frzq1
+    resume: never
+    run_name: Can early features be read directly? | H4 frozen panels | 300-update screen
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_quick300/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      steps: 300
+      min_steps: 300
+      require_saturation: false
+      representation_export_dir: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_quick300/panels
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_frozen_readout_quick300/diagnostic_snapshots

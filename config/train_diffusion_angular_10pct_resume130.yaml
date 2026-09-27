@@ -1,0 +1,32 @@
+# Full training resume with separate W&B history and outputs.
+extends_overlay: train_diffusion_angular_10pct_nersc.yaml
+
+logger:
+  wandb:
+    id: diffang10r130
+    run_name: "Angular Fourier continuation | diffusion 10% FP32 | resume epoch 130"
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_resume130/logs
+    name: diffusion-angular-resume130
+    version: v1
+
+options:
+  Training:
+    pretrain_model_load_path: null
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_seed42/checkpoints/epoch=130_train=0.1952_val=0.2003.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_resume130/checkpoints
+
+experiment:
+  checkpoint_protocol: full_resume_epoch130_optimizer_scheduler_and_loop_state
+  parent_wandb_run: diffang10p1
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_resume130/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_angular_10pct_resume130.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_resume130/ray_results

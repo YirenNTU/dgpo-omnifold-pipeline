@@ -7,6 +7,7 @@ import copy
 import tempfile
 import unittest
 import warnings
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -243,6 +244,56 @@ class TestRawMonitorWarmStart(unittest.TestCase):
             self._ready_fit(empty, steps=2)
         self.assertEqual(empty, {})
 
+    def test_explicit_new_baseline_recertifies_inherited_weights_with_cold_budget(self):
+        cache = {}
+        self._ready_fit(cache)
+        cache.pop('training_policy')
+        cache['recertify_inherited_weights'] = True
+        inherited, cfg = self._ready_fit(cache)
+        self.assertTrue(inherited.warm_started)
+        self.assertTrue(inherited.training_ready)
+        self.assertEqual(cfg.min_steps, 3 * inherited.training_steps_per_epoch)
+        self.assertNotIn('recertify_inherited_weights', cache)
+        warm, cfg = self._ready_fit(cache)
+        self.assertTrue(warm.warm_started)
+        self.assertEqual(cfg.min_steps, warm.training_steps_per_epoch)
+
+    def test_inherited_monitor_as_is_keeps_weights_on_protocol_change(self):
+        cache = {}
+        self._ready_fit(cache)
+        cache.pop('training_policy')
+        cache['inherit_monitor_as_is'] = True
+        inherited, cfg = self._ready_fit(cache)
+        self.assertTrue(inherited.warm_started)
+        self.assertTrue(inherited.training_ready)
+        self.assertEqual(cfg.min_steps, inherited.training_steps_per_epoch)
+        self.assertNotIn('inherit_monitor_as_is', cache)
+        warm, cfg = self._ready_fit(cache)
+        self.assertTrue(warm.warm_started)
+        self.assertEqual(cfg.min_steps, warm.training_steps_per_epoch)
+
+    def test_inherit_as_is_rejects_changed_split_and_recertify(self):
+        cache = {}
+        self._ready_fit(cache)
+        cache['protocol']['seed'] += 1
+        cache['inherit_monitor_as_is'] = True
+        with self.assertRaisesRegex(ValueError, 'split protocol mismatch'):
+            self._ready_fit(cache)
+        cache = {}
+        self._ready_fit(cache)
+        cache['inherit_monitor_as_is'] = True
+        cache['recertify_inherited_weights'] = True
+        with self.assertRaisesRegex(ValueError, 'cannot recertify and inherit-as-is'):
+            self._ready_fit(cache)
+
+    def test_inherited_recertification_rejects_changed_split(self):
+        cache = {}
+        self._ready_fit(cache)
+        cache['protocol']['seed'] += 1
+        cache['recertify_inherited_weights'] = True
+        with self.assertRaisesRegex(ValueError, 'split protocol mismatch'):
+            self._ready_fit(cache)
+
     def test_invalid_monitor_training_readiness_is_rejected(self):
         for settings in ({}, {"cold_start_min_epochs": True, "warm_start_min_epochs": 1},
                          {"cold_start_min_epochs": float("nan"), "warm_start_min_epochs": 1},
@@ -336,6 +387,79 @@ class TestRawMonitorWarmStart(unittest.TestCase):
         self.assertEqual(raw_fit, trust_fit)
         self.assertFalse(cold.warm_started)
         self.assertEqual(weight.item(), 0.0)
+
+    def test_disjoint_warm_monitor_never_trains_on_final_audit_identities(self):
+        condition = torch.arange(500, dtype=torch.float32)[:, None]
+        cache: dict[str, object] = {}
+        observed: dict[str, set[float]] = {}
+
+        def train(
+            _model,
+            data_condition,
+            _data_sample,
+            _data_weight,
+            _gen_condition,
+            _gen_sample,
+            _gen_weight,
+            _fit_config,
+            _seed,
+            validation,
+            **_kwargs,
+        ):
+            observed["train"] = set(data_condition[:, 0].tolist())
+            observed["early_stop"] = set(validation[0][:, 0].tolist())
+            return SimpleNamespace(saturated=True)
+
+        def score(_model, score_condition, _sample, _batch):
+            observed.setdefault("final_audit", set()).update(
+                score_condition[:, 0].tolist()
+            )
+            return torch.zeros(len(score_condition))
+
+        def fit_once():
+            with mock.patch(
+                "RL.DGPO_neutrino.omnifold_ztautau.ratio_fit.fit_density_ratio",
+                side_effect=train,
+            ), mock.patch.object(
+                evenet_ratio_module,
+                "_score_population",
+                side_effect=score,
+            ):
+                return evenet_ratio_module.fit_independent_evenet_audit(
+                    model_factory=lambda: nn.Linear(1, 1, bias=False),
+                    data_condition=condition,
+                    data_sample=condition,
+                    gen_condition=condition,
+                    gen_sample=condition[:, None, :],
+                    gen_weight=torch.ones(len(condition), 1),
+                    fit_config=SimpleNamespace(validation_batch_size=32),
+                    seed=123,
+                    audit_fraction=0.20,
+                    early_stop_fraction=0.20,
+                    reuse_early_stop_for_audit=False,
+                    warm_start_cache=cache,
+                    identity_split_seed=42,
+                )
+
+        cold = fit_once()
+        self.assertFalse(cold.warm_started)
+        self.assertEqual(
+            cache["protocol"]["schema"],
+            "raw-monitor-condition-60-20-20-v1",
+        )
+        self.assertTrue(observed["train"].isdisjoint(observed["early_stop"]))
+        self.assertTrue(observed["train"].isdisjoint(observed["final_audit"]))
+        self.assertTrue(
+            observed["early_stop"].isdisjoint(observed["final_audit"])
+        )
+        self.assertEqual(
+            observed["train"]
+            | observed["early_stop"]
+            | observed["final_audit"],
+            set(condition[:, 0].tolist()),
+        )
+        warm = fit_once()
+        self.assertTrue(warm.warm_started)
 
 
 class TestEventPacking(unittest.TestCase):
@@ -574,22 +698,123 @@ class TestZtautauRatioClassifier(unittest.TestCase):
         model = EvenetAdapterRatioClassifier(
             _FakeZtautauBackbone(),
             spec,
+            asymmetric_attention=True,
+            train_grouped_sequential_embedding=True,
+            train_invisible_projector=True,
+            head_dropout=0.25,
             decoder_hidden_dim=8,
             decoder_layers=1,
             decoder_heads=2,
             adapter_bottleneck=4,
         )
-
-        logits = model(packed, torch.randn(3, 4))
-        logits.sum().backward()
-
-        self.assertTrue(torch.isfinite(logits).all())
-        self.assertTrue(
-            all(
-                parameter.grad is None or torch.isfinite(parameter.grad).all()
-                for parameter in model.parameters()
+        block = model.bank.decoder.blocks[0]
+        self.assertEqual(float(block.self_attn.dropout), 0.0)
+        self.assertEqual(float(block.cross_attn.dropout), 0.0)
+        self.assertEqual(float(block.ffn[2].p), 0.25)
+        candidate = torch.randn(3, 4)
+        target = torch.tensor([0.0, 1.0, 0.0])
+        weight = torch.tensor([0.003, 2.994, 0.003])
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+        position_gradient = None
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(packed, candidate)
+            loss = (
+                weight
+                * torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, target, reduction="none"
+                )
+            ).mean()
+            loss.backward()
+            self.assertTrue(torch.isfinite(loss))
+            self.assertTrue(
+                all(
+                    parameter.grad is None or torch.isfinite(parameter.grad).all()
+                    for parameter in model.parameters()
+                )
             )
+            position_gradient = (
+                model.bank.position_encoder.position_embedding.weight.grad
+            )
+            optimizer.step()
+
+        attention_mask = model.backbone.PET.last_attn_mask
+        self.assertIsNotNone(attention_mask)
+        self.assertEqual(attention_mask.shape, (3, 7, 7))
+        full_valid = torch.cat(
+            (
+                batch["x_mask"].squeeze(-1),
+                torch.ones(3, 2, dtype=torch.bool),
+            ),
+            dim=1,
         )
+        combined_blocked = attention_mask | (~full_valid[:, None, :])
+        self.assertFalse(combined_blocked.all(dim=-1).any())
+        # Only padded visible queries get a safe invisible key.
+        self.assertFalse(attention_mask[0, 0, 5])
+        self.assertTrue(attention_mask[1, 0, 5])
+        self.assertTrue(torch.isfinite(logits).all())
+        self.assertIsNotNone(position_gradient)
+        self.assertGreater(float(position_gradient.abs().sum()), 0.0)
+
+    def test_open_adaln_gates_sparse_memory_peaked_weights_stay_finite(self) -> None:
+        """Regression for acceptance-audit step≈3 finite-fwd / NaN-bwd.
+
+        Force AdaLN gates open (cold start normally delays this ~2 Adam steps),
+        mix empty-visible and single-visible rows, and use tempered-like mean-one
+        weights. Decoder attention dropout must stay off or this graph flakes.
+        """
+        batch = _event_batch(batch_size=4)
+        batch["x"][0] = float("nan")
+        batch["x_mask"][0] = False
+        batch["x_mask"][1, 1:] = False
+        packed, spec = pack_event_inputs(batch)
+        model = EvenetAdapterRatioClassifier(
+            _FakeZtautauBackbone(),
+            spec,
+            asymmetric_attention=True,
+            train_grouped_sequential_embedding=True,
+            train_invisible_projector=True,
+            head_dropout=0.25,
+            decoder_hidden_dim=8,
+            decoder_layers=1,
+            decoder_heads=2,
+            adapter_bottleneck=4,
+        )
+        model.train()
+        for block in model.bank.decoder.blocks:
+            nn.init.normal_(block.modulation.proj.weight, std=0.05)
+            nn.init.normal_(block.modulation.proj.bias, std=0.05)
+        # Exercise the backward through open gates, rather than the null
+        # output head which intentionally blocks every deeper gradient.
+        nn.init.normal_(model.bank.output.weight, std=0.05)
+        candidate = torch.randn(4, 4)
+        target = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        raw = torch.tensor([1.0e-3, 1.0e3, 1.0, 1.0])
+        weight = raw * (raw.numel() / raw.sum())
+        for seed in (0, 1, 2, 3, 4):
+            torch.manual_seed(seed)
+            model.zero_grad(set_to_none=True)
+            logits = model(packed, candidate)
+            loss = (
+                weight
+                * torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, target, reduction="none"
+                )
+            ).mean()
+            loss.backward()
+            self.assertTrue(torch.isfinite(loss).item())
+            self.assertTrue(torch.isfinite(logits).all())
+            bad = [
+                name
+                for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+                and not bool(torch.isfinite(parameter.grad).all())
+            ]
+            self.assertEqual(bad, [], msg=f"seed={seed} nonfinite grads: {bad}")
+            position_grad = model.bank.position_encoder.position_embedding.weight.grad
+            self.assertIsNotNone(position_grad)
+            self.assertGreater(float(position_grad.abs().sum()), 0.0)
 
     def test_fourier_topology_embedding_fuses_with_decoder_and_roundtrips(self) -> None:
         packed, spec = pack_event_inputs(
@@ -628,6 +853,259 @@ class TestZtautauRatioClassifier(unittest.TestCase):
         )
         self.assertTrue(restored._topology_fourier_embedding)
         self.assertEqual(restored.bank.pairwise_feature_dim, 11)
+
+    def test_plain_fourier_head_opens_deep_gradient_after_first_update(self) -> None:
+        """Zero output delays feature gradients, but is not a permanent freeze."""
+        torch.manual_seed(42)
+        packed, spec = pack_event_inputs(
+            _event_batch_with_pair_context(), include_pairwise_context=True
+        )
+        model = EvenetAdapterRatioClassifier(
+            _FakeZtautauBackbone(), spec,
+            periodic_pair_features=True, topology_fourier_embedding=True,
+            topology_max_harmonic=4, topology_include_theta_pair=False,
+            topology_direct_logit=False, topology_conditioning=False,
+            topology_hidden_dim=16, topology_embedding_dim=8,
+            topology_fusion_hidden_dim=12, topology_dropout=0.0,
+            decoder_hidden_dim=8, decoder_layers=1, decoder_heads=2,
+            adapter_bottleneck=4,
+        )
+        self.assertEqual(model.bank.pairwise_feature_dim, 9)
+        self.assertFalse(hasattr(model.bank, "topology_output"))
+        candidate = torch.randn(3, 4)
+        target = torch.tensor([1.0, 0.0, 1.0])
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], lr=2e-4
+        )
+        logits = model(packed, candidate)
+        self.assertTrue(torch.equal(logits, torch.zeros_like(logits)))
+        torch.nn.functional.binary_cross_entropy_with_logits(logits, target).backward()
+        self.assertGreater(float(model.bank.output.weight.grad.norm()), 0)
+        self.assertEqual(float(model.bank.topology_encoder[1].weight.grad.norm()), 0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        torch.nn.functional.binary_cross_entropy_with_logits(
+            model(packed, candidate), target
+        ).backward()
+        self.assertGreater(float(model.bank.topology_encoder[1].weight.grad.norm()), 0)
+        self.assertTrue(all(
+            torch.isfinite(p.grad).all() for p in model.parameters()
+            if p.grad is not None
+        ))
+
+    def test_direct_h4_logit_stages_and_roundtrips(self) -> None:
+        import copy
+
+        packed, spec = pack_event_inputs(
+            _event_batch_with_pair_context(), include_pairwise_context=True
+        )
+        template = _FakeZtautauBackbone()
+
+        def build(restored_spec):
+            return EvenetAdapterRatioClassifier(
+                copy.deepcopy(template),
+                restored_spec,
+                periodic_pair_features=True,
+                topology_fourier_embedding=True,
+                topology_direct_logit=True,
+                topology_context_residual_scale=0.1,
+                topology_max_harmonic=4,
+                topology_hidden_dim=16,
+                topology_embedding_dim=8,
+                topology_fusion_hidden_dim=12,
+                topology_dropout=0.0,
+                train_grouped_sequential_embedding=True,
+                train_invisible_projector=True,
+                train_layernorm=False,
+                train_encoder=False,
+                decoder_hidden_dim=8,
+                decoder_layers=1,
+                decoder_heads=2,
+                adapter_bottleneck=4,
+            )
+
+        model = build(spec)
+        self.assertEqual(model.bank.pairwise_feature_dim, 9)
+        self.assertEqual(model.trainable_parameter_counts["topology_output"], 10)
+        with torch.no_grad():
+            model.bank.topology_output.weight.zero_()
+            model.bank.topology_output.bias.fill_(1.0)
+            model.bank.output.weight.zero_()
+            model.bank.output.bias.fill_(2.0)
+
+        candidate = torch.randn(3, 4)
+        model.configure_topology_training_stage(1)
+        stage1_names = {
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertEqual(
+            stage1_names,
+            {"bank.topology_output.weight", "bank.topology_output.bias"},
+        )
+        torch.testing.assert_close(
+            model(packed, candidate),
+            torch.ones(3),
+            atol=1e-6,
+            rtol=0,
+        )
+
+        model.configure_topology_training_stage(2)
+        stage2_names = {
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(any(name.startswith("bank.decoder.") for name in stage2_names))
+        self.assertTrue(
+            any(name.startswith("backbone.PET.adapters.") for name in stage2_names)
+        )
+        self.assertFalse(
+            any(
+                name.startswith("backbone.GroupedSequentialEmbedding.")
+                for name in stage2_names
+            )
+        )
+        torch.testing.assert_close(
+            model.eval()(packed, candidate),
+            torch.full((3,), 1.2),
+            atol=1e-6,
+            rtol=0,
+        )
+
+        model.configure_topology_training_stage(3)
+        stage3_names = {
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(
+            any(
+                name.startswith("backbone.GroupedSequentialEmbedding.")
+                for name in stage3_names
+            )
+        )
+        self.assertTrue(
+            any(
+                name.startswith("backbone.InvisibleInputProjector.")
+                for name in stage3_names
+            )
+        )
+        self.assertFalse(
+            any(name.startswith("backbone.GlobalEmbedding.") for name in stage3_names)
+        )
+
+        payload = model.peft_payload()
+        self.assertTrue(payload["classifier_config"]["topology_direct_logit"])
+        self.assertEqual(
+            payload["classifier_config"]["topology_context_residual_scale"],
+            0.1,
+        )
+        restored = EvenetAdapterRatioClassifier.from_peft_payload(
+            payload,
+            model_builder=build,
+            device=torch.device("cpu"),
+        )
+        torch.testing.assert_close(
+            restored(packed, candidate),
+            torch.full((3,), 1.2),
+            atol=1e-6,
+            rtol=0,
+        )
+
+    def test_low_rank_conditional_residual_stages_and_roundtrips(self) -> None:
+        import copy
+
+        packed, spec = pack_event_inputs(
+            _event_batch_with_pair_context(), include_pairwise_context=True
+        )
+        template = _FakeZtautauBackbone()
+
+        def build(restored_spec):
+            return EvenetAdapterRatioClassifier(
+                copy.deepcopy(template),
+                restored_spec,
+                periodic_pair_features=True,
+                topology_fourier_embedding=False,
+                topology_max_harmonic=2,
+                conditional_residual_rank=2,
+                asymmetric_attention=True,
+                topology_dropout=0.0,
+                train_grouped_sequential_embedding=True,
+                train_invisible_projector=True,
+                decoder_hidden_dim=8,
+                decoder_layers=1,
+                decoder_heads=2,
+                head_dropout=0.0,
+                adapter_bottleneck=4,
+            )
+
+        model = build(spec)
+        self.assertEqual(model.bank.pairwise_feature_dim, 5)
+        self.assertEqual(model.bank.output.in_features, 16)
+        self.assertEqual(model.bank.conditional_context.out_features, 2)
+        self.assertEqual(model.bank.conditional_candidate.out_features, 2)
+        with torch.no_grad():
+            model.bank.output.weight.zero_()
+            model.bank.output.bias.fill_(0.7)
+
+        candidate = torch.randn(3, 4)
+        model.configure_conditional_residual_training_stage(1)
+        stage1_names = {
+            name for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertFalse(any("conditional_" in name for name in stage1_names))
+        torch.testing.assert_close(
+            model.eval()(packed, candidate),
+            torch.full((3,), 0.7),
+            atol=1e-6,
+            rtol=0,
+        )
+
+        model.configure_conditional_residual_training_stage(2)
+        stage2_names = {
+            name for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertEqual(
+            stage2_names,
+            {
+                "bank.conditional_context.weight",
+                "bank.conditional_candidate.weight",
+            },
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-2)
+        target = torch.tensor([0.0, 1.0, 0.0])
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                model(packed, candidate), target
+            )
+            loss.backward()
+            self.assertTrue(
+                all(
+                    parameter.grad is None or torch.isfinite(parameter.grad).all()
+                    for parameter in model.parameters()
+                )
+            )
+            optimizer.step()
+        self.assertGreater(
+            float(model.bank.conditional_candidate.weight.abs().sum()), 0.0
+        )
+        self.assertEqual(model(packed, torch.randn(3, 4, 4)).shape, (3, 4))
+
+        model.eval()
+        expected = model(packed, candidate).detach()
+        payload = model.peft_payload()
+        self.assertEqual(
+            payload["classifier_config"]["conditional_residual_rank"], 2
+        )
+        restored = EvenetAdapterRatioClassifier.from_peft_payload(
+            payload, model_builder=build, device=torch.device("cpu")
+        )
+        torch.testing.assert_close(restored(packed, candidate), expected)
 
     def test_periodic_pair_classifier_handles_single_and_grouped_candidates(self) -> None:
         packed, spec = pack_event_inputs(
@@ -689,6 +1167,68 @@ class TestZtautauRatioClassifier(unittest.TestCase):
         self.assertFalse(backbone.training)
         model(packed, torch.randn(3, 4))
 
+    def test_last_pet_block_training_scope_and_payload(self) -> None:
+        _packed, spec = pack_event_inputs(_event_batch())
+        backbone = _FakeZtautauBackbone()
+        backbone.PET.transformer_blocks = nn.ModuleList([
+            nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.2)),
+            nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.2)),
+        ])
+        model = EvenetAdapterRatioClassifier(
+            backbone, spec, train_last_pet_block=True,
+            train_grouped_sequential_embedding=False,
+            train_invisible_projector=False,
+            decoder_hidden_dim=8, decoder_layers=1, decoder_heads=2,
+            adapter_bottleneck=4,
+        )
+        for name, parameter in backbone.named_parameters():
+            expected = name.startswith(("PET.transformer_blocks.1.", "PET.adapters."))
+            self.assertEqual(parameter.requires_grad, expected, name)
+        model.train()
+        self.assertFalse(backbone.training)
+        self.assertFalse(backbone.PET.transformer_blocks[0].training)
+        self.assertTrue(backbone.PET.transformer_blocks[-1].training)
+        self.assertTrue(backbone.PET.adapters.training)
+        # Exercise the unfrozen tensors without depending on the fake PET's
+        # forward (which intentionally skips its placeholder blocks).
+        before = backbone.PET.transformer_blocks[-1][0].weight.detach().clone()
+        optimizer = torch.optim.AdamW(
+            [p for p in backbone.parameters() if p.requires_grad], lr=1e-3
+        )
+        backbone.PET.transformer_blocks[-1](torch.ones(3, 8)).square().sum().backward()
+        optimizer.step()
+        self.assertFalse(torch.equal(before, backbone.PET.transformer_blocks[-1][0].weight))
+        self.assertIsNone(backbone.PET.transformer_blocks[0][0].weight.grad)
+        payload = model.peft_payload()
+        self.assertTrue(payload["classifier_config"]["train_last_pet_block"])
+        self.assertTrue(any("transformer_blocks.1." in key for key in payload["body"]))
+        self.assertFalse(any("transformer_blocks.0." in key for key in payload["body"]))
+        rebuilt = EvenetAdapterRatioClassifier(
+            copy.deepcopy(backbone), spec, train_last_pet_block=True,
+            train_grouped_sequential_embedding=False,
+            train_invisible_projector=False,
+            decoder_hidden_dim=8, decoder_layers=1, decoder_heads=2,
+            adapter_bottleneck=4,
+        )
+        with torch.no_grad():
+            rebuilt.backbone.PET.transformer_blocks[-1][0].weight.zero_()
+        restored = EvenetAdapterRatioClassifier.from_peft_payload(
+            payload, model_builder=lambda unused: rebuilt, device=torch.device("cpu")
+        )
+        self.assertEqual(set(restored.peft_payload()["body"]), set(payload["body"]))
+        self.assertTrue(torch.equal(
+            restored.backbone.PET.transformer_blocks[-1][0].weight,
+            backbone.PET.transformer_blocks[-1][0].weight,
+        ))
+        model.eval()
+        self.assertFalse(backbone.PET.transformer_blocks[-1].training)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            EvenetAdapterRatioClassifier(
+                backbone, spec, train_backbone=True, train_last_pet_block=True,
+                decoder_hidden_dim=8, decoder_layers=1, decoder_heads=2,
+                adapter_bottleneck=4,
+            )
+
     def test_new_classifier_uses_full_self_attention(self) -> None:
         packed, spec = pack_event_inputs(_event_batch())
         backbone = _FakeZtautauBackbone()
@@ -718,7 +1258,10 @@ class TestZtautauRatioClassifier(unittest.TestCase):
         )
         model(packed, torch.randn(3, 4))
         self.assertIsNotNone(backbone.PET.last_attn_mask)
-        self.assertEqual(tuple(backbone.PET.last_attn_mask.shape), (7, 7))
+        mask = backbone.PET.last_attn_mask
+        self.assertEqual(tuple(mask.shape), (3, 7, 7))
+        self.assertTrue(mask[:, :5, 5:].all())
+        self.assertFalse(mask[:, 5:, :].any())
 
     def test_accepts_four_dimensional_k1_and_grouped_candidates(self) -> None:
         packed, spec = pack_event_inputs(_event_batch())
@@ -843,6 +1386,15 @@ class TestZtautauRatioClassifier(unittest.TestCase):
                 for parameter in classifier.backbone.PET.feature_embedding.parameters()
             )
         )
+        self.assertGreater(
+            classifier.trainable_parameter_counts["position_encoder"], 0
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in classifier.bank.position_encoder.parameters()
+            )
+        )
         classifier.train()
         classifier(packed, torch.randn(2, 4)).sum().backward()
         self.assertTrue(
@@ -894,6 +1446,187 @@ class TestZtautauRatioClassifier(unittest.TestCase):
 
 
 class TestResidualRatioStack(unittest.TestCase):
+    def test_fold_epoch_controls_use_actual_global_batches(self) -> None:
+        cfg = RatioFitConfig(
+            steps=None, min_steps=1, batch_size=16, train_microbatch_size_per_rank=2,
+            sampling="independent_epoch_shuffle", drop_last_batch=True,
+            validation_interval_steps=40, validation_patience_evaluations=10,
+            restore_best=True, require_saturation=True,
+        )
+        # The parent has 20 full batches; proportional rounding would give
+        # 11 for 161/320, but the actual fold has only 10 complete batches.
+        for n_train, epoch_steps in ((159, 9), (161, 10)):
+            for warm in (False, True):
+                scaled = evenet_ratio_module._scaled_crossfit_config(
+                    cfg, n_train / 320, n_train=n_train,
+                    min_steps_per_fold=0 if warm else 1000,
+                    min_epochs_per_fold=10 if warm else None,
+                    validation_interval_epochs=2., validation_patience_epochs=10.,
+                )
+                self.assertEqual(scaled.min_steps, 10 * epoch_steps if warm else 1000)
+                self.assertEqual(scaled.validation_interval_steps, 2 * epoch_steps)
+                self.assertEqual(scaled.validation_patience_evaluations, 5)
+                self.assertTrue(scaled.restore_best and scaled.require_saturation)
+                self.assertEqual(scaled.train_microbatch_size_per_rank, 2)
+                scaled.validate()
+        tail = evenet_ratio_module._scaled_crossfit_config(
+            replace(cfg, drop_last_batch=False), .5, n_train=161,
+            min_epochs_per_fold=10, validation_interval_epochs=2., validation_patience_epochs=10.,
+        )
+        self.assertEqual((tail.min_steps, tail.validation_interval_steps), (110, 22))
+        # A separate explicit minimum remains respected even for warm fits.
+        larger = evenet_ratio_module._scaled_crossfit_config(
+            replace(cfg, min_steps=400), .5, n_train=161, min_epochs_per_fold=10,
+        )
+        self.assertEqual(larger.min_steps, 200)
+
+    def test_fold_epoch_controls_reject_unsafe_budgets(self) -> None:
+        cfg = RatioFitConfig(steps=None, batch_size=16, drop_last_batch=True,
+                             sampling="independent_epoch_shuffle", validation_interval_steps=2)
+        for key in ('min_epochs_per_fold', 'validation_interval_epochs', 'validation_patience_epochs'):
+            for value in (0, -1, True, '10', float('nan'), float('inf')):
+                with self.assertRaisesRegex(ValueError, key):
+                    evenet_ratio_module._scaled_crossfit_config(cfg, .5, n_train=161, **{key: value})
+        with self.assertRaisesRegex(ValueError, 'no complete'):
+            evenet_ratio_module._scaled_crossfit_config(cfg, .5, n_train=15, min_epochs_per_fold=10)
+        with self.assertRaisesRegex(ValueError, 'step budget'):
+            evenet_ratio_module._scaled_crossfit_config(
+                replace(cfg, steps=150), .5, n_train=161, min_epochs_per_fold=10)
+        with self.assertRaisesRegex(ValueError, 'independent_epoch_shuffle'):
+            evenet_ratio_module._scaled_crossfit_config(
+                replace(cfg, sampling='independent_with_replacement'), .5,
+                n_train=161, min_epochs_per_fold=10)
+
+    def test_warm_epoch_minimum_only_after_matching_fold_loaded(self) -> None:
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = nn.Parameter(torch.zeros(()))
+            def forward(self, condition, sample):
+                return self.bias.expand(sample.shape[:-1])
+        condition = torch.arange(160, dtype=torch.float32).reshape(80, 2)
+        sample = torch.zeros(80, 4)
+        cfg = RatioFitConfig(steps=None, min_steps=1, batch_size=4, drop_last_batch=True,
+                             sampling='independent_epoch_shuffle', validation_interval_steps=40,
+                             validation_patience_evaluations=10, require_saturation=True)
+
+        def run(saved=None, closure=2):
+            observed = []
+            def fit(model, dc, ds, dw, gc, gs, gw, config, *args, **kwargs):
+                warm = model.bias.item() != 0.
+                epoch_steps = len(dc) // cfg.batch_size
+                self.assertEqual(config.min_steps, 10 * epoch_steps if warm else 1000)
+                self.assertEqual(config.validation_interval_steps, 2 * epoch_steps)
+                self.assertEqual(config.validation_patience_evaluations, 5)
+                self.assertNotIn('resume_state', kwargs)
+                observed.append(warm)
+                with torch.no_grad():
+                    model.bias.fill_(len(observed))
+                return SimpleNamespace(saturated=True, loss=.6, balanced_accuracy=.7, steps_completed=config.min_steps)
+            with mock.patch('RL.DGPO_neutrino.omnifold_ztautau.ratio_fit.fit_density_ratio', side_effect=fit), \
+                 mock.patch.object(evenet_ratio_module, '_weighted_binary_score_metrics',
+                                   side_effect=[(.6, .7, .7)] * (closure - 1) + [(.693, .5, .5)]):
+                result = fit_residual_ratio_stack(
+                    model_factory=Tiny, data_condition=condition, data_sample=sample,
+                    gen_condition=condition, gen_sample=sample, iterations=3,
+                    fit_config=cfg, tempering=1., seed=17, crossfit_seed=42,
+                    warm_start_iterations=(1, 2, 3), warm_start_state=saved,
+                    min_steps_per_fold=1000, warm_start_min_epochs_per_fold=10,
+                    validation_interval_epochs=2., validation_patience_epochs=10.,
+                    validation_data_condition=condition, validation_data_sample=sample,
+                    validation_gen_condition=condition, validation_gen_sample=sample,
+                )
+            return result, observed
+
+        cold, observed = run()
+        self.assertEqual(observed, [False] * 4)
+        saved = copy.deepcopy(cold.warm_start_state)
+        saved['models'] = [m for m in saved['models'] if (m['iteration'], m['fold']) != (1, 2)]
+        _, observed = run(saved, closure=3)
+        self.assertEqual(observed, [True, False, True, True, False, False])
+        saved['protocol']['seed'] += 1
+        _, observed = run(saved)
+        self.assertEqual(observed, [False] * 4)
+
+    def test_current_iteration_one_initializes_all_later_folds_and_only_it_crosses_rounds(self):
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = nn.Parameter(torch.zeros(()))
+                self.feature = nn.Parameter(torch.zeros(()))
+            def forward(self, condition, sample):
+                return self.bias.expand(sample.shape[:-1])
+        condition = torch.arange(160, dtype=torch.float32).reshape(80, 2)
+        sample = torch.zeros(80, 4)
+        cfg = RatioFitConfig(steps=None, min_steps=1, batch_size=4, drop_last_batch=True,
+                             sampling='independent_epoch_shuffle', validation_interval_steps=40,
+                             validation_patience_evaluations=5, require_saturation=True,
+                             learning_rate=2e-4, backbone_learning_rate=1e-5)
+
+        def run(saved=None, offset=0):
+            observed, models = [], []
+            def fit(model, dc, ds, dw, gc, gs, gw, config, *args, **kwargs):
+                self.assertTrue(all(p.requires_grad for p in model.parameters()))
+                self.assertNotIn('resume_state', kwargs)
+                value = model.bias.item()
+                self.assertEqual(model.feature.item(), 10 * value)
+                self.assertEqual(config.min_steps, 10 * (len(dc) // 4) if value else 1000)
+                # Only later ITERATIONS get a lower LR; cross-round warm
+                # iteration 1 must retain the original rate.
+                self.assertEqual(config.learning_rate, 2e-4 if len(observed) < 2 else 5e-5)
+                self.assertEqual(config.backbone_learning_rate, 1e-5)
+                self.assertEqual(config.weight_decay, cfg.weight_decay)
+                observed.append((value, set(dc[:, 0].tolist())))
+                models.append(model)
+                with torch.no_grad():
+                    model.bias.fill_(offset + len(observed))
+                    model.feature.fill_(10 * (offset + len(observed)))
+                return SimpleNamespace(saturated=True, loss=.6, balanced_accuracy=.7,
+                                       steps_completed=config.min_steps)
+            with mock.patch('RL.DGPO_neutrino.omnifold_ztautau.ratio_fit.fit_density_ratio', side_effect=fit), \
+                 mock.patch.object(evenet_ratio_module, '_weighted_binary_score_metrics',
+                                   side_effect=[(.6,.7,.7),(.6,.7,.7),(.693,.5,.5)]):
+                result = fit_residual_ratio_stack(
+                    model_factory=Tiny, data_condition=condition, data_sample=sample,
+                    gen_condition=condition, gen_sample=sample, iterations=3,
+                    fit_config=cfg, tempering=1., seed=17, crossfit_seed=42,
+                    warm_start_iterations=(1,), warm_start_state=saved,
+                    warm_start_from_iteration_one=True,
+                    later_iteration_learning_rate=5e-5,
+                    min_steps_per_fold=1000, warm_start_min_epochs_per_fold=10,
+                    validation_interval_epochs=2., validation_patience_epochs=10.,
+                    validation_data_condition=condition, validation_data_sample=sample,
+                    validation_gen_condition=condition, validation_gen_sample=sample,
+                )
+            self.assertEqual(len({id(m) for m in models}), 6)
+            # The active stack still includes both accepted residuals; only
+            # the initialization cache is restricted to iteration 1.
+            self.assertEqual(result.checkpoint_iterations, (1, 1, 2, 2))
+            self.assertEqual([(x['iteration'], x['fold']) for x in result.warm_start_state['models']], [(1,1),(1,2)])
+            self.assertEqual([x['state']['bias'].item() for x in result.warm_start_state['models']],
+                             [offset+1, offset+2])
+            for index in range(2, 6):
+                self.assertEqual(observed[index][1], observed[index % 2][1])
+            self.assertTrue(observed[0][1].isdisjoint(observed[1][1]))
+            return result, [x[0] for x in observed]
+
+        first, values = run()
+        self.assertEqual(values, [0., 0., 1., 2., 1., 2.])
+        saved = copy.deepcopy(first.warm_start_state)
+        # Old all-iteration caches must not override the new current-round base.
+        saved['models'].append({'iteration':2, 'fold':1,
+                                'state':{'bias':torch.tensor(999.), 'feature':torch.tensor(9990.)}})
+        digest = dgpo_reward_module.payload_sha256(saved)
+        _, values = run(saved, offset=100)
+        self.assertEqual(values, [1., 2., 101., 102., 101., 102.])
+        self.assertEqual(dgpo_reward_module.payload_sha256(saved), digest)
+        saved['models'] = [x for x in saved['models'] if (x['iteration'],x['fold']) != (1,2)]
+        _, values = run(saved, offset=200)
+        self.assertEqual(values, [1., 0., 201., 202., 201., 202.])
+        saved['protocol']['seed'] += 1
+        _, values = run(saved)
+        self.assertEqual(values, [0., 0., 1., 2., 1., 2.])
+
     def test_absolute_fold_floor_survives_unequal_fold_scaling(self) -> None:
         cfg = RatioFitConfig(steps=None, min_steps=1, validation_interval_steps=10,
                              restore_best=True)
@@ -991,7 +1724,7 @@ class TestResidualRatioStack(unittest.TestCase):
             self.assertFalse(optimizer.state)
             optimizers.append(optimizer)
 
-        def run(saved=None, seed=17):
+        def run(saved=None, seed=17, warm_epochs=None, from_first=False):
             # Keep the actual fitter/optimizer/early-stopping loop. Only the
             # outer acceptance metric is stubbed to exercise two iterations.
             with mock.patch.object(torch.optim.AdamW, "__init__", record_optimizer), \
@@ -1002,9 +1735,14 @@ class TestResidualRatioStack(unittest.TestCase):
                     data_condition=condition, data_sample=sample,
                     gen_condition=condition, gen_sample=sample,
                     iterations=2, fit_config=cfg, tempering=1., seed=seed,
-                    warm_start_iterations=(1, 2), warm_start_state=saved,
+                    warm_start_iterations=(1,) if from_first else (1, 2), warm_start_state=saved,
+                    warm_start_from_iteration_one=from_first,
+                    later_iteration_learning_rate=5e-5 if from_first else None,
                     crossfit_seed=42, crossfit_partition="identity",
                     min_steps_per_fold=8,
+                    **({"warm_start_min_epochs_per_fold": warm_epochs,
+                        "validation_interval_epochs": 2., "validation_patience_epochs": 10.}
+                       if warm_epochs is not None else {}),
                     validation_data_condition=condition, validation_data_sample=sample,
                     validation_gen_condition=condition, validation_gen_sample=sample,
                 )
@@ -1025,6 +1763,30 @@ class TestResidualRatioStack(unittest.TestCase):
             self.assertTrue(optimizer.state)
             for state in optimizer.state.values():
                 self.assertEqual(int(state["step"].item()), fit.steps_completed)
+
+        shortened = run(saved=frozen.warm_start_state, seed=19, warm_epochs=2)
+        pairs = evenet_ratio_module._identity_crossfit_splits(condition, folds=2, seed=42)
+        self.assertEqual(len(optimizers), 12)
+        self.assertEqual(len({id(optimizer) for optimizer in optimizers}), 12)
+        for iteration in shortened.diagnostics:
+            self.assertEqual(iteration.warm_started_folds, (1, 2))
+            for fit, (train, _) in zip(iteration.fold_diagnostics, pairs):
+                epoch_steps = (len(train) + cfg.batch_size - 1) // cfg.batch_size
+                # First eligible check at 2 epochs, then 4 further checks at
+                # 2-epoch intervals. Not an unconditional stop at the floor.
+                self.assertEqual(fit.steps_completed, 10 * epoch_steps)
+                self.assertTrue(fit.saturated)
+
+        current_first = run(seed=20, warm_epochs=2, from_first=True)
+        self.assertEqual([d.warm_started_folds for d in current_first.diagnostics], [(), (1, 2)])
+        self.assertEqual(len(optimizers), 16)
+        self.assertEqual(len({id(optimizer) for optimizer in optimizers}), 16)
+        for index, optimizer in enumerate(optimizers[-4:]):
+            self.assertEqual(optimizer.param_groups[0]['lr'], cfg.learning_rate if index < 2 else 5e-5)
+            self.assertEqual(optimizer.param_groups[0]['weight_decay'], cfg.weight_decay)
+        for fit, (train, _) in zip(current_first.diagnostics[1].fold_diagnostics, pairs):
+            self.assertEqual(fit.steps_completed, 10 * ((len(train) + cfg.batch_size - 1) // cfg.batch_size))
+            self.assertTrue(fit.saturated)
 
     def test_crossfit_fold_checkpoints_are_averaged_per_iteration(self) -> None:
         class _TinyRatio(nn.Module):
@@ -1137,7 +1899,7 @@ class TestResidualRatioStack(unittest.TestCase):
         self.assertLess(result.diagnostics[0].validation_loss_gain, 0.0)
         torch.testing.assert_close(result.train_log_weight, torch.ones(8))
 
-    def test_warm_start_selects_first_two_iterations_and_keeps_folds(self) -> None:
+    def test_warm_start_selected_iterations_keeps_folds_and_unreached_history(self) -> None:
         class TinyRatio(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1150,7 +1912,8 @@ class TestResidualRatioStack(unittest.TestCase):
         sample = torch.zeros(32, 4)
         fit_config = SimpleNamespace(require_saturation=True, validation_batch_size=8)
 
-        def run(*, saved=None, seed=17, order=None, closure_iteration=3):
+        def run(*, saved=None, seed=17, order=None, closure_iteration=3,
+                selected=(1, 2), trained_offset=0):
             observed, progress = [], []
             if order is None:
                 order = torch.arange(32)
@@ -1159,7 +1922,7 @@ class TestResidualRatioStack(unittest.TestCase):
                 self.assertNotIn("resume_state", kwargs)
                 self.assertTrue(model.logit.requires_grad)
                 observed.append((model.logit.item(), set(positive_condition[:, 0].tolist())))
-                model.logit.data.fill_(float(len(observed)))
+                model.logit.data.fill_(float(trained_offset + len(observed)))
                 return SimpleNamespace(saturated=True, loss=0.6, balanced_accuracy=0.7, steps_completed=1)
 
             with mock.patch(
@@ -1174,7 +1937,7 @@ class TestResidualRatioStack(unittest.TestCase):
                     iterations=4, fit_config=fit_config, tempering=1.0, seed=seed,
                     validation_data_condition=condition, validation_data_sample=sample,
                     validation_gen_condition=condition, validation_gen_sample=sample[:, None, :],
-                    warm_start_iterations=(1, 2), warm_start_state=saved, crossfit_seed=42,
+                    warm_start_iterations=selected, warm_start_state=saved, crossfit_seed=42,
                     progress_callback=progress.append,
                 )
             return result, observed, progress
@@ -1208,12 +1971,257 @@ class TestResidualRatioStack(unittest.TestCase):
         _, skipped, _ = run(saved=mismatched)
         self.assertEqual([row[0] for row in skipped], [-10.0] * 6)
 
+        # The new all-iteration arm warms EVERY matching fold, not iteration
+        # i-1 or the opposite fold; a previously unseen iteration stays cold.
+        all_ids = (1, 2, 3, 4)
+        history, _, _ = run(selected=all_ids, closure_iteration=3)
+        expanded, observed, _ = run(selected=all_ids, saved=history.warm_start_state,
+                                   closure_iteration=4, seed=20, order=torch.arange(31, -1, -1))
+        self.assertEqual([row[0] for row in observed], [1., 2., 3., 4., 5., 6., -10., -10.])
+        self.assertEqual([d.warm_started_folds for d in expanded.diagnostics], [(1, 2)] * 3 + [()])
+        self.assertEqual(len(expanded.warm_start_state["models"]), 8)
+        incoming_hash = dgpo_reward_module.payload_sha256(expanded.warm_start_state)
+        # A shorter middle round updates iterations 1/2 and retains 3/4 only
+        # as initialization, never as extra active reward increments.
+        shorter, _, _ = run(selected=all_ids, saved=expanded.warm_start_state,
+                            closure_iteration=2, trained_offset=100)
+        self.assertEqual(len(shorter.checkpoints), 2)
+        self.assertEqual(shorter.checkpoint_iterations, (1, 1))
+        self.assertEqual(len(shorter.warm_start_state["models"]), 8)
+        self.assertEqual(dgpo_reward_module.payload_sha256(expanded.warm_start_state), incoming_hash)
+        last, observed, _ = run(selected=all_ids, saved=shorter.warm_start_state, closure_iteration=4,
+                                order=torch.arange(31, -1, -1))
+        self.assertEqual([row[0] for row in observed], [101., 102., 103., 104., 5., 6., 7., 8.])
+        self.assertEqual([d.warm_started_folds for d in last.diagnostics], [(1, 2)] * 4)
+        # A protocol mismatch invalidates history, including unused entries.
+        bad_history = copy.deepcopy(shorter.warm_start_state)
+        bad_history["protocol"]["seed"] += 1
+        fresh, observed, _ = run(selected=all_ids, saved=bad_history, closure_iteration=2)
+        self.assertEqual([row[0] for row in observed], [-10.] * 4)
+        self.assertEqual(len(fresh.warm_start_state["models"]), 4)
+
     def test_identity_folds_keep_duplicate_conditions_together(self) -> None:
         unique = torch.arange(128, dtype=torch.float32).reshape(64, 2)
         condition = torch.cat([unique, unique])
         pairs = evenet_ratio_module._identity_crossfit_splits(condition, folds=2, seed=42)
         for fit, holdout in pairs:
             self.assertTrue(set(condition[fit, 0].tolist()).isdisjoint(condition[holdout, 0].tolist()))
+
+    def test_repeated_crossfit_averages_five_oof_predictions_and_warm_starts(self) -> None:
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = nn.Parameter(torch.zeros(()))
+
+            def forward(self, condition, sample):
+                return self.bias.expand(sample.shape[:-1])
+
+        condition = torch.arange(400, dtype=torch.float32).reshape(200, 2)
+        sample = torch.zeros(200, 4)
+        cfg = RatioFitConfig(
+            steps=1,
+            batch_size=8,
+            validation_interval_steps=1,
+            validation_patience_evaluations=1,
+            require_saturation=True,
+        )
+
+        def run(saved=None, offset=0):
+            calls, iteration_rows = [], []
+
+            def fit(model, dc, ds, dw, gc, gs, gw, config, seed, *args, **kwargs):
+                calls.append((float(model.bias), int(seed), set(dc[:, 0].tolist())))
+                with torch.no_grad():
+                    model.bias.fill_(offset + len(calls))
+                return SimpleNamespace(
+                    saturated=True,
+                    loss=.6,
+                    balanced_accuracy=.7,
+                    steps_completed=1,
+                )
+
+            def observer(event, row):
+                if event == "iteration_scored":
+                    iteration_rows.append(row)
+
+            with mock.patch(
+                "RL.DGPO_neutrino.omnifold_ztautau.ratio_fit.fit_density_ratio",
+                side_effect=fit,
+            ), mock.patch.object(
+                evenet_ratio_module,
+                "_weighted_binary_score_metrics",
+                return_value=(.6, .7, .7),
+            ):
+                result = fit_residual_ratio_stack(
+                    model_factory=Tiny,
+                    data_condition=condition,
+                    data_sample=sample,
+                    gen_condition=condition,
+                    gen_sample=sample,
+                    iterations=1,
+                    min_iterations=1,
+                    iteration_one_only=True,
+                    fit_config=cfg,
+                    tempering=1.,
+                    seed=17,
+                    crossfit_seed=42,
+                    crossfit_folds=2,
+                    crossfit_repeats=5,
+                    crossfit_partition="identity",
+                    warm_start_iterations=(1,),
+                    warm_start_state=saved,
+                    validation_data_condition=condition,
+                    validation_data_sample=sample,
+                    validation_gen_condition=condition,
+                    validation_gen_sample=sample,
+                    diagnostic_callback=observer,
+                )
+            return result, calls, iteration_rows[0]
+
+        result, calls, row = run()
+        self.assertEqual(len(calls), 10)
+        expected_repeat_oof = []
+        for repeat in range(1, 6):
+            repeat_oof = torch.empty(200)
+            split_seed = evenet_ratio_module._crossfit_repeat_seed(42, repeat)
+            for fold, (_, holdout) in enumerate(
+                evenet_ratio_module._identity_crossfit_splits(
+                    condition, folds=2, seed=split_seed
+                ),
+                start=1,
+            ):
+                repeat_oof[holdout] = (repeat - 1) * 2 + fold
+            expected_repeat_oof.append(repeat_oof)
+        expected = torch.stack(expected_repeat_oof).mean(0)
+        torch.testing.assert_close(row["oof_logit"].reshape(-1), expected)
+        torch.testing.assert_close(
+            row["validation_gen_logit"],
+            torch.full_like(row["validation_gen_logit"], 5.5),
+        )
+        self.assertEqual(result.checkpoint_coefficients, (0.1,) * 10)
+        self.assertEqual(result.checkpoint_iterations, (1,) * 10)
+        self.assertEqual(result.diagnostics[0].warm_started_folds, ())
+        self.assertEqual(result.warm_start_state["protocol"]["repeats"], 5)
+        self.assertEqual(
+            {
+                (entry["repeat"], entry["fold"])
+                for entry in result.warm_start_state["models"]
+            },
+            {(repeat, fold) for repeat in range(1, 6) for fold in (1, 2)},
+        )
+        reward = FrozenResidualRatioReward.from_fit_result(result, tempering=1.)
+        torch.testing.assert_close(
+            reward(condition, sample),
+            torch.full((200,), 5.5),
+        )
+
+        warmed, warm_calls, _ = run(copy.deepcopy(result.warm_start_state), offset=20)
+        self.assertEqual([value for value, _, _ in warm_calls], list(range(1, 11)))
+        self.assertEqual(warmed.diagnostics[0].warm_started_folds, tuple(range(1, 11)))
+
+        legacy = copy.deepcopy(result.warm_start_state)
+        legacy["protocol"].pop("repeats")
+        legacy["protocol"].pop("repeat_seed_stride")
+        for entry in legacy["models"]:
+            entry.pop("repeat")
+        single, _, _ = run(legacy)
+        self.assertEqual(single.diagnostics[0].warm_started_folds, ())
+
+    def test_five_fold_keeps_held_out_scores_and_five_trainings(self) -> None:
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = nn.Parameter(torch.zeros(()))
+
+            def forward(self, condition, sample):
+                return self.bias.expand(sample.shape[:-1])
+
+        condition = torch.arange(400, dtype=torch.float32).reshape(200, 2)
+        sample = torch.zeros(200, 4)
+        cfg = RatioFitConfig(
+            steps=1,
+            batch_size=8,
+            validation_interval_steps=1,
+            validation_patience_evaluations=1,
+            require_saturation=True,
+        )
+
+        calls, iteration_rows = [], []
+
+        def fit(model, dc, ds, dw, gc, gs, gw, config, seed, *args, **kwargs):
+            fit_ids = set(dc[:, 0].tolist())
+            calls.append(fit_ids)
+            with torch.no_grad():
+                model.bias.fill_(float(len(calls)))
+            return SimpleNamespace(
+                saturated=True,
+                loss=.6,
+                balanced_accuracy=.7,
+                steps_completed=1,
+            )
+
+        def observer(event, row):
+            if event == "fold_scored":
+                fit_ids = set(row["fit_index"].tolist())
+                holdout_ids = set(row["holdout_index"].tolist())
+                self.assertTrue(fit_ids.isdisjoint(holdout_ids))
+                self.assertEqual(fit_ids | holdout_ids, set(range(200)))
+            if event == "iteration_scored":
+                iteration_rows.append(row)
+
+        with mock.patch(
+            "RL.DGPO_neutrino.omnifold_ztautau.ratio_fit.fit_density_ratio",
+            side_effect=fit,
+        ), mock.patch.object(
+            evenet_ratio_module,
+            "_weighted_binary_score_metrics",
+            return_value=(.6, .7, .7),
+        ):
+            result = fit_residual_ratio_stack(
+                model_factory=Tiny,
+                data_condition=condition,
+                data_sample=sample,
+                gen_condition=condition,
+                gen_sample=sample,
+                iterations=1,
+                min_iterations=1,
+                iteration_one_only=True,
+                fit_config=cfg,
+                tempering=1.,
+                seed=17,
+                crossfit_seed=42,
+                crossfit_folds=5,
+                crossfit_repeats=1,
+                crossfit_partition="identity",
+                warm_start_iterations=(1,),
+                validation_data_condition=condition,
+                validation_data_sample=sample,
+                validation_gen_condition=condition,
+                validation_gen_sample=sample,
+                diagnostic_callback=observer,
+            )
+
+        self.assertEqual(len(calls), 5)
+        expected = torch.empty(200)
+        for fold, (_, holdout) in enumerate(
+            evenet_ratio_module._identity_crossfit_splits(
+                condition, folds=5, seed=42
+            ),
+            start=1,
+        ):
+            expected[holdout] = fold
+        torch.testing.assert_close(
+            iteration_rows[0]["oof_logit"].reshape(-1), expected
+        )
+        torch.testing.assert_close(
+            iteration_rows[0]["validation_gen_logit"],
+            torch.full_like(iteration_rows[0]["validation_gen_logit"], 3.0),
+        )
+        self.assertEqual(result.checkpoint_coefficients, (0.2,) * 5)
+        self.assertEqual(result.checkpoint_iterations, (1,) * 5)
+        self.assertEqual(len(result.warm_start_state["models"]), 5)
+        self.assertEqual(result.warm_start_state["protocol"]["folds"], 5)
+        self.assertNotIn("repeats", result.warm_start_state["protocol"])
 
     def test_warm_start_cache_survives_reward_serialization_without_affecting_scores(self) -> None:
         batch = _event_batch(batch_size=4)
@@ -1230,8 +2238,23 @@ class TestResidualRatioStack(unittest.TestCase):
         classifier = factory(spec)
         snapshot = copy.deepcopy(classifier.state_dict())
         cache = {
-            "protocol": {"scheme": "condition_sha256_v1", "seed": 42, "folds": 2, "condition_width": packed.shape[-1]},
-            "models": [{"iteration": 1, "fold": 1, "state": snapshot}],
+            "protocol": {
+                "scheme": "condition_sha256_v1",
+                "seed": 42,
+                "folds": 2,
+                "repeats": 5,
+                "repeat_seed_stride": 104729,
+                "condition_width": packed.shape[-1],
+            },
+            "models": [
+                {
+                    "iteration": 1,
+                    "repeat": repeat,
+                    "fold": fold,
+                    "state": snapshot,
+                }
+                for repeat in range(1, 6) for fold in (1, 2)
+            ],
         }
         reward = FrozenResidualRatioReward(classifier, (snapshot,), warm_start_state=cache)
         candidate = torch.zeros(4, 1, 4)
@@ -1247,6 +2270,8 @@ class TestResidualRatioStack(unittest.TestCase):
         torch.testing.assert_close(restored(packed, candidate), expected)
         self.assertEqual(dgpo_reward_module.payload_sha256(payload), dgpo_reward_module.payload_sha256(restored.serializable_payload()))
         restored.assert_frozen()
+        self.assertEqual(restored.warm_start_state["protocol"]["repeats"], 5)
+        self.assertEqual(len(restored.warm_start_state["models"]), 10)
         for value in restored.warm_start_state["models"][0]["state"].values():
             self.assertEqual(value.device.type, "cpu")
         # The training cache is detached from the caller's tensors.
@@ -1394,15 +2419,118 @@ class TestResidualRatioStack(unittest.TestCase):
 
 
 class TestEvenetAdapterModelBuilder(unittest.TestCase):
+    def test_body_only_checkpoint_discards_truth_head_and_reopens_selected_inputs(
+        self,
+    ) -> None:
+        class TruthHead(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.position_encoder = nn.Linear(4, 4)
+
+        template = _FakeZtautauBackbone()
+        template.TruthGeneration = TruthHead()
+
+        def load_finetuned_weights(model, *_args, **_kwargs):
+            model.GroupedSequentialEmbedding.weight.data.fill_(2.0)
+            model.InvisibleInputProjector.weight.data.fill_(3.0)
+            model.TruthGeneration.position_encoder.weight.data.fill_(9.0)
+            return {"state_dict": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "finetuned.ckpt"
+            checkpoint.touch()
+            with mock.patch.object(
+                evenet_ratio_module,
+                "_config_with_pet_adapters",
+                return_value=SimpleNamespace(),
+            ), mock.patch(
+                "RL.DGPO_neutrino.model_utils.build_evenet_on_device",
+                return_value=template,
+            ), mock.patch(
+                "RL.DGPO_neutrino.model_utils.load_weights_like_configure_model",
+                side_effect=load_finetuned_weights,
+            ):
+                builder = EvenetAdapterModelBuilder(
+                    config=SimpleNamespace(),
+                    normalization_dict={},
+                    checkpoint_path=checkpoint,
+                    device=torch.device("cpu"),
+                    body_only_checkpoint=True,
+                    train_grouped_sequential_embedding=True,
+                    train_invisible_projector=True,
+                )
+
+        self.assertTrue(builder.body_only_checkpoint)
+        self.assertIsNone(builder._position_state)
+        self.assertFalse(hasattr(builder.backbone, "TruthGeneration"))
+        torch.testing.assert_close(
+            builder.backbone.GroupedSequentialEmbedding.weight,
+            torch.full_like(
+                builder.backbone.GroupedSequentialEmbedding.weight,
+                2.0,
+            ),
+        )
+        torch.testing.assert_close(
+            builder.backbone.InvisibleInputProjector.weight,
+            torch.full_like(
+                builder.backbone.InvisibleInputProjector.weight,
+                3.0,
+            ),
+        )
+
+        _packed, spec = pack_event_inputs(_event_batch(batch_size=2))
+        with mock.patch(
+            "RL.DGPO_neutrino.model_utils.build_evenet_on_device",
+            return_value=_FakeZtautauBackbone(),
+        ):
+            classifier = builder.make_classifier(spec, "body_ablation")
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in classifier.backbone.GroupedSequentialEmbedding.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in classifier.backbone.InvisibleInputProjector.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in classifier.backbone.GlobalEmbedding.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in classifier.backbone.PET.adapters.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in classifier.backbone.PET.feature_embedding.parameters()
+            )
+        )
+
     def test_monitor_architecture_override_reaches_builder(self) -> None:
         builder = mock.Mock()
         overrides = dict(head_dropout=.15, decoder_hidden_dim=128, decoder_layers=1,
                          decoder_heads=4, periodic_pair_features=False,
-                         topology_fourier_embedding=False, topology_conditioning=False)
+                         topology_fourier_embedding=True, topology_direct_logit=True,
+                         topology_context_residual_scale=.1,
+                         topology_conditioning=False)
         evenet_ratio_module.peft_bank_factory(builder, "spec", "audit", classifier_overrides=overrides)()
         builder.make_classifier.assert_called_once_with("spec", "audit", reset=True, **overrides)
-        for invalid in ({"decoder_layers": 0}, {"decoder_hidden_dim": True},
-                        {"topology_conditioning": "false"}, {"unknown": 1}):
+        for invalid in (
+            {"decoder_layers": 0},
+            {"decoder_hidden_dim": True},
+            {"topology_conditioning": "false"},
+            {"topology_context_residual_scale": 1.1},
+            {"unknown": 1},
+        ):
             with self.assertRaises(ValueError):
                 evenet_ratio_module.peft_bank_factory(builder, "spec", classifier_overrides=invalid)
 
@@ -1523,6 +2651,107 @@ class TestRatioFitProgress(unittest.TestCase):
         self.assertEqual(config.anomaly_detection_steps, 10)
         with self.assertRaisesRegex(ValueError, "anomaly_detection_steps"):
             RatioFitConfig(anomaly_detection_steps=-1).validate()
+        staged = ztautau_stage.build_fit_config(
+            {
+                "batch_size": 8,
+                "min_steps": 300,
+                "topology_warmup_steps": 100,
+                "topology_body_unfreeze_step": 300,
+                "topology_warmup_learning_rate": 1.0e-3,
+            },
+            n_train=32,
+            n_validation=16,
+        )
+        self.assertEqual(staged.topology_warmup_steps, 100)
+        self.assertEqual(staged.topology_body_unfreeze_step, 300)
+        self.assertEqual(staged.topology_warmup_learning_rate, 1.0e-3)
+        fold = evenet_ratio_module._scaled_crossfit_config(
+            staged,
+            0.5,
+            min_steps_per_fold=300,
+        )
+        self.assertEqual(fold.min_steps, 300)
+        self.assertEqual(fold.topology_warmup_steps, 100)
+        self.assertEqual(fold.topology_body_unfreeze_step, 300)
+
+    def test_topology_fit_schedule_rebuilds_optimizer_and_gates_body(self) -> None:
+        class StagedRatio(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.direct = nn.Parameter(torch.zeros(()))
+                self.head = nn.Parameter(torch.zeros(()))
+                self.body = nn.Parameter(torch.zeros(()))
+                self.stage_calls: list[int] = []
+
+            def configure_topology_training_stage(self, stage: int) -> None:
+                self.stage_calls.append(stage)
+                self.requires_grad_(False)
+                self.direct.requires_grad_(True)
+                if stage >= 2:
+                    self.head.requires_grad_(True)
+                if stage >= 3:
+                    self.body.requires_grad_(True)
+
+            def forward(self, condition: Tensor, sample: Tensor) -> Tensor:
+                del condition
+                return (self.direct + self.head + self.body) * sample[..., 0]
+
+        model = StagedRatio()
+        condition = torch.zeros(8, 1)
+        positive = torch.ones(8, 1)
+        negative = -torch.ones(8, 1)
+        weights = torch.ones(8)
+        validation = (
+            condition,
+            positive,
+            weights,
+            condition,
+            negative,
+            weights,
+        )
+        optimizer_lrs: list[float] = []
+        original_init = torch.optim.AdamW.__init__
+
+        def record_optimizer(optimizer, *args, **kwargs):
+            original_init(optimizer, *args, **kwargs)
+            optimizer_lrs.append(float(kwargs["lr"]))
+
+        evaluator = mock.Mock(
+            side_effect=[
+                (0.70, 0.50, 0.50),
+                (0.69, 0.55, 0.55),
+                (0.68, 0.60, 0.60),
+                (0.67, 0.65, 0.65),
+            ]
+        )
+        with mock.patch.object(torch.optim.AdamW, "__init__", record_optimizer):
+            fit_density_ratio(
+                model,
+                condition,
+                positive,
+                weights,
+                condition,
+                negative,
+                weights,
+                RatioFitConfig(
+                    steps=3,
+                    batch_size=8,
+                    learning_rate=1.0e-3,
+                    min_steps=2,
+                    validation_interval_steps=1,
+                    validation_patience_evaluations=10,
+                    validation_batch_size=8,
+                    topology_warmup_steps=1,
+                    topology_body_unfreeze_step=2,
+                    topology_warmup_learning_rate=1.0e-2,
+                ),
+                seed=17,
+                validation=validation,
+                validation_evaluator=evaluator,
+            )
+
+        self.assertEqual(model.stage_calls, [1, 2, 3])
+        self.assertEqual(optimizer_lrs, [1.0e-2, 1.0e-3, 1.0e-3])
 
     def test_grouped_embedding_and_invisible_projector_share_fast_lr(self) -> None:
         self.assertTrue(
@@ -1700,6 +2929,57 @@ class TestRatioFitProgress(unittest.TestCase):
             places=6,
         )
 
+    def test_checkpoint_can_select_discrimination_before_later_calibration(self) -> None:
+        class _LinearRatio(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(torch.zeros(()))
+
+            def forward(self, condition: Tensor, sample: Tensor) -> Tensor:
+                del condition
+                return self.weight * sample[..., 0]
+
+        model = _LinearRatio()
+        condition = torch.zeros(16, 1)
+        positive = torch.ones(16, 1)
+        negative = -torch.ones(16, 1)
+        population = (
+            condition,
+            positive,
+            torch.ones(16),
+            condition,
+            negative,
+            torch.ones(16),
+        )
+        evaluations = iter(
+            ((0.693, 0.50, float("nan")), (0.80, 0.60, float("nan")),
+             (0.90, 0.70, float("nan")))
+        )
+        diagnostics = fit_density_ratio(
+            model,
+            *population,
+            RatioFitConfig(
+                steps=2,
+                batch_size=16,
+                learning_rate=0.1,
+                weight_decay=0.0,
+                sampling="independent_epoch_shuffle",
+                min_steps=2,
+                validation_interval_steps=1,
+                validation_patience_evaluations=10,
+                validation_batch_size=16,
+                restore_best=True,
+                checkpoint_selection_metric="balanced_accuracy",
+            ),
+            seed=23,
+            validation=population,
+            validation_evaluator=lambda _model: next(evaluations),
+        )
+        self.assertEqual(diagnostics.best_step, 2)
+        self.assertAlmostEqual(diagnostics.validation_loss, 0.90)
+        self.assertAlmostEqual(diagnostics.validation_balanced_accuracy, 0.70)
+        self.assertGreater(abs(float(model.weight)), 0.0)
+
     def test_auc_gap_threshold_stops_an_unbounded_fit_after_one_epoch(self) -> None:
         model = ConditionalRatioMLP(
             condition_dim=2,
@@ -1740,6 +3020,46 @@ class TestRatioFitProgress(unittest.TestCase):
         self.assertFalse(diagnostics.saturated)
         self.assertEqual(diagnostics.steps_completed, 4)
         self.assertFalse(diagnostics.hit_step_cap)
+
+    def test_auc_gap_threshold_cannot_bypass_minimum_steps(self) -> None:
+        model = ConditionalRatioMLP(
+            condition_dim=2,
+            sample_dim=1,
+            hidden_dim=8,
+            hidden_layers=1,
+        )
+        condition = torch.zeros(16, 2)
+        positive = torch.ones(16, 1)
+        negative = -torch.ones(16, 1)
+        validation = (
+            condition,
+            positive,
+            torch.ones(16),
+            condition,
+            negative,
+            torch.ones(16),
+        )
+        diagnostics = fit_density_ratio(
+            model,
+            *validation,
+            RatioFitConfig(
+                steps=None,
+                batch_size=4,
+                sampling="independent_epoch_shuffle",
+                min_steps=12,
+                validation_interval_steps=4,
+                validation_patience_evaluations=10,
+                validation_batch_size=16,
+                restore_best=True,
+            ),
+            seed=11,
+            validation=validation,
+            validation_evaluator=lambda _model: (0.69, 0.60, 0.53),
+            stop_when_validation_auc_gap_exceeds=0.02,
+        )
+        self.assertTrue(diagnostics.threshold_reached)
+        self.assertFalse(diagnostics.saturated)
+        self.assertEqual(diagnostics.steps_completed, 12)
 
     def test_balanced_accuracy_lcb_stops_after_two_confirmations(self) -> None:
         model = ConditionalRatioMLP(
@@ -2123,7 +3443,68 @@ class _FakeFrozenReward(nn.Module):
         return candidate_bk4.sum(dim=-1) + packed_event[:, :1]
 
 
+class _FakeConsensusFrozenReward(_FakeFrozenReward):
+    def __init__(self, packing_spec) -> None:
+        super().__init__(packing_spec)
+        self.num_iterations = 1
+        self.num_checkpoints = 4
+
+    def member_logits(self, packed_event: Tensor, candidate_bk4: Tensor) -> Tensor:
+        base = self.forward(packed_event, candidate_bk4)
+        return torch.stack((base, base, -base, -base))
+
+    def ensemble_from_member_logits(self, member_logits: Tensor) -> Tensor:
+        # Keep a nonzero current direction while member votes remain split.
+        return member_logits[0]
+
+
 class TestDgpoOmniFoldReward(unittest.TestCase):
+    def test_candidate_consensus_gate_changes_only_disagreed_advantages(self) -> None:
+        batch = _event_batch(batch_size=2)
+        packed, spec = pack_event_inputs(batch)
+        del packed
+        source = ZtautauOmniFoldReward(
+            _FakeConsensusFrozenReward(spec).eval(),
+            bundle_sha256="b" * 64,
+            policy_reference_sha256="a" * 64,
+            base_digest="c" * 64,
+            stack_sha256="d" * 64,
+            bundle_schema_version=1,
+            device=torch.device("cpu"),
+            reward_round_id=1,
+            candidate_consensus={
+                "enabled": True,
+                "apply_to_reward": True,
+                "temporal_history_rounds": 0,
+                "minimum_sign_agreement": 0.75,
+                "uncertainty_scale": 1.0,
+                "epsilon": 1.0e-8,
+                "fixed_panel_events_per_rank": 2,
+                "fixed_panel_candidates": 3,
+            },
+        )
+        # The first validation call uses a different validation_K and must not
+        # capture the fixed DGPO training panel.
+        validation_batch = dict(batch)
+        source.compute(torch.randn(3, 2, 2, 2), validation_batch)
+        self.assertFalse(
+            any(
+                key.startswith("reward_rank_audit/")
+                for key in source.last_interface_metrics()
+            )
+        )
+        candidates = torch.randn(3, 2, 2, 2)
+        training_batch = dict(batch)
+        training_batch["_dgpo_reward_context"] = "policy_update"
+        scores = source.compute(candidates, training_batch)
+        torch.testing.assert_close(scores, torch.zeros_like(scores))
+        metrics = source.last_interface_metrics()
+        self.assertEqual(metrics["reward_consensus/applied"], 1.0)
+        self.assertEqual(metrics["reward_consensus/live/zeroed_fraction"], 1.0)
+        self.assertEqual(
+            metrics["reward_rank_audit/fixed_panel/reward_round_id"], 1.0
+        )
+
     def test_simplified_wandb_profile_keeps_topology_acceptance_evidence(self) -> None:
         from RL.DGPO_neutrino import dgpo_trainer
 
@@ -2161,11 +3542,17 @@ class TestDgpoOmniFoldReward(unittest.TestCase):
                     bootstrap_in_dgpo=True,
                     bundle_file=None,
                     backbone_checkpoint="unused-by-mock.ckpt",
+                    candidate_consensus={
+                        "enabled": True,
+                        "apply_to_reward": False,
+                    },
                 ),
             ),
             dgpo=SimpleNamespace(
                 adaptive_omnifold=SimpleNamespace(
                     recalibration=SimpleNamespace(
+                        body_only_checkpoint=True,
+                        train_last_pet_block=True,
                         train_grouped_sequential_embedding=True,
                         train_invisible_projector=True,
                         periodic_pair_features=True,
@@ -2187,6 +3574,12 @@ class TestDgpoOmniFoldReward(unittest.TestCase):
             )
 
         classifier_config = build_reward.call_args.kwargs["classifier_config"]
+        self.assertEqual(
+            build_reward.call_args.kwargs["candidate_consensus"],
+            {"enabled": True, "apply_to_reward": False},
+        )
+        self.assertTrue(classifier_config["body_only_checkpoint"])
+        self.assertTrue(classifier_config["train_last_pet_block"])
         self.assertTrue(
             classifier_config["train_grouped_sequential_embedding"]
         )
@@ -2367,8 +3760,10 @@ class TestDgpoOmniFoldReward(unittest.TestCase):
             tempering=1.0,
             checkpoint_coefficients=(0.5, 0.5),
             checkpoint_iterations=(1, 1),
+            iteration_temperatures=(0.5,),
         )
         reward_payload = frozen.serializable_payload()
+        self.assertEqual(reward_payload["iteration_temperatures"], [0.5])
         class _FakeBuilder:
             def __init__(self):
                 self.default_hidden = 8
@@ -2435,12 +3830,31 @@ class TestDgpoOmniFoldReward(unittest.TestCase):
                     device=torch.device("cpu"),
                     expected_iterations=1,
                 )
+                consensus_loaded = load_ztautau_omnifold_reward(
+                    bundle_file=bundle_path,
+                    backbone_checkpoint=backbone_path,
+                    training_config=object(),
+                    normalization_dict={},
+                    device=torch.device("cpu"),
+                    expected_iterations=1,
+                    candidate_consensus={
+                        "enabled": True,
+                        "apply_to_reward": True,
+                        "temporal_history_rounds": 1,
+                        "minimum_sign_agreement": 0.75,
+                        "uncertainty_scale": 1.0,
+                        "epsilon": 1.0e-8,
+                        "fixed_panel_events_per_rank": 2,
+                        "fixed_panel_candidates": 3,
+                    },
+                )
         candidates = torch.randn(3, 2, 2, 2)
         batch["x_invisible"] = torch.randn(2, 2, 2)
         batch["x_invisible_mask"] = torch.ones(2, 2)
         self.assertEqual(tuple(loaded.compute(candidates, batch).shape), (3, 2))
         self.assertEqual(loaded.iterations, 1)
         self.assertEqual(loaded.frozen_reward.num_checkpoints, 2)
+        self.assertEqual(loaded.frozen_reward.iteration_temperatures, (0.5,))
         loaded.replace_stack(
             loaded.frozen_reward,
             round_id=1,
@@ -2452,9 +3866,47 @@ class TestDgpoOmniFoldReward(unittest.TestCase):
         self.assertEqual(
             resumed_payload["stack_sha256"], dynamic_payload["stack_sha256"]
         )
+        self.assertEqual(
+            resumed_payload["reward"]["iteration_temperatures"], [0.5]
+        )
         self.assertEqual(loaded.reward_round_id, 1)
         self.assertEqual(loaded.reference_kind, "state_dict_sha256")
         self.assertEqual(loaded.policy_reference_sha256, "e" * 64)
+
+        # The fixed candidate panel, previous reward, and audit trajectory are
+        # all recovery state. Verify a round boundary survives serialization.
+        consensus_loaded.replace_stack(
+            consensus_loaded.frozen_reward,
+            round_id=1,
+            reference_sha256="1" * 64,
+        )
+        consensus_training_batch = dict(batch)
+        consensus_training_batch["_dgpo_reward_context"] = "policy_update"
+        first_consensus = consensus_loaded.compute(
+            candidates, consensus_training_batch
+        )
+        consensus_loaded.replace_stack(
+            consensus_loaded.frozen_reward,
+            round_id=2,
+            reference_sha256="2" * 64,
+        )
+        second_consensus = consensus_loaded.compute(
+            candidates, consensus_training_batch
+        )
+        consensus_payload = consensus_loaded.stack_payload()
+        self.assertEqual(len(consensus_payload["consensus_history"]), 1)
+        self.assertEqual(len(consensus_payload["rank_audit_history"]), 2)
+        self.assertEqual(
+            tuple(consensus_payload["rank_audit_panel"]["candidates"].shape),
+            (2, 3, 4),
+        )
+        consensus_loaded.load_stack_payload(consensus_payload)
+        torch.testing.assert_close(
+            consensus_loaded.compute(candidates, consensus_training_batch),
+            second_consensus,
+        )
+        self.assertEqual(len(consensus_loaded.rank_audit_history), 2)
+        self.assertEqual(tuple(first_consensus.shape), (3, 2))
         legacy_payload = copy.deepcopy(dynamic_payload)
         for increment in legacy_payload["reward"]["increments"]:
             increment.pop("classifier_config", None)
@@ -2491,6 +3943,106 @@ class TestDgpoOmniFoldReward(unittest.TestCase):
             allow_source_bundle_migration=True,
         )
         self.assertTrue(migration_target.is_installed)
+
+    def test_resume_keeps_parent_body_keys_when_fork_opens_encoder(self) -> None:
+        """Fork YAML may set train_encoder/LN; parent restore must not expand body."""
+
+        batch = _event_batch(batch_size=2)
+        _, spec = pack_event_inputs(batch)
+        parent_backbone = _FakeZtautauBackbone()
+        parent = EvenetAdapterRatioClassifier(
+            parent_backbone,
+            spec,
+            train_layernorm=False,
+            train_encoder=False,
+            train_grouped_sequential_embedding=True,
+            train_invisible_projector=True,
+            decoder_hidden_dim=8,
+            decoder_layers=1,
+            decoder_heads=2,
+            adapter_bottleneck=4,
+            head_dropout=0.25,
+            bank_name="adaptive_reward",
+        )
+        self.assertFalse(
+            any(name.startswith("GlobalEmbedding") for name in parent._backbone_state_keys)
+        )
+        checkpoint = {
+            key: value.detach().clone() for key, value in parent.state_dict().items()
+        }
+        frozen = FrozenResidualRatioReward(
+            parent,
+            (checkpoint,),
+            tempering=0.75,
+            checkpoint_coefficients=(1.0,),
+            checkpoint_iterations=(1,),
+        )
+        reward_payload = frozen.serializable_payload()
+        stack_sha = dgpo_reward_module.payload_sha256(reward_payload)
+
+        class _ForkBuilder:
+            """Simulates a fork builder whose defaults open LN + GlobalEmbedding."""
+
+            def make_classifier(self, packing_spec, **kwargs):
+                train_layernorm = kwargs.get("train_layernorm", True)
+                train_encoder = kwargs.get("train_encoder", True)
+                return EvenetAdapterRatioClassifier(
+                    _FakeZtautauBackbone(),
+                    packing_spec,
+                    train_layernorm=bool(train_layernorm),
+                    train_encoder=bool(train_encoder),
+                    train_grouped_sequential_embedding=bool(
+                        kwargs.get("train_grouped_sequential_embedding", True)
+                    ),
+                    train_invisible_projector=bool(
+                        kwargs.get("train_invisible_projector", True)
+                    ),
+                    train_backbone=bool(kwargs.get("train_backbone", False)),
+                    head_dropout=kwargs.get("head_dropout", 0.15),
+                    decoder_hidden_dim=int(kwargs.get("decoder_hidden_dim", 8)),
+                    decoder_layers=int(kwargs.get("decoder_layers", 1)),
+                    decoder_heads=int(kwargs.get("decoder_heads", 2)),
+                    adapter_bottleneck=int(kwargs.get("adapter_bottleneck", 4)),
+                    bank_name=kwargs.get("name"),
+                    # Keep the same body digest as the parent payload; production
+                    # builders share one pretrained snapshot, so this matches.
+                    base_digest=str(reward_payload["base_digest"]),
+                )
+
+        target = ZtautauOmniFoldReward(
+            None,
+            bundle_sha256="a" * 64,
+            policy_reference_sha256="d" * 64,
+            base_digest=str(reward_payload["base_digest"]),
+            stack_sha256="",
+            bundle_schema_version=1,
+            device=torch.device("cpu"),
+            model_builder=_ForkBuilder(),
+        )
+        payload = {
+            "schema_version": 1,
+            "kind": "ztautau_adaptive_omnifold_stack",
+            "source_bundle_sha256": "b" * 64,
+            "stack_sha256": stack_sha,
+            "reward_round_id": 1,
+            "policy_reference_sha256": "c" * 64,
+            "reference_kind": "state_dict_sha256",
+            "reward": reward_payload,
+        }
+        # Without the restore-flag fix this raises backbone trainable-state mismatch.
+        target.load_stack_payload(payload, allow_source_bundle_migration=True)
+        self.assertTrue(target.is_installed)
+        self.assertEqual(target.stack_payload()["stack_sha256"], stack_sha)
+        restored = target.frozen_reward.classifier
+        self.assertFalse(restored._train_encoder)
+        self.assertFalse(restored._train_layernorm)
+        self.assertFalse(
+            any(
+                name.startswith("GlobalEmbedding")
+                for name in restored._backbone_state_keys
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

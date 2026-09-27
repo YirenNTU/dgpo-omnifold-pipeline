@@ -1,0 +1,37 @@
+extends_overlay: dgpo_h4_frozen_readout_quick.yaml
+
+experiment:
+  protocol: h4-output-scale300-v1
+  intervention: control_identity_fourier_output_transform
+  primary_decision_rule: >-
+    Matched 300-update pilot. Primary: held-out balanced BCE at update 200;
+    secondary: 50/100/300 BCE and mean of evaluations from 200 through 300.
+    AUC is auxiliary, never a success gate. Compare full histories, not restored
+    best-checkpoint test endpoints. One seed is screening, not replication.
+  historical_context: h4readq1 scaling helped frozen heads; h4readb1 full-batch was not sufficient; h4bceq1 showed small BCE gains without weight collapse.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_control300/ray_results
+
+logger:
+  local:
+    name: h4_scale_control300
+    version: h4_scale_control300_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_control300/logs
+  wandb:
+    id: h4sclc1
+    resume: never
+    run_name: Does Fourier output scaling speed BCE learning? | control | 300 updates
+    group: H4 Fourier output scaling
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_scale_control300/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      fourier_output_standardization: false
+      representation_export_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_control300/panels
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_control300/diagnostic_snapshots

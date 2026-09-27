@@ -1,0 +1,84 @@
+# Read-only optimizer-state decomposition at the h4xfer01 step-20 anchor.
+# One question: does AdamW transform a useful exact H4+reference gradient into
+# a direction that is worse under the frozen installed step-20 H4 ensemble?
+base_config: config/train_diffusion_nersc.yaml
+source_checkpoint: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_20step_v1/checkpoints/last.ckpt
+source_runtime: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_20step_v1/resolved_overlay.yaml
+event_pool: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_reward_interface_v5/fixed_k1_pool.pt
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_adamw_direction_transfer_v3
+
+expected_source_wandb_id: h4xfer01
+expected_policy_step: 20
+expected_reward_round_id: 1
+
+workers: 16
+cpus_per_worker: 2
+K: 8
+
+# This is one complete production estimator for the exact installed reward +
+# coefficient-1 velocity-MSE objective. Gradient clipping is inherited from
+# the source runtime before constructing every optimizer direction.
+events_per_worker: 512
+event_microbatch_size: 128
+gradient_timesteps: 8
+gradient_candidate_seed: 2026091601
+gradient_seed: 2026091602
+panel_selection_seed: 2026091603
+
+# Native AdamW at 1e-6 full-parameter RMS defines the functional radius. The
+# other four directions are independently scaled to its symmetric VP distance.
+curvature_events: 2048
+curvature_candidate_seed: 2026091604
+curvature_timesteps: 8
+curvature_path_seed: 2026091605
+native_parameter_rms: 1.0e-6
+distance_match_tolerance: 0.05
+distance_match_iterations: 4
+minimum_parameter_rms: 1.0e-8
+maximum_parameter_rms: 3.0e-5
+
+# The installed four-member H4 reward remains frozen and is reused only as a
+# judge here. h4xfer01's separate fresh-judge alignment at step 20 (cosine
+# 0.896) is the independent check that it was still representative. Each seed
+# uses common rollout noise for zero, plus, and minus across all directions.
+judge_events: 2048
+judge_rollout_seeds:
+  - 2026091611
+  - 2026091612
+  - 2026091613
+  - 2026091614
+  - 2026091615
+  - 2026091616
+  - 2026091617
+  - 2026091618
+score_batch_size: 32768
+
+save_direction_vectors: true
+upload_direction_vectors: false
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h4opt01
+  # v2 reached W&B stage 0 before failing its local optimizer reconstruction.
+  # Resume the same predeclared run id; no scientific result was logged yet.
+  resume: allow
+  name: c4a91e07_h4_adamw_direction_transfer_v3
+  group: c4a91e07_h4_projection_diagnostics
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - SourceH4xfer01Step20
+    - H4Ensemble
+    - AdamWStateDecomposition
+    - ExactProductionGradient
+    - MatchedVPPathDistance
+    - FrozenStep20InstalledH4Judge
+    - EightSeedCRN
+    - TargetPreserving
+    - NoClassifierFit
+    - NoOptimizerStep
+    - LiveWandb

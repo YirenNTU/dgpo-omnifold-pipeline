@@ -1,0 +1,762 @@
+# Captured original f6b4ec46 configuration; full resume, patience8/staleness10.
+rl:
+  enabled: true
+dgpo:
+  K: 8
+  beta: 1
+  tarp:
+    arms:
+    - full
+    - rank_copula
+    seed: 20260820
+    alpha: 0.05
+    n_bins: 4
+    enabled: true
+    profile: visible_acoplanarity
+    min_events: 500
+    pooled_panel: true
+    n_null_assignments: 399
+    n_reference_trials: 8
+  beta_kl: 0
+  log_every: 1
+  lr_schedule:
+    type: cosine
+    total_steps: 1500
+    min_lr_ratio: 0.1
+  adv_clip_max: null
+  validation_K: 16
+  grad_clip_norm: 1
+  num_ddim_steps: 20
+  reference_trust:
+    enabled: true
+    objective: velocity_mse
+    coefficient: 1
+    adaptive_boundary:
+      enabled: true
+      distance: velocity_mse_ratio
+      delta_max: 0.1
+      delta_floor: 0.02
+      enforcement: post_step_backtracking
+      radius_mode: best_decay
+      max_backtracks: 8
+      backtrack_factor: 0.5
+      warning_fraction: 0.9
+      best_decay_factor: 0.9
+      interior_fraction: 1
+      radius_calibration:
+        enabled: false
+        bidirectional: false
+        allow_expansion: false
+        scale_policy_lr: false
+        refit_on_exhaustion: false
+        signed_direction_probe:
+          enabled: false
+          recover_reverse_only: false
+        lookahead_extragradient:
+          enabled: false
+        cross_round_nonexpanding: false
+        round_acceptance_enabled: false
+        trajectory_search_enabled: false
+      probe_events_per_rank: 128
+      fixed_probe_per_reward_round: true
+      reset_adam_first_moment_on_install: false
+      reset_adam_first_moment_on_zero_step: false
+  steps_per_epoch: 10
+  ztautau_metrics:
+    bins: 60
+    enabled: true
+    log_images: true
+    candidate_index: 0
+    image_observables:
+    - topology/cos_opening
+    - topology/delta_phi_to_pi
+  adaptive_omnifold:
+    enabled: true
+    trigger:
+      best_scope: global
+      probe_seed: 20260905
+      power_alpha: 0.05
+      power_target: 0.8
+      probe_max_events: 250000
+      raw_audit_enabled: true
+      max_reward_age_epochs: null
+      warm_start_classifier: true
+      retrain_cooldown_epochs: 0
+      global_max_failed_rounds: 0
+      require_audit_saturation: true
+      global_confirm_candidates: true
+      raw_improvement_min_delta: 0.001
+      required_consecutive_checks: 8
+      rollback_to_best_on_plateau: true
+    log_only: false
+    audit_fit:
+      sampling: independent_epoch_shuffle
+      min_steps: 0
+      batch_size: 32768
+      min_epochs: 1
+      head_dropout: 0.15
+      restore_best: true
+      weight_decay: 0.0005
+      learning_rate: 0.0002
+      drop_last_batch: true
+      safety_max_epochs: null
+      gradient_clip_norm: 5.0
+      require_saturation: false
+      validation_min_delta: 0.0001
+      validation_batch_size: 2048
+      progress_every_n_steps: 10
+      validation_interval_epochs: 1.0
+      validation_patience_epochs: 10.0
+      train_microbatch_size_per_rank: 2048
+    monitor_mode: raw_plateau_refit
+    recalibration:
+      fit:
+        sampling: independent_epoch_shuffle
+        min_steps: 1
+        batch_size: 16384
+        min_epochs: 1
+        restore_best: true
+        weight_decay: 0.0005
+        learning_rate: 0.0002
+        drop_last_batch: true
+        safety_max_epochs: null
+        gradient_clip_norm: 5
+        require_saturation: true
+        validation_min_delta: 0.0001
+        validation_batch_size: 2048
+        backbone_learning_rate: 1.0e-05
+        progress_every_n_steps: 10
+        anomaly_detection_steps: 0
+        validation_interval_epochs: 1
+        validation_patience_epochs: 25
+        train_microbatch_size_per_rank: 1024
+      seed: 20260906
+      tempering: 1
+      pool_events: null
+      head_dropout: 0.15
+      decoder_heads: 4
+      refit_once_id: ''
+      train_encoder: false
+      crossfit_folds: 2
+      decoder_layers: 1
+      max_iterations: 10
+      min_iterations: 1
+      train_backbone: false
+      train_layernorm: false
+      score_row_budget: 2048
+      score_pool_events: null
+      adapter_bottleneck: 16
+      bootstrap_on_start: false
+      decoder_hidden_dim: 128
+      # Match the saved step330 / round6 protocol; do not restart its completed warmup.
+      policy_warmup_steps: 10
+      pool_selection_seed: 42
+      asymmetric_attention: true
+      candidates_per_event: 1
+      refit_once_on_resume: false
+      bootstrap_fail_closed: true
+      residual_min_auc_gain: 0.01
+      warm_start_iterations:
+      - 1
+      - 2
+      periodic_pair_features: false
+      refit_once_fail_closed: false
+      acceptance_audit_enabled: false
+      train_invisible_projector: true
+      policy_warmup_start_factor: 0.1
+      topology_fourier_embedding: false
+      topology_acceptance_repeats: 1
+      topology_acceptance_max_auc_gap: 0.005
+      acceptance_max_balanced_accuracy: 0.51
+      reset_optimizer_state_on_install: true
+      topology_acceptance_audit_enabled: false
+      train_grouped_sequential_embedding: true
+    classifier_trust:
+      enabled: false
+      probe_max_events: null
+    fixed_audit_panel: true
+    single_pool_split_seed: 42
+    baseline_probe_on_start: false
+    staleness_every_n_steps: 10
+    staleness_every_n_epochs: 1
+    pool_generation_batch_size: 1024
+    single_pool_train_validation: true
+  policy_eval_t_max: 0.7
+  policy_eval_t_min: 0
+  train_dist_enabled: false
+  advantage_estimator: leave_one_out_unscaled
+  num_train_timesteps: 8
+  checkpoint_load_mode: resume
+  auto_resume_from_last: true
+  projection_constraint:
+    type: none
+  validation_batch_size: 512
+  validation_log_batches: true
+  validation_max_batches: 15
+  rollout_parallel_chains: 4
+  variance_regularization:
+    weight: 0
+    enabled: false
+    features: null
+  activation_checkpointing: true
+  checkpoint_every_n_steps: 0
+  float32_matmul_precision: medium
+  checkpoint_every_n_epochs: 1
+  validation_every_n_epochs: 3
+  validation_num_ddim_steps: 20
+  validation_compute_winrate: false
+  require_deterministic_policy: true
+  sequential_vp_trust_backward: false
+  policy_eval_parallel_timesteps: 1
+  validation_full_every_n_epochs: 3
+  best_source_start_new_experiment: false
+  policy_eval_event_microbatch_size: 128
+  global_best_checkpoint_search_dirs:
+  - /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_v26_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/checkpoints
+  - /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_v26_resume1_rawplateau5_patience5_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/checkpoints
+  validation_rollout_parallel_chains: 8
+  auto_resume_fallback_checkpoint_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_v26_resume3_rawplateau5_patience6_val3_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/checkpoints/last.ckpt
+  auto_resume_best_source_checkpoint_dir: null
+nersc:
+  qos: regular
+  ray:
+    temp_dir: /tmp/r${UID}_${SLURM_JOB_ID}
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_v26_resume3_rawplateau5_patience6_val3_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/ray_results
+    start_script: /global/homes/y/yiren/ml_pipeline/NERSC/start_interactive_ray.sh
+    experimental_noset_cuda_visible_devices: null
+  time: '10:00:00'
+  image: registry.nersc.gov/m2616/avencast/evenet:1.3
+  nodes: 4
+  submit: false
+  system: perlmutter
+  account: m5019_g
+  execution:
+    mode: ray_train_ddp
+    command: shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml --overlay-config config/dgpo_omnifold_ztautau_10pct_old_classifier_resume_p8.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_v26_resume3_rawplateau5_patience6_val3_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/ray_results
+    workers: 16
+    gpus_per_worker: 1
+  repo_root: /global/homes/y/yiren/ml_pipeline
+  constraint: gpu
+  cpus_per_task: 128
+  gpus_per_node: 4
+  ntasks_per_node: 1
+  reproducibility:
+    note: Full-state resume from original f6b4ec46 directory last.ckpt; original 128x1
+      classifier without topology features, tempering 1, all classifier fitting and
+      confirmation settings preserved. Match step330 warmup with 10 steps, start factor 0.1.
+      Patience8, monitor10steps. Disable failed-refit-round
+      global stop to resume the previously stopped run; retain global-best rollback.
+      New W&B run, same output directory.
+    dataset_shuffle_seed: 42
+    dgpo_training_fraction: 0.1
+    diffusion_pretrain_fraction: 0.1
+    classifier_backbone_protocol: matched_10pct_pretrain
+compat:
+  backend: dgpo-evenet
+  repo_root: /global/u2/y/yiren/ml_pipeline
+logger:
+  local:
+    name: dgpo_omnifold_10pct_v26_resume3_rawplateau5_patience6_val3_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42
+    version: v26_resume3_rawplateau5_patience6_val3_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_10pct_seed42
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_v26_resume3_rawplateau5_patience6_val3_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/logs
+  wandb:
+    id: null
+    tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - OmniFoldReward
+    - ScalingLawAllData10pct
+    - STICFiltered10pct
+    - PretrainLiveStateDict
+    - FullDGPOResume
+    - CosineLR1500Floor10pct
+    - RestoreOmniFoldStack
+    - NoTopologyFeatures
+    - ClassifierDecoder128
+    - MatchedV23Protocol
+    - GlobalBestTrust10Decay09
+    - NoClassifierTrust
+    - RoundWarmup10ResumeStep330
+    - BestPolicyRollback
+    - GlobalBestRollback
+    - GlobalBestPairedConfirmation
+    - VelocityMSESurrogate
+    - Coefficient1
+    - OmniFoldWarmStartIterations12
+    - RawMonitorWarmStart
+    - RawMonitor250kPool200kTrain
+    - RawMonitorBatch32768
+    - NoAcceptanceAudit
+    - CheckpointEveryEpoch
+    - RawPlateauPatience8
+    - RawMonitorEvery10Steps
+    - ResumeF6b4ec46
+    - ContinuePastFailedRounds
+    entity: ytchou97-university-of-washington
+    resume: never
+    profile: critical
+    project: nu2flow-RL
+    run_name: dgpo_10pct_old_classifier_resume_f6b4ec46_p8_stale10
+    fresh_run: true
+    simplified: true
+network:
+  Body:
+    PET:
+      mode: all
+      dropout: 0
+      num_heads: 16
+      hidden_dim: 256
+      num_layers: 16
+      layer_scale: true
+      local_Krank: 3
+      feature_drop: 0
+      talking_head: false
+      num_local_layer: 10
+      drop_probability: 0
+      layer_scale_init: 1.0e-05
+      num_feature_keep: 0
+      local_point_index:
+      - 2
+      - 3
+      enable_local_embedding: true
+    ObjectEncoder:
+      dropout: 0.1
+      hidden_dim: 256
+      skip_connection: true
+      num_encoder_layers: 2
+      num_attention_heads: 8
+      num_embedding_layers: 2
+      transformer_dim_scale: 2
+      position_embedding_dim: 32
+      encoder_skip_connection: true
+    GlobalEmbedding:
+      dropout: 0
+      hidden_dim: 256
+      normalization: LayerNorm
+      skip_connection: true
+      linear_activation: GELU
+      linear_block_type: GRU
+      num_embedding_layers: 8
+      initial_embedding_dim: 16
+      transformer_dim_scale: 2
+    GroupedSequentialEmbedding:
+      dropout: 0
+      hidden_dim_scale: 2
+  Assignment:
+    dropout: 0.1
+    activation: GELU
+    hidden_dim: 256
+    feature_drop: 0.1
+    skip_connection: true
+    num_feature_keep: 0
+    num_linear_layers: 1
+    encode_event_token: false
+    num_encoder_layers: 1
+    combinatorial_scale: 0
+    num_attention_heads: 4
+    num_detection_layers: 1
+    transformer_dim_scale: 2
+    num_jet_encoder_layers: 0
+    position_embedding_dim: 32
+    encoder_skip_connection: true
+    num_jet_embedding_layers: 0
+    split_symmetric_attention: true
+  Regression:
+    dropout: 0.1
+    hidden_dim: 256
+    skip_connection: true
+    num_regression_layers: 1
+  Segmentation:
+    dropout: 0.1
+    num_heads: 8
+    num_layers: 1
+    norm_before: false
+    num_queries: 4
+    projection_dim: 256
+    mask_mlp_layers: 1
+    encode_event_token: false
+    return_intermediate: true
+  Classification:
+    dropout: 0.1
+    hidden_dim: 256
+    skip_connection: true
+    num_attention_heads: 8
+    num_classification_layers: 1
+  ReconGeneration:
+    dropout: 0.1
+    num_heads: 4
+    hidden_dim: 256
+    num_layers: 1
+    layer_scale: true
+    extend_batch: true
+    feature_drop: 0.1
+    drop_probability: 0.1
+    layer_scale_init: 1.0e-05
+  TruthGeneration:
+    dropout: 0
+    num_heads: 4
+    hidden_dim: 256
+    num_layers: 1
+    layer_scale: true
+    extend_batch: true
+    feature_drop: 0
+    drop_probability: 0
+    layer_scale_init: 1.0e-05
+    max_position_length: 36
+    neutrino_position_encode: true
+  GlobalGeneration:
+    dropout: 0
+    activation: SILU
+    hidden_dim: 64
+    num_layers: 1
+    resnet_dim: 64
+    layer_scale_init: 1.0e-05
+    num_resnet_layers: 1
+    feature_drop_for_stochastic_depth: 0
+options:
+  Dataset:
+    val_split:
+    - 0.8
+    - 1
+    balance_file: null
+    dataset_limit: 1
+    val_dataset_limit: 1
+    normalization_file: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/normalization.pt
+    dataset_limit_apply_to_val_set: false
+  Metrics:
+    Generation-Binning:
+      neutrino-pt:
+      - 121
+      - 0
+      - 60
+      num_vectors:
+      - 21
+      - -1
+      - 20
+      neutrino-eta:
+      - 121
+      - -0.15
+      - 0.15
+      neutrino-phi:
+      - 121
+      - -0.05
+      - 0.05
+      neutrino-btag:
+      - 2
+      - 0
+      - 1
+      neutrino-theta:
+      - 121
+      - -0.05
+      - 0.05
+      neutrino-charge:
+      - 3
+      - -1
+      - 1
+      neutrino-energy:
+      - 121
+      - 0
+      - 60
+      neutrino-log_pt:
+      - 50
+      - 0
+      - 7
+      point cloud-eta:
+      - 50
+      - -4
+      - 4
+      point cloud-phi:
+      - 50
+      - -4
+      - 4
+      point cloud-btag:
+      - 2
+      - 0
+      - 1
+      neutrino-isLepton:
+      - 2
+      - 0
+      - 1
+      neutrino-log_mass:
+      - 10
+      - -1
+      - 1
+      point cloud-charge:
+      - 3
+      - -1
+      - 1
+      point cloud-log_pt:
+      - 50
+      - -1
+      - 10
+      point cloud-isLepton:
+      - 2
+      - 0
+      - 1
+      point cloud-log_energy:
+      - 50
+      - -1
+      - 10
+    ObjectTag-Embedding:
+      alpha: 0.8
+      enable: true
+      group_name: ObjectTag
+      max_points: 10000
+      marker_size: 8
+      max_batches: 10
+      others_label: others
+      label_feature: Part_pdgId
+      interested_labels:
+        '2': e
+        '6': mu
+        '21': gamma
+        '41': pi
+        '42': K
+        '47': pi0
+        '61': K_S0
+        '62': K_L0
+        '65': p
+        '66': n
+      log_every_n_epochs: 20
+      outlier_percentile_low: 0.5
+      outlier_percentile_high: 99.5
+  Training:
+    EMA:
+      decay: 0.999
+      enable: true
+      start_epoch: 0
+      use_for_generation: false
+      replace_model_at_end: false
+      update_every_n_steps: 1
+      replace_model_after_load: false
+      use_ema_during_training_eval: false
+    FAMO:
+      lr: 0.025
+      turn_on: false
+      logits_bound: 1
+      detailed_loss: false
+      detailed_loss_list:
+      - classification
+      - classification-noised
+      - generation-global
+      - generation-event
+      - generation-invisible
+      - assignment
+      - detection
+      - regression
+      - segmentation
+    epochs: 150
+    Components:
+      PET:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        warm_up: true
+        weight_decay: 0.001
+        learning_rate: 2.0e-05
+        optimizer_type: adamW
+        optimizer_group: body
+        decoupled_weight_decay: true
+      Assignment:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        include: false
+        warm_up: true
+        focal_gamma: 1
+        weight_decay: 0.001
+        learning_rate: 5.0e-05
+        optimizer_type: lion
+        optimizer_group: assignment
+        detection_loss_scale: 1
+        assignment_loss_scale: 1
+        decoupled_weight_decay: true
+      Regression:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        include: false
+        warm_up: true
+        loss_scale: 1
+        weight_decay: 0.001
+        learning_rate: 5.0e-05
+        optimizer_type: lion
+        optimizer_group: regression
+        decoupled_weight_decay: true
+      Segmentation:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        include: false
+        warm_up: true
+        weight_decay: 0.001
+        learning_rate: 5.0e-05
+        use_full_mask: true
+        cls_loss_scale: 1
+        optimizer_type: lion
+        dice_loss_scale: 1
+        mask_loss_scale: 1
+        optimizer_group: segmentation
+        decoupled_weight_decay: true
+      ObjectEncoder:
+        freeze:
+          type: full
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        warm_up: true
+        weight_decay: 0.001
+        learning_rate: 0.0002
+        optimizer_type: adamW
+        optimizer_group: object_encoder
+        decoupled_weight_decay: true
+      Classification:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        include: false
+        warm_up: true
+        loss_scale: 1
+        weight_decay: 0.001
+        learning_rate: 0.0002
+        optimizer_type: adamW
+        optimizer_group: classification
+        include_cross_term: true
+        loss_scale_cross_term: 1
+        decoupled_weight_decay: true
+      GlobalEmbedding:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        warm_up: true
+        weight_decay: 0.001
+        learning_rate: 0.0002
+        optimizer_type: adamW
+        optimizer_group: body
+        decoupled_weight_decay: true
+      ReconGeneration:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        include: false
+        warm_up: true
+        loss_scale: 1
+        weight_decay: 0.001
+        learning_rate: 5.0e-05
+        optimizer_type: lion
+        diffusion_steps: 100
+        optimizer_group: generation
+        use_generation_result: false
+        decoupled_weight_decay: true
+      TruthGeneration:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        include: true
+        warm_up: true
+        loss_scale: 1
+        weight_decay: 0.001
+        learning_rate: 0.0002
+        optimizer_type: adamW
+        diffusion_steps: 50
+        optimizer_group: generation
+        decoupled_weight_decay: true
+      GlobalGeneration:
+        freeze:
+          type: none
+          random_freeze_fraction: 0
+          partial_freeze_components: []
+        include: false
+        warm_up: true
+        loss_scale: 1
+        weight_decay: 0.001
+        learning_rate: 5.0e-05
+        optimizer_type: lion
+        diffusion_steps: 20
+        optimizer_group: generation
+        decoupled_weight_decay: true
+      InvisibleInputProjector:
+        weight_decay: 0.001
+        learning_rate: 0.0002
+        optimizer_type: adamW
+        optimizer_group: projector
+      GroupedSequentialEmbedding:
+        warm_up: true
+        weight_decay: 0.001
+        learning_rate: 0.0002
+        optimizer_type: adamW
+        optimizer_group: projector
+        decoupled_weight_decay: true
+    total_epochs: 150
+    weight_decay: 0.001
+    EarlyStopping:
+      mode: min
+      monitor: val/loss
+      verbose: true
+      patience: 1000
+      min_delta: 0
+    learning_rate: 0.0002
+    freeze_modules: []
+    log_gradient_step: 100
+    apply_event_weight: false
+    learning_rate_body: 2.0e-05
+    ProgressiveTraining:
+      stages:
+      - name: neutrino_only
+        epoch_ratio: 1
+        loss_weights:
+          generation-truth:
+          - 1
+          - 1
+        transition_ratio: 0
+    learning_rate_factor: 1
+    learning_rate_median: 0.0002
+    decoupled_weight_decay: true
+    diffusion_every_n_steps: 1
+    diffusion_every_n_epochs: 20
+    pretrain_model_load_path: null
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_v26_resume3_rawplateau5_patience6_val3_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/checkpoints/last.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_v26_resume3_rawplateau5_patience6_val3_returnbest_notopology_d128_l1_velocity_mse_trust10_globalbestdecay09_warm20from10_dropout15_seed42/checkpoints
+    eval_metrics_every_n_epochs: 1
+    model_checkpoint_save_top_k: 0
+    learning_rate_classification: 0.0002
+    learning_rate_warm_up_factor: 1
+platform:
+  use_gpu: true
+  batch_size: 512
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  prefetch_batches: 1
+  number_of_workers: 16
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  resources_per_worker:
+    CPU: 15
+    GPU: 1
+reward_config:
+  type: omnifold
+  weight: 1
+  omnifold:
+    bundle_file: null
+    bootstrap_in_dgpo: true
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+ztautau_domain:
+  enabled: true
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1
+    target_delta_phi_to_pi: 0
+  feature_names:
+  - theta
+  - phi
+  token_sources:
+    event_token: event_token
+    object_token: object_token

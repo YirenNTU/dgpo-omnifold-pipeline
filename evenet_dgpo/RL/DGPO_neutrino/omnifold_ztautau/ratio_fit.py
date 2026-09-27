@@ -18,7 +18,7 @@ import logging
 import math
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -382,6 +382,29 @@ class RatioFitConfig:
     drop_last_batch: bool = False
     learning_rate: float = 2e-3
     backbone_learning_rate: float | None = None
+    decoder_learning_rate: float | None = None
+    adapter_learning_rate: float | None = None
+    lr_scheduler: str = "constant"
+    lr_warmup_epochs: float = 1.0
+    lr_cosine_epochs: float = 250.0
+    lr_min_ratio: float = 0.1
+    decoder_learning_rate_scope: str = "blocks"
+    log_parameter_updates: bool = False
+    diagnostic_enabled: bool = False
+    diagnostic_interval_steps: int = 10
+    diagnostic_probe_rows: int = 16
+    diagnostic_snapshot_dir: str | None = None
+    diagnostic_max_snapshots: int = 2
+    diagnostic_gradient_threshold: float = 1000.0
+    diagnostic_spike_factor: float = 20.0
+    diagnostic_probe_bce_jump: float = 0.02
+    representation_diagnostic_enabled: bool = False
+    representation_path_enabled: bool = False
+    representation_export_dir: str | None = None
+    fourier_output_standardization: bool = False
+    ratio_audit_export_dir: str | None = None
+    representation_probe_rows: int = 128
+    representation_probe_interval_steps: int = 100
     weight_decay: float = 1e-6
     gradient_clip_norm: float | None = None
     sampling: str = "independent_with_replacement"
@@ -391,17 +414,112 @@ class RatioFitConfig:
     validation_min_delta: float = 0.0
     validation_batch_size: int = 8192
     restore_best: bool = True
+    checkpoint_selection_metric: str = "loss"
     require_saturation: bool = False
     progress_interval_steps: int = 0
     checkpoint_interval_steps: int = 0
     train_candidates_per_event: int | None = None
     anomaly_detection_steps: int = 0
+    topology_warmup_steps: int = 0
+    topology_body_unfreeze_step: int = 0
+    topology_warmup_learning_rate: float | None = None
 
     def validate(self) -> None:
+        if self.ratio_audit_export_dir is not None and (
+            not isinstance(self.ratio_audit_export_dir, str)
+            or not self.ratio_audit_export_dir.strip()
+            or not self.restore_best or self.checkpoint_selection_metric != 'loss'
+        ):
+            raise ValueError('ratio_audit_export_dir requires a nonempty path and best-BCE restore')
+        if type(self.fourier_output_standardization) is not bool:
+            raise ValueError('fourier_output_standardization must be boolean')
+        if self.representation_export_dir is not None and (not self.representation_export_dir.strip() or not self.representation_path_enabled):
+            raise ValueError('representation_export_dir requires a nonempty path and representation_path_enabled')
+        if self.representation_path_enabled and not self.representation_diagnostic_enabled:
+            raise ValueError('representation_path_enabled requires representation_diagnostic_enabled')
+        if self.representation_diagnostic_enabled and not self.diagnostic_enabled:
+            raise ValueError("representation diagnostics require diagnostic_enabled")
+        for value in (self.representation_probe_rows, self.representation_probe_interval_steps):
+            if type(value) is not int or value < 1:
+                raise ValueError("representation probe settings must be positive integers")
+        if self.lr_scheduler not in {"constant", "cosine"}:
+            raise ValueError("lr_scheduler must be constant or cosine")
+        for name in ("lr_warmup_epochs", "lr_cosine_epochs", "lr_min_ratio"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
+        if not 0 <= self.lr_warmup_epochs < self.lr_cosine_epochs:
+            raise ValueError("require 0 <= lr_warmup_epochs < lr_cosine_epochs")
+        if not 0 <= self.lr_min_ratio <= 1:
+            raise ValueError("lr_min_ratio must lie in [0, 1]")
+        for value in (self.diagnostic_interval_steps, self.diagnostic_probe_rows):
+            if type(value) is not int or value < 1:
+                raise ValueError("diagnostic interval and probe rows must be positive integers")
+        if type(self.diagnostic_max_snapshots) is not int or self.diagnostic_max_snapshots < 0:
+            raise ValueError("diagnostic_max_snapshots must be a nonnegative integer")
+        for value in (self.diagnostic_gradient_threshold, self.diagnostic_spike_factor, self.diagnostic_probe_bce_jump):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("diagnostic trigger thresholds must be finite and positive")
+        if self.checkpoint_selection_metric not in {
+            "loss",
+            "balanced_accuracy",
+            "auc",
+        }:
+            raise ValueError(
+                "checkpoint_selection_metric must be loss, balanced_accuracy, or auc"
+            )
+        if self.decoder_learning_rate is not None and (
+            isinstance(self.decoder_learning_rate, bool)
+            or not isinstance(self.decoder_learning_rate, (int, float))
+            or not math.isfinite(self.decoder_learning_rate)
+            or self.decoder_learning_rate <= 0
+        ):
+            raise ValueError("decoder_learning_rate must be finite and positive or null")
         if self.anomaly_detection_steps < 0:
             raise ValueError("anomaly_detection_steps must be nonnegative")
+        if min(self.topology_warmup_steps, self.topology_body_unfreeze_step) < 0:
+            raise ValueError("topology stage boundaries must be nonnegative")
+        staged_topology = self.topology_warmup_steps > 0
+        if staged_topology != (self.topology_body_unfreeze_step > 0):
+            raise ValueError(
+                "topology_warmup_steps and topology_body_unfreeze_step must "
+                "both be positive or both be zero"
+            )
+        if staged_topology and (
+            self.topology_body_unfreeze_step < self.topology_warmup_steps
+            or self.min_steps < self.topology_body_unfreeze_step
+            or (
+                self.steps is not None
+                and self.topology_body_unfreeze_step > self.steps
+            )
+        ):
+            raise ValueError(
+                "topology staging requires warmup <= body unfreeze <= min_steps "
+                "and the configured step cap"
+            )
+        if staged_topology and (
+            isinstance(self.topology_warmup_learning_rate, bool)
+            or not isinstance(self.topology_warmup_learning_rate, (int, float))
+            or not math.isfinite(float(self.topology_warmup_learning_rate))
+            or float(self.topology_warmup_learning_rate) <= 0.0
+        ):
+            raise ValueError(
+                "topology_warmup_learning_rate must be finite and positive"
+            )
+        if not staged_topology and self.topology_warmup_learning_rate is not None:
+            raise ValueError(
+                "topology_warmup_learning_rate requires topology staging"
+            )
         if (self.steps is not None and self.steps < 1) or self.batch_size < 1:
             raise ValueError("steps must be positive or null; batch_size must be positive")
+        if self.decoder_learning_rate_scope not in {"blocks", "all"}:
+            raise ValueError("decoder_learning_rate_scope must be blocks or all")
+        for rate in (self.adapter_learning_rate, self.decoder_learning_rate):
+            if rate is not None and (
+                isinstance(rate, bool) or not isinstance(rate, (int, float))
+                or not math.isfinite(rate) or rate <= 0
+            ):
+                raise ValueError("classifier group learning rates must be finite and positive")
         if (
             self.train_microbatch_size_per_rank is not None
             and int(self.train_microbatch_size_per_rank) < 1
@@ -462,6 +580,24 @@ class RatioFitConfig:
                 )
 
 
+def classifier_lr_multiplier(config: RatioFitConfig, step: int, epoch_steps: int) -> float:
+    """EveNet-style linear warmup / half cosine, clamped after its horizon.
+
+    ``step`` counts completed optimizer updates (as in HF LambdaLR). The
+    epoch uses the actual fit population and GLOBAL per-class batch; neither
+    world size nor microbatching multiplies the LR. A floor supports unbounded
+    early-stopped fits; setting it to zero reproduces EveNet through the horizon.
+    """
+    if config.lr_scheduler == "constant":
+        return 1.0
+    warmup = config.lr_warmup_epochs * epoch_steps
+    total = config.lr_cosine_epochs * epoch_steps
+    if step < warmup:
+        return float(step) / max(1.0, warmup)
+    progress = min(1.0, max(0.0, (step - warmup) / max(1.0, total - warmup)))
+    return config.lr_min_ratio + (1.0 - config.lr_min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
 @dataclass(frozen=True)
 class RatioFitDiagnostics:
     loss: float
@@ -487,6 +623,12 @@ class RatioFitDiagnostics:
     positive_seen_fraction: float = 0.0
     negative_seen_fraction: float = 0.0
     validation_history: tuple[dict[str, float], ...] = ()
+    # Optional CPU snapshots retained at validation points for post-fit
+    # ESS-aware checkpoint selection. Empty when retention is disabled.
+    validation_checkpoints: tuple[dict[str, Any], ...] = ()
+    selected_stage: int | None = None
+    stage_a_validation_loss: float | None = None
+    stage_b_validation_loss: float | None = None
 
 
 @dataclass(frozen=True)
@@ -886,6 +1028,134 @@ def _uses_fast_ratio_learning_rate(parameter_name: str) -> bool:
     )
 
 
+def _classifier_gradient_group(parameter_name: str) -> str:
+    """Return a stable, mutually exclusive classifier diagnostic group."""
+
+    if parameter_name.startswith("bank.visible_conditioning."):
+        return "visible_conditioning"
+    if parameter_name.startswith("backbone.PET.angular_conditioning."):
+        return "angular_conditioning"
+    if parameter_name.startswith("bank.topology_output."):
+        return "direct_topology_head"
+    if parameter_name.startswith(("bank.topology_encoder.", "bank.fusion.")):
+        return "topology_context"
+    if parameter_name.startswith("bank.output."):
+        return "context_output_head"
+    if parameter_name.startswith(("bank.decoder.", "bank.position_encoder.")):
+        return "decoder"
+    if parameter_name.startswith("backbone.PET.adapters."):
+        return "adapter"
+    if parameter_name.startswith(
+        (
+            "backbone.GroupedSequentialEmbedding.",
+            "backbone.GlobalEmbedding.",
+            "backbone.InvisibleInputProjector.",
+        )
+    ):
+        return "input_projector"
+    if parameter_name.startswith("backbone."):
+        return "backbone_other"
+    return "other"
+
+
+@torch.no_grad()
+def _classifier_gradient_norms(
+    named_parameters: Sequence[tuple[str, Tensor]],
+) -> dict[str, float]:
+    """Compute pre-clip L2 norms without changing any gradient tensor."""
+
+    squared: dict[str, Tensor] = {}
+    for name, parameter in named_parameters:
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        group = _classifier_gradient_group(name)
+        contribution = gradient.detach().double().square().sum()
+        squared[group] = squared.get(group, contribution.new_zeros(())) + contribution
+    return {
+        group: float(value.sqrt().cpu())
+        for group, value in squared.items()
+    }
+
+
+@torch.no_grad()
+def _classifier_scale_diagnostics(
+    named_parameters: Sequence[tuple[str, Tensor]],
+) -> dict[str, float]:
+    """Return groupwise parameter/gradient RMS and their scale ratio."""
+
+    parameter_squared: dict[str, Tensor] = {}
+    gradient_squared: dict[str, Tensor] = {}
+    counts: dict[str, int] = {}
+    for name, parameter in named_parameters:
+        group = _classifier_gradient_group(name)
+        value = parameter.detach().double()
+        contribution = value.square().sum()
+        parameter_squared[group] = parameter_squared.get(
+            group, contribution.new_zeros(())
+        ) + contribution
+        counts[group] = counts.get(group, 0) + int(parameter.numel())
+        if parameter.grad is not None:
+            gradient = parameter.grad.detach().double()
+            gradient_contribution = gradient.square().sum()
+            gradient_squared[group] = gradient_squared.get(
+                group, gradient_contribution.new_zeros(())
+            ) + gradient_contribution
+
+    diagnostics: dict[str, float] = {}
+    for group, parameter_sum in parameter_squared.items():
+        count = max(1, counts[group])
+        parameter_rms = float((parameter_sum / float(count)).sqrt().cpu())
+        diagnostics[f"parameter_rms_{group}"] = parameter_rms
+        if group not in gradient_squared:
+            continue
+        gradient_rms = float(
+            (gradient_squared[group] / float(count)).sqrt().cpu()
+        )
+        diagnostics[f"gradient_rms_{group}"] = gradient_rms
+        # A deliberately zero-initialized output head has no meaningful
+        # relative update scale until its first optimizer step.  Omitting the
+        # ratio avoids manufacturing an enormous dashboard spike at step zero.
+        if parameter_rms > 1.0e-12:
+            diagnostics[f"gradient_to_parameter_rms_ratio_{group}"] = (
+                gradient_rms / parameter_rms
+            )
+    return diagnostics
+
+
+@torch.no_grad()
+def _classifier_logit_diagnostics(moment: Tensor) -> dict[str, float]:
+    """Convert distributed truth/gen logit moments into stable diagnostics."""
+
+    if moment.numel() != 11:
+        raise ValueError("classifier logit moment vector must have length 11")
+    values = moment.detach().double().cpu()
+    total_count = max(float(values[2]), 1.0)
+    positive_count = max(float(values[7]), 1.0)
+    negative_count = max(float(values[10]), 1.0)
+    positive_mean = float(values[5]) / positive_count
+    negative_mean = float(values[8]) / negative_count
+
+    def standard_deviation(total: float, squared: float, count: float) -> float:
+        mean = total / count
+        return math.sqrt(max(0.0, squared / count - mean * mean))
+
+    return {
+        "logit_mean_positive": positive_mean,
+        "logit_std_positive": standard_deviation(
+            float(values[5]), float(values[6]), positive_count
+        ),
+        "logit_mean_negative": negative_mean,
+        "logit_std_negative": standard_deviation(
+            float(values[8]), float(values[9]), negative_count
+        ),
+        "logit_class_mean_separation": positive_mean - negative_mean,
+        "logit_rms": math.sqrt(max(0.0, float(values[1]) / total_count)),
+        "logit_abs_gt_5_fraction": float(values[3]) / total_count,
+        "logit_abs_gt_10_fraction": float(values[4]) / total_count,
+    }
+
+
 def _backward_ratio_class(
     model: nn.Module,
     condition: Tensor,
@@ -961,16 +1231,31 @@ def fit_density_ratio(
     validation_balanced_accuracy_lcb_confidence_z: float = 1.96,
     validation_balanced_accuracy_lcb_events_per_class: int | None = None,
     validation_balanced_accuracy_lcb_required_consecutive: int = 1,
+    retain_validation_checkpoints: bool = False,
+    max_validation_checkpoints: int = 16,
 ) -> RatioFitDiagnostics:
     """Fit balanced weighted classification on two independently sampled pools."""
 
     config.validate()
+    if type(retain_validation_checkpoints) is not bool:
+        raise ValueError("retain_validation_checkpoints must be a boolean")
+    if (
+        type(max_validation_checkpoints) is not int
+        or max_validation_checkpoints < 1
+    ):
+        raise ValueError("max_validation_checkpoints must be a positive integer")
+    if retain_validation_checkpoints and validation is None:
+        raise ValueError(
+            "retain_validation_checkpoints requires a validation population"
+        )
     if validation is not None and (
         config.validation_interval_steps < 1
         or config.validation_patience_evaluations < 1
         or config.validation_batch_size < 1
     ):
         raise ValueError("validation populations require positive validation controls")
+    if config.checkpoint_selection_metric == "auc" and validation_evaluator is None:
+        raise ValueError("AUC checkpoint selection requires a validation_evaluator")
     if stop_when_validation_auc_gap_exceeds is not None:
         threshold = float(stop_when_validation_auc_gap_exceeds)
         if not 0.0 <= threshold < 0.5:
@@ -1011,10 +1296,9 @@ def fit_density_ratio(
                 "validation balanced-accuracy LCB consecutive count must be "
                 "positive"
             )
-        if validation is None or validation_evaluator is None:
+        if validation is None:
             raise ValueError(
-                "validation balanced-accuracy LCB stopping requires validation "
-                "and a balanced-accuracy evaluator"
+                "validation balanced-accuracy LCB stopping requires validation"
             )
     pos_c, pos_z, pos_w = _flatten_population(
         positive_condition, positive_sample, positive_weight
@@ -1092,12 +1376,152 @@ def fit_density_ratio(
         positive_index, negative_index = draw_independent_class_indices(
             len(pos_z), len(neg_z), config.batch_size, config.steps, seed
         )
-    named_trainable = [
-        (name, parameter)
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad
-    ]
-    trainable_parameters = [parameter for _, parameter in named_trainable]
+    staged_topology = config.topology_warmup_steps > 0
+    active_topology_stage: int | None = None
+    if staged_topology:
+        configure_stage = getattr(model, "configure_topology_training_stage", None)
+        if not callable(configure_stage):
+            raise ValueError(
+                "topology fit schedule requires a classifier with "
+                "configure_topology_training_stage"
+            )
+        saved_stage = (
+            None
+            if resume_state is None
+            else resume_state.get("topology_training_stage")
+        )
+        resume_steps = (
+            0
+            if resume_state is None
+            else int(resume_state.get("steps_completed", 0))
+        )
+        # A checkpoint written exactly at the warm-up boundary still carries
+        # the stage-1 optimizer; the next loop iteration performs the stage-2
+        # transition and intentionally starts a fresh optimizer.
+        active_topology_stage = (
+            int(saved_stage)
+            if saved_stage is not None
+            else (
+                1
+                if resume_steps <= config.topology_warmup_steps
+                else 2
+            )
+        )
+        configure_stage(active_topology_stage)
+
+    def _new_optimizer(
+        *,
+        learning_rate: float,
+    ) -> tuple[torch.optim.Optimizer, list[tuple[str, Tensor]], list[Tensor]]:
+        named = [
+            (name, parameter)
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        ]
+        if not named:
+            raise ValueError("density-ratio classifier has no trainable parameters")
+        decoder_parameters = []
+        adapter_parameters = []
+        conditioning_parameters = [p for n, p in named if n.startswith("bank.visible_conditioning.")]
+        train_angular = bool(getattr(model, "_train_angular_conditioning", False))
+        angular_parameters = [p for n, p in named
+            if train_angular and n.startswith("backbone.PET.angular_conditioning.")]
+        standard_trainable = [(n, p) for n, p in named
+            if not n.startswith("bank.visible_conditioning.")
+            and not (train_angular and n.startswith("backbone.PET.angular_conditioning."))]
+        if config.adapter_learning_rate is not None:
+            adapter_parameters = [p for n, p in standard_trainable if n.startswith("backbone.PET.adapters.")]
+            standard_trainable = [(n, p) for n, p in standard_trainable if not n.startswith("backbone.PET.adapters.")]
+            if not adapter_parameters:
+                raise ValueError("adapter_learning_rate requires trainable PET adapters")
+        if config.decoder_learning_rate is not None:
+            decoder_prefix = "bank.decoder." if config.decoder_learning_rate_scope == "all" else "bank.decoder.blocks."
+            decoder_parameters = [
+                parameter
+                for name, parameter in standard_trainable
+                if name.startswith(decoder_prefix)
+            ]
+            standard_trainable = [
+                (name, parameter)
+                for name, parameter in standard_trainable
+                if not name.startswith(decoder_prefix)
+            ]
+            if not decoder_parameters:
+                raise ValueError(
+                    "decoder_learning_rate requires trainable EveNet decoder blocks"
+                )
+        if config.backbone_learning_rate is None:
+            optimizer_parameters: Any = [
+                parameter for _, parameter in standard_trainable
+            ]
+            if decoder_parameters or adapter_parameters or conditioning_parameters or angular_parameters:
+                optimizer_parameters = [
+                    {"params": optimizer_parameters, "lr": learning_rate, "group_name": "default"}
+                ]
+        else:
+            slow_backbone = [
+                parameter
+                for name, parameter in standard_trainable
+                if not _uses_fast_ratio_learning_rate(name)
+            ]
+            fast_parameters = [
+                parameter
+                for name, parameter in standard_trainable
+                if _uses_fast_ratio_learning_rate(name)
+            ]
+            optimizer_parameters = []
+            if fast_parameters:
+                optimizer_parameters.append(
+                    {"params": fast_parameters, "lr": learning_rate, "group_name": "head"}
+                )
+            if slow_backbone:
+                optimizer_parameters.append(
+                    {
+                        "params": slow_backbone,
+                        "lr": config.backbone_learning_rate,
+                        "group_name": "backbone",
+                    }
+                )
+        if decoder_parameters:
+            optimizer_parameters.append(
+                {
+                    "params": decoder_parameters,
+                    "lr": config.decoder_learning_rate,
+                    "group_name": "decoder",
+                }
+            )
+        if adapter_parameters:
+            optimizer_parameters.append({"params": adapter_parameters, "lr": config.adapter_learning_rate, "group_name": "adapter"})
+        if conditioning_parameters:
+            # Fresh nonlinear branch uses the existing head LR, independently
+            # of the slower pretrained backbone and decoder groups.
+            optimizer_parameters.append({"params": conditioning_parameters, "lr": learning_rate,
+                                         "group_name": "visible_conditioning"})
+        if angular_parameters:
+            optimizer_parameters.append({"params": angular_parameters, "lr": learning_rate,
+                                         "group_name": "angular_conditioning"})
+        new_optimizer = torch.optim.AdamW(
+            optimizer_parameters,
+            lr=learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        for group in new_optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+            group.setdefault("group_name", "head")
+        return (
+            new_optimizer,
+            named,
+            [parameter for _, parameter in named],
+        )
+
+    active_learning_rate = float(
+        config.topology_warmup_learning_rate
+        if active_topology_stage == 1
+        else config.learning_rate
+    )
+    optimizer, named_trainable, trainable_parameters = _new_optimizer(
+        learning_rate=active_learning_rate
+    )
     first_bad_rank, first_bad_location = _first_nonfinite_location(
         [
             *(
@@ -1119,41 +1543,6 @@ def fit_density_ratio(
             "density-ratio classifier starts with non-finite model state: "
             f"first_bad_rank={first_bad_rank}, location={first_bad_location}"
         )
-    if config.backbone_learning_rate is None:
-        optimizer_parameters: Any = [
-            parameter for _, parameter in named_trainable
-        ]
-    else:
-        # Preserve pretrained representations with a conservative LR while
-        # allowing internal adapters, both input embeddings/projectors, and
-        # the classifier head to learn at the regular head LR.
-        slow_backbone = [
-            parameter
-            for name, parameter in named_trainable
-            if not _uses_fast_ratio_learning_rate(name)
-        ]
-        fast_parameters = [
-            parameter
-            for name, parameter in named_trainable
-            if _uses_fast_ratio_learning_rate(name)
-        ]
-        optimizer_parameters = []
-        if fast_parameters:
-            optimizer_parameters.append(
-                {"params": fast_parameters, "lr": config.learning_rate}
-            )
-        if slow_backbone:
-            optimizer_parameters.append(
-                {
-                    "params": slow_backbone,
-                    "lr": config.backbone_learning_rate,
-                }
-            )
-    optimizer = torch.optim.AdamW(
-        optimizer_parameters,
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
     if config.anomaly_detection_steps and rank == 0:
         _log.info(
             "[DGPO/omnifold] autograd anomaly detection enabled for first %s "
@@ -1161,6 +1550,11 @@ def fit_density_ratio(
             "the first affected parameter).",
             config.anomaly_detection_steps,
         )
+    if config.fourier_output_standardization and resume_state is None:
+        from .feature_standardization import fit_output_standardizer
+        stats = fit_output_standardizer(model, [(pos_c, pos_z, pos_w), (neg_c, neg_z, neg_w)], rank, world)
+        if rank == 0:
+            _log.info('[DGPO/omnifold] fixed training-fold Fourier output standardization: %s', stats)
     model.train()
     final_loss = torch.zeros((), device=device, dtype=dtype)
     final_accuracy = torch.zeros((), device=device, dtype=dtype)
@@ -1175,11 +1569,17 @@ def fit_density_ratio(
     patience_validation_loss = float("inf")
     evaluations_without_improvement = 0
     validation_history: list[dict[str, float]] = []
+    validation_checkpoints: list[dict[str, Any]] = []
     last_validation_loss = float("nan")
     last_validation_accuracy = float("nan")
     last_validation_auc = float("nan")
     last_gradient_norm = float("nan")
     last_gradient_clipped = False
+    last_gradient_clip_scale = 1.0
+    last_gradient_group_norms: dict[str, float] = {}
+    last_classifier_scale_diagnostics: dict[str, float] = {}
+    last_classifier_logit_diagnostics: dict[str, float] = {}
+    gradient_clipped_steps = 0
     saturated = False
     threshold_reached = False
     threshold_reason: str | None = None
@@ -1194,6 +1594,35 @@ def fit_density_ratio(
     initial_validation_loss: float | None = None
     initial_validation_accuracy: float | None = None
     initial_validation_auc: float | None = None
+
+    def _remember_validation_checkpoint(
+        *,
+        step: int | None,
+        loss: float,
+        accuracy: float,
+        auc: float,
+        state: Mapping[str, Tensor],
+    ) -> None:
+        if not retain_validation_checkpoints:
+            return
+        entry = {
+            "step": float("nan" if step is None else step),
+            "loss": float(loss),
+            "balanced_accuracy": float(accuracy),
+            "auc": float(auc),
+            "state": {
+                name: value.detach().cpu().clone()
+                for name, value in state.items()
+            },
+        }
+        validation_checkpoints.append(entry)
+        while len(validation_checkpoints) > int(max_validation_checkpoints):
+            best_index = min(
+                range(len(validation_checkpoints)),
+                key=lambda index: validation_checkpoints[index]["loss"],
+            )
+            drop_index = 0 if best_index != 0 else 1
+            validation_checkpoints.pop(drop_index)
 
     def run_validation() -> tuple[float, float, float]:
         if validation_evaluator is not None:
@@ -1247,6 +1676,13 @@ def fit_density_ratio(
             initial_row["auc"] = float(initial_validation_auc)
             initial_row["auc_gap"] = abs(float(initial_validation_auc) - 0.5)
         validation_history.append(initial_row)
+        _remember_validation_checkpoint(
+            step=0,
+            loss=float(initial_validation_loss),
+            accuracy=float(initial_validation_accuracy),
+            auc=float(initial_validation_auc),
+            state=best_state,
+        )
     if resume_state is not None:
         if int(resume_state.get("schema_version", -1)) != 1:
             raise ValueError("unsupported density-ratio recovery checkpoint schema")
@@ -1254,6 +1690,15 @@ def fit_density_ratio(
             raise ValueError("density-ratio recovery checkpoint seed mismatch")
         saved_fit_config = dict(resume_state.get("fit_config") or {})
         saved_fit_config.setdefault("anomaly_detection_steps", 0)
+        saved_fit_config.setdefault("topology_warmup_steps", 0)
+        saved_fit_config.setdefault("topology_body_unfreeze_step", 0)
+        saved_fit_config.setdefault("topology_warmup_learning_rate", None)
+        saved_fit_config.setdefault("checkpoint_selection_metric", "loss")
+        for name in ("lr_scheduler", "lr_warmup_epochs", "lr_cosine_epochs", "lr_min_ratio",
+                     "representation_diagnostic_enabled", "representation_probe_rows",
+                     "representation_probe_interval_steps", "representation_path_enabled", "representation_export_dir",
+                     "fourier_output_standardization", "ratio_audit_export_dir"):
+            saved_fit_config.setdefault(name, getattr(RatioFitConfig(), name))
         if saved_fit_config != asdict(config):
             raise ValueError("density-ratio recovery checkpoint configuration mismatch")
         model.load_state_dict(resume_state["model_state"], strict=True)
@@ -1328,6 +1773,9 @@ def fit_density_ratio(
                 0,
             )
         )
+        gradient_clipped_steps = int(
+            resume_state.get("gradient_clipped_steps", 0)
+        )
         final_loss = torch.tensor(
             float(resume_state["final_loss"]), device=device, dtype=dtype
         )
@@ -1363,6 +1811,7 @@ def fit_density_ratio(
             "model_state": _clone_to_cpu(model.state_dict()),
             "optimizer_state": _clone_to_cpu(optimizer.state_dict()),
             "steps_completed": steps_completed,
+            "topology_training_stage": active_topology_stage,
             "best_step": best_step,
             "best_validation_loss": best_validation_loss,
             "best_validation_accuracy": best_validation_accuracy,
@@ -1394,16 +1843,48 @@ def fit_density_ratio(
             "validation_balanced_accuracy_lcb_streak": (
                 validation_balanced_accuracy_lcb_streak
             ),
+            "gradient_clipped_steps": gradient_clipped_steps,
             "final_loss": float(final_loss.cpu()),
             "final_accuracy": float(final_accuracy.cpu()),
         }
 
+    stability = None
+    if config.diagnostic_enabled:
+        from .stability_diagnostic import StabilityDiagnostic
+        flat_validation = None if validation is None else (
+            *_flatten_population(*validation[:3]), *_flatten_population(*validation[3:])
+        )
+        stability = StabilityDiagnostic(model, flat_validation, config, rank=rank, world=world, seed=seed)
+    scheduler_epoch_steps = (
+        len(pos_z) // config.batch_size if config.drop_last_batch
+        else max(1, math.ceil(len(pos_z) / config.batch_size))
+    )
+    if scheduler_epoch_steps < 1:
+        raise ValueError("scheduler epoch has no complete training batches")
     step = steps_completed
     while (
         not saturated
         and not threshold_reached
         and (config.steps is None or step < config.steps)
     ):
+        if (
+            staged_topology
+            and active_topology_stage == 1
+            and step >= config.topology_warmup_steps
+        ):
+            model.configure_topology_training_stage(2)
+            active_topology_stage = 2
+            active_learning_rate = float(config.learning_rate)
+            optimizer, named_trainable, trainable_parameters = _new_optimizer(
+                learning_rate=active_learning_rate
+            )
+            model.train()
+        # Derive the schedule from the recovery cursor: no unsaved scheduler
+        # clock, no per-rank drift, and no reset at a topology optimizer rebuild.
+        lr_multiplier = classifier_lr_multiplier(config, step, scheduler_epoch_steps)
+        if config.lr_scheduler != "constant":
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] * lr_multiplier
         if config.sampling == "independent_epoch_shuffle":
             assert positive_batcher is not None and negative_batcher is not None
             pos_i = positive_batcher.draw(step).to(device)
@@ -1428,6 +1909,29 @@ def fit_density_ratio(
             int(config.train_microbatch_size_per_rank or local_rows),
         )
         optimizer.zero_grad(set_to_none=True)
+        next_step = step + 1
+        next_is_last_step = bool(
+            config.steps is not None and next_step == config.steps
+        )
+        gradient_diagnostics_due = progress_callback is not None and (
+            (
+                config.progress_interval_steps > 0
+                and next_step % config.progress_interval_steps == 0
+            )
+            or (
+                validation is not None
+                and (
+                    next_step % config.validation_interval_steps == 0
+                    or next_is_last_step
+                )
+            )
+            or next_is_last_step
+        )
+        logit_moment = (
+            torch.zeros(11, device=device, dtype=torch.float64)
+            if gradient_diagnostics_due
+            else None
+        )
         loss = torch.zeros((), device=device, dtype=dtype)
         pos_accuracy = torch.zeros((), device=device, dtype=dtype)
         neg_accuracy = torch.zeros((), device=device, dtype=dtype)
@@ -1445,6 +1949,10 @@ def fit_density_ratio(
                 "negative_loss",
             )
         }
+        if stability is not None:
+            stability.begin(step + 1,
+                (pos_c[pos_i], pos_z[pos_i], pos_w[pos_i], neg_c[neg_i], neg_z[neg_i], neg_w[neg_i]),
+                optimizer, microbatch_rows)
         for micro_start in range(0, local_rows, microbatch_rows):
             micro_stop = min(micro_start + microbatch_rows, local_rows)
             micro_fraction = float(micro_stop - micro_start) / float(local_rows)
@@ -1485,6 +1993,16 @@ def fit_density_ratio(
                 )
             with torch.no_grad():
                 pos_loss_value = pos_loss.detach()
+                if logit_moment is not None:
+                    values = pos_logit.detach().double()
+                    logit_moment[0] += values.sum()
+                    logit_moment[1] += values.square().sum()
+                    logit_moment[2] += values.numel()
+                    logit_moment[3] += (values.abs() > 5.0).sum()
+                    logit_moment[4] += (values.abs() > 10.0).sum()
+                    logit_moment[5] += values.sum()
+                    logit_moment[6] += values.square().sum()
+                    logit_moment[7] += values.numel()
                 pos_credit = (pos_logit > 0.0).to(dtype) + 0.5 * (
                     pos_logit == 0.0
                 ).to(dtype)
@@ -1524,6 +2042,16 @@ def fit_density_ratio(
                 loss += (
                     0.5 * (pos_loss_value + neg_loss.detach()) * micro_fraction
                 )
+                if logit_moment is not None:
+                    values = neg_logit.detach().double()
+                    logit_moment[0] += values.sum()
+                    logit_moment[1] += values.square().sum()
+                    logit_moment[2] += values.numel()
+                    logit_moment[3] += (values.abs() > 5.0).sum()
+                    logit_moment[4] += (values.abs() > 10.0).sum()
+                    logit_moment[8] += values.sum()
+                    logit_moment[9] += values.square().sum()
+                    logit_moment[10] += values.numel()
                 neg_credit = (neg_logit < 0.0).to(dtype) + 0.5 * (
                     neg_logit == 0.0
                 ).to(dtype)
@@ -1531,6 +2059,8 @@ def fit_density_ratio(
                     neg_w[neg_micro_i] * neg_credit
                 ).mean() * micro_fraction
             del neg_logit, neg_loss
+        if stability is not None:
+            stability.after_backward(loss)
         zero_marker = torch.zeros((), device=device, dtype=dtype)
         nan_marker = torch.full((), float("nan"), device=device, dtype=dtype)
         first_bad_rank, first_bad_location = _first_nonfinite_location(
@@ -1551,8 +2081,30 @@ def fit_density_ratio(
             world=world,
         )
         if first_bad_rank is not None:
+            if stability is not None:
+                stability.save("nonfinite_forward_backward", before_update=True)
+            local_nonfinite_gradients = [
+                name
+                for name, parameter in named_trainable
+                if parameter.grad is not None
+                and not bool(torch.isfinite(parameter.grad).all())
+            ]
+            local_details = []
+            if backward_error:
+                local_details.append(backward_error)
+            if local_nonfinite_gradients:
+                shown = local_nonfinite_gradients[:16]
+                suffix = (
+                    f", ... (+{len(local_nonfinite_gradients) - len(shown)} more)"
+                    if len(local_nonfinite_gradients) > len(shown)
+                    else ""
+                )
+                local_details.append(
+                    "nonfinite_gradients=" + ", ".join(shown) + suffix
+                )
             failure_detail = _broadcast_failure_message(
-                backward_error, source_rank=first_bad_rank,
+                "; ".join(local_details),
+                source_rank=first_bad_rank,
                 rank=rank, world=world, device=device,
             )
             optimizer.zero_grad(set_to_none=True)
@@ -1561,11 +2113,23 @@ def fit_density_ratio(
                 "gradient before optimizer.step: "
                 f"step={step + 1}, first_bad_rank={first_bad_rank}, "
                 f"location={first_bad_location}, "
-                f"learning_rate={config.learning_rate:.6g}, "
+                f"learning_rate={active_learning_rate:.6g}, "
                 f"backbone_learning_rate={config.backbone_learning_rate}, "
                 f"autograd_detail={failure_detail or 'not captured; enable anomaly_detection_steps'}"
             )
         _average_gradients(model)
+        if gradient_diagnostics_due:
+            last_gradient_group_norms = _classifier_gradient_norms(
+                named_trainable
+            )
+            last_classifier_scale_diagnostics = (
+                _classifier_scale_diagnostics(named_trainable)
+            )
+            assert logit_moment is not None
+            _all_reduce_sum_tensor(logit_moment)
+            last_classifier_logit_diagnostics = (
+                _classifier_logit_diagnostics(logit_moment)
+            )
         if config.gradient_clip_norm is not None:
             gradient_norm = torch.nn.utils.clip_grad_norm_(
                 trainable_parameters,
@@ -1573,6 +2137,8 @@ def fit_density_ratio(
                 error_if_nonfinite=False,
             )
             if not bool(torch.isfinite(gradient_norm).item()):
+                if stability is not None:
+                    stability.save("nonfinite_distributed_gradient", before_update=True)
                 optimizer.zero_grad(set_to_none=True)
                 raise FloatingPointError(
                     "density-ratio distributed gradient norm became non-finite "
@@ -1582,7 +2148,34 @@ def fit_density_ratio(
             last_gradient_clipped = bool(
                 last_gradient_norm > float(config.gradient_clip_norm)
             )
+            last_gradient_clip_scale = min(
+                1.0,
+                float(config.gradient_clip_norm)
+                / max(last_gradient_norm, 1.0e-12),
+            )
+            gradient_clipped_steps += int(last_gradient_clipped)
+        if stability is not None:
+            stability.prepare_update()
+        update_snapshot = (
+            (stability.pre_update["parameters"] if stability is not None and stability.pre_update is not None
+             else {name: parameter.detach().clone() for name, parameter in named_trainable})
+            if gradient_diagnostics_due and config.log_parameter_updates else None
+        )
         optimizer.step()
+        if update_snapshot is not None:
+            grouped_updates: dict[str, list[Tensor]] = {}
+            for name, parameter in named_trainable:
+                group = _classifier_gradient_group(name)
+                previous = update_snapshot[name]
+                row = torch.stack(((parameter.detach().double() - previous.double()).square().sum(),
+                                   previous.double().square().sum(),
+                                   previous.new_tensor(previous.numel(), dtype=torch.float64)))
+                grouped_updates.setdefault(group, []).append(row)
+            for group, values in grouped_updates.items():
+                update_sq, parameter_sq, count = torch.stack(values).sum(dim=0).tolist()
+                last_classifier_scale_diagnostics[f"parameter_update_rms_{group}"] = math.sqrt(update_sq / count)
+                last_classifier_scale_diagnostics[f"update_to_parameter_rms_ratio_{group}"] = math.sqrt(update_sq / max(parameter_sq, 1e-30))
+            del update_snapshot
         first_bad_rank, first_bad_location = _first_nonfinite_location(
             [
                 (f"parameter:{name}", parameter)
@@ -1593,11 +2186,15 @@ def fit_density_ratio(
             world=world,
         )
         if first_bad_rank is not None:
+            if stability is not None:
+                stability.save("nonfinite_optimizer_update", before_update=False)
             raise FloatingPointError(
                 "density-ratio optimizer produced a non-finite parameter: "
                 f"step={step + 1}, first_bad_rank={first_bad_rank}, "
                 f"location={first_bad_location}"
             )
+        if stability is not None:
+            stability.after_update()
         with torch.no_grad():
             final_loss = _reduce_mean(loss.detach())
             final_accuracy = _reduce_mean(0.5 * (pos_accuracy + neg_accuracy))
@@ -1623,11 +2220,29 @@ def fit_density_ratio(
                 validation_row["auc"] = validation_auc
                 validation_row["auc_gap"] = abs(validation_auc - 0.5)
             validation_history.append(validation_row)
-            # Always retain the numerically best validation checkpoint.  The
-            # min-delta tolerance belongs only to early-stop patience; coupling
-            # it to checkpoint selection can restore the initial null classifier
-            # after a real but weak improvement and force the held-out AUC to 0.5.
-            checkpoint_improved = validation_loss < best_validation_loss
+            _remember_validation_checkpoint(
+                step=steps_completed,
+                loss=float(validation_loss),
+                accuracy=float(validation_accuracy),
+                auc=float(validation_auc),
+                state=model.state_dict(),
+            )
+            # Checkpoint selection and early-stop patience answer different
+            # questions. Patience remains loss-based; diagnostics that calibrate
+            # logits later may select on held-out discrimination instead.
+            if config.checkpoint_selection_metric == "loss":
+                checkpoint_improved = validation_loss < best_validation_loss
+            elif config.checkpoint_selection_metric == "balanced_accuracy":
+                checkpoint_improved = (
+                    best_validation_accuracy is None
+                    or validation_accuracy > best_validation_accuracy
+                )
+            else:
+                checkpoint_improved = math.isfinite(validation_auc) and (
+                    best_validation_auc is None
+                    or not math.isfinite(best_validation_auc)
+                    or validation_auc > best_validation_auc
+                )
             patience_improved = (
                 validation_loss
                 < patience_validation_loss - config.validation_min_delta
@@ -1658,8 +2273,27 @@ def fit_density_ratio(
                     >= config.validation_patience_evaluations
                 ):
                     saturated = True
+            if (
+                staged_topology
+                and active_topology_stage == 2
+                and steps_completed >= config.topology_body_unfreeze_step
+                and patience_improved
+            ):
+                # Open the configured input/body projectors only after held-out
+                # loss is still improving at the 300-step decision boundary.
+                # A null fit remains in the compact bank+adapter stage until
+                # patience stops it.
+                model.configure_topology_training_stage(3)
+                active_topology_stage = 3
+                active_learning_rate = float(config.learning_rate)
+                optimizer, named_trainable, trainable_parameters = _new_optimizer(
+                    learning_rate=active_learning_rate
+                )
+                model.train()
             saturated = _broadcast_flag(saturated, device)
             if (
+                checkpoint_eligible
+                and
                 stop_when_validation_auc_gap_exceeds is not None
                 and math.isfinite(validation_auc)
                 and abs(validation_auc - 0.5)
@@ -1674,6 +2308,8 @@ def fit_density_ratio(
                 threshold_training_loss = float(final_loss.cpu())
                 threshold_training_accuracy = float(final_accuracy.cpu())
             if (
+                checkpoint_eligible
+                and
                 stop_when_validation_balanced_accuracy_lcb_exceeds
                 is not None
             ):
@@ -1731,6 +2367,7 @@ def fit_density_ratio(
             or saturated
             or threshold_reached
             or hit_configured_last_step
+            or (stability is not None and (stability.sampled or stability.metrics.get("stability/gradient_spike")))
         )
         if should_report_progress:
             progress_row = {
@@ -1738,12 +2375,54 @@ def fit_density_ratio(
                 "training_loss": float(final_loss.cpu()),
                 "training_balanced_accuracy": float(final_accuracy.cpu()),
                 "saturated": float(saturated),
+                "validation_evaluated": float(should_validate),
+                "learning_rate": active_learning_rate,
             }
+            conditioning = getattr(getattr(model, "bank", None), "visible_conditioning", None)
+            if conditioning is not None and conditioning.log_diagnostics:
+                # Last forward batch only; no additional inference/probe work.
+                if conditioning.diagnostics:
+                    names = list(conditioning.diagnostics)
+                    values = torch.stack([conditioning.diagnostics[name].detach() for name in names])
+                    _all_reduce_sum_tensor(values)
+                    for name, value in zip(names, values / world):
+                        progress_row[f"visible_conditioning/{name}"] = float(value)
+                for group in ("encoder", "modulations"):
+                    grads = [p.grad.detach().float().square().sum()
+                             for name, p in conditioning.named_parameters() if p.grad is not None
+                             and name.startswith("modulations.") == (group == "modulations")]
+                    progress_row[f"visible_conditioning/{group}_grad_norm_post_clip"] = (
+                        float(torch.stack(grads).sum().sqrt()) if grads else 0.)
+            progress_row["scheduler_multiplier"] = lr_multiplier
+            progress_row["scheduler_epoch"] = step / scheduler_epoch_steps
+            progress_row["scheduler_warmup_steps"] = config.lr_warmup_epochs * scheduler_epoch_steps
+            progress_row["scheduler_total_steps"] = config.lr_cosine_epochs * scheduler_epoch_steps
+            if active_topology_stage is not None:
+                progress_row["topology_training_stage"] = float(
+                    active_topology_stage
+                )
             if math.isfinite(last_gradient_norm):
                 progress_row["gradient_norm"] = last_gradient_norm
                 progress_row["gradient_clipped"] = float(
                     last_gradient_clipped
                 )
+                progress_row["gradient_clip_scale"] = last_gradient_clip_scale
+                progress_row["gradient_clip_fraction"] = (
+                    gradient_clipped_steps / float(steps_completed)
+                )
+            for group, norm in last_gradient_group_norms.items():
+                progress_row[f"gradient_norm_{group}"] = norm
+            progress_row.update(last_classifier_scale_diagnostics)
+            # Always read current optimizer values, independent of expensive
+            # update diagnostics. Keep numbered metrics for existing dashboards.
+            for group_index, optimizer_group in enumerate(optimizer.param_groups):
+                group_name = optimizer_group.get("group_name", f"group{group_index}")
+                actual_lr = float(optimizer_group["lr"])
+                progress_row[f"optimizer_group_lr_{group_index}"] = actual_lr
+                progress_row[f"optimizer_group_lr_{group_name}"] = actual_lr
+            progress_row.update(last_classifier_logit_diagnostics)
+            if stability is not None:
+                progress_row.update(stability.metrics)
             if math.isfinite(last_validation_loss):
                 progress_row["validation_loss"] = last_validation_loss
             if math.isfinite(last_validation_accuracy):
@@ -1858,6 +2537,7 @@ def fit_density_ratio(
         positive_seen_fraction=positive_seen_fraction,
         negative_seen_fraction=negative_seen_fraction,
         validation_history=tuple(validation_history),
+        validation_checkpoints=tuple(validation_checkpoints),
     )
 
 
@@ -1944,6 +2624,9 @@ def fit_step2(
 def _ratio_diagnostics_from_dict(payload: dict[str, Any]) -> RatioFitDiagnostics:
     values = dict(payload)
     values["validation_history"] = tuple(values.get("validation_history", ()))
+    values["validation_checkpoints"] = tuple(
+        values.get("validation_checkpoints", ())
+    )
     return RatioFitDiagnostics(**values)
 
 

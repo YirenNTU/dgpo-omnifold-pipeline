@@ -5,8 +5,9 @@ no detector response to invert.  Each round therefore fits one residual conditio
 density ratio and adds its logit to the cumulative log weight.  There is deliberately
 no OmniFold Step-2 projection classifier in this module.
 
-The adaptive path owns one reusable classifier architecture and creates separate
-cross-fit fold instances for every residual. Selected iterations can initialize
+The adaptive path owns one reusable pretrained builder and creates separate
+reward and monitor banks with independent architecture overrides. Cross-fit fold
+instances remain isolated for every residual. Selected iterations can initialize
 from the previous round's weights using persistent event-based folds. It trains PET's registered internal
 adapters and may also fine-tune the complete active EveNet body, saving held-out
 improvements over the exact null classifier, and propagating only out-of-fold
@@ -19,10 +20,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -30,9 +32,31 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from evenet.network.body.embedding import PointCloudPositionalEmbedding
+from evenet.network.body.visible_conditioning import VisibleConditioning, visible_conditioning_spec
+from .rest_frame import REST_FRAME_DIM, REST_FRAME_KEY, VISIBLE_P4_KEYS, visible_pair_rest_features
+from .feature_standardization import FixedFeatureStandardizer
 
 
 _log = logging.getLogger(__name__)
+
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
+
+    def _stable_decoder_attention_context():
+        """Use math SDPA for the tiny candidate decoder under autograd.
+
+        Efficient CUDA attention has produced finite forwards with non-finite
+        backwards through this two-token self/cross-attn stack (especially once
+        AdaLN-Zero gates open around step 3). PET stays on the fast kernels.
+        """
+
+        if torch.is_grad_enabled():
+            return _sdpa_kernel(SDPBackend.MATH)
+        return nullcontext()
+
+except Exception:  # pragma: no cover - older torch without nn.attention
+    def _stable_decoder_attention_context():
+        return nullcontext()
 
 _EVENT_KEYS = ("x", "x_mask", "conditions", "conditions_mask")
 _PAIRWISE_CONTEXT_KEYS = (
@@ -43,6 +67,7 @@ _PAIRWISE_CONTEXT_KEYS = (
     "lead_b_visible_py",
     "lead_b_visible_pz",
 )
+_REST_ENERGY_KEYS = ("lead_a_visible_E", "lead_b_visible_E")
 
 
 @dataclass(frozen=True)
@@ -70,6 +95,7 @@ def pack_event_inputs(
     spec: EventPackingSpec | None = None,
     *,
     include_pairwise_context: bool = False,
+    include_visible_pair_rest_frame: bool = False,
 ) -> tuple[Tensor, EventPackingSpec]:
     """Pack deterministic EveNet inputs into one ``(B, D)`` tensor.
 
@@ -83,8 +109,19 @@ def pack_event_inputs(
         tuple(spec.shapes)
         if spec is not None
         else _EVENT_KEYS
-        + (_PAIRWISE_CONTEXT_KEYS if include_pairwise_context else ())
+        + (_PAIRWISE_CONTEXT_KEYS if include_pairwise_context or include_visible_pair_rest_frame else ())
+        + ((*_REST_ENERGY_KEYS, REST_FRAME_KEY) if include_visible_pair_rest_frame else ())
     )
+    if REST_FRAME_KEY in keys:
+        # Derive once when packing, not on every classifier minibatch. Never
+        # accept a supplied/label-dependent cached feature in place of physics.
+        missing_p4 = [key for key in VISIBLE_P4_KEYS if not isinstance(batch.get(key), Tensor)]
+        if missing_p4:
+            raise KeyError(f"visible-pair rest frame requires visible E,px,py,pz: {missing_p4}")
+        legs = [torch.stack([batch[f"lead_{leg}_visible_{component}"].reshape(-1)
+                             for component in ("E", "px", "py", "pz")], -1)
+                for leg in ("a", "b")]
+        batch = {**batch, REST_FRAME_KEY: visible_pair_rest_features(*legs)}
     missing = [key for key in keys if not isinstance(batch.get(key), Tensor)]
     if missing:
         raise KeyError(f"EveNet ratio classifier needs tensor inputs {missing}")
@@ -126,6 +163,31 @@ def unpack_event_inputs(packed: Tensor, spec: EventPackingSpec) -> dict[str, Ten
     return result
 
 
+def event_identity_inputs(packed: Tensor, spec: EventPackingSpec) -> Tensor:
+    """Keep pre-existing Fourier event folds when adding derived rest context.
+
+    Rest-frame arithmetic/energies are not event IDs. Retain the unchanged
+    original condition bytes; never hash candidate values or labels. Legacy
+    pools without the versioned rest block retain exactly their old hash.
+    """
+    if REST_FRAME_KEY not in spec.shapes:
+        return packed
+    pieces, offset, kept_width, last_kept_end = [], 0, 0, 0
+    for key, shape in spec.shapes.items():
+        width = int(np.prod(shape))
+        if key not in (*_REST_ENERGY_KEYS, REST_FRAME_KEY):
+            pieces.append(packed[:, offset:offset + width])
+            kept_width += width
+            last_kept_end = offset + width
+        offset += width
+    if offset != packed.shape[-1]:
+        raise ValueError("identity projection packing width mismatch")
+    if kept_width == last_kept_end:
+        # The normal layout appends rest columns: no copy of the large pool.
+        return packed[:, :kept_width]
+    return torch.cat(pieces, -1)
+
+
 def periodic_tau_pair_features(
     packed_event: Tensor,
     candidate_flat: Tensor,
@@ -133,6 +195,7 @@ def periodic_tau_pair_features(
     *,
     max_harmonic: int = 1,
     include_theta_pair: bool = False,
+    theta_fourier: bool = False,
 ) -> Tensor:
     """Exact smooth pair features derived from visible legs and candidate deltas.
 
@@ -194,6 +257,11 @@ def periodic_tau_pair_features(
         + torch.cos(theta_a) * torch.cos(theta_b)
     )
     features = [*harmonics, cos_opening]
+    if theta_fourier:
+        # Candidate-dependent joint geometry, never the other class's truth.
+        for frequency in range(1, int(max_harmonic) + 1):
+            for angle in (theta_a - theta_b, theta_a + theta_b):
+                features.extend((torch.sin(frequency * angle), torch.cos(frequency * angle)))
     if include_theta_pair:
         features.extend(
             (
@@ -208,10 +276,12 @@ def periodic_tau_pair_feature_dim(
     max_harmonic: int = 1,
     *,
     include_theta_pair: bool = False,
+    theta_fourier: bool = False,
 ) -> int:
     if int(max_harmonic) < 1:
         raise ValueError("max_harmonic must be at least one")
-    return 2 * int(max_harmonic) + 1 + (2 if include_theta_pair else 0)
+    return (2 * int(max_harmonic) + 1 + (2 if include_theta_pair else 0)
+            + (4 * int(max_harmonic) if theta_fourier else 0))
 
 
 PEFT_SCHEMA_VERSION = 6
@@ -254,30 +324,49 @@ def configure_adapter_training(
     train_encoder: bool = False,
     train_grouped_sequential_embedding: bool = False,
     train_invisible_projector: bool = False,
+    train_angular_conditioning: bool = False,
     train_backbone: bool = False,
+    train_last_pet_block: bool = False,
 ) -> None:
     """Freeze the shared body, then optionally reopen selected tensors.
 
     PET's registered internal adapters are always trainable. ``train_backbone``
     additionally opens every module on this classifier's forward path,
     including PET attention.
+    ``train_last_pet_block`` instead opens only the final PET transformer
+    block, in addition to adapters and any explicitly enabled input modules.
     ``train_encoder`` opens GlobalEmbedding (AdaLN event token).
     ``train_grouped_sequential_embedding`` opens the visible-object input
     embedding without unfreezing PET attention or the rest of the backbone.
     ``train_invisible_projector`` opens only the projector that maps normalized
     neutrino features into the PET input basis. ObjectEncoder is unused on this
     path. ``train_layernorm`` opens every affine norm in the body.
+    ``train_angular_conditioning`` opens only the added PET Fourier branch,
+    leaving the pretrained PET weights frozen unless separately requested.
     """
 
     pet = getattr(model, "PET", None)
     if pet is None:
         raise ValueError("EveNet ratio classifier requires a PET body")
+    if train_backbone and train_last_pet_block:
+        raise ValueError("train_backbone and train_last_pet_block are mutually exclusive")
     freeze_shared_backbone(model)
+    if train_last_pet_block:
+        blocks = getattr(pet, "transformer_blocks", None)
+        if blocks is None or len(blocks) == 0:
+            raise ValueError("train_last_pet_block requires PET.transformer_blocks")
+        for parameter in blocks[-1].parameters():
+            parameter.requires_grad_(True)
     adapters = getattr(pet, "adapters", None)
     if adapters is None or len(adapters) == 0:
         raise ValueError("EveNet ratio classifier requires internal PET adapters")
     for parameter in adapters.parameters():
         parameter.requires_grad_(True)
+    if train_angular_conditioning:
+        angular = getattr(pet, "angular_conditioning", None)
+        if angular is None:
+            raise ValueError("train_angular_conditioning=true requires PET.angular_conditioning")
+        angular.requires_grad_(True)
     if train_backbone:
         # ObjectEncoder and the task heads are not called by the ratio forward.
         # Do not checkpoint/optimize unreachable parameters under the label
@@ -347,6 +436,48 @@ def _require_pet_adapter_flag(pet: nn.Module) -> None:
         raise ValueError("EveNet ratio classifier requires Body.PET.use_adapter=true")
 
 
+def _safe_asymmetric_attention_mask(
+    visible_mask: Tensor,
+    *,
+    num_invisible_slots: int,
+) -> Tensor:
+    """Build the legacy Q-visible -> K-invisible mask without fully masked queries.
+
+    A padded visible query has every visible key removed by ``key_padding_mask``.
+    The legacy asymmetric mask would also remove every invisible key, leaving an
+    all-masked attention row.  Some CUDA SDPA kernels return a finite forward for
+    that row but a non-finite backward.  Let only padded (semantically ignored)
+    queries attend the first invisible token.  Valid queries and all invisible
+    queries retain the exact legacy mask.
+    """
+
+    if visible_mask.ndim != 3 or int(visible_mask.shape[-1]) != 1:
+        raise ValueError(
+            "asymmetric ratio attention needs visible_mask shaped (B, N, 1)"
+        )
+    n_visible = int(visible_mask.shape[1])
+    n_invisible = int(num_invisible_slots)
+    if n_visible < 1 or n_invisible < 1:
+        raise ValueError("asymmetric ratio attention needs visible and invisible slots")
+    total = n_visible + n_invisible
+    is_invisible = torch.cat(
+        (
+            torch.zeros(n_visible, dtype=torch.bool, device=visible_mask.device),
+            torch.ones(n_invisible, dtype=torch.bool, device=visible_mask.device),
+        )
+    )
+    mask = (
+        ((~is_invisible[:, None]) & is_invisible[None, :])
+        .unsqueeze(0)
+        .expand(len(visible_mask), total, total)
+        .clone()
+    )
+    # This slice is True for valid visible queries (legacy behavior), and False
+    # only for padded queries. Their outputs are discarded by the object mask.
+    mask[:, :n_visible, n_visible] &= visible_mask.squeeze(-1).bool()
+    return mask
+
+
 class AdaLNZeroModulation(nn.Module):
     """Per-branch scale, shift, and residual gate from the event token."""
 
@@ -363,7 +494,15 @@ class AdaLNZeroModulation(nn.Module):
 
 
 class AdaLNZeroDecoderBlock(nn.Module):
-    """Candidate residual block: self-attn, event-memory cross-attn, FFN."""
+    """Candidate residual block: self-attn, event-memory cross-attn, FFN.
+
+    Attention dropout stays off.  The decoder only has two candidate tokens and
+    often a single surviving cross-attn key (empty-visible sentinel or one
+    visible particle).  With ``head_dropout>0``, MHA dropout can zero every
+    post-softmax weight on that row; CUDA/math kernels then return a finite
+    forward and a non-finite backward once AdaLN-Zero gates open (~step 3).
+    FFN dropout still applies ``head_dropout`` for regularization.
+    """
 
     def __init__(
         self,
@@ -374,12 +513,13 @@ class AdaLNZeroDecoderBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.norm_self = nn.LayerNorm(hidden_dim)
+        # Keep MHA dropout at 0 even when head_dropout > 0 (see class docstring).
         self.self_attn = nn.MultiheadAttention(
-            hidden_dim, int(num_heads), float(dropout), batch_first=True
+            hidden_dim, int(num_heads), dropout=0.0, batch_first=True
         )
         self.norm_cross = nn.LayerNorm(hidden_dim)
         self.cross_attn = nn.MultiheadAttention(
-            hidden_dim, int(num_heads), float(dropout), batch_first=True
+            hidden_dim, int(num_heads), dropout=0.0, batch_first=True
         )
         self.norm_ffn = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
@@ -400,21 +540,28 @@ class AdaLNZeroDecoderBlock(nn.Module):
         memory: Tensor,
         memory_padding_mask: Tensor,
         event_token: Tensor,
+        extra_modulation=None,
     ) -> Tensor:
         scale_self, shift_self, gate_self, scale_cross, shift_cross, gate_cross, scale_ffn, shift_ffn, gate_ffn = (
             self.modulation(event_token)
         )
+        if extra_modulation is not None:
+            ds, bs, dc, bc, df, bf = extra_modulation
+            scale_self, shift_self = scale_self + ds, shift_self + bs
+            scale_cross, shift_cross = scale_cross + dc, shift_cross + bc
+            scale_ffn, shift_ffn = scale_ffn + df, shift_ffn + bf
         query = self._adaln(self.norm_self(hidden), scale_self, shift_self)
-        self_update, _ = self.self_attn(query, query, query, need_weights=False)
-        hidden = hidden + gate_self.unsqueeze(1) * self_update
-        query = self._adaln(self.norm_cross(hidden), scale_cross, shift_cross)
-        cross_update, _ = self.cross_attn(
-            query,
-            memory,
-            memory,
-            key_padding_mask=memory_padding_mask,
-            need_weights=False,
-        )
+        with _stable_decoder_attention_context():
+            self_update, _ = self.self_attn(query, query, query, need_weights=False)
+            hidden = hidden + gate_self.unsqueeze(1) * self_update
+            query = self._adaln(self.norm_cross(hidden), scale_cross, shift_cross)
+            cross_update, _ = self.cross_attn(
+                query,
+                memory,
+                memory,
+                key_padding_mask=memory_padding_mask,
+                need_weights=False,
+            )
         hidden = hidden + gate_cross.unsqueeze(1) * cross_update
         hidden = hidden + gate_ffn.unsqueeze(1) * self.ffn(
             self._adaln(self.norm_ffn(hidden), scale_ffn, shift_ffn)
@@ -422,8 +569,24 @@ class AdaLNZeroDecoderBlock(nn.Module):
         return hidden
 
 
+class RelationDecoderBlock(AdaLNZeroDecoderBlock):
+    """Read all event/candidate tokens before exchanging information among latents."""
+
+    def forward(self, hidden, memory, memory_padding_mask, event_token):
+        ss, bs, gs, sc, bc, gc, sf, bf, gf = self.modulation(event_token)
+        with _stable_decoder_attention_context():
+            query = self._adaln(self.norm_cross(hidden), sc, bc)
+            update, _ = self.cross_attn(query, memory, memory,
+                key_padding_mask=memory_padding_mask, need_weights=False)
+            hidden = hidden + gc.unsqueeze(1) * update
+            query = self._adaln(self.norm_self(hidden), ss, bs)
+            update, _ = self.self_attn(query, query, query, need_weights=False)
+            hidden = hidden + gs.unsqueeze(1) * update
+        return hidden + gf.unsqueeze(1) * self.ffn(self._adaln(self.norm_ffn(hidden), sf, bf))
+
+
 class AdaLNZeroCandidateDecoder(nn.Module):
-    """Read the ratio off the two neutrino tokens, conditioned on PET visibles.
+    """Read candidate tokens and an optional pair token, conditioned on PET visibles.
 
     The candidate tokens stay on the residual stream.  Visible PET tokens are
     read-only cross-attention memory.  The GlobalEmbedding event token only
@@ -439,21 +602,35 @@ class AdaLNZeroCandidateDecoder(nn.Module):
         num_layers: int,
         num_heads: int,
         dropout: float = 0.0,
+        pair_feature_dim: int = 0,
+        relation_token_count: int = 0,
     ) -> None:
         super().__init__()
         if num_layers < 1:
             raise ValueError("candidate decoder needs at least one layer")
         self.hidden_dim = int(hidden_dim)
-        self.num_slots = 2
+        self.pair_feature_dim = int(pair_feature_dim)
+        if self.pair_feature_dim < 0:
+            raise ValueError("pair_feature_dim must be nonnegative")
+        self.relation_token_count = int(relation_token_count)
+        if self.relation_token_count < 0 or (self.relation_token_count and self.pair_feature_dim):
+            raise ValueError("Relation tokens require nonnegative count and no pair features")
+        # Relation latents read the whole event, then mean-pool to one readout.
+        self.num_slots = 1 if self.relation_token_count else 2 + int(self.pair_feature_dim > 0)
+        if self.relation_token_count:
+            self.relation_tokens = nn.Parameter(torch.empty(self.relation_token_count, self.hidden_dim))
+            nn.init.normal_(self.relation_tokens, std=0.02)
         self.candidate_in = nn.Linear(int(token_dim), self.hidden_dim)
         self.memory_in = nn.Linear(int(token_dim), self.hidden_dim)
         self.blocks = nn.ModuleList(
-            AdaLNZeroDecoderBlock(
+            (RelationDecoderBlock if self.relation_token_count else AdaLNZeroDecoderBlock)(
                 self.hidden_dim, int(num_heads), float(dropout), int(event_dim)
             )
             for _ in range(int(num_layers))
         )
         self.output_norm = nn.LayerNorm(self.hidden_dim)
+        if self.pair_feature_dim:
+            self.pair_in = nn.Linear(self.pair_feature_dim, self.hidden_dim)
 
     def forward(
         self,
@@ -464,20 +641,43 @@ class AdaLNZeroCandidateDecoder(nn.Module):
         memory_mask: Tensor | None = None,
         context_tokens: Tensor | None = None,
         context_mask: Tensor | None = None,
+        pair_features: Tensor | None = None,
+        visible_modulations=None,
     ) -> Tensor:
         if memory_tokens is None:
             memory_tokens = context_tokens
             memory_mask = context_mask if memory_mask is None else memory_mask
         if memory_tokens is None or memory_mask is None:
             raise ValueError("candidate decoder needs event memory tokens and mask")
+        if candidate_tokens.ndim != 3 or candidate_tokens.shape[1] != 2:
+            raise ValueError("candidate decoder requires two physical candidate tokens")
         hidden = self.candidate_in(candidate_tokens)
+        if self.pair_feature_dim:
+            if pair_features is None or pair_features.shape != (hidden.shape[0], self.pair_feature_dim):
+                raise ValueError("pair-token decoder requires one pair-feature vector per candidate")
+            hidden = torch.cat((hidden, self.pair_in(pair_features.to(hidden)).unsqueeze(1)), dim=1)
+        elif pair_features is not None:
+            raise ValueError("pair features supplied to decoder without pair token")
         memory = self.memory_in(memory_tokens)
         padding_mask = ~memory_mask.squeeze(-1).bool()
-        for block in self.blocks:
-            hidden = block(hidden, memory, padding_mask, event_token)
+        if self.relation_token_count:
+            memory = torch.cat((memory, hidden), dim=1)
+            padding_mask = torch.cat((padding_mask, torch.zeros(
+                hidden.shape[:2], dtype=torch.bool, device=hidden.device)), dim=1)
+            hidden = self.relation_tokens.unsqueeze(0).expand(hidden.shape[0], -1, -1)
+        if visible_modulations is not None and (self.relation_token_count or len(visible_modulations) != len(self.blocks)):
+            raise ValueError("visible modulation requires matching ordinary candidate-decoder blocks")
+        for index, block in enumerate(self.blocks):
+            if visible_modulations is None:
+                hidden = block(hidden, memory, padding_mask, event_token)
+            else:
+                hidden = block(hidden, memory, padding_mask, event_token, extra_modulation=visible_modulations[index])
+        if self.relation_token_count:
+            # Normalize each relation before pooling; no candidate/output bypass.
+            return self.output_norm(hidden).mean(dim=1, keepdim=True)
         if int(hidden.shape[1]) != self.num_slots:
             raise ValueError(
-                f"candidate decoder expects {self.num_slots} neutrino slots, "
+                f"candidate decoder expects {self.num_slots} readout slots, "
                 f"got {tuple(hidden.shape)}"
             )
         return self.output_norm(hidden)
@@ -573,10 +773,16 @@ class EvenetRatioPEFTBank(nn.Module):
         pairwise_feature_dim: int = 0,
         topology_fourier_embedding: bool = False,
         topology_conditioning: bool = False,
+        topology_pair_token: bool = False,
+        relation_token_count: int = 0,
+        visible_pair_rest_frame: bool = False,
         topology_hidden_dim: int = 64,
         topology_embedding_dim: int = 32,
         topology_fusion_hidden_dim: int = 64,
         topology_dropout: float = 0.15,
+        topology_direct_logit: bool = False,
+        topology_context_residual_scale: float = 1.0,
+        conditional_residual_rank: int = 0,
     ) -> None:
         super().__init__()
         self.position_encoder = PointCloudPositionalEmbedding(
@@ -584,11 +790,31 @@ class EvenetRatioPEFTBank(nn.Module):
             embed_dim=int(token_dim),
         )
         self.topology_conditioning = bool(topology_conditioning)
+        self.topology_pair_token = bool(topology_pair_token)
+        self.relation_token_count = int(relation_token_count)
+        if self.relation_token_count < 0:
+            raise ValueError("relation_token_count must be nonnegative")
+        if self.relation_token_count and (pairwise_feature_dim or topology_pair_token
+                or topology_fourier_embedding or topology_conditioning or topology_direct_logit
+                or visible_pair_rest_frame or conditional_residual_rank):
+            raise ValueError("Relation tokens exclude engineered topology, rest-frame and residual branches")
+        if self.topology_pair_token and (
+            int(pairwise_feature_dim) < 1 or topology_fourier_embedding
+            or topology_conditioning or topology_direct_logit
+            or int(conditional_residual_rank) > 0
+        ):
+            raise ValueError("topology_pair_token requires pair features and excludes Fourier fusion, conditioning, direct logit and residual branches")
+        self.visible_pair_rest_frame = bool(visible_pair_rest_frame)
         if self.topology_conditioning and not topology_fourier_embedding:
             raise ValueError("topology_conditioning requires topology_fourier_embedding")
+        effective_event_dim = int(event_dim) + int(topology_embedding_dim) * (
+            int(self.topology_conditioning) + int(self.visible_pair_rest_frame)
+        )
         self.decoder = AdaLNZeroCandidateDecoder(
             token_dim=int(token_dim),
-            event_dim=int(event_dim) + (int(topology_embedding_dim) if self.topology_conditioning else 0),
+            event_dim=effective_event_dim,
+            pair_feature_dim=int(pairwise_feature_dim) if self.topology_pair_token else 0,
+            relation_token_count=self.relation_token_count,
             hidden_dim=int(hidden_dim),
             num_layers=int(num_layers),
             num_heads=int(num_heads),
@@ -596,7 +822,54 @@ class EvenetRatioPEFTBank(nn.Module):
         )
         self.pairwise_feature_dim = int(pairwise_feature_dim)
         self.topology_fourier_embedding = bool(topology_fourier_embedding)
+        self.topology_direct_logit = bool(topology_direct_logit)
+        self.topology_context_residual_scale = float(
+            topology_context_residual_scale
+        )
+        self.conditional_residual_rank = int(conditional_residual_rank)
+        if self.conditional_residual_rank < 0:
+            raise ValueError("conditional_residual_rank must be nonnegative")
+        if self.conditional_residual_rank > 0:
+            if self.pairwise_feature_dim < 1:
+                raise ValueError(
+                    "conditional residual requires periodic pair features"
+                )
+            if self.topology_fourier_embedding:
+                raise ValueError(
+                    "conditional residual is an alternative to Fourier topology fusion"
+                )
+            if self.topology_direct_logit or self.topology_conditioning:
+                raise ValueError(
+                    "conditional residual cannot be combined with topology direct-logit/conditioning"
+                )
+        if self.topology_direct_logit and not self.topology_fourier_embedding:
+            raise ValueError(
+                "topology_direct_logit requires topology_fourier_embedding"
+            )
+        if self.topology_direct_logit and self.topology_conditioning:
+            raise ValueError(
+                "topology_direct_logit supports late fusion, not "
+                "topology_conditioning"
+            )
+        if (
+            not math.isfinite(self.topology_context_residual_scale)
+            or not 0.0 <= self.topology_context_residual_scale <= 1.0
+        ):
+            raise ValueError(
+                "topology_context_residual_scale must be finite and in [0, 1]"
+            )
         decoder_width = self.decoder.num_slots * int(hidden_dim)
+        if self.visible_pair_rest_frame:
+            if min(int(topology_hidden_dim), int(topology_embedding_dim)) < 1:
+                raise ValueError("rest-frame encoder dimensions must be positive")
+            if not 0.0 <= float(topology_dropout) < 1.0:
+                raise ValueError("rest-frame dropout must lie in [0, 1)")
+            self.rest_frame_encoder = nn.Sequential(
+                nn.LayerNorm(REST_FRAME_DIM),
+                nn.Linear(REST_FRAME_DIM, int(topology_hidden_dim)), nn.GELU(),
+                nn.Dropout(float(topology_dropout)),
+                nn.Linear(int(topology_hidden_dim), int(topology_embedding_dim)), nn.GELU(),
+            )
         if self.topology_fourier_embedding:
             if self.pairwise_feature_dim < 1:
                 raise ValueError("Fourier topology embedding requires pair features")
@@ -616,6 +889,7 @@ class EvenetRatioPEFTBank(nn.Module):
                 nn.Linear(int(topology_hidden_dim), int(topology_embedding_dim)),
                 nn.GELU(),
             )
+            self.topology_standardizer = FixedFeatureStandardizer(int(topology_embedding_dim))
             if self.topology_conditioning:
                 # Fourier context controls every decoder block through AdaLN;
                 # keep the ordinary two-token readout, with no late-fusion path.
@@ -631,13 +905,59 @@ class EvenetRatioPEFTBank(nn.Module):
                     nn.Dropout(float(topology_dropout)),
                 )
                 self.output = nn.Linear(int(topology_fusion_hidden_dim), 1)
+            if self.topology_direct_logit:
+                # Give the low-dimensional periodic basis the shortest possible
+                # gradient path. The zero initialization preserves the exact
+                # balanced-null classifier at step zero; the deeper EveNet
+                # path remains a gated residual correction.
+                self.topology_output = nn.Linear(self.pairwise_feature_dim, 1)
+                nn.init.zeros_(self.topology_output.weight)
+                nn.init.zeros_(self.topology_output.bias)
+        elif self.conditional_residual_rank > 0:
+            # Keep the legacy classifier logit as an exact base path.  The new
+            # branch is a rank-controlled conditional correction between a
+            # candidate-independent event summary and low-bandwidth topology
+            # features.  Zero-initialize one factor so stage one is byte-for-
+            # byte the legacy function while the other factor supplies a
+            # nonzero gradient when the residual stage opens.
+            self.output = nn.Linear(decoder_width, 1)
+            context_dim = effective_event_dim + int(token_dim)
+            self.conditional_context = nn.Linear(
+                context_dim, self.conditional_residual_rank, bias=False
+            )
+            self.conditional_candidate = nn.Linear(
+                self.pairwise_feature_dim,
+                self.conditional_residual_rank,
+                bias=False,
+            )
+            nn.init.xavier_uniform_(self.conditional_context.weight)
+            nn.init.zeros_(self.conditional_candidate.weight)
         else:
             self.output = nn.Linear(
-                decoder_width + self.pairwise_feature_dim,
+                decoder_width + (0 if self.topology_pair_token else self.pairwise_feature_dim),
                 1,
             )
-        nn.init.zeros_(self.output.weight)
+        # Constant learned latents + zero AdaLN gates + zero output weights
+        # would block candidate-dependent gradients at initialization.
+        if self.relation_token_count:
+            nn.init.normal_(self.output.weight, std=0.02)
+        else:
+            nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
+        self.visible_conditioning = None
+        self.visible_conditioning_config = None
+
+    def configure_visible_conditioning(self, spec) -> None:
+        """A saved classifier owns its architecture, independently of live flags."""
+        if spec:
+            spec = dict(spec)
+            if (self.relation_token_count or spec["hidden_dim"] != self.decoder.hidden_dim
+                    or spec["num_layers"] != len(self.decoder.blocks) or spec["n_branches"] != 3):
+                raise ValueError("visible conditioning is incompatible with the saved candidate decoder")
+        if spec == self.visible_conditioning_config:
+            return
+        self.visible_conditioning = VisibleConditioning(**spec) if spec else None
+        self.visible_conditioning_config = dict(self.visible_conditioning.spec) if spec else None
 
     @classmethod
     def from_backbone(
@@ -651,12 +971,19 @@ class EvenetRatioPEFTBank(nn.Module):
         periodic_pair_features: bool = False,
         topology_fourier_embedding: bool = False,
         topology_conditioning: bool = False,
+        topology_pair_token: bool = False,
+        relation_token_count: int = 0,
+        visible_pair_rest_frame: bool = False,
         topology_max_harmonic: int = 1,
         topology_include_theta_pair: bool = False,
+        topology_theta_fourier: bool = False,
         topology_hidden_dim: int = 64,
         topology_embedding_dim: int = 32,
         topology_fusion_hidden_dim: int = 64,
         topology_dropout: float = 0.15,
+        topology_direct_logit: bool = False,
+        topology_context_residual_scale: float = 1.0,
+        conditional_residual_rank: int = 0,
         position_state: Mapping[str, Tensor] | None = None,
     ) -> "EvenetRatioPEFTBank":
         pet_cfg = backbone.network_cfg.Body.PET
@@ -678,22 +1005,35 @@ class EvenetRatioPEFTBank(nn.Module):
                 periodic_tau_pair_feature_dim(
                     topology_max_harmonic,
                     include_theta_pair=topology_include_theta_pair,
+                    theta_fourier=topology_theta_fourier,
                 )
                 if periodic_pair_features
                 else 0
             ),
             topology_fourier_embedding=topology_fourier_embedding,
             topology_conditioning=topology_conditioning,
+            topology_pair_token=topology_pair_token,
+            relation_token_count=relation_token_count,
+            visible_pair_rest_frame=visible_pair_rest_frame,
             topology_hidden_dim=topology_hidden_dim,
             topology_embedding_dim=topology_embedding_dim,
             topology_fusion_hidden_dim=topology_fusion_hidden_dim,
             topology_dropout=topology_dropout,
+            topology_direct_logit=topology_direct_logit,
+            topology_context_residual_scale=topology_context_residual_scale,
+            conditional_residual_rank=conditional_residual_rank,
         )
         if position_state is not None:
             try:
                 bank.position_encoder.load_state_dict(position_state)
             except RuntimeError:
                 _log.info("[DGPO/omnifold] pretrained slot position weights were shape-incompatible")
+        if dict(getattr(backbone.network_cfg, "VisibleConditioning", {}) or {}).get("classifier_enabled", False):
+            bank.configure_visible_conditioning(visible_conditioning_spec(
+                backbone.network_cfg, target="classifier", feature_names=backbone._raw_sequential_feature_names(),
+                token_dim=backbone.sequential_input_dim, hidden_dim=int(hidden_dim),
+                num_layers=int(num_layers), n_branches=3,
+            ))
         return bank
 
     def assert_complete(self) -> None:
@@ -705,22 +1045,57 @@ class EvenetRatioPEFTBank(nn.Module):
         ]
         if missing:
             raise ValueError(f"EveNet PEFT bank is missing required groups: {missing}")
+        if self.topology_pair_token and not any(key.startswith("decoder.pair_in.") for key in keys):
+            raise ValueError("Pair-token PEFT bank is missing decoder.pair_in")
+        if self.visible_pair_rest_frame and not any(key.startswith("rest_frame_encoder.") for key in keys):
+            raise ValueError("EveNet PEFT bank is missing rest_frame_encoder")
         if self.topology_fourier_embedding:
             for prefix in (("topology_encoder.",) if self.topology_conditioning else ("topology_encoder.", "fusion.")):
                 if not any(key.startswith(prefix) for key in keys):
                     raise ValueError(
                         f"Fourier topology PEFT bank is missing {prefix}"
                     )
+        if self.topology_direct_logit and not any(
+            key.startswith("topology_output.") for key in keys
+        ):
+            raise ValueError("Fourier topology PEFT bank is missing topology_output")
+        if self.conditional_residual_rank > 0:
+            for prefix in ("conditional_context.", "conditional_candidate."):
+                if not any(key.startswith(prefix) for key in keys):
+                    raise ValueError(
+                        f"conditional residual PEFT bank is missing {prefix}"
+                    )
 
-    def score(self, decoder_readout: Tensor, pair_features: Tensor | None) -> Tensor:
-        if self.topology_conditioning:
+    def score(
+        self,
+        decoder_readout: Tensor,
+        pair_features: Tensor | None,
+        conditional_context: Tensor | None = None,
+    ) -> Tensor:
+        if self.topology_conditioning or self.topology_pair_token:
             return self.output(decoder_readout).squeeze(-1)
         if self.topology_fourier_embedding:
             if pair_features is None:
                 raise ValueError("Fourier topology bank requires pair features")
-            topology = self.topology_encoder(pair_features)
+            topology = self.topology_standardizer(self.topology_encoder(pair_features))
             fused = self.fusion(torch.cat((decoder_readout, topology), dim=-1))
-            return self.output(fused).squeeze(-1)
+            context_logit = self.output(fused).squeeze(-1)
+            if self.topology_direct_logit:
+                direct_logit = self.topology_output(pair_features).squeeze(-1)
+                return direct_logit + (
+                    self.topology_context_residual_scale * context_logit
+                )
+            return context_logit
+        if self.conditional_residual_rank > 0:
+            if pair_features is None or conditional_context is None:
+                raise ValueError(
+                    "conditional residual requires pair features and event context"
+                )
+            context_factor = self.conditional_context(conditional_context)
+            candidate_factor = self.conditional_candidate(pair_features)
+            residual = (context_factor * candidate_factor).sum(dim=-1)
+            residual = residual / math.sqrt(float(self.conditional_residual_rank))
+            return self.output(decoder_readout).squeeze(-1) + residual
         if pair_features is not None:
             decoder_readout = torch.cat((decoder_readout, pair_features), dim=-1)
         return self.output(decoder_readout).squeeze(-1)
@@ -741,17 +1116,26 @@ class EvenetAdapterRatioClassifier(nn.Module):
         train_encoder: bool = False,
         train_grouped_sequential_embedding: bool = False,
         train_invisible_projector: bool = False,
+        train_angular_conditioning: bool = False,
         train_backbone: bool = False,
+        train_last_pet_block: bool = False,
         asymmetric_attention: bool = False,
         periodic_pair_features: bool = False,
         topology_fourier_embedding: bool = False,
         topology_conditioning: bool = False,
+        topology_pair_token: bool = False,
+        relation_token_count: int = 0,
+        visible_pair_rest_frame: bool = False,
         topology_max_harmonic: int = 1,
         topology_include_theta_pair: bool = False,
+        topology_theta_fourier: bool = False,
         topology_hidden_dim: int = 64,
         topology_embedding_dim: int = 32,
         topology_fusion_hidden_dim: int = 64,
         topology_dropout: float = 0.15,
+        topology_direct_logit: bool = False,
+        topology_context_residual_scale: float = 1.0,
+        conditional_residual_rank: int = 0,
         head_dropout: float | None = None,
         decoder_hidden_dim: int | None = None,
         decoder_layers: int | None = None,
@@ -782,7 +1166,9 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 train_grouped_sequential_embedding
             ),
             train_invisible_projector=train_invisible_projector,
+            train_angular_conditioning=train_angular_conditioning,
             train_backbone=train_backbone,
+            train_last_pet_block=train_last_pet_block,
         )
         self._train_layernorm = bool(train_layernorm)
         self._train_encoder = bool(train_encoder)
@@ -792,23 +1178,40 @@ class EvenetAdapterRatioClassifier(nn.Module):
         self._include_train_grouped_sequential_embedding_in_payload = True
         self._train_invisible_projector = bool(train_invisible_projector)
         self._include_train_invisible_projector_in_payload = True
+        self._train_angular_conditioning = bool(train_angular_conditioning)
         self._train_backbone = bool(train_backbone)
+        self._train_last_pet_block = bool(train_last_pet_block)
         self._asymmetric_attention = bool(asymmetric_attention)
         self._include_asymmetric_attention_in_payload = True
         self._periodic_pair_features = bool(periodic_pair_features)
         self._include_periodic_pair_features_in_payload = True
         self._topology_fourier_embedding = bool(topology_fourier_embedding)
         self._topology_conditioning = bool(topology_conditioning)
+        self._topology_pair_token = bool(topology_pair_token)
+        self._relation_token_count = int(relation_token_count)
+        self._visible_pair_rest_frame = bool(visible_pair_rest_frame)
         if self._topology_fourier_embedding and not self._periodic_pair_features:
             raise ValueError(
                 "topology_fourier_embedding requires periodic_pair_features"
             )
+        if self._topology_pair_token and not self._periodic_pair_features:
+            raise ValueError("topology_pair_token requires periodic_pair_features")
         self._topology_max_harmonic = int(topology_max_harmonic)
         self._topology_include_theta_pair = bool(topology_include_theta_pair)
+        self._topology_theta_fourier = bool(topology_theta_fourier)
         self._topology_hidden_dim = int(topology_hidden_dim)
         self._topology_embedding_dim = int(topology_embedding_dim)
         self._topology_fusion_hidden_dim = int(topology_fusion_hidden_dim)
         self._topology_dropout = float(topology_dropout)
+        self._topology_direct_logit = bool(topology_direct_logit)
+        self._topology_context_residual_scale = float(
+            topology_context_residual_scale
+        )
+        self._conditional_residual_rank = int(conditional_residual_rank)
+        if self._topology_direct_logit and self._topology_conditioning:
+            raise ValueError(
+                "topology_direct_logit supports late fusion, not topology_conditioning"
+            )
         self._backbone_state_keys = tuple(
             name
             for name, parameter in backbone.named_parameters()
@@ -816,6 +1219,8 @@ class EvenetAdapterRatioClassifier(nn.Module):
         )
         self._shared = _SharedModuleRef(backbone)
         self.packing_spec = packing_spec
+        if self._visible_pair_rest_frame and packing_spec.shapes.get(REST_FRAME_KEY) != (REST_FRAME_DIM,):
+            raise ValueError("visible-pair rest classifier requires versioned rest-frame features in the pool")
         if self._periodic_pair_features:
             missing_pair_context = [
                 key for key in _PAIRWISE_CONTEXT_KEYS if key not in packing_spec.shapes
@@ -872,15 +1277,44 @@ class EvenetAdapterRatioClassifier(nn.Module):
             periodic_pair_features=self._periodic_pair_features,
             topology_fourier_embedding=self._topology_fourier_embedding,
             topology_conditioning=self._topology_conditioning,
+            topology_pair_token=self._topology_pair_token,
+            relation_token_count=self._relation_token_count,
+            visible_pair_rest_frame=self._visible_pair_rest_frame,
             topology_max_harmonic=self._topology_max_harmonic,
             topology_include_theta_pair=self._topology_include_theta_pair,
+            topology_theta_fourier=self._topology_theta_fourier,
             topology_hidden_dim=self._topology_hidden_dim,
             topology_embedding_dim=self._topology_embedding_dim,
             topology_fusion_hidden_dim=self._topology_fusion_hidden_dim,
             topology_dropout=self._topology_dropout,
+            topology_direct_logit=self._topology_direct_logit,
+            topology_context_residual_scale=(
+                self._topology_context_residual_scale
+            ),
+            conditional_residual_rank=self._conditional_residual_rank,
             position_state=position_state,
         )
         self.bank.assert_complete()
+        if self.bank.relation_token_count != self._relation_token_count:
+            raise ValueError("PEFT bank relation-token count mismatch")
+        if self.bank.topology_pair_token != self._topology_pair_token:
+            raise ValueError("pair-token bank/classifier architecture mismatch")
+        if self.bank.visible_pair_rest_frame != self._visible_pair_rest_frame:
+            raise ValueError("rest-frame bank/classifier architecture mismatch")
+        if self.bank.topology_direct_logit != self._topology_direct_logit:
+            raise ValueError("direct-topology bank/classifier architecture mismatch")
+        if not math.isclose(
+            self.bank.topology_context_residual_scale,
+            self._topology_context_residual_scale,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError("topology residual-scale bank/classifier mismatch")
+        if (
+            self.bank.conditional_residual_rank
+            != self._conditional_residual_rank
+        ):
+            raise ValueError("conditional-residual bank/classifier architecture mismatch")
         internal_adapters = getattr(backbone.PET, "adapters", None)
         if internal_adapters is None or len(internal_adapters) == 0:
             raise RuntimeError(
@@ -895,8 +1329,13 @@ class EvenetAdapterRatioClassifier(nn.Module):
             )
             for group, prefix in (
                 ("head", "bank.decoder."),
+                ("visible_conditioning", "bank.visible_conditioning."),
                 ("output", "bank.output."),
                 ("topology_encoder", "bank.topology_encoder."),
+                ("topology_output", "bank.topology_output."),
+                ("conditional_context", "bank.conditional_context."),
+                ("conditional_candidate", "bank.conditional_candidate."),
+                ("rest_frame_encoder", "bank.rest_frame_encoder."),
                 ("fusion", "bank.fusion."),
                 ("position_encoder", "bank.position_encoder."),
                 ("object_encoder", "backbone.ObjectEncoder."),
@@ -908,6 +1347,7 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 ("invisible_projector", "backbone.InvisibleInputProjector."),
                 ("pet", "backbone.PET."),
                 ("internal_pet_adapters", "backbone.PET.adapters."),
+                ("angular_conditioning", "backbone.PET.angular_conditioning."),
             )
         }
         self.trainable_parameter_counts["total"] = sum(
@@ -950,6 +1390,26 @@ class EvenetAdapterRatioClassifier(nn.Module):
     def train(self, mode: bool = True):
         """Keep the unregistered EveNet body in the correct stochastic mode."""
 
+        if getattr(self, "_conditional_residual_only", False):
+            # The residual fit treats the selected legacy classifier as a
+            # deterministic offset.  Repeated model.train() calls from the
+            # fitter must not reactivate dropout in that inherited path.
+            super().train(False)
+            self.backbone.eval()
+            self.training = mode
+            self.bank.conditional_context.train(mode)
+            self.bank.conditional_candidate.train(mode)
+            return self
+        if getattr(self, "_residual_last_block_only", False):
+            # model.train() is called again by the fitter after every validation.
+            # Keep inherited feature extractors deterministic on EVERY call.
+            super().train(False)
+            self.backbone.eval()
+            self.training = mode
+            if not getattr(self, "_residual_output_only", False):
+                self.bank.decoder.blocks[-1].train(mode)
+            self.bank.output.train(mode)
+            return self
         super().train(mode)
         if self._train_backbone:
             self.backbone.train(mode)
@@ -960,7 +1420,201 @@ class EvenetAdapterRatioClassifier(nn.Module):
             # Internal adapters are trainable even when the pretrained body is
             # frozen; enable their dropout without enabling frozen PET dropout.
             self.backbone.PET.adapters.train(mode)
+            if self._train_angular_conditioning:
+                self.backbone.PET.angular_conditioning.train(mode)
+            if self._train_last_pet_block:
+                self.backbone.PET.transformer_blocks[-1].train(mode)
         return self
+
+    def configure_conditional_residual_training_stage(self, stage: int) -> None:
+        """Train the exact legacy base first, then only its low-rank residual.
+
+        Stage 1 leaves the normal legacy classifier path trainable and freezes
+        the zero-valued residual. Stage 2 freezes the selected legacy logit and
+        opens only the two rank-factor projections. Both stages optimize the
+        same balanced BCE; stage 2 simply uses the stage-1 logit as an offset.
+        """
+
+        if self._conditional_residual_rank < 1:
+            raise ValueError(
+                "conditional residual staging requires conditional_residual_rank > 0"
+            )
+        if stage not in (1, 2):
+            raise ValueError("conditional residual training stage must be 1 or 2")
+        if getattr(self, "_residual_last_block_only", False):
+            raise ValueError(
+                "conditional residual staging cannot be combined with residual last-block fitting"
+            )
+
+        if stage == 1:
+            # Restore the architecture's ordinary training view, then close the
+            # new branch. configure_adapter_training reproduces constructor
+            # semantics after a preceding stage-2 freeze.
+            self.bank.requires_grad_(True)
+            configure_adapter_training(
+                self.backbone,
+                train_layernorm=self._train_layernorm,
+                train_encoder=self._train_encoder,
+                train_grouped_sequential_embedding=(
+                    self._train_grouped_sequential_embedding
+                ),
+                train_invisible_projector=self._train_invisible_projector,
+                train_angular_conditioning=self._train_angular_conditioning,
+                train_backbone=self._train_backbone,
+                train_last_pet_block=self._train_last_pet_block,
+            )
+            self.bank.conditional_context.requires_grad_(False)
+            self.bank.conditional_candidate.requires_grad_(False)
+            self._conditional_residual_only = False
+        else:
+            self.bank.requires_grad_(False)
+            self.backbone.requires_grad_(False)
+            self.bank.conditional_context.requires_grad_(True)
+            self.bank.conditional_candidate.requires_grad_(True)
+            self._conditional_residual_only = True
+        for parameter in list(self.bank.parameters()) + list(
+            self.backbone.parameters()
+        ):
+            parameter.grad = None
+        self._conditional_residual_training_stage = int(stage)
+        self.train(self.training)
+        self._refresh_trainable_parameter_counts()
+        _log.info(
+            "[DGPO/omnifold] conditional residual stage=%s rank=%s trainable parameters=%s",
+            stage,
+            self._conditional_residual_rank,
+            self.trainable_parameter_counts,
+        )
+
+    def _refresh_trainable_parameter_counts(self) -> None:
+        groups = (
+            ("head", "bank.decoder."),
+            ("visible_conditioning", "bank.visible_conditioning."),
+            ("output", "bank.output."),
+            ("topology_encoder", "bank.topology_encoder."),
+            ("topology_output", "bank.topology_output."),
+            ("conditional_context", "bank.conditional_context."),
+            ("conditional_candidate", "bank.conditional_candidate."),
+            ("rest_frame_encoder", "bank.rest_frame_encoder."),
+            ("fusion", "bank.fusion."),
+            ("position_encoder", "bank.position_encoder."),
+            ("object_encoder", "backbone.ObjectEncoder."),
+            (
+                "grouped_sequential_embedding",
+                "backbone.GroupedSequentialEmbedding.",
+            ),
+            ("global_embedding", "backbone.GlobalEmbedding."),
+            ("invisible_projector", "backbone.InvisibleInputProjector."),
+            ("pet", "backbone.PET."),
+            ("internal_pet_adapters", "backbone.PET.adapters."),
+            ("angular_conditioning", "backbone.PET.angular_conditioning."),
+        )
+        named = list(self.named_parameters())
+        self.trainable_parameter_counts = {
+            group: sum(
+                int(parameter.numel())
+                for name, parameter in named
+                if parameter.requires_grad and name.startswith(prefix)
+            )
+            for group, prefix in groups
+        }
+        self.trainable_parameter_counts["total"] = sum(
+            int(parameter.numel())
+            for _name, parameter in named
+            if parameter.requires_grad
+        )
+
+    def configure_topology_training_stage(self, stage: int) -> None:
+        """Select the direct-H4 staged optimization view without changing keys.
+
+        Stage 1 trains only the direct periodic-basis logit. Stage 2 opens the
+        classifier bank and PET adapters. Stage 3 additionally restores the
+        configured body/projector flags. Keeping the complete state schema
+        fixed makes PEFT payloads and fit recovery checkpoints portable across
+        stage boundaries.
+        """
+
+        if not self._topology_direct_logit:
+            raise ValueError(
+                "topology staged training requires topology_direct_logit=true"
+            )
+        if type(stage) is not int or not 1 <= stage <= 3:
+            raise ValueError("topology training stage must be 1, 2, or 3")
+        if getattr(self, "_residual_last_block_only", False):
+            raise ValueError(
+                "topology staged training cannot be combined with residual "
+                "last-block-only fitting"
+            )
+
+        self.bank.requires_grad_(False)
+        self.backbone.requires_grad_(False)
+        self.bank.topology_output.requires_grad_(True)
+        if stage >= 2:
+            self.bank.requires_grad_(True)
+            self.backbone.PET.adapters.requires_grad_(True)
+        if stage >= 3:
+            configure_adapter_training(
+                self.backbone,
+                train_layernorm=self._train_layernorm,
+                train_encoder=self._train_encoder,
+                train_grouped_sequential_embedding=(
+                    self._train_grouped_sequential_embedding
+                ),
+                train_invisible_projector=self._train_invisible_projector,
+                train_angular_conditioning=self._train_angular_conditioning,
+                train_backbone=self._train_backbone,
+                train_last_pet_block=self._train_last_pet_block,
+            )
+        for parameter in list(self.bank.parameters()) + list(
+            self.backbone.parameters()
+        ):
+            parameter.grad = None
+        self._topology_training_stage = int(stage)
+        self.train(self.training)
+        self._refresh_trainable_parameter_counts()
+        _log.info(
+            "[DGPO/omnifold] topology training stage=%s trainable parameters=%s",
+            stage,
+            self.trainable_parameter_counts,
+        )
+
+    def configure_residual_last_block_training(self, *, output_only: bool = False, reset_output: bool = True) -> None:
+        """Fit output only or last block + output, optionally resetting the head.
+
+        Call only after loading the same-fold iteration-1 state. This is a fit
+        policy, not a different architecture. Preserve _backbone_state_keys:
+        inherited-but-now-frozen tensors still belong in snapshots/PEFT payloads.
+        """
+        if (not isinstance(self.bank.decoder, AdaLNZeroCandidateDecoder)
+            or not len(self.bank.decoder.blocks)
+            or not isinstance(self.bank.output, nn.Linear)
+            or self.bank.output.in_features != self.bank.decoder.hidden_dim * self.bank.decoder.num_slots
+            or getattr(self.bank, "fusion", None) is not None):
+            raise ValueError("last_decoder_and_output requires the direct two-token linear readout")
+        self.bank.requires_grad_(False)
+        self.backbone.requires_grad_(False)
+        self.bank.decoder.blocks[-1].requires_grad_(not output_only)
+        self.bank.output.requires_grad_(True)
+        if reset_output:
+            with torch.no_grad():
+                self.bank.output.weight.zero_()
+                if self.bank.output.bias is not None:
+                    self.bank.output.bias.zero_()
+        for parameter in list(self.bank.parameters()) + list(self.backbone.parameters()):
+            parameter.grad = None
+        self._residual_last_block_only = True
+        self._residual_output_only = bool(output_only)
+        self.train(self.training)
+        self.trainable_parameter_counts = dict.fromkeys(self.trainable_parameter_counts, 0)
+        self.trainable_parameter_counts["head"] = sum(p.numel() for p in self.bank.decoder.blocks[-1].parameters() if p.requires_grad)
+        self.trainable_parameter_counts["output"] = sum(p.numel() for p in self.bank.output.parameters())
+        self.trainable_parameter_counts["total"] = (
+            self.trainable_parameter_counts["head"] + self.trainable_parameter_counts["output"]
+        )
+        _log.info("[DGPO/omnifold] residual fit mode=%s; output_reset=%s; "
+                  "frozen modules eval; trainable parameters=%s",
+                  "output_only" if output_only else "last_decoder_and_output",
+                  reset_output, self.trainable_parameter_counts)
 
     def _trainable_backbone_parameters(
         self,
@@ -1078,7 +1732,9 @@ class EvenetAdapterRatioClassifier(nn.Module):
         mask = torch.ones(
             *features.shape[:-1], 1, device=features.device, dtype=torch.bool
         )
-        return self.backbone.invisible_normalizer(x=features, mask=mask)[..., :inv_in]
+        normalizer = self.backbone.invisible_normalizer
+        normalize = normalizer.forward_grad if getattr(self, "endpoint_candidate_grad", False) else normalizer
+        return normalize(x=features, mask=mask)[..., :inv_in]
 
     def forward(self, packed_event: Tensor, candidate_flat: Tensor) -> Tensor:
         output_shape = candidate_flat.shape[:-1]
@@ -1096,6 +1752,7 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 self.packing_spec,
                 max_harmonic=self._topology_max_harmonic,
                 include_theta_pair=self._topology_include_theta_pair,
+                theta_fourier=self._topology_theta_fourier,
             )
         if candidate_flat.ndim == 3:
             bsz, count = int(candidate_flat.shape[0]), int(candidate_flat.shape[1])
@@ -1110,6 +1767,18 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 "candidate sample must be (B,F) or (B,K,F), "
                 f"got {tuple(candidate_flat.shape)}"
             )
+        if getattr(self, "_topology_training_stage", None) == 1:
+            if pair_features is None:
+                raise RuntimeError(
+                    "direct-topology warmup requires periodic pair features"
+                )
+            direct_logits = self.bank.topology_output(
+                pair_features.to(
+                    device=candidate_flat.device,
+                    dtype=candidate_flat.dtype,
+                )
+            ).squeeze(-1)
+            return direct_logits.reshape(output_shape)
 
         batch = unpack_event_inputs(packed_event, self.packing_spec)
         x = batch["x"]
@@ -1164,19 +1833,11 @@ class EvenetAdapterRatioClassifier(nn.Module):
         if self._asymmetric_attention:
             # Legacy reward checkpoints were trained with visible queries
             # blocked from attending to invisible keys. Preserve that behavior
-            # only while restoring those frozen stacks; new fits use full
-            # bidirectional self-attention.
-            is_invisible = torch.cat(
-                (
-                    torch.zeros(n_visible, dtype=torch.bool, device=x.device),
-                    torch.ones(
-                        self.num_invisible_slots,
-                        dtype=torch.bool,
-                        device=x.device,
-                    ),
-                )
+            # while preventing all-masked rows for padded visible queries.
+            attention_mask = _safe_asymmetric_attention_mask(
+                visible_mask,
+                num_invisible_slots=self.num_invisible_slots,
             )
-            attention_mask = (~is_invisible[:, None]) & is_invisible[None, :]
         time_masking = torch.cat(
             (torch.zeros_like(visible_mask), invisible_mask), dim=1
         ).float()
@@ -1192,9 +1853,23 @@ class EvenetAdapterRatioClassifier(nn.Module):
             time_masking=time_masking,
             # ``None`` always selects PET's registered internal adapter stack.
             adapters=None,
+            **({"visible_raw": x} if getattr(self.backbone.PET, "angular_conditioning", None) is not None else {}),
+        )
+        # Invalid PET slots are semantically absent. ``where`` also prevents a
+        # masked non-finite value from leaking through (NaN * 0 remains NaN).
+        encoded = torch.where(
+            full_mask,
+            encoded,
+            torch.zeros((), device=encoded.device, dtype=encoded.dtype),
         )
         memory_tokens = encoded[:, :n_visible]
         memory_mask = visible_mask
+        conditional_visible_summary = None
+        if self._conditional_residual_rank > 0:
+            visible_weight = memory_mask.to(memory_tokens.dtype)
+            conditional_visible_summary = (
+                memory_tokens * visible_weight
+            ).sum(dim=1) / visible_weight.sum(dim=1).clamp_min(1.0)
         # Multihead cross-attention is undefined for a row whose every memory
         # key is masked.  Some CUDA kernels return finite zeros in the forward
         # pass but NaN gradients in the backward pass.  Supply one neutral
@@ -1212,21 +1887,39 @@ class EvenetAdapterRatioClassifier(nn.Module):
             dim=1,
         )
         event_token = self._event_token_from_global(global_embedding)
+        if self.bank.visible_pair_rest_frame:
+            # Visible-only context: shared by every candidate of this event.
+            # It modulates candidate processing; no event-only logit bypass.
+            rest_context = self.bank.rest_frame_encoder(batch[REST_FRAME_KEY].to(event_token))
+            event_token = torch.cat((event_token, rest_context), dim=-1)
         if self.bank.topology_conditioning:
             if pair_features is None:
                 raise ValueError("Fourier decoder conditioning requires candidate pair features")
             topology = self.bank.topology_encoder(pair_features.to(event_token))
             event_token = torch.cat((event_token, topology), dim=-1)
+        conditional_context = None
+        if self._conditional_residual_rank > 0:
+            assert conditional_visible_summary is not None
+            conditional_context = torch.cat(
+                (event_token, conditional_visible_summary.to(event_token)), dim=-1
+            )
         candidate_tokens = self.bank.position_encoder(
             x=encoded[:, n_visible:],
             time_mask=invisible_mask.to(encoded.dtype),
             x_mask=invisible_mask.to(encoded.dtype),
         )
+        visible_modulations = None
+        if self.bank.visible_conditioning is not None:
+            extra = (dict(normalized_raw=visible_raw)
+                     if self.bank.visible_conditioning.feature_mode == "kinematics" else {})
+            visible_modulations = self.bank.visible_conditioning(x, visible, visible_mask, **extra)
         hidden = self.bank.decoder(
             candidate_tokens=candidate_tokens,
             memory_tokens=memory_tokens,
             memory_mask=memory_mask,
             event_token=event_token,
+            pair_features=pair_features if self.bank.topology_pair_token else None,
+            visible_modulations=visible_modulations,
         )
         readout = hidden.reshape(hidden.shape[0], -1)
         if pair_features is not None:
@@ -1234,7 +1927,7 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 device=readout.device,
                 dtype=readout.dtype,
             )
-        logits = self.bank.score(readout, pair_features)
+        logits = self.bank.score(readout, pair_features, conditional_context)
         return logits.reshape(output_shape)
 
     def peft_payload(self) -> dict[str, Any]:
@@ -1270,6 +1963,13 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 "adapter_bottleneck": self._adapter_bottleneck,
                 "train_backbone": self._train_backbone,
             }
+            if self.bank.visible_conditioning_config:
+                classifier_config["visible_conditioning"] = dict(self.bank.visible_conditioning_config)
+            if self._train_last_pet_block:
+                classifier_config["train_last_pet_block"] = True
+            # Omit False to preserve legacy classifier payloads byte-for-byte.
+            if self._train_angular_conditioning:
+                classifier_config["train_angular_conditioning"] = True
             if getattr(
                 self,
                 "_include_train_grouped_sequential_embedding_in_payload",
@@ -1284,6 +1984,12 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 classifier_config["train_invisible_projector"] = (
                     self._train_invisible_projector
                 )
+            # Omit defaults (False) so legacy parent stacks keep a stable digest.
+            # Persist True so a later resume rebuilds the same body key set.
+            if self._train_layernorm:
+                classifier_config["train_layernorm"] = True
+            if self._train_encoder:
+                classifier_config["train_encoder"] = True
             if getattr(self, "_include_asymmetric_attention_in_payload", True):
                 classifier_config["asymmetric_attention"] = (
                     self._asymmetric_attention
@@ -1294,24 +2000,46 @@ class EvenetAdapterRatioClassifier(nn.Module):
                 )
             if (
                 self._topology_fourier_embedding
+                or self._visible_pair_rest_frame
                 or self._topology_max_harmonic != 1
                 or self._topology_include_theta_pair
+                or self._topology_theta_fourier
             ):
                 classifier_config.update(
                     {
                         "topology_fourier_embedding": self._topology_fourier_embedding,
                         "topology_max_harmonic": self._topology_max_harmonic,
                         "topology_include_theta_pair": self._topology_include_theta_pair,
+                        "topology_theta_fourier": self._topology_theta_fourier,
                         "topology_hidden_dim": self._topology_hidden_dim,
                         "topology_embedding_dim": self._topology_embedding_dim,
                         "topology_fusion_hidden_dim": self._topology_fusion_hidden_dim,
                         "topology_dropout": self._topology_dropout,
                     }
                 )
+            if self._relation_token_count:
+                classifier_config["relation_token_count"] = self._relation_token_count
+            if self._topology_pair_token:
+                classifier_config["topology_pair_token"] = True
+            if self._topology_direct_logit:
+                classifier_config.update(
+                    {
+                        "topology_direct_logit": True,
+                        "topology_context_residual_scale": (
+                            self._topology_context_residual_scale
+                        ),
+                    }
+                )
+            if self._conditional_residual_rank > 0:
+                classifier_config["conditional_residual_rank"] = (
+                    self._conditional_residual_rank
+                )
             classifier_config["adapter_placement"] = "internal"
             # Omit the default to preserve legacy PEFT payload digests.
             if self._topology_conditioning:
                 classifier_config["topology_conditioning"] = True
+            if self._visible_pair_rest_frame:
+                classifier_config["visible_pair_rest_frame"] = True
             payload["classifier_config"] = classifier_config
         return payload
 
@@ -1327,6 +2055,14 @@ class EvenetAdapterRatioClassifier(nn.Module):
             raise ValueError("unsupported EveNet ratio PEFT schema")
         spec = EventPackingSpec.from_dict(payload["packing_spec"])
         model = model_builder(spec)
+        saved_conditioning = dict(payload.get("classifier_config") or {}).get("visible_conditioning")
+        if saved_conditioning:
+            if (list(saved_conditioning["feature_names"]) != list(model.backbone._raw_sequential_feature_names())
+                    or saved_conditioning["token_dim"] != model.backbone.sequential_input_dim):
+                raise ValueError("saved visible conditioning does not match the backbone input schema")
+        model.bank.configure_visible_conditioning(saved_conditioning)
+        model._peft_state_keys = tuple(model.bank.state_dict())
+        model._refresh_trainable_parameter_counts()
         # Preserve legacy payload bytes exactly so an architecture migration can
         # restore an older reward stack without changing its integrity digest.
         model._include_classifier_config_in_payload = (
@@ -1441,21 +2177,31 @@ class EvenetAdapterModelBuilder:
         checkpoint_path: str | Path,
         device: torch.device,
         adapter_bottleneck: int = 16,
+        body_only_checkpoint: bool = False,
         train_layernorm: bool = False,
         train_encoder: bool = False,
         train_grouped_sequential_embedding: bool = False,
         train_invisible_projector: bool = False,
+        train_angular_conditioning: bool = False,
         train_backbone: bool = False,
+        train_last_pet_block: bool = False,
         asymmetric_attention: bool = False,
         periodic_pair_features: bool = False,
         topology_fourier_embedding: bool = False,
         topology_conditioning: bool = False,
+        topology_pair_token: bool = False,
+        relation_token_count: int = 0,
+        visible_pair_rest_frame: bool = False,
         topology_max_harmonic: int = 1,
         topology_include_theta_pair: bool = False,
+        topology_theta_fourier: bool = False,
         topology_hidden_dim: int = 64,
         topology_embedding_dim: int = 32,
         topology_fusion_hidden_dim: int = 64,
         topology_dropout: float = 0.15,
+        topology_direct_logit: bool = False,
+        topology_context_residual_scale: float = 1.0,
+        conditional_residual_rank: int = 0,
         head_dropout: float | None = None,
         decoder_hidden_dim: int | None = None,
         decoder_layers: int | None = None,
@@ -1475,13 +2221,20 @@ class EvenetAdapterModelBuilder:
             template, path, device, ratio_config, for_dgpo_training=False
         )
         position_state = None
-        truth_head = getattr(template, "TruthGeneration", None)
-        if truth_head is not None and hasattr(truth_head, "position_encoder"):
-            position_state = {
-                key: value.detach().cpu().clone()
-                for key, value in truth_head.position_encoder.state_dict().items()
-            }
+        if not body_only_checkpoint:
+            truth_head = getattr(template, "TruthGeneration", None)
+            if truth_head is not None and hasattr(truth_head, "position_encoder"):
+                position_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in truth_head.position_encoder.state_dict().items()
+                }
         self._strip_task_heads(template)
+        if body_only_checkpoint:
+            _log.info(
+                "[DGPO/omnifold] initialized classifier from checkpoint Body "
+                "only; task heads including TruthGeneration were discarded and "
+                "the ratio position encoder starts independently"
+            )
         freeze_shared_backbone(template)
         self._pretrained_body = {
             key: value.detach().cpu().clone()
@@ -1492,23 +2245,37 @@ class EvenetAdapterModelBuilder:
         self._config = ratio_config
         self._normalization_dict = normalization_dict
         self._device = device
+        self._body_only_checkpoint = bool(body_only_checkpoint)
         self._train_layernorm = bool(train_layernorm)
         self._train_encoder = bool(train_encoder)
         self._train_grouped_sequential_embedding = bool(
             train_grouped_sequential_embedding
         )
         self._train_invisible_projector = bool(train_invisible_projector)
+        self._train_angular_conditioning = bool(train_angular_conditioning)
         self._train_backbone = bool(train_backbone)
+        self._train_last_pet_block = bool(train_last_pet_block)
         self._asymmetric_attention = bool(asymmetric_attention)
         self._periodic_pair_features = bool(periodic_pair_features)
         self._topology_fourier_embedding = bool(topology_fourier_embedding)
         self._topology_conditioning = bool(topology_conditioning)
+        self._topology_pair_token = bool(topology_pair_token)
+        self._relation_token_count = int(relation_token_count)
+        self._visible_pair_rest_frame = bool(visible_pair_rest_frame)
+        if self._topology_pair_token and not self._periodic_pair_features:
+            raise ValueError("topology_pair_token requires periodic_pair_features")
         self._topology_max_harmonic = int(topology_max_harmonic)
         self._topology_include_theta_pair = bool(topology_include_theta_pair)
+        self._topology_theta_fourier = bool(topology_theta_fourier)
         self._topology_hidden_dim = int(topology_hidden_dim)
         self._topology_embedding_dim = int(topology_embedding_dim)
         self._topology_fusion_hidden_dim = int(topology_fusion_hidden_dim)
         self._topology_dropout = float(topology_dropout)
+        self._topology_direct_logit = bool(topology_direct_logit)
+        self._topology_context_residual_scale = float(
+            topology_context_residual_scale
+        )
+        self._conditional_residual_rank = int(conditional_residual_rank)
         self._head_dropout = None if head_dropout is None else float(head_dropout)
         self._adapter_bottleneck = int(adapter_bottleneck)
         self._decoder_hidden_dim = decoder_hidden_dim
@@ -1541,6 +2308,10 @@ class EvenetAdapterModelBuilder:
     def base_digest(self) -> str:
         return self._base_digest
 
+    @property
+    def body_only_checkpoint(self) -> bool:
+        return self._body_only_checkpoint
+
     def _fresh_backbone(self) -> nn.Module:
         """Return an isolated pretrained body for a full/partial fine-tune."""
 
@@ -1571,12 +2342,19 @@ class EvenetAdapterModelBuilder:
         periodic_pair_features: bool | None = None,
         topology_fourier_embedding: bool | None = None,
         topology_conditioning: bool | None = None,
+        topology_pair_token: bool | None = None,
+        relation_token_count: int | None = None,
+        visible_pair_rest_frame: bool | None = None,
         topology_max_harmonic: int | None = None,
         topology_include_theta_pair: bool | None = None,
+        topology_theta_fourier: bool | None = None,
         topology_hidden_dim: int | None = None,
         topology_embedding_dim: int | None = None,
         topology_fusion_hidden_dim: int | None = None,
         topology_dropout: float | None = None,
+        topology_direct_logit: bool | None = None,
+        topology_context_residual_scale: float | None = None,
+        conditional_residual_rank: int | None = None,
     ) -> EvenetRatioPEFTBank:
         source = self._backbone if backbone is None else backbone
         resolved_dropout = (
@@ -1603,9 +2381,16 @@ class EvenetAdapterModelBuilder:
             if topology_fourier_embedding is None
             else bool(topology_fourier_embedding)
         )
+        resolved_relation_token_count = (
+            self._relation_token_count if relation_token_count is None else int(relation_token_count)
+        )
+        resolved_topology_pair_token = (
+            self._topology_pair_token if topology_pair_token is None else bool(topology_pair_token)
+        )
         resolved_topology_conditioning = (
             self._topology_conditioning if topology_conditioning is None else bool(topology_conditioning)
         )
+        resolved_rest_frame = self._visible_pair_rest_frame if visible_pair_rest_frame is None else bool(visible_pair_rest_frame)
         resolved_topology_max_harmonic = (
             self._topology_max_harmonic
             if topology_max_harmonic is None
@@ -1615,6 +2400,11 @@ class EvenetAdapterModelBuilder:
             self._topology_include_theta_pair
             if topology_include_theta_pair is None
             else bool(topology_include_theta_pair)
+        )
+        resolved_topology_theta_fourier = (
+            self._topology_theta_fourier
+            if topology_theta_fourier is None
+            else bool(topology_theta_fourier)
         )
         resolved_topology_hidden_dim = (
             self._topology_hidden_dim
@@ -1635,6 +2425,21 @@ class EvenetAdapterModelBuilder:
             self._topology_dropout
             if topology_dropout is None
             else float(topology_dropout)
+        )
+        resolved_topology_direct_logit = (
+            self._topology_direct_logit
+            if topology_direct_logit is None
+            else bool(topology_direct_logit)
+        )
+        resolved_topology_context_residual_scale = (
+            self._topology_context_residual_scale
+            if topology_context_residual_scale is None
+            else float(topology_context_residual_scale)
+        )
+        resolved_conditional_residual_rank = (
+            self._conditional_residual_rank
+            if conditional_residual_rank is None
+            else int(conditional_residual_rank)
         )
         return EvenetRatioPEFTBank.from_backbone(
             source,
@@ -1661,12 +2466,21 @@ class EvenetAdapterModelBuilder:
             periodic_pair_features=resolved_periodic_pair_features,
             topology_fourier_embedding=resolved_topology_fourier_embedding,
             topology_conditioning=resolved_topology_conditioning,
+            topology_pair_token=resolved_topology_pair_token,
+            relation_token_count=resolved_relation_token_count,
+            visible_pair_rest_frame=resolved_rest_frame,
             topology_max_harmonic=resolved_topology_max_harmonic,
             topology_include_theta_pair=resolved_topology_include_theta_pair,
+            topology_theta_fourier=resolved_topology_theta_fourier,
             topology_hidden_dim=resolved_topology_hidden_dim,
             topology_embedding_dim=resolved_topology_embedding_dim,
             topology_fusion_hidden_dim=resolved_topology_fusion_hidden_dim,
             topology_dropout=resolved_topology_dropout,
+            topology_direct_logit=resolved_topology_direct_logit,
+            topology_context_residual_scale=(
+                resolved_topology_context_residual_scale
+            ),
+            conditional_residual_rank=resolved_conditional_residual_rank,
             position_state=self._position_state,
         ).to(self._device)
 
@@ -1682,19 +2496,30 @@ class EvenetAdapterModelBuilder:
         decoder_layers: int | None = None,
         decoder_heads: int | None = None,
         adapter_bottleneck: int | None = None,
+        train_layernorm: bool | None = None,
+        train_encoder: bool | None = None,
         train_grouped_sequential_embedding: bool | None = None,
         train_invisible_projector: bool | None = None,
+        train_angular_conditioning: bool | None = None,
         train_backbone: bool | None = None,
+        train_last_pet_block: bool | None = None,
         asymmetric_attention: bool | None = None,
         periodic_pair_features: bool | None = None,
         topology_fourier_embedding: bool | None = None,
         topology_conditioning: bool | None = None,
+        topology_pair_token: bool | None = None,
+        relation_token_count: int | None = None,
+        visible_pair_rest_frame: bool | None = None,
         topology_max_harmonic: int | None = None,
         topology_include_theta_pair: bool | None = None,
+        topology_theta_fourier: bool | None = None,
         topology_hidden_dim: int | None = None,
         topology_embedding_dim: int | None = None,
         topology_fusion_hidden_dim: int | None = None,
         topology_dropout: float | None = None,
+        topology_direct_logit: bool | None = None,
+        topology_context_residual_scale: float | None = None,
+        conditional_residual_rank: int | None = None,
     ) -> EvenetAdapterRatioClassifier:
         if (
             bank is None
@@ -1703,10 +2528,25 @@ class EvenetAdapterModelBuilder:
             and name in self._classifiers
         ):
             return self._classifiers[name]
+        # Resume must rebuild the *saved* body key set. A fork YAML may open
+        # GlobalEmbedding / LayerNorm for the next refit, but applying those
+        # flags while restoring a parent stack expands ``_backbone_state_keys``
+        # beyond the checkpoint body and fails digest round-trip.
+        resolved_train_layernorm = (
+            self._train_layernorm if train_layernorm is None else bool(train_layernorm)
+        )
+        resolved_train_encoder = (
+            self._train_encoder if train_encoder is None else bool(train_encoder)
+        )
         resolved_train_invisible_projector = (
             self._train_invisible_projector
             if train_invisible_projector is None
             else bool(train_invisible_projector)
+        )
+        resolved_train_angular_conditioning = (
+            self._train_angular_conditioning
+            if train_angular_conditioning is None
+            else bool(train_angular_conditioning)
         )
         resolved_train_grouped_sequential_embedding = (
             self._train_grouped_sequential_embedding
@@ -1717,6 +2557,11 @@ class EvenetAdapterModelBuilder:
             self._train_backbone
             if train_backbone is None
             else bool(train_backbone)
+        )
+        resolved_train_last_pet_block = (
+            self._train_last_pet_block
+            if train_last_pet_block is None
+            else bool(train_last_pet_block)
         )
         resolved_asymmetric_attention = (
             self._asymmetric_attention
@@ -1733,9 +2578,16 @@ class EvenetAdapterModelBuilder:
             if topology_fourier_embedding is None
             else bool(topology_fourier_embedding)
         )
+        resolved_relation_token_count = (
+            self._relation_token_count if relation_token_count is None else int(relation_token_count)
+        )
+        resolved_topology_pair_token = (
+            self._topology_pair_token if topology_pair_token is None else bool(topology_pair_token)
+        )
         resolved_topology_conditioning = (
             self._topology_conditioning if topology_conditioning is None else bool(topology_conditioning)
         )
+        resolved_rest_frame = self._visible_pair_rest_frame if visible_pair_rest_frame is None else bool(visible_pair_rest_frame)
         resolved_topology_max_harmonic = (
             self._topology_max_harmonic
             if topology_max_harmonic is None
@@ -1745,6 +2597,11 @@ class EvenetAdapterModelBuilder:
             self._topology_include_theta_pair
             if topology_include_theta_pair is None
             else bool(topology_include_theta_pair)
+        )
+        resolved_topology_theta_fourier = (
+            self._topology_theta_fourier
+            if topology_theta_fourier is None
+            else bool(topology_theta_fourier)
         )
         resolved_topology_hidden_dim = (
             self._topology_hidden_dim
@@ -1766,6 +2623,21 @@ class EvenetAdapterModelBuilder:
             if topology_dropout is None
             else float(topology_dropout)
         )
+        resolved_topology_direct_logit = (
+            self._topology_direct_logit
+            if topology_direct_logit is None
+            else bool(topology_direct_logit)
+        )
+        resolved_topology_context_residual_scale = (
+            self._topology_context_residual_scale
+            if topology_context_residual_scale is None
+            else float(topology_context_residual_scale)
+        )
+        resolved_conditional_residual_rank = (
+            self._conditional_residual_rank
+            if conditional_residual_rank is None
+            else int(conditional_residual_rank)
+        )
         # Internal PET adapters are always trainable, so every classifier/fold
         # must own an isolated body even when the rest of the backbone is frozen.
         backbone = self._fresh_backbone()
@@ -1779,12 +2651,21 @@ class EvenetAdapterModelBuilder:
                 periodic_pair_features=resolved_periodic_pair_features,
                 topology_fourier_embedding=resolved_topology_fourier_embedding,
                 topology_conditioning=resolved_topology_conditioning,
+                topology_pair_token=resolved_topology_pair_token,
+                relation_token_count=resolved_relation_token_count,
+                visible_pair_rest_frame=resolved_rest_frame,
                 topology_max_harmonic=resolved_topology_max_harmonic,
                 topology_include_theta_pair=resolved_topology_include_theta_pair,
+                topology_theta_fourier=resolved_topology_theta_fourier,
                 topology_hidden_dim=resolved_topology_hidden_dim,
                 topology_embedding_dim=resolved_topology_embedding_dim,
                 topology_fusion_hidden_dim=resolved_topology_fusion_hidden_dim,
                 topology_dropout=resolved_topology_dropout,
+                topology_direct_logit=resolved_topology_direct_logit,
+                topology_context_residual_scale=(
+                    resolved_topology_context_residual_scale
+                ),
+                conditional_residual_rank=resolved_conditional_residual_rank,
             )
             if name is not None:
                 self._banks[name] = bank
@@ -1792,23 +2673,34 @@ class EvenetAdapterModelBuilder:
             backbone,
             packing_spec,
             bank=bank,
-            train_layernorm=self._train_layernorm,
-            train_encoder=self._train_encoder,
+            train_layernorm=resolved_train_layernorm,
+            train_encoder=resolved_train_encoder,
             train_grouped_sequential_embedding=(
                 resolved_train_grouped_sequential_embedding
             ),
             train_invisible_projector=resolved_train_invisible_projector,
+            train_angular_conditioning=resolved_train_angular_conditioning,
             train_backbone=resolved_train_backbone,
+            train_last_pet_block=resolved_train_last_pet_block,
             asymmetric_attention=resolved_asymmetric_attention,
             periodic_pair_features=resolved_periodic_pair_features,
             topology_fourier_embedding=resolved_topology_fourier_embedding,
             topology_conditioning=resolved_topology_conditioning,
+            topology_pair_token=resolved_topology_pair_token,
+            relation_token_count=resolved_relation_token_count,
+            visible_pair_rest_frame=resolved_rest_frame,
             topology_max_harmonic=resolved_topology_max_harmonic,
             topology_include_theta_pair=resolved_topology_include_theta_pair,
+            topology_theta_fourier=resolved_topology_theta_fourier,
             topology_hidden_dim=resolved_topology_hidden_dim,
             topology_embedding_dim=resolved_topology_embedding_dim,
             topology_fusion_hidden_dim=resolved_topology_fusion_hidden_dim,
             topology_dropout=resolved_topology_dropout,
+            topology_direct_logit=resolved_topology_direct_logit,
+            topology_context_residual_scale=(
+                resolved_topology_context_residual_scale
+            ),
+            conditional_residual_rank=resolved_conditional_residual_rank,
             head_dropout=(
                 self._head_dropout if head_dropout is None else head_dropout
             ),
@@ -1868,16 +2760,63 @@ def peft_bank_factory(
     overrides = dict(classifier_overrides or {})
     if overrides:
         dropout_keys = {"head_dropout", "topology_dropout"}
-        dimension_keys = {"decoder_hidden_dim", "decoder_layers", "decoder_heads"}
-        flag_keys = {"periodic_pair_features", "topology_fourier_embedding", "topology_conditioning"}
-        if set(overrides) - dropout_keys - dimension_keys - flag_keys:
+        scale_keys = {"topology_context_residual_scale"}
+        dimension_keys = {
+            "decoder_hidden_dim",
+            "decoder_layers",
+            "decoder_heads",
+            "topology_max_harmonic",
+            "topology_hidden_dim",
+            "topology_embedding_dim",
+            "topology_fusion_hidden_dim",
+        }
+        rank_keys = {"conditional_residual_rank", "relation_token_count"}
+        flag_keys = {
+            "periodic_pair_features",
+            "topology_fourier_embedding",
+            "topology_direct_logit",
+            "topology_conditioning",
+            "topology_pair_token",
+            "visible_pair_rest_frame",
+            "topology_include_theta_pair",
+            "topology_theta_fourier",
+            "train_layernorm",
+            "train_encoder",
+            "train_grouped_sequential_embedding",
+            "train_invisible_projector",
+            "train_angular_conditioning",
+            "train_backbone",
+            "train_last_pet_block",
+            "asymmetric_attention",
+        }
+        if (
+            set(overrides)
+            - dropout_keys
+            - scale_keys
+            - dimension_keys
+            - rank_keys
+            - flag_keys
+        ):
             raise ValueError("Unsupported classifier architecture override")
         if any(not 0.0 <= float(overrides[key]) < 1.0 for key in dropout_keys & overrides.keys()):
             raise ValueError("Classifier dropout must be in [0, 1)")
         if any(type(overrides[key]) is not int or overrides[key] < 1 for key in dimension_keys & overrides.keys()):
             raise ValueError("Classifier dimensions must be positive integers")
+        if any(
+            type(overrides[key]) is not int or overrides[key] < 0
+            for key in rank_keys & overrides.keys()
+        ):
+            raise ValueError("Classifier residual ranks must be nonnegative integers")
         if any(type(overrides[key]) is not bool for key in flag_keys & overrides.keys()):
             raise ValueError("Classifier feature flags must be boolean")
+        if any(
+            isinstance(overrides[key], bool)
+            or not isinstance(overrides[key], (int, float))
+            or not math.isfinite(float(overrides[key]))
+            or not 0.0 <= float(overrides[key]) <= 1.0
+            for key in scale_keys & overrides.keys()
+        ):
+            raise ValueError("Classifier residual scales must be finite and in [0, 1]")
         if not hasattr(builder, "make_classifier"):
             raise TypeError("Classifier overrides require make_classifier")
         return lambda: builder.make_classifier(packing_spec, name, reset=reset, **overrides)
@@ -1902,11 +2841,26 @@ class ResidualIterationDiagnostics:
     accepted: bool
     rejection_reason: str | None = None
     warm_started_folds: tuple[int, ...] = ()
+    applied_tempering: float = 1.0
+    train_ess_fraction: float = float("nan")
+    validation_ess_fraction: float = float("nan")
+    ess_target_reached: bool = False
 
     @property
     def saturated(self) -> bool:
         return bool(self.fold_diagnostics) and all(
             bool(getattr(item, "saturated", False))
+            for item in self.fold_diagnostics
+        )
+
+    @property
+    def minimum_sufficient(self) -> bool:
+        """Whether every fold reached the configured signal-strength target."""
+
+        return bool(self.fold_diagnostics) and all(
+            bool(getattr(item, "threshold_reached", False))
+            and getattr(item, "threshold_reason", None)
+            == "validation_balanced_accuracy_lcb"
             for item in self.fold_diagnostics
         )
 
@@ -1939,6 +2893,7 @@ class ResidualRatioResult:
     train_log_weight: Tensor
     validation_log_weight: Tensor | None
     warm_start_state: dict[str, Any] | None = None
+    iteration_temperatures: tuple[float, ...] = ()
 
     @property
     def iterations(self) -> int:
@@ -2059,14 +3014,35 @@ def _seeded_model(
 
 def _scaled_crossfit_config(
     fit_config: Any, train_fraction: float, *, min_steps_per_fold: int = 0,
+    max_steps_per_fold: int | None = None,
+    n_train: int | None = None,
+    min_epochs_per_fold: float | None = None,
+    validation_interval_epochs: float | None = None,
+    validation_patience_epochs: float | None = None,
 ) -> Any:
     """Preserve epoch-based controls when a fold trains on fewer events."""
 
     if type(min_steps_per_fold) is not int or min_steps_per_fold < 0:
         raise ValueError("min_steps_per_fold must be a nonnegative integer")
+    if max_steps_per_fold is not None and (
+        type(max_steps_per_fold) is not int or max_steps_per_fold < 1
+    ):
+        raise ValueError("max_steps_per_fold must be a positive integer or null")
+    epoch_controls = {
+        "min_epochs_per_fold": min_epochs_per_fold,
+        "validation_interval_epochs": validation_interval_epochs,
+        "validation_patience_epochs": validation_patience_epochs,
+    }
+    for name, value in epoch_controls.items():
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0
+        ):
+            raise ValueError(f"{name} must be a finite positive number")
+    use_epochs = any(value is not None for value in epoch_controls.values())
     if not is_dataclass(fit_config):
-        if min_steps_per_fold:
-            raise TypeError("min_steps_per_fold requires a dataclass fit configuration")
+        if min_steps_per_fold or max_steps_per_fold is not None or use_epochs:
+            raise TypeError("fold training controls require a dataclass fit configuration")
         return fit_config
     fraction = float(train_fraction)
     if not 0.0 < fraction <= 1.0:
@@ -2081,7 +3057,7 @@ def _scaled_crossfit_config(
             return 0
         return max(1, int(math.ceil(value * fraction)))
 
-    steps = scaled("steps")
+    steps = scaled("steps") if max_steps_per_fold is None else max_steps_per_fold
     scaled_min_steps = scaled("min_steps", allow_zero=True)
     assert scaled_min_steps is not None
     updates = {
@@ -2104,6 +3080,32 @@ def _scaled_crossfit_config(
     if steps is not None and steps < min_steps_per_fold:
         raise ValueError("classifier step budget is smaller than min_steps_per_fold")
     updates["min_steps"] = max(updates["min_steps"], min_steps_per_fold)
+    if use_epochs:
+        if type(n_train) is not int or n_train < 1:
+            raise ValueError("epoch-based fold controls require a positive n_train")
+        if fit_config.sampling != "independent_epoch_shuffle":
+            raise ValueError("epoch-based fold controls require independent_epoch_shuffle")
+        # Count optimizer updates from this fold's actual event population and
+        # GLOBAL per-class batch, not local microbatches, candidates or the
+        # rounded parent-pool epoch length. Training drops its tail if requested.
+        epoch_steps = (
+            n_train // fit_config.batch_size if fit_config.drop_last_batch
+            else math.ceil(n_train / fit_config.batch_size)
+        )
+        if epoch_steps < 1:
+            raise ValueError("drop_last_batch leaves no complete fold training batch")
+        if min_epochs_per_fold is not None:
+            updates["min_steps"] = max(
+                updates["min_steps"], math.ceil(min_epochs_per_fold * epoch_steps),
+            )
+        if validation_interval_epochs is not None:
+            updates["validation_interval_steps"] = math.ceil(validation_interval_epochs * epoch_steps)
+        if validation_patience_epochs is not None:
+            updates["validation_patience_evaluations"] = max(1, math.ceil(
+                validation_patience_epochs * epoch_steps / updates["validation_interval_steps"]
+            ))
+        if steps is not None and steps < updates["min_steps"]:
+            raise ValueError("classifier step budget is smaller than the fold epoch minimum")
     return replace(fit_config, **updates)
 
 
@@ -2127,6 +3129,20 @@ def _crossfit_splits(
     return tuple(pairs)
 
 
+def _local_identity_fold_labels(condition: Tensor, *, folds: int, seed: int) -> Tensor:
+    """The crossfit hash, without collectives; safe on unequal per-rank batches."""
+    assignments = np.empty(len(condition), dtype=np.int64)
+    salt = f"residual-condition-v1:{int(seed)}:".encode()
+    for start in range(0, len(condition), 8192):
+        rows = condition[start:start + 8192].detach().cpu().numpy()
+        rows = np.array(rows, dtype="<f4", order="C", copy=True)
+        rows[rows == 0] = 0
+        for offset, row in enumerate(rows):
+            digest = hashlib.sha256(salt + row.tobytes()).digest()
+            assignments[start + offset] = int.from_bytes(digest[:8], "little") % folds
+    return torch.from_numpy(assignments).to(condition.device)
+
+
 def _identity_crossfit_splits(
     condition: Tensor, *, folds: int, seed: int
 ) -> tuple[tuple[Tensor, Tensor], ...]:
@@ -2143,16 +3159,7 @@ def _identity_crossfit_splits(
     rank, world = distributed_context()
     labels = torch.zeros(len(condition), dtype=torch.int64, device=condition.device)
     if rank == 0:
-        assignments = np.empty(len(condition), dtype=np.int64)
-        salt = f"residual-condition-v1:{int(seed)}:".encode()
-        for start in range(0, len(condition), 8192):
-            rows = condition[start:start + 8192].detach().cpu().numpy()
-            rows = np.array(rows, dtype="<f4", order="C", copy=True)
-            rows[rows == 0] = 0  # Canonicalize signed zero.
-            for offset, row in enumerate(rows):
-                digest = hashlib.sha256(salt + row.tobytes()).digest()
-                assignments[start + offset] = int.from_bytes(digest[:8], "little") % folds
-        labels.copy_(torch.from_numpy(assignments).to(labels.device))
+        labels.copy_(_local_identity_fold_labels(condition, folds=folds, seed=seed))
     if world > 1:
         _broadcast_tensor(labels)
     pairs = []
@@ -2163,6 +3170,28 @@ def _identity_crossfit_splits(
             raise ValueError("identity cross-fitting needs at least two events in each fold")
         pairs.append((fit_index, holdout_index))
     return tuple(pairs)
+
+
+_CROSSFIT_REPEAT_SEED_STRIDE = 104729
+
+
+def _crossfit_repeat_seed(seed: int, repeat: int) -> int:
+    """Derive independent repeat seeds while preserving repeat one's protocol."""
+
+    if type(repeat) is not int or repeat < 1:
+        raise ValueError("cross-fit repeat index must be a positive integer")
+    return int(seed) + (int(repeat) - 1) * _CROSSFIT_REPEAT_SEED_STRIDE
+
+
+def _normalized_crossfit_protocol(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize legacy single-repeat provenance for compatibility checks."""
+
+    result = dict(value or {})
+    repeats = int(result.get("repeats", 1))
+    result["repeats"] = repeats
+    if repeats > 1:
+        result.setdefault("repeat_seed_stride", _CROSSFIT_REPEAT_SEED_STRIDE)
+    return result
 
 
 @torch.no_grad()
@@ -2211,6 +3240,297 @@ def _weighted_binary_score_metrics(
     return float(loss.cpu()), float(balanced_accuracy.cpu()), auc
 
 
+def fit_staged_residual_classifier(
+    model, data_condition, data_sample, data_weight,
+    gen_condition, gen_sample, gen_weight, config, seed, validation,
+    *, decoder_learning_rate: float, progress_callback=None,
+):
+    """Fit output only, then cautiously adapt the last block; retain best stage.
+
+    Both stages use identical samples, weights and validation, with fresh AdamW.
+    Stage B starts from restored-best A, not A's last training iterate. This is
+    a fit policy; architecture/checkpoint tensor keys stay unchanged.
+    """
+    from .ratio_fit import fit_density_ratio
+    if not isinstance(model, EvenetAdapterRatioClassifier):
+        raise TypeError("staged residual fitting requires an EveNet ratio classifier")
+    if not config.restore_best or validation is None:
+        raise ValueError("staged residual fitting requires validation and restore_best")
+    if (isinstance(decoder_learning_rate, bool)
+            or not isinstance(decoder_learning_rate, (int, float))
+            or not math.isfinite(decoder_learning_rate)
+            or not 0 < decoder_learning_rate <= config.learning_rate):
+        raise ValueError("staged decoder LR must be positive and no greater than output LR")
+
+    def fit_stage(stage, stage_config):
+        _log.info("[DGPO/omnifold] residual stage=%s output_lr=%s decoder_lr=%s minimum_steps=%s",
+                  stage, stage_config.learning_rate, stage_config.decoder_learning_rate, stage_config.min_steps)
+        diag = fit_density_ratio(
+            model, data_condition, data_sample, data_weight,
+            gen_condition, gen_sample, gen_weight, stage_config, seed, validation,
+            progress_callback=(None if progress_callback is None else
+                               lambda row: progress_callback({**row, "fit_stage": float(stage)})),
+        )
+        if config.require_saturation and not diag.saturated:
+            raise RuntimeError(f"residual stage {stage} did not saturate")
+        if diag.validation_loss is None or not math.isfinite(diag.validation_loss):
+            raise FloatingPointError(f"residual stage {stage} has invalid validation loss")
+        return diag
+
+    model.configure_residual_last_block_training(output_only=True)
+    stage_a = fit_stage(1, replace(config, decoder_learning_rate=None))
+    state_a = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model.configure_residual_last_block_training(reset_output=False)
+    stage_b = fit_stage(2, replace(config, decoder_learning_rate=float(decoder_learning_rate)))
+    use_b = stage_b.validation_loss < stage_a.validation_loss - config.validation_min_delta
+    if not use_b:
+        model.load_state_dict(state_a, strict=True)
+        model.configure_residual_last_block_training(output_only=True, reset_output=False)
+    model.eval()
+    steps_a, steps_b = int(stage_a.steps_completed or 0), int(stage_b.steps_completed or 0)
+    selected = stage_b if use_b else stage_a
+    history = tuple({**row, "fit_stage": 1.} for row in stage_a.validation_history) + tuple(
+        {**row, "step": float(row.get("step", 0)) + steps_a, "fit_stage": 2.}
+        for row in stage_b.validation_history
+    )
+    diag = replace(
+        selected, steps_completed=steps_a + steps_b,
+        best_step=(None if selected.best_step is None else selected.best_step + (steps_a if use_b else 0)),
+        saturated=bool(stage_a.saturated and stage_b.saturated), validation_history=history,
+        selected_stage=2 if use_b else 1,
+        stage_a_validation_loss=stage_a.validation_loss, stage_b_validation_loss=stage_b.validation_loss,
+    )
+    _log.info("[DGPO/omnifold] residual stage selected=%s A_val=%.8g B_val=%.8g total_steps=%s",
+              diag.selected_stage, stage_a.validation_loss, stage_b.validation_loss, diag.steps_completed)
+    if progress_callback is not None:
+        progress_callback({"step": float(diag.steps_completed), "selected_stage": float(diag.selected_stage),
+                           "stage_a_validation_loss": stage_a.validation_loss,
+                           "stage_b_validation_loss": stage_b.validation_loss})
+    return diag
+
+
+def _log_weight_ess_fraction(log_weight: Tensor) -> float:
+    flat = log_weight.detach().reshape(-1).double()
+    if not flat.numel() or not bool(torch.isfinite(flat).all()):
+        return float("nan")
+    shares = torch.softmax(flat, dim=0)
+    ess = 1.0 / shares.square().sum().clamp_min(torch.finfo(shares.dtype).tiny)
+    return float((ess / flat.numel()).cpu())
+
+
+def _tempered_log_weight(
+    current: Tensor,
+    increment: Tensor,
+    *,
+    alpha: float,
+    clip: float | None,
+) -> Tensor:
+    proposed = current + float(alpha) * increment
+    if clip is not None:
+        proposed = proposed.clamp(min=-float(clip), max=float(clip))
+    return proposed
+
+
+def _select_ess_tempering(
+    *,
+    train_log_weight: Tensor,
+    validation_log_weight: Tensor,
+    train_increment: Tensor,
+    validation_increment: Tensor,
+    maximum: float,
+    minimum: float,
+    target_ess_fraction: float,
+    grid_steps: int,
+    log_ratio_clip: float | None,
+) -> tuple[float, Tensor, Tensor, float, float, bool]:
+    """Choose the largest independently safe alpha on a deterministic grid."""
+
+    alphas = [
+        float(maximum)
+        - (float(maximum) - float(minimum)) * index / (int(grid_steps) - 1)
+        for index in range(int(grid_steps))
+    ]
+    fallback: tuple[float, Tensor, Tensor, float, float, bool] | None = None
+    for alpha in alphas:
+        proposed_train = _tempered_log_weight(
+            train_log_weight,
+            train_increment,
+            alpha=alpha,
+            clip=log_ratio_clip,
+        )
+        proposed_validation = _tempered_log_weight(
+            validation_log_weight,
+            validation_increment,
+            alpha=alpha,
+            clip=log_ratio_clip,
+        )
+        train_ess = _log_weight_ess_fraction(proposed_train)
+        validation_ess = _log_weight_ess_fraction(proposed_validation)
+        candidate = (
+            float(alpha),
+            proposed_train,
+            proposed_validation,
+            float(train_ess),
+            float(validation_ess),
+            bool(
+                math.isfinite(train_ess)
+                and math.isfinite(validation_ess)
+                and min(train_ess, validation_ess)
+                >= float(target_ess_fraction)
+            ),
+        )
+        fallback = candidate
+        if candidate[-1]:
+            return candidate
+    assert fallback is not None
+    return fallback
+
+
+def _select_ess_aware_fold_checkpoint(
+    model: nn.Module,
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    holdout_condition: Tensor,
+    holdout_sample: Tensor,
+    holdout_log_weight: Tensor,
+    validation_data_condition: Tensor,
+    validation_data_sample: Tensor,
+    validation_gen_condition: Tensor,
+    validation_gen_sample: Tensor,
+    validation_log_weight: Tensor,
+    score_batch_size: int,
+    min_auc: float,
+    tempering_maximum: float,
+    tempering_minimum: float,
+    target_ess_fraction: float,
+    tempering_grid_steps: int,
+    adaptive_tempering: bool,
+    log_ratio_clip: float | None,
+    increment_coefficient: float = 1.0,
+) -> dict[str, Any]:
+    """Pick the smoothest signal-bearing fold snapshot from one fit trail.
+
+    Ranking prefers checkpoints that clear the fold AUC gate and reach the ESS
+    target at the largest independent alpha. Later residuals may therefore
+    restore an earlier-in-training state than validation-loss restore_best.
+    """
+
+    if not candidates:
+        raise ValueError("ESS-aware checkpoint selection needs validation snapshots")
+    if (
+        not math.isfinite(float(increment_coefficient))
+        or not 0.0 < float(increment_coefficient) <= 1.0
+    ):
+        raise ValueError("increment_coefficient must lie in (0, 1]")
+    loss_best = min(candidates, key=lambda item: float(item["loss"]))
+    scored: list[dict[str, Any]] = []
+    for candidate in candidates:
+        model.load_state_dict(candidate["state"], strict=True)
+        model.eval()
+        holdout_logit = _score_population(
+            model,
+            holdout_condition,
+            holdout_sample,
+            int(score_batch_size),
+        )
+        validation_data_logit = _score_population(
+            model,
+            validation_data_condition,
+            validation_data_sample,
+            int(score_batch_size),
+        )
+        validation_gen_logit = _score_population(
+            model,
+            validation_gen_condition,
+            validation_gen_sample,
+            int(score_batch_size),
+        )
+        _loss, _accuracy, fold_auc = _weighted_binary_score_metrics(
+            validation_data_logit,
+            validation_gen_logit,
+            torch.ones_like(validation_gen_logit),
+        )
+        if adaptive_tempering:
+            (
+                applied_alpha,
+                _train,
+                _validation,
+                train_ess,
+                validation_ess,
+                reached,
+            ) = _select_ess_tempering(
+                train_log_weight=holdout_log_weight,
+                validation_log_weight=validation_log_weight,
+                train_increment=float(increment_coefficient) * holdout_logit,
+                validation_increment=(
+                    float(increment_coefficient) * validation_gen_logit
+                ),
+                maximum=float(tempering_maximum),
+                minimum=float(tempering_minimum),
+                target_ess_fraction=float(target_ess_fraction),
+                grid_steps=int(tempering_grid_steps),
+                log_ratio_clip=log_ratio_clip,
+            )
+        else:
+            applied_alpha = float(tempering_maximum)
+            proposed_train = _tempered_log_weight(
+                holdout_log_weight,
+                float(increment_coefficient) * holdout_logit,
+                alpha=applied_alpha,
+                clip=log_ratio_clip,
+            )
+            proposed_validation = _tempered_log_weight(
+                validation_log_weight,
+                float(increment_coefficient) * validation_gen_logit,
+                alpha=applied_alpha,
+                clip=log_ratio_clip,
+            )
+            train_ess = _log_weight_ess_fraction(proposed_train)
+            validation_ess = _log_weight_ess_fraction(proposed_validation)
+            reached = bool(
+                math.isfinite(train_ess)
+                and math.isfinite(validation_ess)
+                and min(train_ess, validation_ess) >= float(target_ess_fraction)
+            )
+        scored.append(
+            {
+                **dict(candidate),
+                "fold_auc": float(fold_auc),
+                "applied_tempering": float(applied_alpha),
+                "train_ess_fraction": float(train_ess),
+                "validation_ess_fraction": float(validation_ess),
+                "ess_target_reached": bool(reached),
+            }
+        )
+    eligible = [
+        item
+        for item in scored
+        if math.isfinite(float(item["fold_auc"]))
+        and float(item["fold_auc"]) > float(min_auc)
+    ]
+    pool = eligible or scored
+    selected = max(
+        pool,
+        key=lambda item: (
+            bool(item["ess_target_reached"]),
+            float(item["applied_tempering"]),
+            min(
+                float(item["train_ess_fraction"]),
+                float(item["validation_ess_fraction"]),
+            ),
+            -float(item["loss"]),
+        ),
+    )
+    selected = {
+        **selected,
+        "used_loss_best_fallback": bool(not eligible),
+        "loss_best_step": float(loss_best["step"]),
+    }
+    model.load_state_dict(selected["state"], strict=True)
+    model.eval()
+    return selected
+
+
 def fit_residual_ratio_stack(
     *,
     model_factory: Callable[[], nn.Module],
@@ -2225,6 +3545,7 @@ def fit_residual_ratio_stack(
     min_iterations: int = 1,
     stop_balanced_accuracy: float | None = None,
     crossfit_folds: int = 2,
+    crossfit_repeats: int = 1,
     residual_min_auc_gain: float = 1.0e-3,
     validation_data_condition: Tensor | None = None,
     validation_data_sample: Tensor | None = None,
@@ -2234,25 +3555,73 @@ def fit_residual_ratio_stack(
     device: torch.device | None = None,
     warm_start_iterations: tuple[int, ...] = (),
     warm_start_state: Mapping[str, Any] | None = None,
+    warm_start_from_iteration_one: bool = False,
+    later_iteration_learning_rate: float | None = None,
+    later_iteration_train_mode: str = "full",
+    later_iteration_decoder_learning_rate: float | None = None,
     crossfit_seed: int | None = None,
     crossfit_partition: str = "auto",
     min_steps_per_fold: int = 0,
+    max_steps_per_fold: int | None = None,
+    warm_start_min_epochs_per_fold: float | None = None,
+    validation_interval_epochs: float | None = None,
+    validation_patience_epochs: float | None = None,
+    identity_condition: Tensor | None = None,
+    diagnostic_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    iteration_one_only: bool = False,
+    fixed_iteration_budget: bool = False,
+    log_ratio_clip: float | None = None,
+    minimum_ess_fraction: float = 0.0,
+    adaptive_tempering: bool = False,
+    target_ess_fraction: float = 0.2,
+    minimum_tempering: float = 0.1,
+    tempering_grid_steps: int = 14,
+    inherit_previous_tempering: bool = False,
+    ess_aware_checkpoint_selection: bool = False,
+    ess_aware_max_checkpoints: int = 16,
+    ess_aware_first_residual_only: bool = False,
+    minimum_sufficient_balanced_accuracy: float | None = None,
+    minimum_sufficient_confidence_z: float = 0.0,
+    minimum_sufficient_required_consecutive: int = 1,
 ) -> ResidualRatioResult:
     """Fit safe residual increments with event-level cross-fitting.
 
-    Every event's propagated training weight is predicted out-of-fold by a model
-    that did not fit that identity.  Each accepted residual is an equal-weight
-    ensemble of the fold models on unseen validation and DGPO events. A proposal
-    is committed only when its oriented held-out AUC clears the configured residual
-    threshold. Held-out BCE remains diagnostic but is not an outer-iteration gate.
-    The first no-op/invalid proposal is kept in diagnostics but never added to the
-    reward stack.
+    Every event's propagated training weight is predicted out-of-fold by one
+    model per repeat, none of which fitted that identity. Their logits are
+    averaged before the residual is applied. Each accepted residual is an
+    equal-weight ensemble of all repeat/fold models on unseen validation and
+    DGPO events. A proposal is committed only when its oriented held-out AUC
+    clears the configured residual threshold. Held-out BCE remains diagnostic
+    but is not an outer-iteration gate. The first no-op/invalid proposal is kept
+    in diagnostics but never added to the reward stack.
 
-    ``warm_start_iterations`` reuses only the corresponding previous fold's
-    weights. Matching event-hash fold provenance is mandatory; legacy or changed
-    protocols start fresh. Cumulative weights and classifier optimizers always
+    ``warm_start_iterations`` reuses only the corresponding
+    iteration/repeat/fold's most recent compatible weights (including across
+    shorter intervening rounds). Matching event-hash repeat/fold provenance is
+    mandatory; legacy single-repeat protocols remain compatible with
+    ``crossfit_repeats=1``. Cumulative weights and classifier optimizers always
     start fresh. The selected fitted models (including closure-only fits) are
     returned as a CPU cache for the next refit.
+
+    When enabled, ``warm_start_min_epochs_per_fold`` replaces the absolute
+    per-fold update floor only after successfully loading a matching state.
+    Cold folds retain ``min_steps_per_fold``. Epoch controls count actual fold
+    training batches; minimum budgets do not replace saturation-based stopping.
+
+    With ``warm_start_from_iteration_one``, only iteration 1 crosses refit
+    boundaries. Every later iteration clones this round's fitted iteration-1
+    checkpoint for the SAME repeat/fold, never the previous residual's weights.
+
+    ``diagnostic_callback`` is an opt-in, synchronous observer for standalone
+    tests. It runs on every rank; tensor/model references are read-only by
+    contract. Production callers leave it unset. Return values are ignored.
+
+    Adaptive tempering searches each accepted residual independently. It may
+    lower an early sharp correction and later return to the configured maximum
+    when a new residual preserves or improves cumulative ESS.
+
+    ESS-aware checkpoint selection keeps validation snapshots during each fold
+    fit and restores the smoothest signal-bearing state before OOF scoring.
     """
 
     from RL.DGPO_neutrino.omnifold_ztautau.ratio_fit import (
@@ -2262,6 +3631,8 @@ def fit_residual_ratio_stack(
 
     if iterations < 1:
         raise ValueError("residual ratio stack needs at least one classifier")
+    if iteration_one_only and (iterations != 1 or min_iterations != 1):
+        raise ValueError("iteration_one_only requires min_iterations=max_iterations=1")
     if int(min_iterations) < 1 or int(min_iterations) > int(iterations):
         raise ValueError("min_iterations must lie in [1, iterations]")
     if stop_balanced_accuracy is not None and not (
@@ -2270,8 +3641,117 @@ def fit_residual_ratio_stack(
         raise ValueError("stop_balanced_accuracy must lie in (0.5, 1)")
     if not 0.0 < float(tempering) <= 1.0:
         raise ValueError("tempering must lie in (0, 1]")
+    if type(ess_aware_checkpoint_selection) is not bool:
+        raise ValueError("ess_aware_checkpoint_selection must be a boolean")
+    if (
+        type(ess_aware_max_checkpoints) is not int
+        or ess_aware_max_checkpoints < 1
+    ):
+        raise ValueError("ess_aware_max_checkpoints must be a positive integer")
+    if (
+        ess_aware_checkpoint_selection
+        and later_iteration_train_mode == "output_then_last_decoder"
+    ):
+        raise ValueError(
+            "ESS-aware checkpoint selection is not supported with staged residual fitting"
+        )
+    if (
+        log_ratio_clip is not None
+        and (
+            isinstance(log_ratio_clip, bool)
+            or not isinstance(log_ratio_clip, (int, float))
+            or not math.isfinite(float(log_ratio_clip))
+            or float(log_ratio_clip) <= 0.0
+        )
+    ):
+        raise ValueError("log_ratio_clip must be finite and positive")
+    if (
+        isinstance(minimum_ess_fraction, bool)
+        or not isinstance(minimum_ess_fraction, (int, float))
+        or not math.isfinite(float(minimum_ess_fraction))
+        or not 0.0 <= float(minimum_ess_fraction) <= 1.0
+    ):
+        raise ValueError("minimum_ess_fraction must lie in [0, 1]")
+    if type(adaptive_tempering) is not bool:
+        raise ValueError("adaptive_tempering must be a boolean")
+    if type(inherit_previous_tempering) is not bool:
+        raise ValueError("inherit_previous_tempering must be a boolean")
+    if inherit_previous_tempering and not adaptive_tempering:
+        raise ValueError(
+            "inherit_previous_tempering requires adaptive_tempering"
+        )
+    if type(ess_aware_first_residual_only) is not bool:
+        raise ValueError("ess_aware_first_residual_only must be a boolean")
+    if ess_aware_first_residual_only and not ess_aware_checkpoint_selection:
+        raise ValueError(
+            "ess_aware_first_residual_only requires "
+            "ess_aware_checkpoint_selection"
+        )
+    if minimum_sufficient_balanced_accuracy is not None:
+        if (
+            isinstance(minimum_sufficient_balanced_accuracy, bool)
+            or not isinstance(
+                minimum_sufficient_balanced_accuracy, (int, float)
+            )
+            or not math.isfinite(float(minimum_sufficient_balanced_accuracy))
+            or not 0.5 < float(minimum_sufficient_balanced_accuracy) < 1.0
+        ):
+            raise ValueError(
+                "minimum_sufficient_balanced_accuracy must lie in (0.5, 1)"
+            )
+        if bool(getattr(fit_config, "require_saturation", False)):
+            raise ValueError(
+                "minimum-sufficient stopping requires require_saturation=false"
+            )
+        if (
+            not math.isfinite(float(minimum_sufficient_confidence_z))
+            or float(minimum_sufficient_confidence_z) < 0.0
+        ):
+            raise ValueError(
+                "minimum_sufficient_confidence_z must be finite and nonnegative"
+            )
+        if (
+            type(minimum_sufficient_required_consecutive) is not int
+            or minimum_sufficient_required_consecutive < 1
+        ):
+            raise ValueError(
+                "minimum_sufficient_required_consecutive must be a positive integer"
+            )
+        if later_iteration_train_mode == "output_then_last_decoder":
+            raise ValueError(
+                "minimum-sufficient stopping is not supported with staged residual fitting"
+            )
+    if adaptive_tempering:
+        if (
+            isinstance(minimum_tempering, bool)
+            or not isinstance(minimum_tempering, (int, float))
+            or not math.isfinite(float(minimum_tempering))
+            or not 0.0 < float(minimum_tempering) <= float(tempering)
+        ):
+            raise ValueError(
+                "minimum_tempering must lie in (0, tempering]"
+            )
+        if (
+            isinstance(target_ess_fraction, bool)
+            or not isinstance(target_ess_fraction, (int, float))
+            or not math.isfinite(float(target_ess_fraction))
+            or not float(minimum_ess_fraction)
+            <= float(target_ess_fraction)
+            <= 1.0
+        ):
+            raise ValueError(
+                "target_ess_fraction must lie in "
+                "[minimum_ess_fraction, 1]"
+            )
+        if (
+            type(tempering_grid_steps) is not int
+            or int(tempering_grid_steps) < 2
+        ):
+            raise ValueError("tempering_grid_steps must be an integer >= 2")
     if int(crossfit_folds) < 2:
         raise ValueError("crossfit_folds must be at least two")
+    if type(crossfit_repeats) is not int or crossfit_repeats < 1:
+        raise ValueError("crossfit_repeats must be a positive integer")
     if not 0.0 <= float(residual_min_auc_gain) < 0.5:
         raise ValueError("residual_min_auc_gain must lie in [0, 0.5)")
     have_validation = validation_data_condition is not None
@@ -2298,16 +3778,55 @@ def fit_residual_ratio_stack(
             "cross-fitted residual populations must share event identities"
         )
     selected_iterations = tuple(int(value) for value in warm_start_iterations)
+    if type(warm_start_from_iteration_one) is not bool:
+        raise ValueError("warm_start_from_iteration_one must be a boolean")
+    if warm_start_from_iteration_one and selected_iterations != (1,):
+        raise ValueError("warm_start_from_iteration_one requires warm_start_iterations: [1]")
+    if later_iteration_train_mode not in ("full", "last_decoder_and_output", "output_then_last_decoder"):
+        raise ValueError("unsupported later_iteration_train_mode")
+    if later_iteration_train_mode != "full" and not warm_start_from_iteration_one:
+        raise ValueError("later_iteration_train_mode requires warm_start_from_iteration_one")
+    if later_iteration_learning_rate is not None:
+        if (isinstance(later_iteration_learning_rate, bool)
+            or not isinstance(later_iteration_learning_rate, (int, float))
+            or not math.isfinite(later_iteration_learning_rate)
+            or later_iteration_learning_rate <= 0):
+            raise ValueError("later_iteration_learning_rate must be finite and positive")
+        if not warm_start_from_iteration_one:
+            raise ValueError("later_iteration_learning_rate requires warm_start_from_iteration_one")
+    if later_iteration_train_mode == "output_then_last_decoder":
+        output_lr = later_iteration_learning_rate or fit_config.learning_rate
+        if (isinstance(later_iteration_decoder_learning_rate, bool)
+                or not isinstance(later_iteration_decoder_learning_rate, (int, float))
+                or not math.isfinite(later_iteration_decoder_learning_rate)
+                or not 0 < later_iteration_decoder_learning_rate <= output_lr):
+            raise ValueError("staged fitting requires positive decoder LR <= output LR")
+        if not fit_config.restore_best:
+            raise ValueError("staged fitting requires restore_best")
+    elif later_iteration_decoder_learning_rate is not None:
+        raise ValueError("later_iteration_decoder_learning_rate requires output_then_last_decoder")
     if crossfit_partition not in ("auto", "identity"):
         raise ValueError("crossfit_partition must be 'auto' or 'identity'")
     if type(min_steps_per_fold) is not int or min_steps_per_fold < 0:
         raise ValueError("min_steps_per_fold must be a nonnegative integer")
+    if warm_start_min_epochs_per_fold is not None and (
+        isinstance(warm_start_min_epochs_per_fold, bool)
+        or not isinstance(warm_start_min_epochs_per_fold, (int, float))
+        or not math.isfinite(warm_start_min_epochs_per_fold)
+        or warm_start_min_epochs_per_fold <= 0
+    ):
+        raise ValueError("warm_start_min_epochs_per_fold must be a finite positive number")
     if len(set(selected_iterations)) != len(selected_iterations) or any(
         value < 1 or value > int(iterations) for value in selected_iterations
     ):
         raise ValueError("warm_start_iterations must be unique ids in [1, iterations]")
     protocol = None
-    initial_states: dict[tuple[int, int], Mapping[str, Tensor]] = {}
+    initial_states: dict[tuple[int, int, int], Mapping[str, Tensor]] = {}
+    if identity_condition is not None and (
+        identity_condition.ndim != 2 or len(identity_condition) != len(gen_condition)
+    ):
+        raise ValueError("cross-fit identity condition must align with event rows")
+    repeat_fold_pairs: list[tuple[int, int, Tensor, Tensor]] = []
     if selected_iterations or crossfit_partition == "identity":
         if not torch.equal(data_condition, gen_condition):
             raise ValueError("warm-start cross-fitting requires paired event conditions")
@@ -2317,28 +3836,84 @@ def fit_residual_ratio_stack(
             "seed": int(seed if crossfit_seed is None else crossfit_seed),
             "condition_width": int(gen_condition.shape[-1]),
         }
-        fold_pairs = _identity_crossfit_splits(
-            gen_condition, folds=int(crossfit_folds), seed=protocol["seed"]
+        if crossfit_repeats > 1:
+            protocol.update(
+                repeats=int(crossfit_repeats),
+                repeat_seed_stride=_CROSSFIT_REPEAT_SEED_STRIDE,
+            )
+        split_condition = (
+            gen_condition if identity_condition is None else identity_condition
         )
-        if warm_start_state is not None and warm_start_state.get("protocol") == protocol:
+        for repeat_index in range(1, int(crossfit_repeats) + 1):
+            repeat_seed = _crossfit_repeat_seed(protocol["seed"], repeat_index)
+            for fold_index, (fit_index, holdout_index) in enumerate(
+                _identity_crossfit_splits(
+                    split_condition,
+                    folds=int(crossfit_folds),
+                    seed=repeat_seed,
+                ),
+                start=1,
+            ):
+                repeat_fold_pairs.append(
+                    (repeat_index, fold_index, fit_index, holdout_index)
+                )
+        if identity_condition is not None:
+            protocol["identity_scheme"] = "exclude-visible-pair-rest-v1"
+            protocol["identity_width"] = int(identity_condition.shape[-1])
+        saved_protocol = (
+            None if warm_start_state is None else warm_start_state.get("protocol")
+        )
+        if (
+            warm_start_state is not None
+            and _normalized_crossfit_protocol(saved_protocol)
+            == _normalized_crossfit_protocol(protocol)
+        ):
             for entry in warm_start_state.get("models", ()):
-                iteration_id, fold_id = int(entry["iteration"]), int(entry["fold"])
+                iteration_id = int(entry["iteration"])
+                repeat_id = int(entry.get("repeat", 1))
+                fold_id = int(entry["fold"])
                 if iteration_id in selected_iterations:
-                    key = (iteration_id, fold_id)
-                    if key in initial_states or not 1 <= fold_id <= int(crossfit_folds):
-                        raise ValueError("invalid or duplicate warm-start fold")
+                    key = (iteration_id, repeat_id, fold_id)
+                    if (
+                        key in initial_states
+                        or not 1 <= repeat_id <= int(crossfit_repeats)
+                        or not 1 <= fold_id <= int(crossfit_folds)
+                    ):
+                        raise ValueError(
+                            "invalid or duplicate warm-start repeat/fold"
+                        )
                     initial_states[key] = entry["state"]
         elif selected_iterations:
             _log.info(
-                "[DGPO/omnifold] warm start unavailable: no matching saved fold "
-                "protocol; fit fresh classifiers and save identity-stable folds."
+                "[DGPO/omnifold] warm start unavailable: no matching saved "
+                "repeat/fold protocol; fit fresh classifiers and save "
+                "identity-stable folds."
             )
     else:
-        fold_pairs = _crossfit_splits(
-            n_events, folds=int(crossfit_folds), seed=int(seed) + 313,
-            device=gen_sample.device,
-        )
-    next_warm_models: list[dict[str, Any]] = []
+        for repeat_index in range(1, int(crossfit_repeats) + 1):
+            repeat_seed = _crossfit_repeat_seed(int(seed) + 313, repeat_index)
+            for fold_index, (fit_index, holdout_index) in enumerate(
+                _crossfit_splits(
+                    n_events,
+                    folds=int(crossfit_folds),
+                    seed=repeat_seed,
+                    device=gen_sample.device,
+                ),
+                start=1,
+            ):
+                repeat_fold_pairs.append(
+                    (repeat_index, fold_index, fit_index, holdout_index)
+                )
+    # Keep the latest compatible weights even if this round closes before
+    # reaching a previously fitted iteration. They are initialization only:
+    # the active reward snapshots/log weights below always start empty/zero.
+    next_warm_models: dict[tuple[int, int, int], dict[str, Tensor]] = {
+        key: {name: value.detach().cpu().clone() for name, value in saved.items()}
+        for key, saved in initial_states.items()
+    }
+    # Loading these CPU snapshots copies tensors into fresh trainable models;
+    # later fits must not mutate iteration 1's weights or next-round cache.
+    current_first_states: dict[tuple[int, int], dict[str, Tensor]] = {}
 
     train_logw = torch.zeros(
         gen_sample.shape[:-1],
@@ -2361,6 +3936,7 @@ def fit_residual_ratio_stack(
     snapshots: list[dict[str, Tensor]] = []
     checkpoint_coefficients: list[float] = []
     checkpoint_iterations: list[int] = []
+    iteration_temperatures: list[float] = []
     diagnostics: list[Any] = []
     converged = False
     model: nn.Module | None = None
@@ -2371,22 +3947,45 @@ def fit_residual_ratio_stack(
         validation_negative_weight = global_mean_one(
             torch.exp(val_logw - val_logw.max())
         )
-        oof_logit = torch.empty_like(train_logw)
+        oof_logit = torch.zeros_like(train_logw)
+        oof_coverage = torch.zeros(
+            n_events,
+            dtype=torch.int32,
+            device=train_logw.device,
+        )
         validation_data_logit: Tensor | None = None
         validation_gen_logit: Tensor | None = None
         fold_snapshots: list[dict[str, Tensor]] = []
         fold_diagnostics: list[Any] = []
         warm_started_folds: list[int] = []
-        for fold_index, (fit_index, holdout_index) in enumerate(
-            fold_pairs, start=1
-        ):
-            fold_seed = int(seed) + 1000 * iteration + 37 * fold_index
+        for repeat_index, fold_index, fit_index, holdout_index in repeat_fold_pairs:
+            member_index = (
+                (int(repeat_index) - 1) * int(crossfit_folds)
+                + int(fold_index)
+            )
+            fold_seed = (
+                int(seed)
+                + 1000 * iteration
+                + 37 * fold_index
+                + (int(repeat_index) - 1) * _CROSSFIT_REPEAT_SEED_STRIDE
+            )
             model = _seeded_model(
                 model_factory,
                 seed=fold_seed,
                 device=fit_device,
             ).to(fit_device)
-            initial_state = initial_states.get((iteration, fold_index))
+            repeat_fold_key = (int(repeat_index), int(fold_index))
+            initial_state = initial_states.get(
+                (iteration, int(repeat_index), int(fold_index))
+            )
+            from_current_first = warm_start_from_iteration_one and iteration > 1
+            if from_current_first:
+                if repeat_fold_key not in current_first_states:
+                    raise RuntimeError(
+                        "missing current iteration-1 checkpoint for the same "
+                        "repeat/fold"
+                    )
+                initial_state = current_first_states[repeat_fold_key]
             if initial_state is not None:
                 # Copy weights into a fresh trainable instance. The installed
                 # reward stays frozen; no previous Adam moments or log weights
@@ -2400,19 +3999,45 @@ def fit_residual_ratio_stack(
                 if any(not torch.isfinite(value).all() for value in initial_state.values()):
                     raise FloatingPointError("warm-start classifier has non-finite weights")
                 model.load_state_dict(initial_state, strict=True)
-                warm_started_folds.append(fold_index)
+                warm_started_folds.append(member_index)
+            if from_current_first and later_iteration_train_mode == "last_decoder_and_output":
+                if not isinstance(model, EvenetAdapterRatioClassifier):
+                    raise TypeError("last_decoder_and_output requires an EveNet ratio classifier")
+                model.configure_residual_last_block_training()
             _log.info(
-                "[DGPO/omnifold] residual iteration=%s fold=%s warm_started=%s; "
-                "new optimizer and fresh policy samples",
-                iteration, fold_index, initial_state is not None,
+                "[DGPO/omnifold] residual iteration=%s repeat=%s fold=%s "
+                "warm_started=%s; "
+                "source=%s source_iteration=%s; new optimizer and current-policy samples",
+                iteration, repeat_index, fold_index, initial_state is not None,
+                ("current_round" if from_current_first else "previous_round") if initial_state is not None else "cold",
+                (1 if from_current_first else iteration) if initial_state is not None else None,
+            )
+            warm_epoch_floor = (
+                warm_start_min_epochs_per_fold if initial_state is not None else None
             )
             fold_config = _scaled_crossfit_config(
                 fit_config,
                 float(len(fit_index)) / float(n_events),
-                min_steps_per_fold=min_steps_per_fold,
+                min_steps_per_fold=(min_steps_per_fold if warm_epoch_floor is None else 0),
+                max_steps_per_fold=max_steps_per_fold,
+                n_train=len(fit_index),
+                min_epochs_per_fold=warm_epoch_floor,
+                validation_interval_epochs=validation_interval_epochs,
+                validation_patience_epochs=validation_patience_epochs,
             )
-            _log.info("[DGPO/omnifold] residual iteration=%s fold=%s minimum_updates=%s partition=%s",
-                      iteration, fold_index, getattr(fold_config, "min_steps", None),
+            if from_current_first and later_iteration_learning_rate is not None:
+                # Only the regular head/embedding/adapter rate changes. Keep
+                # the conservative pretrained-position rate and AdamW decay.
+                fold_config = replace(fold_config, learning_rate=float(later_iteration_learning_rate))
+            _log.info("[DGPO/omnifold] residual iteration=%s repeat=%s fold=%s minimum_updates=%s "
+                      "warm_min_epochs=%s validation_interval_updates=%s patience_evaluations=%s "
+                      "learning_rate=%s backbone_learning_rate=%s partition=%s",
+                      iteration, repeat_index, fold_index,
+                      getattr(fold_config, "min_steps", None),
+                      warm_epoch_floor, getattr(fold_config, "validation_interval_steps", None),
+                      getattr(fold_config, "validation_patience_evaluations", None),
+                      getattr(fold_config, "learning_rate", None),
+                      getattr(fold_config, "backbone_learning_rate", None),
                       "identity" if selected_iterations or crossfit_partition == "identity" else "index")
             validation = (
                 validation_data_condition,
@@ -2422,7 +4047,21 @@ def fit_residual_ratio_stack(
                 validation_gen_sample,
                 validation_negative_weight,
             )
-            diag = fit_density_ratio(
+            fit_callable = fit_density_ratio
+            fit_extra = {}
+            if from_current_first and later_iteration_train_mode == "output_then_last_decoder":
+                fit_callable = fit_staged_residual_classifier
+                fit_extra["decoder_learning_rate"] = later_iteration_decoder_learning_rate
+            if diagnostic_callback is not None:
+                diagnostic_callback("before_fit", {
+                    "iteration": iteration, "repeat": repeat_index,
+                    "fold": fold_index, "member": member_index, "model": model,
+                    "fit_index": fit_index, "holdout_index": holdout_index,
+                    "fit_config": fold_config, "seed": fold_seed,
+                    "train_log_weight": train_logw,
+                    "validation_log_weight": val_logw,
+                })
+            diag = fit_callable(
                 model,
                 data_condition[fit_index],
                 data_sample[fit_index],
@@ -2433,15 +4072,45 @@ def fit_residual_ratio_stack(
                 fold_config,
                 fold_seed,
                 validation,
+                **fit_extra,
+                **({
+                    "stop_when_validation_balanced_accuracy_lcb_exceeds": float(
+                        minimum_sufficient_balanced_accuracy
+                    ),
+                    "validation_balanced_accuracy_lcb_confidence_z": float(
+                        minimum_sufficient_confidence_z
+                    ),
+                    "validation_balanced_accuracy_lcb_events_per_class": int(
+                        len(validation_data_sample)
+                    ),
+                    "validation_balanced_accuracy_lcb_required_consecutive": int(
+                        minimum_sufficient_required_consecutive
+                    ),
+                } if minimum_sufficient_balanced_accuracy is not None else {}),
+                **({
+                    "retain_validation_checkpoints": True,
+                    "max_validation_checkpoints": int(ess_aware_max_checkpoints),
+                } if (
+                    ess_aware_checkpoint_selection
+                    and fit_callable is fit_density_ratio
+                    and (
+                        not ess_aware_first_residual_only
+                        or int(iteration) == 1
+                    )
+                ) else {}),
                 progress_callback=(
                     None
                     if progress_callback is None
-                    else lambda row, iteration=iteration, fold_index=fold_index,
+                    else lambda row, iteration=iteration,
+                    repeat_index=repeat_index, fold_index=fold_index,
+                    member_index=member_index,
                     warm_started=initial_state is not None: (
                         progress_callback(
                             {
                                 "iteration": float(iteration),
+                                "repeat": float(repeat_index),
                                 "fold": float(fold_index),
+                                "member": float(member_index),
                                 "warm_started": float(warm_started),
                                 **row,
                             }
@@ -2451,9 +4120,110 @@ def fit_residual_ratio_stack(
             )
             if fit_config.require_saturation and not bool(diag.saturated):
                 raise RuntimeError(
-                    f"residual classifier {iteration} fold {fold_index} "
+                    f"residual classifier {iteration} repeat {repeat_index} "
+                    f"fold {fold_index} "
                     "did not saturate"
                 )
+            if minimum_sufficient_balanced_accuracy is not None and not (
+                bool(getattr(diag, "threshold_reached", False))
+                and getattr(diag, "threshold_reason", None)
+                == "validation_balanced_accuracy_lcb"
+            ):
+                raise RuntimeError(
+                    f"residual classifier {iteration} repeat {repeat_index} "
+                    f"fold {fold_index} did not reach minimum-sufficient "
+                    "balanced accuracy"
+                )
+            if (
+                ess_aware_checkpoint_selection
+                and (
+                    not ess_aware_first_residual_only
+                    or int(iteration) == 1
+                )
+            ):
+                selected = _select_ess_aware_fold_checkpoint(
+                    model,
+                    getattr(diag, "validation_checkpoints", ()) or (),
+                    holdout_condition=gen_condition[holdout_index].to(fit_device),
+                    holdout_sample=gen_sample[holdout_index].to(fit_device),
+                    holdout_log_weight=train_logw[holdout_index].to(fit_device),
+                    validation_data_condition=validation_data_condition,
+                    validation_data_sample=validation_data_sample,
+                    validation_gen_condition=validation_gen_condition,
+                    validation_gen_sample=validation_gen_sample,
+                    validation_log_weight=val_logw,
+                    score_batch_size=int(fit_config.validation_batch_size),
+                    min_auc=0.5 + float(residual_min_auc_gain),
+                    tempering_maximum=float(tempering),
+                    tempering_minimum=float(
+                        minimum_tempering if adaptive_tempering else tempering
+                    ),
+                    target_ess_fraction=float(
+                        target_ess_fraction
+                        if adaptive_tempering
+                        else max(minimum_ess_fraction, 0.0)
+                    ),
+                    tempering_grid_steps=int(tempering_grid_steps),
+                    adaptive_tempering=bool(adaptive_tempering),
+                    log_ratio_clip=log_ratio_clip,
+                    increment_coefficient=1.0 / float(crossfit_repeats),
+                )
+                diag = replace(
+                    diag,
+                    best_step=(
+                        None
+                        if not math.isfinite(float(selected["step"]))
+                        else int(float(selected["step"]))
+                    ),
+                    validation_loss=float(selected["loss"]),
+                    validation_balanced_accuracy=float(
+                        selected["balanced_accuracy"]
+                    ),
+                    validation_auc=float(selected["fold_auc"]),
+                    validation_checkpoints=(),
+                )
+                _log.info(
+                    "[DGPO/omnifold] residual iteration=%s repeat=%s fold=%s "
+                    "ESS-aware checkpoint step=%s fold_auc=%.6g "
+                    "alpha=%.4g ess=(%.4g,%.4g) target_reached=%s "
+                    "loss_best_fallback=%s",
+                    iteration,
+                    repeat_index,
+                    fold_index,
+                    selected["step"],
+                    selected["fold_auc"],
+                    selected["applied_tempering"],
+                    selected["train_ess_fraction"],
+                    selected["validation_ess_fraction"],
+                    selected["ess_target_reached"],
+                    selected["used_loss_best_fallback"],
+                )
+                if progress_callback is not None:
+                    progress_callback({
+                        "iteration": float(iteration),
+                        "repeat": float(repeat_index),
+                        "fold": float(fold_index),
+                        "member": float(member_index),
+                        "step": float(selected["step"]),
+                        "ess_aware_checkpoint_selected": 1.0,
+                        "selected_checkpoint_step": float(selected["step"]),
+                        "selected_fold_auc": float(selected["fold_auc"]),
+                        "selected_applied_tempering": float(
+                            selected["applied_tempering"]
+                        ),
+                        "selected_train_ess_fraction": float(
+                            selected["train_ess_fraction"]
+                        ),
+                        "selected_validation_ess_fraction": float(
+                            selected["validation_ess_fraction"]
+                        ),
+                        "selected_ess_target_reached": float(
+                            selected["ess_target_reached"]
+                        ),
+                        "selected_loss_best_fallback": float(
+                            selected["used_loss_best_fallback"]
+                        ),
+                    })
             fold_diagnostics.append(diag)
             fold_snapshots.append(
                 {
@@ -2462,10 +4232,11 @@ def fit_residual_ratio_stack(
                 }
             )
             if iteration in selected_iterations:
-                next_warm_models.append({
-                    "iteration": iteration, "fold": fold_index,
-                    "state": fold_snapshots[-1],
-                })
+                next_warm_models[
+                    (iteration, int(repeat_index), int(fold_index))
+                ] = fold_snapshots[-1]
+            if warm_start_from_iteration_one and iteration == 1:
+                current_first_states[repeat_fold_key] = fold_snapshots[-1]
             holdout_condition = gen_condition[holdout_index].to(fit_device)
             holdout_sample = gen_sample[holdout_index].to(fit_device)
             holdout_logit = _score_population(
@@ -2474,7 +4245,11 @@ def fit_residual_ratio_stack(
                 holdout_sample,
                 fit_config.validation_batch_size,
             )
-            oof_logit[holdout_index] = holdout_logit.to(oof_logit.device)
+            oof_logit[holdout_index] += (
+                holdout_logit.to(oof_logit.device)
+                / float(crossfit_repeats)
+            )
+            oof_coverage[holdout_index] += 1
             del holdout_condition, holdout_sample, holdout_logit
             fold_data_logit = _score_population(
                 model,
@@ -2488,7 +4263,16 @@ def fit_residual_ratio_stack(
                 validation_gen_sample,
                 fit_config.validation_batch_size,
             )
-            coefficient = 1.0 / float(crossfit_folds)
+            if diagnostic_callback is not None:
+                diagnostic_callback("fold_scored", {
+                    "iteration": iteration, "repeat": repeat_index,
+                    "fold": fold_index, "member": member_index, "model": model,
+                    "fit_index": fit_index, "holdout_index": holdout_index,
+                    "diagnostics": diag,
+                    "validation_data_logit": fold_data_logit,
+                    "validation_gen_logit": fold_gen_logit,
+                })
+            coefficient = 1.0 / float(crossfit_folds * crossfit_repeats)
             validation_data_logit = (
                 coefficient * fold_data_logit
                 if validation_data_logit is None
@@ -2500,6 +4284,11 @@ def fit_residual_ratio_stack(
                 else validation_gen_logit + coefficient * fold_gen_logit
             )
 
+        if not bool((oof_coverage == int(crossfit_repeats)).all().item()):
+            raise RuntimeError(
+                "repeated cross-fitting must score every event exactly once "
+                "per repeat"
+            )
         assert model is not None
         assert validation_data_logit is not None
         assert validation_gen_logit is not None
@@ -2524,6 +4313,95 @@ def fit_residual_ratio_stack(
                 f"auc={validation_auc:.6g}, "
                 f"required_auc>{0.5 + float(residual_min_auc_gain):.6g}"
             )
+        applied_tempering = float(tempering)
+        train_ess_fraction = float("nan")
+        validation_ess_fraction = float("nan")
+        ess_target_reached = False
+        if useful and adaptive_tempering:
+            if inherit_previous_tempering and iteration_temperatures:
+                applied_tempering = float(iteration_temperatures[-1])
+                proposed_train_logw = _tempered_log_weight(
+                    train_logw,
+                    oof_logit,
+                    alpha=applied_tempering,
+                    clip=log_ratio_clip,
+                )
+                proposed_val_logw = _tempered_log_weight(
+                    val_logw,
+                    validation_gen_logit,
+                    alpha=applied_tempering,
+                    clip=log_ratio_clip,
+                )
+                train_ess_fraction = _log_weight_ess_fraction(
+                    proposed_train_logw
+                )
+                validation_ess_fraction = _log_weight_ess_fraction(
+                    proposed_val_logw
+                )
+                ess_target_reached = bool(
+                    math.isfinite(train_ess_fraction)
+                    and math.isfinite(validation_ess_fraction)
+                    and min(train_ess_fraction, validation_ess_fraction)
+                    >= float(target_ess_fraction)
+                )
+            else:
+                (
+                    applied_tempering,
+                    proposed_train_logw,
+                    proposed_val_logw,
+                    train_ess_fraction,
+                    validation_ess_fraction,
+                    ess_target_reached,
+                ) = _select_ess_tempering(
+                    train_log_weight=train_logw,
+                    validation_log_weight=val_logw,
+                    train_increment=oof_logit,
+                    validation_increment=validation_gen_logit,
+                    maximum=float(tempering),
+                    minimum=float(minimum_tempering),
+                    target_ess_fraction=float(target_ess_fraction),
+                    grid_steps=int(tempering_grid_steps),
+                    log_ratio_clip=log_ratio_clip,
+                )
+        else:
+            proposed_train_logw = _tempered_log_weight(
+                train_logw,
+                oof_logit,
+                alpha=applied_tempering,
+                clip=log_ratio_clip,
+            )
+            proposed_val_logw = _tempered_log_weight(
+                val_logw,
+                validation_gen_logit,
+                alpha=applied_tempering,
+                clip=log_ratio_clip,
+            )
+        if (
+            useful
+            and not adaptive_tempering
+            and minimum_ess_fraction > 0.0
+        ):
+            train_ess_fraction = _log_weight_ess_fraction(
+                proposed_train_logw
+            )
+            validation_ess_fraction = _log_weight_ess_fraction(
+                proposed_val_logw
+            )
+        if useful and minimum_ess_fraction > 0.0:
+            observed_ess_fraction = min(
+                train_ess_fraction, validation_ess_fraction
+            )
+            if (
+                not math.isfinite(observed_ess_fraction)
+                or observed_ess_fraction < float(minimum_ess_fraction)
+            ):
+                useful = False
+                rejection_reason = (
+                    "held-out residual failed the cumulative ESS gate: "
+                    f"train_ess_fraction={train_ess_fraction:.6g}, "
+                    f"validation_ess_fraction={validation_ess_fraction:.6g}, "
+                    f"required>={float(minimum_ess_fraction):.6g}"
+                )
         iteration_diag = ResidualIterationDiagnostics(
             iteration=int(iteration),
             fold_diagnostics=tuple(fold_diagnostics),
@@ -2535,12 +4413,32 @@ def fit_residual_ratio_stack(
             accepted=bool(useful),
             rejection_reason=rejection_reason,
             warm_started_folds=tuple(warm_started_folds),
+            applied_tempering=float(applied_tempering),
+            train_ess_fraction=float(train_ess_fraction),
+            validation_ess_fraction=float(validation_ess_fraction),
+            ess_target_reached=bool(ess_target_reached),
         )
         diagnostics.append(iteration_diag)
+        if diagnostic_callback is not None:
+            diagnostic_callback("iteration_scored", {
+                "iteration": iteration, "diagnostics": iteration_diag,
+                "crossfit_folds": int(crossfit_folds),
+                "crossfit_repeats": int(crossfit_repeats),
+                "train_log_weight": train_logw,
+                "validation_log_weight": val_logw,
+                "oof_logit": oof_logit,
+                "validation_data_logit": validation_data_logit,
+                "validation_gen_logit": validation_gen_logit,
+                "applied_tempering": float(applied_tempering),
+                "proposed_train_log_weight": proposed_train_logw,
+                "proposed_validation_log_weight": proposed_val_logw,
+            })
         if progress_callback is not None:
             progress_callback({
                 "iteration": float(iteration),
+                "repeat": 0.0,
                 "fold": 0.0,
+                "member": 0.0,
                 "step": float(
                     max(
                         int(getattr(item, "steps_completed", 0) or 0)
@@ -2555,11 +4453,23 @@ def fit_residual_ratio_stack(
                 "accepted": float(useful),
                 "saturated": float(iteration_diag.saturated),
                 "warm_started_folds": float(len(warm_started_folds)),
+                "train_ess_fraction": float(train_ess_fraction),
+                "validation_ess_fraction": float(
+                    validation_ess_fraction
+                ),
+                "applied_tempering": float(applied_tempering),
+                "ess_target_reached": float(ess_target_reached),
             })
         if not useful:
             if not snapshots:
+                gate = (
+                    "ESS"
+                    if rejection_reason is not None
+                    and "ESS gate" in rejection_reason
+                    else "AUC"
+                )
                 raise RuntimeError(
-                    "first residual classifier failed the AUC gate: "
+                    f"first residual classifier failed the {gate} gate: "
                     f"{rejection_reason}"
                 )
             if iteration < int(min_iterations):
@@ -2572,14 +4482,19 @@ def fit_residual_ratio_stack(
             break
 
         snapshots.extend(fold_snapshots)
+        ensemble_members = int(crossfit_folds) * int(crossfit_repeats)
         checkpoint_coefficients.extend(
-            [1.0 / float(crossfit_folds)] * int(crossfit_folds)
+            [1.0 / float(ensemble_members)] * ensemble_members
         )
-        checkpoint_iterations.extend([int(iteration)] * int(crossfit_folds))
-        train_logw = train_logw + float(tempering) * oof_logit
-        val_logw = val_logw + float(tempering) * validation_gen_logit
+        checkpoint_iterations.extend([int(iteration)] * ensemble_members)
+        iteration_temperatures.append(float(applied_tempering))
+        train_logw = proposed_train_logw
+        val_logw = proposed_val_logw
 
-    if not converged:
+    # Explicit production ablation: install one useful, saturated cross-fit
+    # increment without fitting a second classifier to claim residual closure.
+    # Default residual-stack safety-cap behavior remains unchanged.
+    if not converged and not (iteration_one_only or fixed_iteration_budget):
         raise RuntimeError(
             "residual classifier did not produce a held-out no-op before the "
             f"{int(iterations)}-iteration safety cap"
@@ -2596,8 +4511,22 @@ def fit_residual_ratio_stack(
         diagnostics=tuple(diagnostics),
         train_log_weight=train_logw.detach(),
         validation_log_weight=val_logw.detach(),
+        iteration_temperatures=tuple(iteration_temperatures),
         warm_start_state=(
-            {"protocol": protocol, "models": next_warm_models}
+            {"protocol": protocol, "models": [
+                {
+                    "iteration": iteration_id,
+                    **(
+                        {"repeat": repeat_id}
+                        if int(crossfit_repeats) > 1
+                        else {}
+                    ),
+                    "fold": fold_id,
+                    "state": saved,
+                }
+                for (iteration_id, repeat_id, fold_id), saved
+                in sorted(next_warm_models.items())
+            ]}
             if protocol is not None else None
         ),
     )
@@ -2642,6 +4571,8 @@ def fit_independent_evenet_audit(
     identity_split_seed: int | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     training_readiness: Mapping[str, Any] | None = None,
+    identity_condition: Tensor | None = None,
+    explicit_split_indices: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> EvenetAuditResult:
     """Fit a temporary EveNet judge and score evaluation identities.
 
@@ -2650,9 +4581,12 @@ def fit_independent_evenet_audit(
     are disjoint. ``reuse_early_stop_for_audit`` instead uses an 80/20 train/validation
     protocol and reports final metrics on the restored-best model's validation split.
     The caller must provide a factory distinct from all reward-classifier factories.
-    Optional raw-monitor warm starts use condition-hashed 80/20 identities and
-    transfer only weights, never optimizer or early-stopping state. Without a
-    cache (including trust monitors), initialization remains fresh.
+    Optional raw-monitor warm starts use condition-hashed 80/20 identities or
+    a leakage-resistant 60/20/20 train/early-stop/final-audit split and transfer
+    only weights, never optimizer or early-stopping state. Without a cache
+    (including trust monitors), initialization remains fresh.
+    ``explicit_split_indices`` supplies disjoint fit/early-stop/test rows for a
+    cold audit with an external training population. No internal re-split occurs.
     Optional training readiness gives cold and certified warm fits separate
     event-epoch floors. A completed fit certifies the training budget, not the
     statistical power of this architecture or equality of the distributions.
@@ -2664,12 +4598,24 @@ def fit_independent_evenet_audit(
     if readiness is not None:
         if not isinstance(fit_config, RatioFitConfig) or fit_config.sampling != "independent_epoch_shuffle":
             raise ValueError("monitor training_readiness requires epoch-shuffle RatioFitConfig")
-        if not reuse_early_stop_for_audit or early_stop_fraction != .20 or identity_split_seed is None:
-            raise ValueError("monitor training_readiness requires identity-stable 80/20 train/validation")
+        if early_stop_fraction != .20 or identity_split_seed is None:
+            raise ValueError(
+                "monitor training_readiness requires an identity-stable split "
+                "with a 20% early-stop population"
+            )
         if early_stop_auc_gap is not None or early_stop_balanced_accuracy_lcb is not None:
             raise ValueError("monitor training_readiness cannot use classifier-trust threshold early stopping")
 
     n_events = int(data_condition.shape[0])
+    ratio_export = getattr(fit_config, "ratio_audit_export_dir", None)
+    if ratio_export:
+        if (reuse_early_stop_for_audit or not fit_config.restore_best
+                or fit_config.checkpoint_selection_metric != "loss"
+                or gen_sample.numel() != n_events * gen_sample.shape[-1]
+                or not torch.allclose(gen_weight, torch.ones_like(gen_weight))):
+            raise ValueError("Ratio health export requires independent test, best BCE, K=1 and unit generated weights")
+        if Path(ratio_export).exists():
+            raise ValueError("Ratio health output already exists; use a fresh run directory")
     if not (
         int(data_sample.shape[0])
         == int(gen_condition.shape[0])
@@ -2702,16 +4648,63 @@ def fit_independent_evenet_audit(
         fit_idx.to(device), early_idx.to(device), audit_idx.to(device)
     )
     split_seed = int(seed if identity_split_seed is None else identity_split_seed)
-    protocol = {"schema": "raw-monitor-condition-split-v1", "seed": split_seed, "folds": 5}
+    protocol = {
+        "schema": (
+            "raw-monitor-condition-80-20-v1"
+            if reuse_early_stop_for_audit
+            else "raw-monitor-condition-60-20-20-v1"
+        ),
+        "seed": split_seed,
+        "folds": 5,
+    }
+    if identity_condition is not None:
+        if identity_condition.ndim != 2 or len(identity_condition) != n_events:
+            raise ValueError("raw monitor identity condition must align with event rows")
+        protocol["identity_scheme"] = "exclude-visible-pair-rest-v1"
+        protocol["identity_width"] = int(identity_condition.shape[-1])
     if warm_start_cache is not None or identity_split_seed is not None:
-        if not reuse_early_stop_for_audit or early_stop_fraction != 0.20:
-            raise ValueError("warm-start raw monitor requires identity-stable 80/20 train/validation")
+        if early_stop_fraction != 0.20 or (
+            not reuse_early_stop_for_audit and audit_fraction != 0.20
+        ):
+            raise ValueError(
+                "warm-start raw monitor requires an identity-stable 80/20 "
+                "or 60/20/20 split"
+            )
         # Never let an old training identity become validation when Ray reorders
         # rows or the pool grows. The visible condition, not generated x, owns
         # the assignment. Duplicate conditions therefore stay together too.
-        fit_idx, early_idx = _identity_crossfit_splits(
-            data_condition, folds=5, seed=split_seed,
-        )[0]
+        identity_folds = _identity_crossfit_splits(
+            data_condition if identity_condition is None else identity_condition,
+            folds=5, seed=split_seed,
+        )
+        if reuse_early_stop_for_audit:
+            fit_idx, early_idx = identity_folds[0]
+            audit_idx = early_idx
+        else:
+            # Two untouched hash folds separate model selection from the
+            # reported staleness score. Repeated warm fits may inspect the
+            # early-stop fold, but can never train on or select against the
+            # final audit identities.
+            holdouts = [pair[1] for pair in identity_folds]
+            audit_idx = holdouts[0]
+            early_idx = holdouts[1]
+            fit_idx = torch.cat(holdouts[2:], dim=0)
+
+    if explicit_split_indices is not None:
+        if (reuse_early_stop_for_audit or warm_start_cache is not None
+                or readiness is not None or ratio_export):
+            raise ValueError("explicit audit splits require a cold disjoint audit without readiness/export")
+        if len(explicit_split_indices) != 3 or any(
+            index.ndim != 1 or index.dtype != torch.long or len(index) < 2
+            for index in explicit_split_indices
+        ):
+            raise ValueError("explicit audit splits need three nonempty int64 event-index vectors")
+        joined = torch.cat([index.to(device) for index in explicit_split_indices])
+        if (len(joined) != n_events or joined.min() < 0 or joined.max() >= n_events
+                or len(torch.unique(joined)) != n_events):
+            raise ValueError("explicit audit splits must be disjoint and cover the population")
+        fit_idx, early_idx, audit_idx = (index.to(device) for index in explicit_split_indices)
+        protocol = {"schema": "external-fit-disjoint-evaluation-v1", "seed": split_seed}
 
     model = _seeded_model(model_factory, seed=int(seed) + 71, device=device).to(device)
     initial_state = (
@@ -2719,6 +4712,12 @@ def fit_independent_evenet_audit(
         if warm_start_cache is not None and warm_start_cache.get("protocol") == protocol
         else None
     )
+    recertify_inherited = bool(warm_start_cache and warm_start_cache.get("recertify_inherited_weights", False))
+    inherit_as_is = bool(warm_start_cache and warm_start_cache.get("inherit_monitor_as_is", False))
+    if recertify_inherited and inherit_as_is:
+        raise ValueError("raw monitor cannot recertify and inherit-as-is in the same fit")
+    if (recertify_inherited or inherit_as_is) and initial_state is None:
+        raise ValueError("Inherited raw monitor split protocol mismatch; refusing silent cold start")
     training_policy = None
     if readiness is not None:
         training_policy = {
@@ -2730,8 +4729,15 @@ def fit_independent_evenet_audit(
         if initial_state is not None and warm_start_cache.get("training_policy") != training_policy:
             # An old 60-step null fit is not a certified warm start. This also
             # rejects changed training/packing protocols without mutating cache.
-            initial_state = None
-            _log.info("[DGPO/omnifold] raw monitor training protocol changed or uncertified; cold-start fitting required")
+            if recertify_inherited:
+                _log.info("[DGPO/omnifold] inheriting raw monitor weights with matching split; "
+                          "recertifying with full cold-start budget and a new baseline")
+            elif inherit_as_is:
+                _log.info("[DGPO/omnifold] inheriting raw monitor weights as-is; "
+                          "keeping the split and using the warm-start budget")
+            else:
+                initial_state = None
+                _log.info("[DGPO/omnifold] raw monitor training protocol changed or uncertified; cold-start fitting required")
     if initial_state is not None:
         current_state = model.state_dict()
         if set(initial_state) != set(current_state) or any(
@@ -2742,6 +4748,11 @@ def fit_independent_evenet_audit(
             raise FloatingPointError("raw monitor warm-start weights are non-finite")
         model.load_state_dict(initial_state, strict=True)
     training_steps_per_epoch = 0
+    if explicit_split_indices is not None:
+        training_steps_per_epoch = (
+            len(fit_idx) // fit_config.batch_size if fit_config.drop_last_batch
+            else max(1, math.ceil(len(fit_idx) / fit_config.batch_size))
+        )
     if readiness is not None:
         training_steps_per_epoch = (
             len(fit_idx) // fit_config.batch_size if fit_config.drop_last_batch
@@ -2749,7 +4760,7 @@ def fit_independent_evenet_audit(
         )
         if training_steps_per_epoch < 1:
             raise ValueError("monitor training fold is smaller than its drop-last batch")
-        min_epochs = readiness["warm_start_min_epochs" if initial_state is not None else "cold_start_min_epochs"]
+        min_epochs = readiness["warm_start_min_epochs" if initial_state is not None and not recertify_inherited else "cold_start_min_epochs"]
         fit_config = replace(
             fit_config,
             min_steps=max(fit_config.min_steps, math.ceil(min_epochs * training_steps_per_epoch)),
@@ -2860,6 +4871,34 @@ def fit_independent_evenet_audit(
         raise FloatingPointError("independent EveNet audit produced NaN/Inf logits")
     if not bool(torch.isfinite(gen_weight[score_idx]).all().item()):
         raise FloatingPointError("independent EveNet audit received NaN/Inf weights")
+    if ratio_export:
+        from .ratio_fit import distributed_context
+        from .ratio_health import export_bundle
+        rank, world = distributed_context()
+        health = {}
+        error = None
+        if rank == 0:
+            try:
+                health = export_bundle(
+                    ratio_export, model, fit_config, diagnostics, protocol, seed,
+                    data_condition, data_sample, gen_sample, data_score, gen_score,
+                    fit_idx, early_idx, score_idx,
+                    data_condition if identity_condition is None else identity_condition,
+                )
+            except Exception as exc:
+                error = str(exc)
+                _log.exception("Ratio health export failed")
+        failed = torch.tensor(int(error is not None), device=device)
+        if world > 1:
+            torch.distributed.all_reduce(failed)
+        if failed.item():
+            raise RuntimeError(f"Ratio health export failed on rank zero: {error or 'see rank zero log'}")
+        if progress_callback is not None:
+            payload = [health]
+            if world > 1:
+                torch.distributed.broadcast_object_list(payload, src=0)
+            progress_callback({"step": diagnostics.steps_completed,
+                              **{f"ratio_health/{k}":v for k,v in payload[0].items()}})
     _, balanced_accuracy, auc = _weighted_binary_score_metrics(
         data_score,
         gen_score,
@@ -2920,6 +4959,8 @@ class FrozenResidualRatioReward(nn.Module):
         checkpoint_coefficients: tuple[float, ...] | None = None,
         checkpoint_iterations: tuple[int, ...] | None = None,
         warm_start_state: Mapping[str, Any] | None = None,
+        log_ratio_clip: float | None = None,
+        iteration_temperatures: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         if checkpoints is None:
@@ -2959,6 +5000,24 @@ class FrozenResidualRatioReward(nn.Module):
         )
         if observed_iterations != expected_iterations:
             raise ValueError("residual checkpoint iteration ids must be contiguous")
+        if iteration_temperatures is None:
+            iteration_temperatures = tuple(
+                float(tempering) for _ in expected_iterations
+            )
+        if len(iteration_temperatures) != len(expected_iterations):
+            raise ValueError(
+                "residual iteration temperature metadata length mismatch"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or not 0.0 < float(value) <= 1.0
+            for value in iteration_temperatures
+        ):
+            raise ValueError(
+                "residual iteration temperatures must be finite and in (0, 1]"
+            )
         for iteration in sorted(set(int(value) for value in checkpoint_iterations)):
             total = sum(
                 float(coefficient)
@@ -2983,6 +5042,22 @@ class FrozenResidualRatioReward(nn.Module):
             int(value) for value in checkpoint_iterations
         )
         self.tempering = float(tempering)
+        self._iteration_temperatures = tuple(
+            float(value) for value in iteration_temperatures
+        )
+        if (
+            log_ratio_clip is not None
+            and (
+                isinstance(log_ratio_clip, bool)
+                or not isinstance(log_ratio_clip, (int, float))
+                or not math.isfinite(float(log_ratio_clip))
+                or float(log_ratio_clip) <= 0.0
+            )
+        ):
+            raise ValueError("log_ratio_clip must be finite and positive")
+        self.log_ratio_clip = (
+            None if log_ratio_clip is None else float(log_ratio_clip)
+        )
         # Training-only CPU cache; never replayed in the cumulative reward and
         # never moved onto each GPU by _apply. Includes a selected closure-only
         # iteration if it was fitted but not installed as a ratio increment.
@@ -2994,7 +5069,11 @@ class FrozenResidualRatioReward(nn.Module):
 
     @classmethod
     def from_fit_result(
-        cls, result: ResidualRatioResult, *, tempering: float
+        cls,
+        result: ResidualRatioResult,
+        *,
+        tempering: float,
+        log_ratio_clip: float | None = None,
     ) -> "FrozenResidualRatioReward":
         return cls(
             result.classifier,
@@ -3003,6 +5082,12 @@ class FrozenResidualRatioReward(nn.Module):
             checkpoint_coefficients=result.checkpoint_coefficients,
             checkpoint_iterations=result.checkpoint_iterations,
             warm_start_state=result.warm_start_state,
+            log_ratio_clip=log_ratio_clip,
+            iteration_temperatures=(
+                None
+                if not result.iteration_temperatures
+                else result.iteration_temperatures
+            ),
         )
 
     @property
@@ -3012,6 +5097,10 @@ class FrozenResidualRatioReward(nn.Module):
     @property
     def num_checkpoints(self) -> int:
         return len(self._checkpoints)
+
+    @property
+    def iteration_temperatures(self) -> tuple[float, ...]:
+        return self._iteration_temperatures
 
     @property
     def packing_spec(self) -> EventPackingSpec:
@@ -3045,15 +5134,103 @@ class FrozenResidualRatioReward(nn.Module):
         )
 
     @torch.no_grad()
+    def member_logits(self, condition: Tensor, candidate: Tensor) -> Tensor:
+        """Scaled member scores for a one-iteration cross-fit ensemble.
+
+        Candidate-consensus DGPO deliberately supports only iteration-one
+        rewards.  Each returned member has the same tempering as the installed
+        ensemble but is not multiplied by its averaging coefficient.
+        """
+
+        if self.num_iterations != 1 or any(
+            int(iteration) != 1 for iteration in self._checkpoint_iterations
+        ):
+            raise ValueError(
+                "candidate consensus requires an iteration-one-only reward stack"
+            )
+        if self.log_ratio_clip is not None:
+            raise ValueError(
+                "candidate consensus requires unclipped member log ratios"
+            )
+        temperature = float(self._iteration_temperatures[0])
+        return torch.stack(
+            [
+                temperature * self.checkpoint_logits(index, condition, candidate)
+                for index in range(self.num_checkpoints)
+            ],
+            dim=0,
+        )
+
+    def ensemble_from_member_logits(self, member_logits: Tensor) -> Tensor:
+        """Reconstruct the installed one-iteration ensemble exactly."""
+
+        if member_logits.ndim != 3 or int(member_logits.shape[0]) != self.num_checkpoints:
+            raise ValueError("member logits do not match reward checkpoint count")
+        coefficients = member_logits.new_tensor(
+            self._checkpoint_coefficients
+        ).reshape(-1, 1, 1)
+        return (member_logits * coefficients).sum(dim=0)
+
+    @torch.no_grad()
     def forward(self, condition: Tensor, candidate: Tensor) -> Tensor:
-        total: Tensor | None = None
-        for index, coefficient in enumerate(self._checkpoint_coefficients):
+        legacy_tempering = all(
+            math.isclose(
+                value,
+                self.tempering,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+            for value in self._iteration_temperatures
+        )
+        if self.log_ratio_clip is None and legacy_tempering:
+            total: Tensor | None = None
+            for index, coefficient in enumerate(self._checkpoint_coefficients):
+                logit = float(coefficient) * self.checkpoint_logits(
+                    index, condition, candidate
+                )
+                total = logit if total is None else total + logit
+            assert total is not None
+            return self.tempering * total
+
+        cumulative: Tensor | None = None
+        iteration_total: Tensor | None = None
+        current_iteration: int | None = None
+        for index, (coefficient, iteration) in enumerate(
+            zip(self._checkpoint_coefficients, self._checkpoint_iterations)
+        ):
+            if current_iteration is not None and iteration != current_iteration:
+                assert iteration_total is not None
+                increment = (
+                    self._iteration_temperatures[current_iteration - 1]
+                    * iteration_total
+                )
+                cumulative = (
+                    increment if cumulative is None else cumulative + increment
+                )
+                if self.log_ratio_clip is not None:
+                    cumulative = cumulative.clamp(
+                        min=-self.log_ratio_clip, max=self.log_ratio_clip
+                    )
+                iteration_total = None
             logit = float(coefficient) * self.checkpoint_logits(
                 index, condition, candidate
             )
-            total = logit if total is None else total + logit
-        assert total is not None
-        return self.tempering * total
+            iteration_total = (
+                logit if iteration_total is None else iteration_total + logit
+            )
+            current_iteration = int(iteration)
+        assert iteration_total is not None
+        assert current_iteration is not None
+        increment = (
+            self._iteration_temperatures[current_iteration - 1]
+            * iteration_total
+        )
+        cumulative = increment if cumulative is None else cumulative + increment
+        if self.log_ratio_clip is not None:
+            cumulative = cumulative.clamp(
+                min=-self.log_ratio_clip, max=self.log_ratio_clip
+            )
+        return cumulative
 
     def assert_frozen(self) -> None:
         if self.training or any(parameter.requires_grad for parameter in self.parameters()):
@@ -3083,6 +5260,15 @@ class FrozenResidualRatioReward(nn.Module):
         # Omit for legacy stacks so checkpoint digests still round-trip exactly.
         if self.warm_start_state is not None:
             payload["warm_start_state"] = deepcopy(self.warm_start_state)
+        if self.log_ratio_clip is not None:
+            payload["log_ratio_clip"] = float(self.log_ratio_clip)
+        legacy_temperatures = tuple(
+            self.tempering for _ in self._iteration_temperatures
+        )
+        if self._iteration_temperatures != legacy_temperatures:
+            payload["iteration_temperatures"] = list(
+                self._iteration_temperatures
+            )
         return payload
 
     @classmethod
@@ -3110,11 +5296,14 @@ class FrozenResidualRatioReward(nn.Module):
         checkpoints: list[dict[str, Tensor]] = []
         expected_spec = increments[0].get("packing_spec")
         expected_digest = increments[0].get("base_digest")
+        expected_conditioning = dict(increments[0].get("classifier_config") or {}).get("visible_conditioning")
         for item in increments:
             if item.get("packing_spec") != expected_spec:
                 raise ValueError("residual checkpoints use different event packing specs")
             if item.get("base_digest") != expected_digest:
                 raise ValueError("residual checkpoints use different backbone digests")
+            if dict(item.get("classifier_config") or {}).get("visible_conditioning") != expected_conditioning:
+                raise ValueError("residual checkpoints use different visible conditioning architectures")
             checkpoint = {
                 f"bank.{name}": value.detach().clone()
                 for name, value in dict(item.get("state") or {}).items()
@@ -3145,6 +5334,15 @@ class FrozenResidualRatioReward(nn.Module):
                 )
             ),
             warm_start_state=payload.get("warm_start_state"),
+            log_ratio_clip=payload.get("log_ratio_clip"),
+            iteration_temperatures=(
+                None
+                if payload.get("iteration_temperatures") is None
+                else tuple(
+                    float(value)
+                    for value in payload["iteration_temperatures"]
+                )
+            ),
         )
         reward.to(device).eval()
         reward.assert_frozen()

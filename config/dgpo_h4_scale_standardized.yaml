@@ -1,0 +1,28 @@
+extends_overlay: dgpo_h4_scale_control.yaml
+
+experiment:
+  intervention: fixed_training_fold_fourier_encoder_output_standardization
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized300/ray_results
+
+logger:
+  local:
+    name: h4_scale_standardized300
+    version: h4_scale_standardized300_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized300/logs
+  wandb:
+    id: h4scls1
+    run_name: Does Fourier output scaling speed BCE learning? | standardized | 300 updates
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized300/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      fourier_output_standardization: true
+      representation_export_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized300/panels
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized300/diagnostic_snapshots

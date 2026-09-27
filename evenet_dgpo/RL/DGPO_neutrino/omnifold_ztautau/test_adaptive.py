@@ -18,6 +18,7 @@ from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
     auc_null_standard_error,
     adaptive_audit_protocol_signature,
     adaptive_trust_policy_lr_scale,
+    baseline_probe_auc_gap,
     build_reference_trust_pool,
     clamp_fixed_trust_radius_after_resume,
     evaluate_round_auc_change,
@@ -106,6 +107,7 @@ def _config(
     pool_data_parquet_dir: str | None = None,
     reset_adam_first_moment_on_install: bool | None = None,
     warm_start_iterations: tuple[int, ...] = (),
+    crossfit_repeats: int = 1,
 ):
     payload = {
             "reference_trust": {
@@ -260,6 +262,7 @@ def _config(
                     "topology_acceptance_repeats": (
                         topology_acceptance_repeats
                     ),
+                    "crossfit_repeats": crossfit_repeats,
                     "residual_min_auc_gain": residual_min_auc_gain,
                 },
             }
@@ -608,6 +611,43 @@ class TestEpochRefitAblation(unittest.TestCase):
             )
             self.assertFalse(due)
 
+    def test_rejected_refit_attempt_enforces_age_retry_cooldown(self):
+        _, cfg = self._config()
+        cfg = replace(cfg, max_reward_age_epochs=1, retrain_cooldown_epochs=3)
+        state = AdaptiveOmniFoldState(
+            installed_at_epoch=0,
+            last_recalibration_epoch=0,
+            last_recalibration_attempt_epoch=10,
+        )
+        restored = AdaptiveOmniFoldState.from_dict(state.to_dict())
+
+        due, diagnostics = adaptive_module.scheduled_raw_refit_due(
+            restored,
+            cfg=cfg,
+            epoch=11,
+        )
+        self.assertFalse(due)
+        self.assertEqual(diagnostics["staleness/age_refit_due"], 1.0)
+        self.assertEqual(
+            diagnostics["staleness/age_refit_cooldown_active"],
+            1.0,
+        )
+        self.assertEqual(
+            diagnostics["staleness/last_refit_attempt_epoch"],
+            10.0,
+        )
+
+        due, diagnostics = adaptive_module.scheduled_raw_refit_due(
+            restored,
+            cfg=cfg,
+            epoch=13,
+        )
+        self.assertTrue(due)
+        self.assertEqual(
+            diagnostics["staleness/age_refit_cooldown_active"],
+            0.0,
+        )
+
 
 class TestGlobalRawRollback(unittest.TestCase):
     def test_warmup_intervals_do_not_consume_patience_across_resume(self):
@@ -764,10 +804,102 @@ class TestGlobalRawRollback(unittest.TestCase):
 
 
 class TestStepStaleness(unittest.TestCase):
+    schedule = ((0, 6), (100, 10), (300, 16), (600, 24))
+
     def _cfg(self):
         return replace(_config(monitor_mode="raw_plateau_refit", raw_audit_enabled=True,
                                require_audit_saturation=True, required_consecutive_epochs=5),
                        staleness_every_n_steps=5)
+
+    def test_schedule_parser_validation_and_legacy_default(self):
+        parse = adaptive_module._raw_patience_schedule
+        valid = [{'start_step': s, 'required_consecutive_checks': p}
+                 for s, p in self.schedule]
+        self.assertEqual(parse(valid), self.schedule)
+        self.assertEqual(parse([SimpleNamespace(**entry) for entry in valid]), parse(valid))
+        self.assertEqual(parse(None), ())
+        self.assertEqual(parse([]), ())
+        invalid = [
+            {}, '4,6,8', [True], [{'start_step': 0}],
+            [{'start_step': True, 'required_consecutive_checks': 4}],
+            [{'start_step': 0, 'required_consecutive_checks': False}],
+            [{'start_step': 0, 'required_consecutive_checks': 0}],
+            [{'start_step': 0.0, 'required_consecutive_checks': 4}],
+            [{'start_step': 5, 'required_consecutive_checks': 4}],
+            [valid[0], valid[0]], [valid[0], valid[2], valid[1]],
+            [valid[0], {'start_step': 100, 'required_consecutive_checks': 3}],
+        ]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'patience_schedule'):
+                parse(value)
+        self.assertEqual(adaptive_module.raw_staleness_patience(self._cfg(), global_step=-1), 5)
+        with self.assertRaisesRegex(ValueError, 'requires step-based'):
+            resolve_adaptive_config({'adaptive_omnifold': {'trigger': {'patience_schedule': valid}}})
+
+    def test_patience_stages_and_trigger_counts(self):
+        cfg = replace(self._cfg(), raw_patience_schedule=self.schedule)
+        for step, expected in ((0, 6), (99, 6), (100, 10), (299, 10), (300, 16), (599, 16), (600, 24), (1500, 24)):
+            self.assertEqual(adaptive_module.raw_staleness_patience(cfg, global_step=step), expected)
+        with self.assertRaisesRegex(ValueError, 'global_step'):
+            adaptive_module.raw_staleness_patience(cfg, global_step=-1)
+        for start, patience in self.schedule:
+            state = AdaptiveOmniFoldState(raw_best_auc_gap=.1)
+            for missed in range(1, patience + 1):
+                step = start + missed * 5
+                fired, metrics = update_raw_plateau_controller(
+                    state, {'raw_auc_gap': .12, 'raw_audit_saturated': 1.},
+                    cfg=cfg, epoch=step//10, global_step=step,
+                )
+                self.assertEqual(fired, missed == patience)
+                self.assertEqual(metrics['staleness/raw_no_improvement_patience'], patience)
+                self.assertEqual(state.probe_history[-1]['raw_no_improvement_patience'], patience)
+                state = AdaptiveOmniFoldState.from_dict(state.to_dict())
+
+    def test_schedule_boundary_resume_and_round_install_preserve_clock(self):
+        cfg = replace(self._cfg(), raw_best_scope='global',
+                      raw_patience_schedule=self.schedule)
+        state = AdaptiveOmniFoldState(raw_best_auc_gap=.1, raw_best_global_step=5,
+                                      raw_best_epoch=0, raw_global_initialized=True)
+        for step in range(75, 121, 5):
+            fired, _ = update_raw_plateau_controller(
+                state, {'raw_auc_gap': .12, 'raw_audit_saturated': 1.},
+                cfg=cfg, epoch=step//10, global_step=step,
+            )
+            self.assertEqual(fired, step == 120)  # step 100 already uses patience 10
+            state = AdaptiveOmniFoldState.from_dict(state.to_dict())
+        self.assertEqual(state.raw_no_improvement_streak, 10)
+        # Installing a reward after rewinding only policy weights resets the
+        # streak, not the training clock or the global-best checkpoint metadata.
+        state.install(baseline_auc_gap=.02, cfg=cfg, epoch=60, round_id=2)
+        self.assertEqual(state.raw_no_improvement_streak, 0)
+        self.assertEqual(state.raw_best_global_step, 5)
+        _, metrics = update_raw_plateau_controller(
+            state, {'raw_auc_gap': .12, 'raw_audit_saturated': 1.},
+            cfg=cfg, epoch=60, global_step=605,
+        )
+        self.assertEqual(metrics['staleness/raw_no_improvement_patience'], 24)
+        self.assertEqual(state.raw_no_improvement_streak, 1)
+
+    def test_schedule_keeps_warmup_eligibility_and_improvement_rules(self):
+        cfg = replace(self._cfg(), raw_patience_schedule=self.schedule,
+                      policy_warmup_steps=10, raw_pause_patience_during_warmup=True)
+        state = AdaptiveOmniFoldState(raw_best_auc_gap=.1, reward_round_id=2)
+        adaptive_module.start_policy_round_warmup(state, cfg=cfg)
+        fired, metrics = update_raw_plateau_controller(
+            state, {'raw_auc_gap': .12, 'raw_audit_saturated': 1.},
+            cfg=cfg, epoch=60, global_step=605,
+        )
+        self.assertFalse(fired)
+        self.assertEqual(metrics['staleness/patience_paused_for_warmup'], 1.)
+        self.assertEqual(state.raw_no_improvement_streak, 0)
+        for gap, saturated in ((.09, 1.), (.12, 0.), (float('nan'), 1.)):
+            state = AdaptiveOmniFoldState(raw_best_auc_gap=.1, raw_no_improvement_streak=23)
+            fired, _ = update_raw_plateau_controller(
+                state, {'raw_auc_gap': gap, 'raw_audit_saturated': saturated},
+                cfg=cfg, epoch=60, global_step=605,
+            )
+            self.assertFalse(fired)
+            self.assertEqual(state.raw_no_improvement_streak, 0)
 
     def test_five_checks_trigger_at_step_25_and_resume_does_not_duplicate(self):
         cfg = self._cfg()
@@ -857,6 +989,21 @@ class TestStepStaleness(unittest.TestCase):
 
 
 class TestAdaptiveConfig(unittest.TestCase):
+    def test_baseline_probe_uses_the_active_controller_metric(self) -> None:
+        probe = {"weighted_auc_gap": 0.01, "raw_auc_gap": 0.20}
+        self.assertEqual(baseline_probe_auc_gap(probe, cfg=_config()), 0.01)
+        self.assertEqual(
+            baseline_probe_auc_gap(
+                probe,
+                cfg=_config(
+                    monitor_mode="raw_plateau_refit",
+                    raw_audit_enabled=True,
+                    acceptance_audit_enabled=False,
+                ),
+            ),
+            0.20,
+        )
+
     def test_monitor_readiness_requires_safe_raw_protocol_and_changes_signature(self):
         import copy
         import yaml
@@ -901,6 +1048,10 @@ class TestAdaptiveConfig(unittest.TestCase):
         self.assertTrue(cfg.acceptance_audit_enabled)
         self.assertEqual(cfg.acceptance_max_balanced_accuracy, 0.51)
         self.assertEqual(cfg.crossfit_folds, 2)
+        self.assertEqual(cfg.crossfit_repeats, 1)
+        self.assertEqual(_config(crossfit_repeats=5).crossfit_repeats, 5)
+        with self.assertRaises(ValueError):
+            _config(crossfit_repeats=0)
         self.assertAlmostEqual(cfg.residual_min_auc_gain, 1.0e-3)
         self.assertFalse(cfg.bootstrap_on_start)
         self.assertTrue(cfg.bootstrap_fail_closed)
@@ -3280,6 +3431,7 @@ class TestAdaptivePool(unittest.TestCase):
         }
         log_weight = torch.linspace(-1.0, 1.0, 32).reshape(32, 1)
         phases: list[str] = []
+        raw_monitor_cache: dict[str, object] = {}
         source = SimpleNamespace(frozen_reward=object(), model_builder=object())
         with (
             mock.patch.object(
@@ -3299,6 +3451,7 @@ class TestAdaptivePool(unittest.TestCase):
                 cfg=cfg,
                 device=torch.device("cpu"),
                 seed=123,
+                raw_warm_start_cache=raw_monitor_cache,
                 progress_callback=lambda phase, _row: phases.append(phase),
             )
 
@@ -3315,6 +3468,11 @@ class TestAdaptivePool(unittest.TestCase):
             torch.zeros_like(log_weight),
         )
         self.assertIsNone(fit.call_args_list[1].kwargs["early_stop_auc_gap"])
+        self.assertNotIn("warm_start_cache", fit.call_args_list[0].kwargs)
+        self.assertIs(
+            fit.call_args_list[1].kwargs["warm_start_cache"],
+            raw_monitor_cache,
+        )
         self.assertAlmostEqual(metrics["raw_auc"], 0.66)
         self.assertAlmostEqual(metrics["raw_auc_gap"], 0.16)
         self.assertAlmostEqual(metrics["raw_balanced_accuracy"], 0.64)
@@ -3387,12 +3545,44 @@ class TestPolicyRoundWarmup(unittest.TestCase):
         from dataclasses import replace
         with self.assertRaises(ValueError):
             adaptive_module.policy_round_warmup_metrics(self.state, cfg=self.cfg)
+        self.assertEqual(adaptive_module.start_inherited_round_policy_warmup(self.state, cfg=self.cfg), {})
+        with self.assertRaises(ValueError):
+            adaptive_module.policy_round_warmup_metrics(self.state, cfg=self.cfg)
         adaptive_module.start_policy_round_warmup(self.state, cfg=self.cfg)
         with self.assertRaises(ValueError):
             adaptive_module.policy_round_warmup_metrics(self.state, cfg=replace(self.cfg, policy_warmup_steps=10))
         self.state.policy_warmup_completed_updates = -1
         with self.assertRaises(ValueError):
             adaptive_module.policy_round_warmup_metrics(self.state, cfg=self.cfg)
+
+    def test_inherited_round_starts_warmup_without_a_new_install(self):
+        self.state.last_decision = "new_experiment_from_best"
+        metrics = adaptive_module.start_inherited_round_policy_warmup(self.state, cfg=self.cfg)
+        self.assertAlmostEqual(metrics["train/round_warmup/lr_scale"], .1)
+        self.assertEqual(self.state.policy_warmup_round_id, 1)
+        self.assertEqual(self.state.policy_warmup_completed_updates, 0)
+        restored = AdaptiveOmniFoldState.from_dict(self.state.to_dict())
+        restored.raw_monitor_baseline_pending = False
+        restored.last_decision = "raw_improved"
+        self.assertEqual(adaptive_module.start_inherited_round_policy_warmup(restored, cfg=self.cfg), {})
+        self.assertEqual(
+            adaptive_module.policy_round_warmup_metrics(restored, cfg=self.cfg)["train/round_warmup/completed_updates"],
+            0.0,
+        )
+
+    def test_step0_last_ckpt_after_baseline_still_starts_warmup(self):
+        self.state.last_decision = "raw_improved"
+        self.assertEqual(
+            adaptive_module.start_inherited_round_policy_warmup(self.state, cfg=self.cfg, global_step=30),
+            {},
+        )
+        with self.assertRaises(ValueError):
+            adaptive_module.policy_round_warmup_metrics(self.state, cfg=self.cfg)
+        metrics = adaptive_module.start_inherited_round_policy_warmup(
+            self.state, cfg=self.cfg, global_step=0,
+        )
+        self.assertAlmostEqual(metrics["train/round_warmup/lr_scale"], .1)
+        self.assertEqual(self.state.policy_warmup_round_id, 1)
 
 
 class TestBestDecayTrustRadius(unittest.TestCase):
@@ -3506,6 +3696,39 @@ class TestBestDecayTrustRadius(unittest.TestCase):
                                                              initialize_round_decay=False), {})
         with self.assertRaisesRegex(ValueError, "fresh reference"):
             clamp_fixed_trust_radius_after_resume(cold, cfg=self.cfg)
+        # A live radius without a best-decay schedule is a mid-run protocol switch.
+        switched = AdaptiveOmniFoldState(reward_round_id=3, baseline_auc_gap=.1,
+                                         trigger_threshold=.02, trust_current_delta=.05)
+        with self.assertRaisesRegex(ValueError, "fresh reference"):
+            clamp_fixed_trust_radius_after_resume(switched, cfg=self.cfg)
+        self.assertIsNone(switched.trust_best_decay_protocol)
+
+    def test_best_point_restart_opts_inherited_reference_in_at_age_zero(self):
+        # Installed, calibrated reference whose trust schedule was reset by a
+        # best-point / pinned-classifier restart: no live radius, no global record.
+        self.shrink(5)
+        restart = AdaptiveOmniFoldState(
+            reward_round_id=self.state.reward_round_id,
+            baseline_auc_gap=self.state.baseline_auc_gap,
+            trigger_threshold=self.state.trigger_threshold,
+        )
+        self.assertFalse(math.isfinite(restart.trust_current_delta))
+        diag = clamp_fixed_trust_radius_after_resume(restart, cfg=self.cfg)
+        self.assertEqual(diag["reference_trust/best_decay/inherited_reference_age_zero"], 1.)
+        self.assertEqual(restart.trust_best_decay_count, 0)
+        self.assertEqual(restart.trust_best_decay_round_id, self.state.reward_round_id)
+        self.assertEqual(restart.trust_best_decay_protocol, self.state.trust_best_decay_protocol)
+        self.assertAlmostEqual(restart.trust_current_delta, self.cfg.trust_delta_max)
+        # Idempotent across serialization and repeated resumes; no second reset.
+        restored = AdaptiveOmniFoldState.from_dict(restart.to_dict())
+        for _ in range(3):
+            clamp_fixed_trust_radius_after_resume(restored, cfg=self.cfg)
+        self.assertEqual(restored.to_dict(), restart.to_dict())
+        # The fresh schedule then shrinks from the initial radius on a new global best.
+        self.state = restored
+        self.shrink(5)
+        self.assertEqual(self.state.trust_best_decay_count, 1)
+        self.assertAlmostEqual(self.state.trust_current_delta, .09)
 
 
 class TestRoundDecayTrustRadius(unittest.TestCase):
@@ -4039,7 +4262,12 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
             torch.testing.assert_close(round_ref.state_dict()[key], expected)
 
     def test_accepted_stack_moves_reward_and_round_reference_together(self) -> None:
-        cfg = _config(trust_boundary_enabled=True, warm_start_iterations=(1, 2))
+        cfg = replace(_config(trust_boundary_enabled=True, warm_start_iterations=(1,)),
+                      warm_start_from_iteration_one=True)
+        cfg.fit.update(warm_start_min_epochs_per_fold=10,
+                       validation_interval_epochs=2., validation_patience_epochs=10.,
+                       later_iteration_learning_rate=5e-5,
+                       later_iteration_train_mode='last_decoder_and_output')
         state = AdaptiveOmniFoldState()
         state.install(baseline_auc_gap=0.08, cfg=cfg, epoch=-1, round_id=0)
         spec = EventPackingSpec(
@@ -4111,10 +4339,16 @@ class TestAtomicAdaptiveInstall(unittest.TestCase):
         progress_events: list[tuple[str, int]] = []
 
         def _fit_side_effect(**kwargs):
-            self.assertEqual(kwargs["warm_start_iterations"], (1, 2))
+            self.assertEqual(kwargs["warm_start_iterations"], (1,))
+            self.assertTrue(kwargs['warm_start_from_iteration_one'])
+            self.assertEqual(kwargs['later_iteration_learning_rate'], 5e-5)
+            self.assertEqual(kwargs['later_iteration_train_mode'], 'last_decoder_and_output')
             self.assertIs(kwargs["warm_start_state"], warm_cache)
             self.assertEqual(kwargs["crossfit_seed"], cfg.seed)
             self.assertEqual(kwargs["fit_config"].weight_decay, 0.0005)
+            self.assertEqual(kwargs["warm_start_min_epochs_per_fold"], 10)
+            self.assertEqual(kwargs["validation_interval_epochs"], 2.)
+            self.assertEqual(kwargs["validation_patience_epochs"], 10.)
             self.assertNotIn("resume_state", kwargs)
             kwargs["progress_callback"]({"iteration": 1.0, "step": 10.0})
             return fit_result

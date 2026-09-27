@@ -1,0 +1,42 @@
+extends_overlay: dgpo_h4_classifier_representation.yaml
+
+experiment:
+  protocol: h4-representation-path-v1
+  diagnostic_parent_run: h4clfrep1
+  baseline_measurement: h4clfrep1_step1110_clean_validation
+  intervention: detached_raw_normalized_fourier_and_nested_ridge_readouts_only
+  single_question: Where along the Fourier path does linear readability change?
+  primary_decision_rule: >-
+    Compare raw Fourier, input LayerNorm, encoder, concat and fusion on identical
+    context-disjoint holdout rows at updates 0, 10, 50, 100, 200 and 400.
+    Retain fixed lambda=1. Select additional ridge lambda only with two-fold CV
+    inside the readout-fit partition; never tune on outer holdout or final test.
+    These are descriptive probes, not evidence of causal information deletion.
+    Preserve model, initialization, optimizer, seeds, data and stopping.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_representation_path/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_classifier_representation.py --path-readouts
+
+logger:
+  local:
+    name: h4_classifier_representation_path
+    version: h4_classifier_representation_path_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_representation_path/logs
+  wandb:
+    id: h4clfpath1
+    resume: never
+    run_name: Where is the signal hard to read? | H4 Fourier path | nested ridge | step-1110
+    tags: [ClassifierOnly, NoPolicyUpdate, H4, SixteenGPU, ConstantLR, RepresentationPath, CleanValidation]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_representation_path/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      representation_path_enabled: true
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_representation_path/diagnostic_snapshots

@@ -1,0 +1,141 @@
+# Matched reference-dynamics arm for h4rep01.  Every ten policy updates, fit a
+# new saturated H4 density-ratio estimator on the current policy and install
+# that same policy as its paired velocity-MSE reference.  The H4 score,
+# calibrated LOO loss, coefficient-1 reference formula, and native AdamW are
+# unchanged.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_gradient_transfer_seed2_replication_20step.yaml
+
+experiment:
+  protocol: h4-saturated-refit10-keepadam-50step-v1
+  single_experimental_change: paired_h4_reward_reference_refresh_every_10_updates
+  single_question: >-
+    Does a mathematically paired saturated-H4 refit and reference recenter every
+    ten committed policy updates prevent the growing reference gradient from
+    canceling H4 and produce a more stable late-window cold-H4 closure than the
+    matched fixed-reward h4rep01 control?
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4rep01
+  historical_reference_runs:
+    - ytchou97-university-of-washington/nu2flow-RL/h4xfer01
+    - ytchou97-university-of-washington/nu2flow-RL/h4xfer02
+    - ytchou97-university-of-washington/nu2flow-RL/h4b70c50
+  rounds: 5
+  policy_updates_per_round: 10
+  reward_lifetime_updates: 10
+  reward_refresh_steps: [0, 10, 20, 30, 40]
+  audit_steps: [0, 10, 20, 30, 40, 50]
+  endpoint_global_step: 50
+  endpoint_selection: fixed_step_50
+  reward_members: 4
+  audit_repeats: 1
+  applied_objective_changed: false
+  h4_reward_formula_changed: false
+  reference_formula_changed: false
+  reference_anchor_dynamics_changed: true
+  applied_reference_trust_coefficient: 1.0
+  gradient_trace_update_end_steps: [1, 2, 5, 10, 20, 30, 40, 50]
+  cold_h4_audit_policy_steps: [0, 10, 20, 30, 40, 50]
+  cold_h4_audit_min_optimizer_updates: 1000
+  primary_endpoint: late_window_mean_staleness_raw_auc_gap
+  primary_decision_rule: >-
+    The arm passes within-run closure when mean(gap30,gap40,gap50)-gap0 is
+    negative and every contributing audit is cold, saturated, and trained for
+    at least 1000 optimizer updates.  After h4rep01 finishes, stability is
+    compared descriptively by total variation and worst excursion on the same
+    six fixed boundaries.  Intermediate monotonicity is not required.
+
+nersc:
+  reproducibility:
+    note: >-
+      Matched parallel arm for h4rep01 from the same c4a91e07 step-1110
+      weights-only source and the same independent seed2 bundle.  H4
+      architecture, 2x2 ensemble, K=8 calibrated leave-one-out objective,
+      ESS15 tempering, coefficient-1 velocity-MSE reference, native AdamW,
+      policy LR, audit panel, and fifty-update endpoint are fixed.  The only
+      applied change is a selection-blind ten-update outer loop: at steps
+      10/20/30/40, a fresh saturated H4 reward and its exact current-policy
+      denominator/reference are installed together.  AdamW moments and its LR
+      clock remain continuous.  No reference-only recenter, hard boundary,
+      projection, rollback, reward transformation, or early stopping is used.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_saturated_refit10_keepadam_50step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_saturated_refit10.py
+
+logger:
+  local:
+    name: c4a91e07_h4_saturated_refit10_keepadam_50step_v1
+    version: h4_saturated_refit10_keepadam_50step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_saturated_refit10_keepadam_50step_v1/logs
+  wandb:
+    id: h4ref10
+    run_name: c4a91e07_h4_saturated_refit10_keepadam_50step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - ReferenceDynamics
+      - MatchedH4rep01
+      - SeedBundle2
+      - SourceC4a91e07Step1110
+      - SaturatedH4EveryRound
+      - FourMemberEnsemble
+      - RefitEvery10Updates
+      - PairedRewardReferenceInstall
+      - ContinuousPolicyAdamW
+      - ReferenceCoefficientOne
+      - RawCalibratedLOO
+      - ESSTarget15pct
+      - ColdSaturatedH4Audit
+      - ExactProductionGradientTrace
+      - NoReferenceOnlyRecenter
+      - NoHardTrust
+      - NoProjection
+      - NoRollback
+      - LiveWandb
+
+options:
+  Training:
+    total_epochs: 5
+    epochs: 5
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_saturated_refit10_keepadam_50step_v1/checkpoints
+
+dgpo:
+  gradient_transfer_trace:
+    enabled: true
+    update_end_steps: [1, 2, 5, 10, 20, 30, 40, 50]
+    counterfactual_trust_coefficients: [0.0, 0.1, 0.2, 0.5, 1.0]
+    norm_floor: 1.0e-12
+  gradient_conflict:
+    enabled: true
+    monitor_refit_lifecycle: true
+    every_n_steps: 10
+  adaptive_omnifold:
+    trigger:
+      # The cadence is fixed before the run.  Cold audits measure the trajectory
+      # and never trigger, delay, accept, or reject a refresh.
+      fixed_schedule_skip_staleness_audit: true
+      fixed_schedule_log_raw_audit: true
+      max_reward_age_epochs: 1
+      warm_start_classifier: false
+      require_audit_saturation: true
+      rollback_to_best_on_plateau: false
+    audit_fit:
+      min_steps: 1000
+      require_saturation: false
+      fail_if_unsaturated: true
+      disjoint_final_audit: true
+      checkpoint_selection_metric: balanced_accuracy
+      repeats: 1
+      repeat_seed_stride: 104729
+    recalibration:
+      max_reward_rounds: 5
+      reset_optimizer_state_on_install: false
+      reset_adam_first_moment_on_install: false
+      scheduled_refit_fail_closed: true
+      fit:
+        min_steps_per_fold: 1000
+        require_saturation: true
+        minimum_sufficient_balanced_accuracy: null
+        minimum_sufficient_confidence_z: 0.0
+        minimum_sufficient_required_consecutive: 1

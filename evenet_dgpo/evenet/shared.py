@@ -133,7 +133,7 @@ def register_dataset(
             "num_cpus": 0.5,
         },
         # Disable file-level shuffling for inference
-        shuffle="files" if file_shuffling else None,
+        shuffle=("files" if file_shuffling and not platform_info.get("ordered_data", False) else None),
     )
 
     total_events = total_rows

@@ -37,6 +37,9 @@ class Normalizer(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: Tensor, mask: Tensor = None) -> Tensor:
+        return self.forward_grad(x, mask)
+
+    def forward_grad(self, x: Tensor, mask: Tensor = None) -> Tensor:
         """
         :param x: input point cloud (batch_size, num_objects, num_features)
         :param mask: mask for point cloud (batch_size, num_objects)

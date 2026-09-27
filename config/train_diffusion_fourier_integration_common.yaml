@@ -1,0 +1,91 @@
+# The launcher reads the shared source checkpoint below; CLI override is optional.
+extends_overlay: train_diffusion_angular_10pct_nersc.yaml
+
+experiment:
+  question: Can Fourier improve velocity prediction when added to a trained no-Fourier model?
+  source_wandb_run: ytchou97-university-of-washington/EveNet/bvp5rn76
+  source_stage: trained_no_fourier_diffusion
+  checkpoint_protocol: identical_raw_weights_fresh_optimizer_scheduler
+  interpretation: >-
+    Start every arm from the same trained 10pct no-Fourier raw checkpoint.
+    All backbones remain trainable. The primary comparison is parallel matched
+    continuation with no Fourier (none) versus the existing input Fourier branch.
+    input_slow and input_fast change only the Fourier learning rate.
+    The output adapter is a separate optional architecture follow-up.
+  primary_endpoint: mean_val_loss_last_5_epochs_at_fixed_50_epoch_budget
+
+platform:
+  ordered_data: true
+
+logger:
+  wandb:
+    project: EveNet
+    id: null
+    group: Fourier pretrained continuation
+    tags: [Ztautau, Diffusion, FourierIntegration, RawWeights, Data10pct, GPU16]
+
+options:
+  Training:
+    # Best raw 10pct no-Fourier diffusion checkpoint from bvp5rn76.
+    pretrain_model_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/epoch=190_train=0.1381_val=0.1263.ckpt
+    model_checkpoint_load_path: null
+    strict_no_fourier_source: true
+    paired_diffusion_seed: 420024
+    seed: 42
+    epochs: 50
+    total_epochs: 50
+    learning_rate_warm_up_factor: 5.0
+    scale_lr_with_world_size: false
+    learning_rate_factor: 1.0
+    learning_rate: 0.0001
+    learning_rate_body: 0.00002
+    learning_rate_median: 0.00002
+    freeze_modules: []
+    model_checkpoint_save_top_k: 3
+    log_gradient_step: 100
+    diffusion_every_n_epochs: 1000
+    eval_metrics_every_n_epochs: 1000
+    EarlyStopping:
+      patience: 51
+      min_delta: 0.0
+    EMA:
+      enable: false
+      replace_model_after_load: false
+      replace_model_at_end: false
+      use_ema_during_training_eval: false
+      use_for_generation: false
+    Components:
+      PET:
+        learning_rate: 0.00002
+      GlobalEmbedding:
+        learning_rate: 0.00002
+      ObjectEncoder:
+        learning_rate: 0.00002
+      GroupedSequentialEmbedding:
+        learning_rate: 0.0001
+      InvisibleInputProjector:
+        learning_rate: 0.0001
+      TruthGeneration:
+        learning_rate: 0.0001
+        low_noise_cutoff: 0.0
+        low_noise_weight: 1.0
+      # Separate ownership prevents the branch being updated twice via PET.
+      # The input control matches PET's LR; slow/fast overlays vary this alone.
+      PET.angular_conditioning:
+        optimizer_group: fourier
+        optimizer_type: adamW
+        learning_rate: 0.00002
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        warm_up: true
+
+network:
+  Body:
+    PET:
+      dropout: 0.1
+      drop_probability: 0.1
+    GlobalEmbedding:
+      dropout: 0.1
+  TruthGeneration:
+    dropout: 0.1
+    drop_probability: 0.1

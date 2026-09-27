@@ -1,0 +1,10 @@
+# Fixed-checkpoint evaluation only; run on one GPU through Shifter.
+source_run: ytchou97-university-of-washington/EveNet/s93qlh9m
+runtime_config: /pscratch/sd/y/yiren/Ztautau/fourier_integration/seed42/input_fast/runtime.yaml
+checkpoint: /pscratch/sd/y/yiren/Ztautau/fourier_integration/seed42/input_fast/checkpoints/last.ckpt
+output_dir: /pscratch/sd/y/yiren/Ztautau/fourier_scale_diagnostic/s93qlh9m
+scales: [0.0, 0.5, 1.0, 2.0]
+noise_seeds: [420024, 420025, 420026]
+max_events: 8192
+batch_size: 256
+device: cuda

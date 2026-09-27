@@ -1,0 +1,27 @@
+extends_overlay: train_diffusion_fourier_integration_common.yaml
+experiment:
+  intervention: noisy_token_fourier_cross_attention_k4
+  comparison_runs:
+    input_linear: ytchou97-university-of-washington/EveNet/98q3imcl
+    none: ytchou97-university-of-washington/EveNet/mpvmx945
+  interpretation: >-
+    Independent visible Fourier memory is read by noisy invisible PET output
+    tokens, with diffusion time in the queries. Add the zero-initialized
+    readout only to invisible tokens before the generation head. All backbone
+    parameters remain trainable. Compare with readout_multiscale to isolate
+    bandwidth at identical parameter count; comparison with input_linear tests
+    the entire new fusion architecture, not a capacity-matched intervention.
+logger:
+  wandb:
+    run_name: "Direct Fourier readout | noisy tokens | harmonics 1,2,3,4"
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        enabled: true
+        placement: output
+        projection_type: cross_attention
+        mlp_dim: 128
+        attention_heads: 4
+        harmonics: [1, 2, 3, 4]
+        log_diagnostics: true

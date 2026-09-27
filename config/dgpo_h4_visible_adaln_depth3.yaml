@@ -1,0 +1,131 @@
+# Fresh DGPO from original raw step1110; preserve the older source configs.
+extends_overlay: dgpo_h4_visible_adaln.yaml
+
+network:
+  TruthGeneration:
+    num_layers: 3
+    # Zero-based: load block 0; append identity-initialized blocks 1 and 2.
+    identity_init_from_layer: 1
+
+options:
+  Training:
+    epochs: 1500
+    total_epochs: 1500
+    pretrain_model_load_path: null
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln_depth3_1110/checkpoints
+
+reward_config:
+  omnifold:
+    # User-confirmed: classifier body comes from before DGPO, NOT policy step1110.
+    # OmniFold and cold audit use this shared builder source with fresh heads.
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    bootstrap_in_dgpo: true
+    bundle_file: null
+
+dgpo:
+  checkpoint_load_mode: weights_only
+  auto_resume_from_last: false
+  unbounded_training: false
+  # Only the two newly attached policy branches learn faster. Classifier LR
+  # and all pretrained parent-module LRs remain unchanged.
+  conditioning_learning_rates:
+    angular_conditioning: 1.0e-4
+    visible_conditioning: 1.0e-4
+  lr_schedule:
+    type: cosine
+    total_epochs: 1500
+    # Clear the inherited 1500-STEPS setting. At 10 steps/logical epoch,
+    # this schedule spans 15000 policy updates, not 1500 updates.
+    total_steps: null
+    min_lr_ratio: 0.1
+    groups: [angular_conditioning, visible_conditioning]
+  adaptive_omnifold:
+    recalibration:
+      decoder_layers: 3
+      train_backbone: false
+      train_last_pet_block: true
+      train_encoder: false
+      train_layernorm: false
+      train_grouped_sequential_embedding: false
+      train_invisible_projector: true
+      train_angular_conditioning: true
+    audit_fit:
+      # Fresh raw judge on the SAME repeat-1/fold-1 training identities as OmniFold.
+      # External validation is split 50/50 into early-stop and final-test events.
+      training_population: omnifold_fold
+      training_fold: 1
+      decoder_layers: 3
+      train_backbone: false
+      train_last_pet_block: true
+      train_encoder: false
+      train_layernorm: false
+      train_grouped_sequential_embedding: false
+      train_invisible_projector: true
+      train_angular_conditioning: true
+
+logger:
+  local:
+    name: h4-visible-adaln-depth3-1110
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln_depth3_1110/logs
+  wandb:
+    id: h4vad3s1110
+    run_name: "Can deeper conditioning unlock DGPO? | angle FiLM | three blocks | raw step 1110"
+    group: H4 nonlinear conditioning depth
+    tags: [DGPO, VisibleOnly, NonlinearAdaLN, Depth3, RawWeights, Step1110, VelocityMSE, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln_depth3_1110/ray_results
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    classifier_backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    note: >-
+      Original raw c4a91e07 step1110 source, NOT diffang10lr5e4. Weights-only:
+      reset policy step/epoch, optimizer, references and classifier state.
+      Classifier backbone separately loads the original pre-DGPO 10% diffusion
+      pretrain raw checkpoint; neither step1110 nor its fitted classifiers are
+      used as the classifier initializer. OmniFold and audit share that source.
+      Keep the final classifier PET block trainable; freeze earlier PET blocks,
+      GlobalEmbedding and visible input embedding. Also train PET adapters, the
+      added angular Fourier branch, invisible projector, new visible nonlinear
+      FiLM, decoder and H4 heads. No blanket LayerNorm or full-backbone unfreeze.
+      TruthGeneration, fresh OmniFold and cold audit now have three blocks each.
+      Only appended diffusion residual output projections start at zero, with
+      unit LayerScale; all loaded weights remain untouched. The absent PET
+      angular projection and new visible modulation heads start at zero.
+      No EMA, truth leakage or restored old reward stack. Shared encoder,
+      harmonics and loss are unchanged. Only the two new policy branches use
+      separate 1e-4 LR groups, cosine-decaying to 1e-5 over 1500 logical policy
+      epochs. Other policy and classifier LRs are unchanged. Training is capped
+      at 1500 epochs; refits do not restart the scheduler.
+      Raw audit now trains on the fixed
+      OmniFold repeat-1/fold-1 population with fresh policy samples, not 60% of
+      the validation pool. External validation is split into disjoint early-stop
+      and final-test halves; patience uses the larger training population.
+      Both policy and classifier depth change: this tests the combined package,
+      not the causal effect of diffusion depth alone.
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_h4_visible_adaln_depth3.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln_depth3_1110/ray_results
+
+experiment:
+  protocol: h4-visible-nonlinear-adaln-depth3-1110
+  source_run: c4a91e07
+  source_policy_step: 1110
+  intervention: three_conditioned_blocks_in_policy_omnifold_and_audit
+  matched_configuration: null
+  architecture_reference: config/dgpo_h4_visible_adaln.yaml
+  single_question: Can three-block nonlinear conditioning in diffusion and H4 improve DGPO transfer from the raw step1110 policy?
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln_depth3_1110/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+  primary_decision_rule: >-
+    Compare cold-audit validation BCE and abs(AUC-0.5) at matched policy epochs,
+    checking fit convergence and train/validation gap. Audit capacity changes
+    against the older one-block runs, and their source checkpoints differ;
+    those runs are not matched depth controls or capacity-matched rulers.
+    Also track within-round fixed-reward gain, reference velocity MSE and ESS;
+    never compare absolute rewards across independently fitted critics.
+    This is a combined depth/initialization package, not isolated FiLM causality.

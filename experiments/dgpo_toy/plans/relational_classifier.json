@@ -1,0 +1,26 @@
+{
+  "schema": "relational_cube_v1",
+  "kind": "classifier",
+  "question": "Does relational input access explain the classifier Fourier advantage?",
+  "run_name": "Can the classifier read relations? | visible cube | raw vs particle vs relative",
+  "wandb_mode": "disabled",
+  "output": "artifacts/dgpo_toy/relational_access_v1/classifier",
+  "panels": "artifacts/dgpo_toy/reward_shape_failure_early1k_v1/round_0/baseline/cold_audit/baseline_panels.pt",
+  "swap_directory": "artifacts/dgpo_toy/conditioning_closed_loop_20260926/round05",
+  "representations": ["raw", "particle", "relative"],
+  "rotation_seed": 951083,
+  "fit": {
+    "seed": 83,
+    "width": 32,
+    "min_steps": 32000,
+    "max_steps": 64000,
+    "check_every": 100,
+    "patience": 20,
+    "min_delta": 0.0001
+  },
+  "bootstrap_repeats": 2000,
+  "material_bce_margin": 0.002,
+  "primary_endpoint": "Selected held-out balanced BCE: particle-minus-raw, relative-minus-raw and relative-minus-particle. Simultaneous paired IID-context intervals; exact min validation BCE selects weights. k=1..4 output Fourier fixed in every arm. Frozen A/B/C/D mode-shape swaps include the same three representation contrasts, each on B-minus-A, C-minus-A and D-minus-A (nine simultaneous descriptive intervals). Common-rotation invariance diagnoses content separately.",
+  "decision_rule": "All three fits must plateau after at least32k and no more than64k updates; otherwise unresolved. Material gain needs paired BCE upper95 < -0.002 and concordant increased AUC. Eligibility for RL additionally requires B-minus-A mode-content BCE contrast to raw upper95 < -0.002 and higher B AUC. That grid interval is descriptive, not IID population uncertainty. No automatic representation choice or RL launch. Summarize first; reviewer chooses particle or relative explicitly.",
+  "scope": "Same archived scalar c, truth y and source y, lifted to two unit visible vectors with independent uniform common rotation. No truth function, parity or mode ID enters learned models. C explicitly encodes a structural relation; it is a diagnostic prior, not prior-free discovery. k1 particle harmonics duplicate Cartesian components; C repeats its8 extras to match B's16-slot amplitude, not active rank. No new seeds, changed truth, capacity search, policy updates, remote work or uploads. This is a separately reviewed follow-on to the completed18-round campaign; that ledger and paused automation remain untouched."
+}

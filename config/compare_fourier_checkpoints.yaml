@@ -1,0 +1,86 @@
+# User-run evaluation on an EXISTING 16-GPU Ray allocation; generators never train.
+checkpoints:
+  baseline:
+    source_run: ytchou97-university-of-washington/EveNet/mpvmx945
+    runtime_config: /pscratch/sd/y/yiren/Ztautau/fourier_integration/seed42/none/runtime.yaml
+    checkpoint: /pscratch/sd/y/yiren/Ztautau/fourier_integration/seed42/none/checkpoints/last.ckpt
+  candidate:
+    source_run: ytchou97-university-of-washington/EveNet/snx80o90
+    runtime_config: /pscratch/sd/y/yiren/Ztautau/fourier_integration/seed42/readout_multiscale/runtime.yaml
+    checkpoint: /pscratch/sd/y/yiren/Ztautau/fourier_integration/seed42/readout_multiscale/checkpoints/last.ckpt
+# Compare the TWO CONFIGURED endpoints; resolve last.ckpt once and record actual
+# epoch/global_step. Epoch differences limit architecture-causal claims, not the
+# paired sample-quality comparison. Do not assume last.ckpt means epoch49.
+# Optional latest_common scans both directories for a matched epoch/update count
+# and fails if no such saved pair exists (training retains only the best three).
+checkpoint_selection: configured
+expected_epoch: null
+# Each invocation gets an epoch + timestamp subdirectory, preserving failed runs.
+output_dir: /pscratch/sd/y/yiren/Ztautau/fourier_checkpoint_comparison/none_vs_multiscale_16gpu
+workers: 16
+# null uses the shared generator validation directory, already used for model selection.
+# An explicit independent test parquet directory can be supplied here instead.
+evaluation_data_dir: null
+panel_events: 32768
+panel_seed: 20260924
+split_seed: 20260925
+noise_seed: 20260926
+candidates_per_event: 4
+# The FIRST unselected conditional draw is used by H4 (K=1), all draws by physics.
+ddim_steps: 100
+sampler: stable_v
+generation_batch_size: 256
+score_batch_size: 256
+device: cuda
+classifier_seeds: [31415, 31416, 31417]
+# Both judges start from this common backbone, never from their tested generators.
+classifier_backbone: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/epoch=190_train=0.1381_val=0.1263.ckpt
+classifier:
+  adapter_bottleneck: 16
+  train_backbone: false
+  train_grouped_sequential_embedding: true
+  train_invisible_projector: true
+  asymmetric_attention: true
+  head_dropout: 0.15
+  decoder_hidden_dim: 128
+  decoder_layers: 1
+  decoder_heads: 4
+  periodic_pair_features: true
+  topology_fourier_embedding: true
+  topology_max_harmonic: 4
+  topology_conditioning: false
+  topology_include_theta_pair: false
+  visible_pair_rest_frame: false
+  topology_hidden_dim: 64
+  topology_embedding_dim: 32
+  topology_fusion_hidden_dim: 64
+  topology_dropout: 0.15
+classifier_fit:
+  steps: 5000
+  min_steps: 1000
+  batch_size: 512  # GLOBAL per class: 32 per rank on 16 GPUs; LR unchanged.
+  drop_last_batch: true  # Equal-size shards; reshuffle before the next epoch.
+  train_microbatch_size_per_rank: 128
+  learning_rate: 0.0002
+  backbone_learning_rate: 0.00001
+  weight_decay: 0.0005
+  gradient_clip_norm: 5.0
+  sampling: independent_epoch_shuffle
+  validation_interval_steps: 50
+  validation_patience_evaluations: 15
+  validation_min_delta: 0.0001
+  validation_batch_size: 256
+  restore_best: true
+  checkpoint_selection_metric: loss
+  # Return capped fits for inspection, but exclude them from the scientific decision.
+  require_saturation: false
+  progress_interval_steps: 50
+bootstrap_replicates: 500
+bootstrap_seed: 20260927
+material_auc_gap: 0.005
+wandb:
+  enabled: true
+  entity: ytchou97-university-of-washington
+  project: EveNet
+  group: Fourier checkpoint evaluation
+  name: "Does Fourier improve generation? | paired checkpoints | cold H4 audits"

@@ -1,0 +1,58 @@
+# Treatment arm: preserve the native AdamW direction and moments, then apply
+# the same proposal at exactly 3e-5 full-parameter RMS.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_ba55_m2_adamw_native_1step.yaml
+
+experiment:
+  arm: rms_calibrated_adamw
+  paired_run_id: ba55nat1
+  target_parameter_update_rms: 3.0e-5
+
+nersc:
+  reproducibility:
+    note: >-
+      Treatment paired to ba55nat1. The only training-affecting change is a
+      common scalar on the complete native AdamW proposal so its realized
+      full-parameter RMS is exactly 3e-5. AdamW moments, per-parameter
+      preconditioning, weight decay, gradient, reward, candidates, reference,
+      and mathematical DGPO objective are unchanged.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_rms3e5_1step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_ba55_rms_calibration.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_ba55_m2_adamw_rms3e5_1step.yaml
+
+logger:
+  local:
+    name: h4_ba55_m2_adamw_rms3e5_1step
+    version: h4_ba55_m2_adamw_rms3e5_1step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_rms3e5_1step_v1/logs
+  wandb:
+    id: ba55rms1
+    run_name: RMS-calibrated AdamW at 3e-5 | BA55 two-fold H4 | cold H4 audit
+    group: H4 policy projection
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - BA55
+      - TwoFoldOneRepeat
+      - AdamWRmsCalibration
+      - TargetRms3e5
+      - OnePolicyUpdate
+      - ColdSaturatedH4Endpoint
+      - TargetPreserving
+      - NoHardTrust
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_rms3e5_1step_v1/checkpoints
+
+dgpo:
+  parameter_update_rms_calibration:
+    enabled: true
+    target_rms: 3.0e-5
+    minimum_scale: 1.0
+    maximum_scale: 100.0

@@ -1,0 +1,64 @@
+# Weights-only fine-tuning; do NOT pass --resume_checkpoint.
+extends_overlay: train_diffusion_angular_10pct_nersc.yaml
+
+experiment:
+  question: Can higher learning rates improve the trained angular diffusion?
+  intervention: higher_lr_fresh_adamw_five_epoch_warmup_cosine_200_epochs
+  checkpoint_protocol: raw_weights_only_fresh_optimizer_scheduler_epoch_zero
+  source_stage: angular_diffusion_best_epoch390
+  parent_wandb_run: diffang10r130
+  interpretation: Tests additional optimization headroom, not a matched Fourier architecture ablation.
+
+logger:
+  wandb:
+    id: diffang10lr1
+    run_name: "Higher learning rate | Fourier diffusion 10% | 200 epochs | epoch 390 weights"
+    group: Diffusion angular conditioning
+    tags: [Ztautau, Diffusion, FineTune, VisibleAngularFourier, Float32, RawWeights, Data10pct, GPU16, HigherLR, CosineDecay]
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_highlr/logs
+    name: diffusion-angular-highlr
+    version: v1
+
+options:
+  Training:
+    pretrain_model_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_resume130/checkpoints/epoch=390_train=0.1764_val=0.1745.ckpt
+    model_checkpoint_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_highlr/checkpoints
+    epochs: 200
+    total_epochs: 200
+    learning_rate_warm_up_factor: 5.0
+    scale_lr_with_world_size: false
+    learning_rate: 0.0002
+    learning_rate_body: 0.0001
+    learning_rate_median: 0.0001
+    Components:
+      PET:
+        learning_rate: 0.0001
+        warm_up: true
+      GlobalEmbedding:
+        learning_rate: 0.0001
+        warm_up: true
+      ObjectEncoder:
+        learning_rate: 0.0001
+        warm_up: true
+      GroupedSequentialEmbedding:
+        learning_rate: 0.0002
+        warm_up: true
+      InvisibleInputProjector:
+        learning_rate: 0.0002
+        warm_up: true
+      TruthGeneration:
+        learning_rate: 0.0002
+        warm_up: true
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_highlr/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_angular_10pct_highlr.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_highlr/ray_results

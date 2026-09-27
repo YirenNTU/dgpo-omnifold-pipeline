@@ -1,0 +1,51 @@
+extends_overlay: dgpo_h4_scale_standardized_long.yaml
+
+experiment:
+  protocol: h4-pair-token-v1
+  single_question: Can pair features learn stably as a decoder token without a separate Fourier encoder?
+  intervention: pair_token_replaces_fourier_encoder_standardizer_and_late_fusion
+  diagnostic_parent_run: h4ratio1
+  baseline_measurement: h4ratio1_and_h4scls1-retry1
+  primary_endpoint: mean_validation_bce_at_shared_steps_200_to_300
+  primary_decision_rule: Compare early BCE within +0.01 of standardized control; report full clipping and BCE rebound histories before any stability claim.
+  inference_scope: Single-seed classifier architecture pilot on fixed policy; no DGPO or across-seed stability claim.
+  truth_pool: clean_validation_20pct
+  dataset_fraction: 0.1
+  dataset_fraction_scope: policy_training_lineage_only
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_pair_token/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_pair_token.py
+
+logger:
+  local:
+    name: h4_pair_token
+    version: h4_pair_token_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_pair_token/logs
+  wandb:
+    id: h4pair01
+    resume: never
+    run_name: Can pair tokens stabilize learning? | H4 decoder input | step-1110 classifier
+    group: H4 feature fusion
+    tags: [ClassifierOnly, NoPolicyUpdate, H4, PairToken, CleanValidation, SixteenGPU]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_pair_token/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    recalibration:
+      topology_pair_token: true
+      topology_fourier_embedding: false
+    audit_fit:
+      topology_pair_token: true
+      topology_fourier_embedding: false
+      fourier_output_standardization: false
+      validation_min_delta: 0.001
+      representation_path_enabled: false
+      representation_export_dir: null
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_pair_token/diagnostic_snapshots
+      ratio_audit_export_dir: /pscratch/sd/y/yiren/Ztautau/h4_pair_token/ratio_audit

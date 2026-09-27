@@ -1,0 +1,457 @@
+# Next-round dual-classifier experiment: weak/bulk reward, strong monitor-only.
+# Pinned-inherit d17994d9 epoch=-1 OmniFold/raw-monitor stack; keep its still-
+# cold diffusion-pretrain policy, then restart clocks/optimizer under the new
+# round-rollback / no-hard-trust controller.
+nersc:
+  reproducibility:
+    diffusion_pretrain_fraction: 0.1
+    dgpo_training_fraction: 0.1
+    classifier_backbone_protocol: matched_10pct_pretrain
+    note: First start pinned-inherits d17994d9 dgpo-epoch=-1-next_ep=0-step=0.ckpt
+      (diffusion-pretrain policy plus that run's installed dual-classifier
+      OmniFold reward folds and raw monitor). Do not load d17994d9 last.ckpt.
+      A smooth legacy width-128 one-layer classifier supplies the bounded DGPO
+      density-ratio reward; an independent width-128 two-layer
+      Fourier/topology/visible-rest classifier is monitor-only. Fit up to 10
+      saturated legacy residuals and stop at the first held-out residual AUC <=
+      0.52; that closure-only classifier is not installed. No cold OmniFold
+      bootstrap on start. Residual 1 searches the largest alpha in [0.10,0.75]
+      and may restore an earlier within-fit validation snapshot so
+      train/validation ESS/N >= 0.30; later residuals warm-start inherit the
+      previous classifier and reuse that residual-1 alpha (no independent raise).
+      Reward log-ratio stays clipped sequentially to [-2.5,2.5]. Reference-trust
+      keeps only its coefficient-0.2 soft objective; the hard adaptive boundary
+      is disabled because d17994d9 rejected 77.8% of policy steps. Raw rollback
+      is scoped to each installed reward round so later plateaus cannot return
+      to the original step-5 global best. Raw patience is 4 before step 100 and
+      8 thereafter. beta_kl=0. Fresh optimizer/clocks/global best;
+      auto-resume only this output.
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_dual_classifier_inheritalpha_ess30_t075_trust02_pretrain_seed42/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+    source_dgpo_global_step: 0
+    source_epoch: -1
+    source_next_epoch: 0
+    source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/d17994d9
+    source_classifier_wandb_run: ytchou97-university-of-washington/nu2flow-RL/d17994d9
+    source_classifier_epoch: -1
+    source_classifier_next_epoch: 0
+    source_classifier_global_step: 0
+    control_overlay: config/dgpo_omnifold_ztautau_10pct_iteration1_only.yaml
+    diagnostic_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c3b347fe4eea
+    source_policy_sha256: null
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_dual_classifier_roundrollback_nohardtrust_ess30_t075_trust02_pretrain_seed42/ray_results
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: shifter python3 scripts/train_dgpo_iteration_one_tempered.py --config
+      config/dgpo_omnifold_ztautau_10pct_dual_classifier_t075_trust02_step260.yaml
+platform:
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  batch_size: 512
+  number_of_workers: 16
+  use_gpu: true
+  resources_per_worker:
+    CPU: 15
+    GPU: 1
+logger:
+  wandb:
+    profile: critical
+    classifier_loss_curves: true
+    simplified: true
+    resume: allow
+    fresh_run: false
+    id: b7f316a4
+    project: nu2flow-RL
+    entity: ytchou97-university-of-washington
+    run_name: dgpo_omnifold_10pct_dual_classifier_roundrollback_nohardtrust_ess30_t075_trust02_pretrain_seed42
+    tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - ScalingLawAllData10pct
+    - ArchitectureAblation
+    - fourier_conditioning
+    - VisiblePairRestFrameV3Compact8
+    - InitialRawPatience4
+    - RawPatience8AfterStep100
+    - PinnedClassifierRestart
+    - InheritD17994d9EpochMinus1Stack
+    - FreshClockOptimizerGlobalBest
+    - FixedClassifierInputCache
+    - PerFitLossCurves
+    - OmniFoldWarmStartIteration1Base
+    - AllIterationsSameTrainableScopeAndLR
+    - OOFAndValidationWeightConcentration
+    - ResidualTempering075
+    - ResidualFullIteration1WarmStart
+    - RoundBestRollback
+    - RawMinDelta005
+    - AutoResumeFromLast
+    - BetaKLZero
+    - GradientRefitLifecycle
+    - RawMonitorWarmStart
+    - TrustCoefficient02
+    - NoHardTrustBoundary
+    - DualClassifier
+    - LegacyBulkRewardClassifier
+    - StrongFourierRestMonitorOnly
+    - RewardDecoder128Layers1Heads4Dropout15
+    - MonitorDecoder128Layers2Heads4Dropout15
+    - BoundedLogRatioClip2p5
+    - MinimumESSFraction030
+    - AdaptiveAlphaTargetESS030
+    - InheritPreviousAlpha
+    - ESSAwareFirstResidualOnly
+    - ResidualMax10ClosureAUC052
+    - PerIterationESSGuard
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_dual_classifier_roundrollback_nohardtrust_ess30_t075_trust02_pretrain_seed42/logs
+    name: dgpo_omnifold_10pct_dual_classifier_roundrollback_nohardtrust_ess30_t075_trust02_pretrain_seed42
+    version: dual_legacyreward_strongmonitor_roundrollback_nohardtrust_ess30_clip25_patience4to8_pininherit_pretrain
+options:
+  Dataset:
+    dataset_limit: 1.0
+    val_dataset_limit: 1.0
+  Training:
+    total_epochs: 150
+    epochs: 150
+    weight_decay: 0.001
+    decoupled_weight_decay: true
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_dual_classifier_inheritalpha_ess30_t075_trust02_pretrain_seed42/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+    pretrain_model_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_dual_classifier_roundrollback_nohardtrust_ess30_t075_trust02_pretrain_seed42/checkpoints
+    model_checkpoint_save_top_k: 0
+    Components:
+      InvisibleInputProjector:
+        weight_decay: 0.001
+      GroupedSequentialEmbedding:
+        weight_decay: 0.001
+      GlobalEmbedding:
+        weight_decay: 0.001
+      PET:
+        weight_decay: 0.001
+      TruthGeneration:
+        weight_decay: 0.001
+      ObjectEncoder:
+        freeze:
+          type: full
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+    EMA:
+      replace_model_after_load: false
+      use_for_generation: false
+network:
+  Body:
+    GroupedSequentialEmbedding:
+      dropout: 0.0
+    GlobalEmbedding:
+      dropout: 0.0
+    PET:
+      feature_drop: 0.0
+      dropout: 0.0
+      drop_probability: 0.0
+  TruthGeneration:
+    feature_drop: 0.0
+    dropout: 0.0
+    drop_probability: 0.0
+rl:
+  enabled: true
+reward_config:
+  type: omnifold
+  weight: 1.0
+  omnifold:
+    bootstrap_in_dgpo: true
+    bundle_file: null
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+ztautau_domain:
+  enabled: true
+  feature_names:
+  - theta
+  - phi
+  token_sources:
+    event_token: event_token
+    object_token: object_token
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1.0
+    target_delta_phi_to_pi: 0.0
+dgpo:
+  auto_resume_from_last: true
+  auto_resume_best_source_checkpoint_dir: null
+  best_source_start_new_experiment: false
+  auto_resume_fallback_checkpoint_path: null
+  checkpoint_load_mode: resume
+  pinned_classifier_restart: true
+  global_best_checkpoint_search_dirs: []
+  lr_schedule:
+    type: cosine
+    total_steps: 1500
+    min_lr_ratio: 0.1
+  require_deterministic_policy: true
+  float32_matmul_precision: medium
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  beta: 1.0
+  beta_kl: 0.0
+  adv_clip_max: null
+  grad_clip_norm: 1.0
+  gradient_conflict:
+    monitor_refit_lifecycle: true
+    enabled: true
+    every_n_steps: 10
+    blocks: 8
+    events_per_block: 512
+    event_microbatch_size: 32
+    seed: 20260910
+    confidence: 0.95
+    min_split_cosine: 0.1
+    norm_floor: 1.0e-12
+  num_ddim_steps: 20
+  num_train_timesteps: 8
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  activation_checkpointing: true
+  policy_eval_event_microbatch_size: 128
+  policy_eval_parallel_timesteps: 1
+  rollout_parallel_chains: 4
+  sequential_vp_trust_backward: false
+  steps_per_epoch: 10
+  log_every: 1
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 1
+  reference_trust:
+    enabled: true
+    coefficient: 0.2
+    objective: velocity_mse
+    adaptive_boundary:
+      enabled: false
+      radius_mode: best_decay
+      distance: velocity_mse_ratio
+      delta_max: 0.1
+      delta_floor: 0.02
+      best_decay_factor: 0.9
+      warning_fraction: 0.9
+      reset_adam_first_moment_on_install: false
+      reset_adam_first_moment_on_zero_step: false
+      enforcement: post_step_backtracking
+      backtrack_factor: 0.5
+      max_backtracks: 8
+      probe_events_per_rank: 128
+      fixed_probe_per_reward_round: true
+      interior_fraction: 1.0
+      radius_calibration:
+        enabled: false
+        bidirectional: false
+        allow_expansion: false
+        cross_round_nonexpanding: false
+        scale_policy_lr: false
+        refit_on_exhaustion: false
+        round_acceptance_enabled: false
+        trajectory_search_enabled: false
+        signed_direction_probe:
+          enabled: false
+          recover_reverse_only: false
+        lookahead_extragradient:
+          enabled: false
+  variance_regularization:
+    enabled: false
+    weight: 0.0
+    features: null
+  projection_constraint:
+    type: none
+  validation_K: 16
+  validation_num_ddim_steps: 20
+  validation_batch_size: 512
+  validation_every_n_epochs: 5
+  validation_full_every_n_epochs: 5
+  validation_max_batches: 15
+  validation_compute_winrate: false
+  validation_log_batches: true
+  validation_rollout_parallel_chains: 8
+  train_dist_enabled: false
+  ztautau_metrics:
+    enabled: true
+    candidate_index: 0
+    bins: 60
+    log_images: false
+    image_observables:
+    - topology/cos_opening
+    - topology/delta_phi_to_pi
+  tarp:
+    enabled: false
+    profile: visible_acoplanarity
+    n_bins: 4
+    min_events: 500
+    arms:
+    - full
+    - rank_copula
+    n_null_assignments: 399
+    n_reference_trials: 8
+    seed: 20260820
+    alpha: 0.05
+    pooled_panel: true
+  adaptive_omnifold:
+    enabled: true
+    log_only: false
+    monitor_mode: raw_plateau_refit
+    single_pool_train_validation: true
+    single_pool_split_seed: 42
+    baseline_probe_on_start: true
+    fixed_audit_panel: true
+    cache_event_inputs: true
+    pool_generation_batch_size: 1024
+    staleness_every_n_epochs: 1
+    staleness_every_n_steps: 5
+    trigger:
+      raw_audit_enabled: true
+      warm_start_classifier: true
+      raw_improvement_min_delta: 0.005
+      best_scope: round
+      global_confirm_candidates: false
+      global_max_failed_rounds: 0
+      pause_patience_during_warmup: true
+      max_reward_age_epochs: null
+      required_consecutive_checks: 4
+      patience_schedule:
+      - start_step: 0
+        required_consecutive_checks: 4
+      - start_step: 100
+        required_consecutive_checks: 8
+      rollback_to_best_on_plateau: true
+      retrain_cooldown_epochs: 0
+      require_audit_saturation: true
+      power_alpha: 0.05
+      power_target: 0.8
+      probe_seed: 20260905
+      probe_max_events: 250000
+    classifier_trust:
+      enabled: false
+      probe_max_events: null
+    audit_fit:
+      training_readiness:
+        cold_start_min_epochs: 167
+        warm_start_min_epochs: 5
+      batch_size: 32768
+      train_microbatch_size_per_rank: 2048
+      drop_last_batch: true
+      learning_rate: 0.0002
+      weight_decay: 0.0005
+      gradient_clip_norm: 5.0
+      sampling: independent_epoch_shuffle
+      safety_max_epochs: null
+      min_steps: 0
+      min_epochs: 1
+      validation_interval_epochs: 2.0
+      validation_patience_epochs: 10.0
+      validation_min_delta: 0.0001
+      validation_batch_size: 2048
+      progress_every_n_steps: 10
+      restore_best: true
+      require_saturation: false
+      head_dropout: 0.15
+      decoder_hidden_dim: 128
+      decoder_layers: 2
+      decoder_heads: 4
+      periodic_pair_features: true
+      topology_fourier_embedding: true
+      topology_conditioning: true
+      visible_pair_rest_frame: true
+    recalibration:
+      reset_optimizer_state_on_install: true
+      policy_warmup_steps: 10
+      policy_warmup_start_factor: 0.1
+      warm_start_iterations:
+      - 1
+      warm_start_from_iteration_one: true
+      crossfit_partition: identity
+      candidates_per_event: 1
+      bootstrap_on_start: false
+      bootstrap_fail_closed: true
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      refit_once_id: ''
+      pool_events: null
+      score_pool_events: null
+      pool_selection_seed: 42
+      min_iterations: 1
+      max_iterations: 10
+      iteration_one_only: false
+      acceptance_audit_enabled: false
+      acceptance_max_balanced_accuracy: 0.51
+      topology_acceptance_audit_enabled: false
+      topology_acceptance_max_auc_gap: 0.005
+      topology_acceptance_repeats: 1
+      periodic_pair_features: true
+      topology_fourier_embedding: true
+      tempering: 0.75
+      adaptive_tempering:
+        enabled: true
+        target_ess_fraction: 0.3
+        minimum: 0.1
+        grid_steps: 14
+        inherit_previous: true
+      ess_aware_checkpoint_selection:
+        enabled: true
+        max_checkpoints: 16
+        first_residual_only: true
+      crossfit_folds: 2
+      residual_min_auc_gain: 0.02
+      residual_closure_schedule:
+      - start_step: 0
+        max_auc: 0.52
+      seed: 20260906
+      score_row_budget: 2048
+      adapter_bottleneck: 16
+      train_layernorm: false
+      train_encoder: false
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+      train_backbone: false
+      asymmetric_attention: true
+      decoder_hidden_dim: 128
+      decoder_layers: 2
+      decoder_heads: 4
+      head_dropout: 0.15
+      fit:
+        anomaly_detection_steps: 0
+        batch_size: 16384
+        train_microbatch_size_per_rank: 1024
+        drop_last_batch: true
+        learning_rate: 0.0002
+        later_iteration_train_mode: full
+        backbone_learning_rate: 1.0e-05
+        weight_decay: 0.0005
+        gradient_clip_norm: 5.0
+        sampling: independent_epoch_shuffle
+        safety_max_epochs: null
+        min_steps: 1
+        min_steps_per_fold: 1000
+        warm_start_min_epochs_per_fold: 10
+        min_epochs: 1
+        validation_interval_epochs: 2.0
+        validation_patience_epochs: 10.0
+        validation_min_delta: 0.0001
+        validation_batch_size: 2048
+        progress_every_n_steps: 10
+        restore_best: true
+        require_saturation: true
+      topology_conditioning: true
+      visible_pair_rest_frame: true
+      topology_max_harmonic: 4
+      topology_include_theta_pair: true
+      topology_hidden_dim: 64
+      topology_embedding_dim: 32
+      topology_dropout: 0.15
+      log_ratio_clip: 2.5
+      minimum_ess_fraction: 0.3
+      reward_classifier:
+        head_dropout: 0.15
+        decoder_hidden_dim: 128
+        decoder_layers: 1
+        decoder_heads: 4
+        periodic_pair_features: false
+        topology_fourier_embedding: false
+        topology_conditioning: false
+        visible_pair_rest_frame: false

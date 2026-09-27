@@ -1,0 +1,100 @@
+# Continue the exact h4xfer01 trajectory from step 20 through step 50.
+#
+# Full-state resume preserves policy, EMA, native AdamW moments, the installed
+# four-member H4 reward, its paired round reference, adaptive state, and clocks.
+# No bootstrap or refit is allowed. Cold saturated audits and exact gradient
+# telemetry are added at the three remaining ten-step boundaries.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_gradient_transfer_trace_20step.yaml
+
+experiment:
+  protocol: h4-gradient-transfer-trace-resume20-to50-v1
+  single_experimental_change: extend_same_fixed_reward_trajectory_step20_to50
+  single_question: >-
+    Is the h4xfer01 step-20 cold-H4 improvement persistent over the same fixed
+    reward trajectory, or is it a transient low point in an oscillation?
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4xfer01
+  continuation_of: ytchou97-university-of-washington/nu2flow-RL/h4xfer01
+  source_global_step: 20
+  source_reward_round_id: 1
+  rounds: 1
+  policy_updates_per_round: 50
+  continuation_policy_updates: 30
+  reward_lifetime_updates: 50
+  endpoint_selection: fixed_step_50
+  endpoint_global_step: 50
+  gradient_trace_update_end_steps: [30, 40, 50]
+  cold_h4_audit_policy_steps: [30, 40, 50]
+  primary_endpoint: late_window_mean_staleness_raw_auc_gap
+  primary_decision_rule: >-
+    Persistence passes if mean(gap30, gap40, gap50) is below the h4xfer01
+    paired step-0 gap 0.36228927164638947. Step-50 gap and monotonicity are
+    reported separately and do not replace the predeclared late-window mean.
+
+nersc:
+  reproducibility:
+    note: >-
+      Full-state continuation of h4xfer01 from its completed step-20 last.ckpt.
+      Policy, EMA, AdamW moments, installed four-member H4 reward, paired
+      coefficient-1 velocity-MSE reference, adaptive state, and clocks are
+      restored. The reward stays round 1 through step 50. No bootstrap, refit,
+      hard boundary, projection, or optimizer reset occurs. Cold saturated H4
+      audits and repaired exact gradient-transfer logging run at 30/40/50.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_resume20_to50_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_gradient_transfer_trace.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_gradient_transfer_trace_resume20_to50.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_gradient_transfer_trace_resume20_to50_v1
+    version: h4_gradient_transfer_trace_resume20_to50_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_resume20_to50_v1/logs
+  wandb:
+    id: h4xfer02
+    run_name: c4a91e07_h4_gradient_transfer_trace_resume20_to50_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - ContinueH4xfer01Step20
+      - PreserveFullDGPOState
+      - PreserveInstalledH4Reward
+      - FourMemberEnsemble
+      - FixedH4RewardThroughStep50
+      - ExactProductionGradientTrace
+      - NativeAdamWDisplacement
+      - ReferenceCoefficientOne
+      - CounterfactualLambdaReadOnly
+      - ColdSaturatedH4Audit
+      - NoBootstrap
+      - NoRefit
+      - NoOptimizerReset
+      - NoObjectiveChange
+      - NoHardTrust
+      - NoProjection
+      - LiveWandb
+
+options:
+  Training:
+    total_epochs: 5
+    epochs: 5
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_20step_v1/checkpoints/last.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_resume20_to50_v1/checkpoints
+
+dgpo:
+  auto_resume_from_last: true
+  auto_resume_fallback_checkpoint_path: null
+  checkpoint_load_mode: resume
+  gradient_transfer_trace:
+    enabled: true
+    update_end_steps: [30, 40, 50]
+    counterfactual_trust_coefficients: [0.0, 0.1, 0.2, 0.5, 1.0]
+    norm_floor: 1.0e-12
+  adaptive_omnifold:
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      max_reward_rounds: 1

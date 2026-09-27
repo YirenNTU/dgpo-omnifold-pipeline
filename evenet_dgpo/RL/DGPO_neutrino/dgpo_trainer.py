@@ -13,6 +13,7 @@ import copy
 import heapq
 import logging
 import math
+import re
 import os
 import sys
 import tempfile
@@ -32,6 +33,7 @@ import torch.nn.functional as F
 from scipy.spatial.distance import jensenshannon
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
+from evenet.utilities.fourier_integration import optimizer_parameters as module_optimizer_parameters
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -85,6 +87,12 @@ from RL.DGPO_neutrino.model_utils import (
     update_last_checkpoint_pointer,
     unwrap_for_state_dict,
 )
+from RL.DGPO_neutrino.endpoint_kl import (
+    CHECKPOINT_KEY as ENDPOINT_KL_CHECKPOINT_KEY,
+    EndpointKLConfig,
+    EndpointKLController,
+    validate_endpoint_protocol,
+)
 from RL.DGPO_neutrino.monitoring import (
     append_reference_prediction_arrays,
     paired_finite_truth_pred,
@@ -115,6 +123,17 @@ from RL.DGPO_neutrino.projection_cpo import (
     resolve_projection_constraint_config,
     snapshot_params,
     trainable_params_all_finite,
+)
+from RL.DGPO_neutrino.gradient_transfer import (
+    resolve_gradient_transfer_trace_config,
+    summarize_gradient_transfer,
+    trace_due as gradient_transfer_trace_due,
+)
+from RL.DGPO_neutrino.optimizer_transaction import (
+    assign_scaled_trainable_update_,
+    resolve_parameter_update_rms_calibration,
+    restore_adamw_state_from_transaction_,
+    snapshot_adamw_state_for_transaction,
 )
 from RL.DGPO_neutrino.rewards import (
     CalibrationMagnitudeReward,
@@ -1947,6 +1966,9 @@ def build_reward_aggregator(
         bootstrap_in_dgpo = bool(
             _dgpo_cfg_get(block, "bootstrap_in_dgpo", False)
         )
+        candidate_consensus = _dgpo_cfg_get(
+            block, "candidate_consensus", None
+        )
         if not backbone_checkpoint or (not bootstrap_in_dgpo and not bundle_file):
             raise ValueError(
                 "reward_config.type=omnifold requires omnifold.backbone_checkpoint "
@@ -1959,6 +1981,7 @@ def build_reward_aggregator(
             recal = _dgpo_cfg_get(adaptive_block, "recalibration", None)
             classifier_defaults = {
                 "adapter_bottleneck": 16,
+                "body_only_checkpoint": False,
                 "train_layernorm": False,
                 "train_encoder": False,
                 "train_grouped_sequential_embedding": False,
@@ -1967,12 +1990,17 @@ def build_reward_aggregator(
                 # mapping here, so omitting the key silently freezes the
                 # projector even when the YAML enables it.
                 "train_invisible_projector": False,
+                "train_angular_conditioning": False,
                 "train_backbone": False,
+                "train_last_pet_block": False,
                 "asymmetric_attention": False,
                 "periodic_pair_features": False,
                 "topology_fourier_embedding": False,
+                "topology_direct_logit": False,
+                "topology_context_residual_scale": 1.0,
                 "topology_max_harmonic": 1,
                 "topology_include_theta_pair": False,
+                "topology_theta_fourier": False,
                 "topology_hidden_dim": 64,
                 "topology_embedding_dim": 32,
                 "topology_fusion_hidden_dim": 64,
@@ -1988,12 +2016,19 @@ def build_reward_aggregator(
             }
             if _dgpo_cfg_get(recal, "topology_conditioning", False):
                 classifier_config["topology_conditioning"] = True
+            if _dgpo_cfg_get(recal, "relation_token_count", 0):
+                classifier_config["relation_token_count"] = int(_dgpo_cfg_get(recal, "relation_token_count", 0))
+            if _dgpo_cfg_get(recal, "topology_pair_token", False):
+                classifier_config["topology_pair_token"] = True
+            if _dgpo_cfg_get(recal, "visible_pair_rest_frame", False):
+                classifier_config["visible_pair_rest_frame"] = True
             reward = build_uninstalled_ztautau_omnifold_reward(
                 backbone_checkpoint=backbone_checkpoint,
                 training_config=global_config,
                 normalization_dict=normalization_dict,
                 device=device,
                 classifier_config=classifier_config,
+                candidate_consensus=candidate_consensus,
             )
             _log.info(
                 "[DGPO/reward] OmniFold will fit and install its initial K=1 "
@@ -2013,6 +2048,7 @@ def build_reward_aggregator(
             expected_iterations=(
                 None if expected_iterations is None else int(expected_iterations)
             ),
+            candidate_consensus=candidate_consensus,
         )
         _log.info(
             "[DGPO/reward] using frozen Ztautau OmniFold reward: iterations=%s "
@@ -2812,6 +2848,38 @@ def _build_reward_extra_metrics(
         out["reward/raw/mean"] = float("nan")
         out["reward/raw/std"] = float("nan")
 
+    for source, _weight in reward_agg.sources:
+        interface_metrics = getattr(source, "last_interface_metrics", None)
+        if callable(interface_metrics):
+            out.update(interface_metrics())
+    interface_keys = sorted(
+        key
+        for key in out
+        if key.startswith(("reward_consensus/", "reward_rank_audit/"))
+    )
+    if interface_keys and dist.is_available() and dist.is_initialized():
+        # Every worker evaluates an equally sized fixed panel and live training
+        # batch. One packed collective exposes their finite scalar mean to the
+        # rank-0 W&B logger without gathering candidate tensors.
+        packed = torch.zeros(
+            (len(interface_keys), 2),
+            device=rewards.device,
+            dtype=torch.float64,
+        )
+        for index, key in enumerate(interface_keys):
+            value = float(out[key])
+            if math.isfinite(value):
+                packed[index, 0] = value
+                packed[index, 1] = 1.0
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        for index, key in enumerate(interface_keys):
+            count = float(packed[index, 1].item())
+            out[key] = (
+                float(packed[index, 0].item()) / count
+                if count > 0.0
+                else float("nan")
+            )
+
     if compact:
         return out
 
@@ -3516,9 +3584,19 @@ class _DgpoOptimizerWithSchedule:
             groups = list(warmup_groups or [True] * len(optimizer.param_groups))
             if len(groups) != len(optimizer.param_groups):
                 raise ValueError("cosine warmup group count mismatch")
+            selected_groups = cosine_config.get("groups")
+            group_names = [pg.get("group_name") for pg in optimizer.param_groups]
+            if selected_groups is not None and (
+                not isinstance(selected_groups, (list, tuple)) or not selected_groups
+                or any(not isinstance(name, str) for name in selected_groups)
+                or len(set(selected_groups)) != len(selected_groups)
+                or set(selected_groups) - set(group_names)
+            ):
+                raise ValueError("cosine groups must name distinct existing optimizer groups")
             self.cosine_state = {
                 "kind": "cosine", "total_steps": total, "min_lr_ratio": floor,
                 "warmup_steps": int(warmup_steps), "warmup_groups": groups,
+                "decay_groups": [selected_groups is None or name in selected_groups for name in group_names],
                 "start_step": int(warmup_steps),
                 "anchor_factors": [1.0] * len(groups),
             }
@@ -3533,6 +3611,8 @@ class _DgpoOptimizerWithSchedule:
         assert s is not None
         if step < s["warmup_steps"]:
             return step / s["warmup_steps"] if s["warmup_groups"][group] else 1.0
+        if not s["decay_groups"][group]:
+            return float(s["anchor_factors"][group])
         progress = min(1.0, max(0.0, (step - s["start_step"]) /
                                 (s["total_steps"] - s["start_step"])))
         factor = s["min_lr_ratio"] + (1 - s["min_lr_ratio"]) * .5 * (1 + math.cos(math.pi * progress))
@@ -3551,6 +3631,10 @@ class _DgpoOptimizerWithSchedule:
             for key in ("kind", "total_steps", "min_lr_ratio", "warmup_steps", "warmup_groups"):
                 if saved.get(key) != current[key]:
                     raise ValueError(f"cosine resume protocol mismatch: {key}")
+            # Older cosine checkpoints decayed every group.
+            saved_decay_groups = saved.get("decay_groups", [True] * len(self.param_groups))
+            if saved_decay_groups != current["decay_groups"]:
+                raise ValueError("cosine resume protocol mismatch: decay_groups")
             if not current["warmup_steps"] <= saved["start_step"] < current["total_steps"]:
                 raise ValueError("invalid saved cosine start_step")
             anchors = saved["anchor_factors"]
@@ -3559,6 +3643,7 @@ class _DgpoOptimizerWithSchedule:
             ):
                 raise ValueError("invalid saved cosine anchor_factors")
             self.cosine_state = dict(saved)
+            self.cosine_state["decay_groups"] = list(saved_decay_groups)
         else:
             # One-time migration from linear->constant: anchor at saved LR,
             # preserving Adam moments and scheduler clock with no LR jump.
@@ -3603,10 +3688,28 @@ class _DgpoOptimizerWithSchedule:
             result["lr_schedule"] = copy.deepcopy(self.cosine_state)
         return result
 
-    def load_state_dict(self, state: Any) -> None:
+    def load_state_dict(self, state: Any, *, use_config_lr_schedule: bool = False) -> None:
         # Resume Adam moments/LR scheduling, but take weight decay from the
         # current YAML. PyTorch otherwise silently restores the old group WD.
         configured_weight_decay = [float(pg["weight_decay"]) for pg in self.param_groups]
+        configured_base_lrs = list(self.scheduler.base_lrs)
+        if use_config_lr_schedule:
+            # Only the explicit startup resume opts in. Rollback/transaction
+            # restores still use the checkpoint's exact LR/scheduler state.
+            if self.cosine_state is None:
+                raise ValueError("resume_use_config requires a configured cosine schedule")
+            if not isinstance(state, dict) or "optimizer" not in state or "scheduler" not in state:
+                raise ValueError("resume_use_config requires optimizer and scheduler state")
+            saved_names = [pg.get("group_name") for pg in state["optimizer"]["param_groups"]]
+            current_names = [pg.get("group_name") for pg in self.param_groups]
+            if (saved_names != current_names or any(name is None for name in current_names)
+                    or len(set(current_names)) != len(current_names)):
+                raise ValueError("resume_use_config requires matching named optimizer groups in order")
+            if len(state["scheduler"].get("base_lrs", [])) != len(configured_base_lrs):
+                raise ValueError("resume_use_config scheduler group count mismatch")
+            saved_step = state["scheduler"].get("last_epoch")
+            if isinstance(saved_step, bool) or not isinstance(saved_step, int) or saved_step < 0:
+                raise ValueError("resume_use_config requires a valid saved scheduler clock")
         if self.cosine_state is not None and not (
             isinstance(state, dict) and "optimizer" in state and "scheduler" in state
         ):
@@ -3619,7 +3722,21 @@ class _DgpoOptimizerWithSchedule:
                 self.scheduler.load_state_dict(state["scheduler"])
             for pg, weight_decay in zip(self.param_groups, configured_weight_decay, strict=True):
                 pg["weight_decay"] = weight_decay
-            if self.cosine_state is not None:
+            if use_config_lr_schedule:
+                # New base rates/decay scope at the OLD absolute clock: never
+                # reset Adam moments, optimizer steps, warmup, or epoch count.
+                saved_lrs = [float(pg["lr"]) for pg in self.param_groups]
+                self.scheduler.base_lrs = configured_base_lrs
+                for pg, base in zip(self.param_groups, configured_base_lrs, strict=True):
+                    pg["initial_lr"] = base
+                self._apply_cosine_lr()
+                _log.info(
+                    "[DGPO] Explicit LR resume override at scheduler_step=%s: saved_lrs=%s "
+                    "configured_base_lrs=%s effective_lrs=%s end_step=%s; Adam moments/clock preserved.",
+                    self.scheduler.last_epoch, saved_lrs, configured_base_lrs,
+                    [pg["lr"] for pg in self.param_groups], self.cosine_state["total_steps"],
+                )
+            elif self.cosine_state is not None:
                 self._restore_cosine(state)
             return
         try:
@@ -4465,6 +4582,7 @@ def train_step(
     reference_trust_interior_fraction: float = 1.0,
     reference_trust_policy_lr_scale: float = 1.0,
     reference_trust_reset_adam_first_moment_on_zero_step: bool = False,
+    reference_trust_transactional_rejection: bool = False,
     reference_trust_probe_cache: dict[str, Any] | None = None,
     log_reward_dist: bool = False,
     log_diagnostic_dist: bool = False,
@@ -4481,6 +4599,9 @@ def train_step(
     constraint_state: ProjectionConstraintState | None = None,
     world_size: int = 1,
     extragradient_optimizer_base_params: Mapping[str, Tensor] | None = None,
+    parameter_update_rms_target: float | None = None,
+    parameter_update_rms_min_scale: float = 0.0,
+    parameter_update_rms_max_scale: float = float("inf"),
 ) -> dict[str, Any]:
     """Rollout once, accumulate gradients, then apply one controlled AdamW update.
 
@@ -4492,6 +4613,10 @@ def train_step(
     # Frozen method constant: all K candidates share the diffusion timestep t and
     # noise eps during policy evaluation (only the DDIM chain index varies).
     shared_noise = True
+    endpoint_controller = getattr(_unwrap_core_evenet(model), "_endpoint_kl_controller", None)
+    endpoint_active = endpoint_controller is not None and endpoint_controller.config.enabled
+    if endpoint_active and extragradient_optimizer_base_params is not None:
+        raise ValueError("endpoint KL currently requires the ordinary optimizer step")
     trust_objective = str(reference_trust_objective).strip().lower()
     if trust_objective not in VALID_REFERENCE_TRUST_OBJECTIVES:
         raise ValueError(
@@ -4542,6 +4667,38 @@ def train_step(
     freeze_reference_model(ref_model)
     proj_cfg = resolve_projection_constraint_config(global_config.dgpo)
     projection_active = bool(proj_cfg.active and constraint_state is not None)
+    rms_calibration_active = parameter_update_rms_target is not None
+    rms_target = (
+        float(parameter_update_rms_target)
+        if parameter_update_rms_target is not None
+        else float("nan")
+    )
+    rms_min_scale = float(parameter_update_rms_min_scale)
+    rms_max_scale = float(parameter_update_rms_max_scale)
+    if rms_calibration_active:
+        if not math.isfinite(rms_target) or rms_target <= 0.0:
+            raise ValueError(
+                "parameter_update_rms_target must be finite and positive"
+            )
+        if (
+            not math.isfinite(rms_min_scale)
+            or not math.isfinite(rms_max_scale)
+            or rms_min_scale <= 0.0
+            or rms_max_scale < rms_min_scale
+        ):
+            raise ValueError(
+                "parameter-update RMS scale bounds must be finite, positive, "
+                "and ordered"
+            )
+        if reference_trust_max_ratio is not None or projection_active:
+            raise ValueError(
+                "parameter-update RMS calibration requires no hard trust boundary "
+                "or post-AdamW projection"
+            )
+        if extragradient_optimizer_base_params is not None:
+            raise ValueError(
+                "parameter-update RMS calibration requires the ordinary AdamW path"
+            )
     if reference_trust_max_ratio is not None and projection_active:
         raise ValueError(
             "strict adaptive trust backtracking is incompatible with the "
@@ -4559,6 +4716,56 @@ def train_step(
     variance_reg_features = _variance_regularization_feature_names(global_config.dgpo)
 
     core = _unwrap_core_evenet(model)
+    gradient_transfer_cfg = resolve_gradient_transfer_trace_config(
+        _dgpo_cfg_get(global_config.dgpo, "gradient_transfer_trace", None)
+    )
+    gradient_transfer_active = gradient_transfer_trace_due(
+        gradient_transfer_cfg,
+        update_end_step=int(global_step) + 1,
+    )
+    gradient_transfer_parameters: tuple[Tensor, ...] = ()
+    gradient_transfer_h4_accum: list[Tensor] | None = None
+    gradient_transfer_ref_accum: list[Tensor] | None = None
+    if gradient_transfer_active:
+        if trust_objective != REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE:
+            raise ValueError(
+                "gradient transfer trace currently requires velocity_mse reference trust"
+            )
+        if reference_trust_coefficient <= 0.0:
+            raise ValueError(
+                "gradient transfer trace requires a positive reference trust coefficient"
+            )
+        if projection_active or reference_trust_max_ratio is not None:
+            raise ValueError(
+                "gradient transfer trace requires no hard trust boundary or projection"
+            )
+        if sequential_vp_trust_backward:
+            raise ValueError(
+                "gradient transfer trace is incompatible with sequential VP backward"
+            )
+        if float(_dgpo_cfg_get(global_config.dgpo, "beta_kl", 0.0)) != 0.0:
+            raise ValueError("gradient transfer trace requires dgpo.beta_kl=0")
+        if variance_reg_active and variance_reg_weight != 0.0:
+            raise ValueError(
+                "gradient transfer trace requires variance regularization to be inactive"
+            )
+        if extragradient_optimizer_base_params is not None:
+            raise ValueError(
+                "gradient transfer trace requires the ordinary native AdamW update"
+            )
+        gradient_transfer_parameters = tuple(
+            parameter for parameter in core.parameters() if parameter.requires_grad
+        )
+        if not gradient_transfer_parameters:
+            raise RuntimeError("gradient transfer trace found no trainable policy parameters")
+        gradient_transfer_h4_accum = [
+            torch.zeros_like(parameter, dtype=torch.float32)
+            for parameter in gradient_transfer_parameters
+        ]
+        gradient_transfer_ref_accum = [
+            torch.zeros_like(parameter, dtype=torch.float32)
+            for parameter in gradient_transfer_parameters
+        ]
     B = int(batch["x"].shape[0])
     if policy_eval_event_microbatch_size is None:
         policy_event_microbatch_size = B
@@ -4624,7 +4831,9 @@ def train_step(
         )
         candidates_phys = _dgpo_zero_nonfinite(candidates_phys)
 
-    rewards, reward_breakdown = reward_agg.compute(candidates_phys, batch)
+    reward_batch = dict(batch)
+    reward_batch["_dgpo_reward_context"] = "policy_update"
+    rewards, reward_breakdown = reward_agg.compute(candidates_phys, reward_batch)
     rewards, reward_breakdown, rew_nonfinite_diag = _dgpo_sanitize_rollout_rewards(
         rewards,
         reward_breakdown,
@@ -4965,7 +5174,7 @@ def train_step(
         trust_weight_correction: Tensor,
         path_kl_stratum_offset: int,
         path_kl_seed: int,
-    ) -> list[tuple[Tensor, dict[str, Tensor]]]:
+    ) -> list[tuple[Tensor, dict[str, Tensor], Tensor, Tensor]]:
         nonlocal trust_probe
         local_B = int(eval_batch["x"].shape[0])
         (
@@ -5100,7 +5309,7 @@ def train_step(
                 rows_per_timestep,
                 *path_noise_mask_all.shape[1:],
             )
-        outcomes: list[tuple[Tensor, dict[str, Tensor]]] = []
+        outcomes: list[tuple[Tensor, dict[str, Tensor], Tensor, Tensor]] = []
         for timestep_index in range(count):
             L_cur = L_cur_all[timestep_index]
             L_ref = L_ref_all[timestep_index]
@@ -5218,6 +5427,9 @@ def train_step(
                 + beta_kl * kl_loss
                 + float(variance_reg_weight) * variance_loss
             )
+            # The unweighted component is retained only long enough for the
+            # opt-in exact transfer trace.  It never changes ``loss_backward``.
+            reference_trace_loss = loss_vel.new_zeros(())
             if reference_trust_coefficient > 0.0:
                 if trust_objective == REFERENCE_TRUST_OBJECTIVE_VP_PATH_KL:
                     assert path_model_v_all is not None
@@ -5240,11 +5452,9 @@ def train_step(
                         noise_mask_rep,
                         L_ref_2d=L_ref,
                     )
-                loss_backward = (
-                    loss_backward
-                    + float(reference_trust_coefficient)
-                    * trust_weight_correction
-                    * trust_loss
+                reference_trace_loss = trust_weight_correction * trust_loss
+                loss_backward = loss_backward + (
+                    float(reference_trust_coefficient) * reference_trace_loss
                 )
                 for trust_key in (
                     "reference_trust/loss",
@@ -5330,7 +5540,9 @@ def train_step(
                 dtype=torch.float64,
             )
             dlast.update(variance_diag)
-            outcomes.append((loss_backward, dlast))
+            outcomes.append(
+                (loss_backward, dlast, loss_vel, reference_trace_loss)
+            )
         return outcomes
 
     # Accumulate the sub-step gradients into ONE AdamW update per batch, then run
@@ -5545,7 +5757,8 @@ def train_step(
                 )
                 ctx = (
                     model.no_sync()
-                    if isinstance(model, DDP) and not is_last_backward
+                    if isinstance(model, DDP)
+                    and (endpoint_active or gradient_transfer_active or not is_last_backward)
                     else nullcontext()
                 )
                 with ctx:
@@ -5571,7 +5784,14 @@ def train_step(
                         ),
                     )
                     finite_losses: list[Tensor] = []
-                    for chunk_offset, (loss, dlast) in enumerate(chunk_outcomes):
+                    finite_h4_losses: list[Tensor] = []
+                    finite_ref_losses: list[Tensor] = []
+                    for chunk_offset, (
+                        loss,
+                        dlast,
+                        h4_component,
+                        ref_component,
+                    ) in enumerate(chunk_outcomes):
                         sub = completed_substeps + chunk_offset + 1
                         diags.append(dlast)
                         diag_weights.append(event_weight)
@@ -5589,21 +5809,111 @@ def train_step(
                             )
                             continue
                         finite_losses.append(loss)
+                        finite_h4_losses.append(h4_component)
+                        finite_ref_losses.append(ref_component)
                     if finite_losses:
-                        (
+                        backward_weight = event_weight / float(acc_steps)
+                        total_chunk_loss = (
                             torch.stack(finite_losses).sum()
-                            * event_weight
-                            / float(acc_steps)
-                        ).backward()
+                            * backward_weight
+                        )
+                        if gradient_transfer_active:
+                            assert gradient_transfer_h4_accum is not None
+                            assert gradient_transfer_ref_accum is not None
+                            h4_chunk_loss = (
+                                torch.stack(finite_h4_losses).sum()
+                                * backward_weight
+                            )
+                            ref_chunk_loss = (
+                                torch.stack(finite_ref_losses).sum()
+                                * backward_weight
+                            )
+                            h4_grads = torch.autograd.grad(
+                                h4_chunk_loss,
+                                gradient_transfer_parameters,
+                                retain_graph=True,
+                                allow_unused=True,
+                            )
+                            with torch.no_grad():
+                                for accumulator, gradient in zip(
+                                    gradient_transfer_h4_accum,
+                                    h4_grads,
+                                    strict=True,
+                                ):
+                                    if gradient is not None:
+                                        accumulator.add_(gradient.detach().float())
+                            del h4_grads, h4_chunk_loss
+                            ref_grads = torch.autograd.grad(
+                                ref_chunk_loss,
+                                gradient_transfer_parameters,
+                                retain_graph=True,
+                                allow_unused=True,
+                            )
+                            with torch.no_grad():
+                                for accumulator, gradient in zip(
+                                    gradient_transfer_ref_accum,
+                                    ref_grads,
+                                    strict=True,
+                                ):
+                                    if gradient is not None:
+                                        accumulator.add_(gradient.detach().float())
+                            del ref_grads, ref_chunk_loss
+                        total_chunk_loss.backward()
             completed_substeps += chunk_size
         del parallel_input_cache
+    endpoint_metrics = {}
+    if endpoint_active:
+        # All policy backwards stay local until BOTH losses have accumulated.
+        # This also permits multiple DDIM forwards without re-arming DDP.
+        endpoint_ctx = model.no_sync() if isinstance(model, DDP) else nullcontext()
+        with endpoint_ctx:
+            endpoint_metrics = endpoint_controller.backward(
+                model=core, reference=ref_model, source=reward_agg.omnifold_source,
+                batch=batch, sampler=sampler, num_ddim_steps=num_ddim_steps,
+                device=device, global_step=global_step, valid=valid_b,
+                reduce_gradients=lambda critic: _all_reduce_accumulated_gradients(critic, world_size=world_size),
+            )
     manually_reduced_gradient_tensors = 0
-    if sequential_vp_trust_backward:
+    if sequential_vp_trust_backward or gradient_transfer_active or endpoint_active:
         manually_reduced_gradient_tensors = _all_reduce_accumulated_gradients(
             core,
             world_size=world_size,
         )
+    gradient_transfer_vectors: dict[str, Tensor] | None = None
+    if gradient_transfer_active:
+        assert gradient_transfer_h4_accum is not None
+        assert gradient_transfer_ref_accum is not None
+
+        def _flatten_and_average_trace(parts: Sequence[Tensor]) -> Tensor:
+            vector = torch.cat([part.reshape(-1) for part in parts])
+            if world_size > 1:
+                if not dist.is_initialized():
+                    raise RuntimeError(
+                        "distributed gradient transfer trace requires an initialized process group"
+                    )
+                dist.all_reduce(vector, op=dist.ReduceOp.SUM)
+                vector.div_(float(world_size))
+            return vector
+
+        gradient_transfer_h4_flat = _flatten_and_average_trace(
+            gradient_transfer_h4_accum
+        )
+        del gradient_transfer_h4_accum
+        gradient_transfer_ref_flat = _flatten_and_average_trace(
+            gradient_transfer_ref_accum
+        )
+        del gradient_transfer_ref_accum
+        gradient_transfer_vectors = {
+            "h4": gradient_transfer_h4_flat,
+            "reference": gradient_transfer_ref_flat,
+            # The actual accumulated gradient was synchronized above before
+            # clipping. ``flatten_param_grads`` returns independent storage.
+            "actual_unclipped": flatten_param_grads(core).detach().float(),
+        }
     diag_last = _weighted_mean_diag_dict(diags, diag_weights)
+    if endpoint_active:
+        # Add the endpoint component once, not once per denoising timestep.
+        diag_last["loss_total"] = diag_last["loss_total"] + endpoint_metrics["endpoint_kl/weighted_loss"]
     diag_last["reference_trust/sequential_backward"] = torch.tensor(
         float(sequential_vp_trust_backward),
         device=device,
@@ -5642,6 +5952,7 @@ def train_step(
     trust_nominal_interior_limit = float("nan")
     trust_acceptance_limit = float("nan")
     trust_optimizer_state_advanced = False
+    trust_optimizer_state_restored = False
     trust_zero_step_adam_reset_count = 0
     if strict_trust_enabled:
         if trust_probe is None:
@@ -5728,6 +6039,9 @@ def train_step(
     )
     grad_norm_pre_clip_max = gn
     grad_clip_active_any = clip_on > 0.5
+    gradient_transfer_theta_old = (
+        snapshot_params(core) if gradient_transfer_active else None
+    )
     theta_old_snap: dict[str, Tensor] | None = None
     if preexisting_trust_violation or trust_interior_saturated:
         trust_boundary_hit = True
@@ -5774,10 +6088,26 @@ def train_step(
         # smaller LR without copying the full optimizer state.
         theta_old_snap = (
             snapshot_params(model)
-            if strict_trust_enabled or projection_active
+            if (
+                strict_trust_enabled
+                or projection_active
+                or rms_calibration_active
+                or bool(
+                    _dgpo_cfg_get(
+                        global_config.dgpo,
+                        "log_parameter_update_rms",
+                        False,
+                    )
+                )
+            )
             else None
         )
         original_group_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        optimizer_transaction = (
+            snapshot_adamw_state_for_transaction(optimizer)
+            if strict_trust_enabled and reference_trust_transactional_rejection
+            else None
+        )
         if trust_policy_lr_scale * trust_initial_scale < 1.0:
             for group, original_lr in zip(
                 optimizer.param_groups, original_group_lrs, strict=True
@@ -5794,6 +6124,64 @@ def train_step(
             ):
                 group["lr"] = original_lr
         optimizer_ran = True
+        if rms_calibration_active:
+            assert theta_old_snap is not None
+            theta_candidate = snapshot_params(model)
+            proposed_rms = _trainable_direction_rms(
+                theta_old_snap,
+                theta_candidate,
+            )
+            if not math.isfinite(proposed_rms) or proposed_rms <= 0.0:
+                raise RuntimeError(
+                    "AdamW proposed a zero or non-finite parameter displacement; "
+                    "cannot apply RMS calibration"
+                )
+            rms_scale = rms_target / proposed_rms
+            if not rms_min_scale <= rms_scale <= rms_max_scale:
+                raise RuntimeError(
+                    "required parameter-update RMS scale lies outside the "
+                    f"predeclared bounds: target={rms_target:.9g}, "
+                    f"proposed={proposed_rms:.9g}, scale={rms_scale:.9g}, "
+                    f"bounds=[{rms_min_scale:.9g}, {rms_max_scale:.9g}]"
+                )
+            assign_scaled_trainable_update_(
+                model,
+                theta_old_snap,
+                theta_candidate,
+                rms_scale,
+            )
+            applied_rms = _trainable_direction_rms(
+                theta_old_snap,
+                snapshot_params(model),
+            )
+            relative_error = abs(applied_rms - rms_target) / rms_target
+            if not math.isfinite(applied_rms) or relative_error > 5.0e-4:
+                raise RuntimeError(
+                    "parameter-update RMS calibration missed its target: "
+                    f"target={rms_target:.9g}, applied={applied_rms:.9g}, "
+                    f"relative_error={relative_error:.6g}"
+                )
+            metric_device = device
+            diag_last.update({
+                "parameter_update_rms_calibration/enabled": torch.tensor(
+                    1.0, device=metric_device, dtype=torch.float64
+                ),
+                "parameter_update_rms_calibration/target_rms": torch.tensor(
+                    rms_target, device=metric_device, dtype=torch.float64
+                ),
+                "parameter_update_rms_calibration/proposed_rms": torch.tensor(
+                    proposed_rms, device=metric_device, dtype=torch.float64
+                ),
+                "parameter_update_rms_calibration/applied_rms": torch.tensor(
+                    applied_rms, device=metric_device, dtype=torch.float64
+                ),
+                "parameter_update_rms_calibration/scale": torch.tensor(
+                    rms_scale, device=metric_device, dtype=torch.float64
+                ),
+                "parameter_update_rms_calibration/relative_error": torch.tensor(
+                    relative_error, device=metric_device, dtype=torch.float64
+                ),
+            })
         if strict_trust_enabled:
             assert theta_old_snap is not None
             (
@@ -5849,6 +6237,13 @@ def train_step(
                         break
                 if not accepted:
                     assign_params_(model, theta_old_snap)
+                    if optimizer_transaction is not None:
+                        restore_adamw_state_from_transaction_(
+                            optimizer,
+                            optimizer_transaction,
+                        )
+                        trust_optimizer_state_advanced = False
+                        trust_optimizer_state_restored = True
                     optimizer.zero_grad(set_to_none=True)
                     if reference_trust_reset_adam_first_moment_on_zero_step:
                         trust_zero_step_adam_reset_count = (
@@ -5856,11 +6251,9 @@ def train_step(
                         )
                     # Zero displacement is always feasible. Treat failure to
                     # find a positive line-search scale as a safely rejected
-                    # policy step instead of aborting the distributed job. AdamW
-                    # AdamW's variance/step state has observed this gradient;
-                    # the optional convergence controller clears its first
-                    # moment so rejected outward momentum is not carried into
-                    # the next batch. EMA and the LR scheduler must not advance
+                    # policy proposal instead of aborting the distributed job.
+                    # The opt-in transactional path restores every AdamW moment
+                    # and step counter; EMA and the LR scheduler never advance
                     # because no parameter update was committed.
                     optimizer_ran = False
                     trust_accepted_scale = 0.0
@@ -5935,6 +6328,9 @@ def train_step(
             "reference_trust/optimizer_state_advanced": float(
                 trust_optimizer_state_advanced
             ),
+            "reference_trust/optimizer_state_restored": float(
+                trust_optimizer_state_restored
+            ),
             "reference_trust/zero_step_adam_first_moments_reset": float(
                 trust_zero_step_adam_reset_count
             ),
@@ -5971,6 +6367,37 @@ def train_step(
             constraint_seed_base=int(global_step),
         )
 
+    gradient_transfer_metrics: dict[str, float] = {}
+    if gradient_transfer_active:
+        assert gradient_transfer_vectors is not None
+        assert gradient_transfer_theta_old is not None
+        adamw_descent = None
+        if optimizer_ran:
+            adamw_delta = flatten_param_delta(
+                snapshot_params(core),
+                gradient_transfer_theta_old,
+            ).detach().float()
+            adamw_descent = -adamw_delta
+        gradient_transfer_metrics = summarize_gradient_transfer(
+            h4_gradient=gradient_transfer_vectors["h4"],
+            reference_gradient=gradient_transfer_vectors["reference"],
+            actual_unclipped_gradient=gradient_transfer_vectors[
+                "actual_unclipped"
+            ],
+            trust_coefficient=float(reference_trust_coefficient),
+            counterfactual_coefficients=(
+                gradient_transfer_cfg.counterfactual_trust_coefficients
+            ),
+            update_start_step=int(global_step),
+            update_end_step=int(global_step) + 1,
+            norm_floor=float(gradient_transfer_cfg.norm_floor),
+            adamw_descent=adamw_descent,
+        )
+        gradient_transfer_metrics["gradient_transfer/optimizer_step_ran"] = (
+            float(optimizer_ran)
+        )
+        del gradient_transfer_vectors, gradient_transfer_theta_old, adamw_descent
+
     if optimizer_ran and ema_rollout is not None:
         ema_rollout.update(core, decay_=_dgpo_rollout_ema_decay(global_step))
     if optimizer_ran and ema_save is not None:
@@ -5986,6 +6413,7 @@ def train_step(
         advantages=advantages,
     )
     out["train/policy_eval/parallel_timesteps"] = float(parallel_eval_steps)
+    out.update(endpoint_metrics)
     out["train/policy_eval/event_microbatch_size"] = float(
         policy_event_microbatch_size
     )
@@ -6036,6 +6464,34 @@ def train_step(
     out["train/grad/global_norm_pre_clip"] = float(grad_norm_pre_clip_max)
     out["train/grad/clip_active"] = 1.0 if grad_clip_active_any else 0.0
     out["train/optimizer_step_ran"] = float(optimizer_ran)
+    angular = getattr(getattr(unwrap_for_state_dict(model), "PET", None), "angular_conditioning", None)
+    if angular is not None:
+        angular_weight = angular.projection.weight
+        out["train/angular_conditioning/weight_norm"] = float(angular_weight.detach().float().norm())
+        out["train/angular_conditioning/trainable"] = float(angular_weight.requires_grad)
+        out["train/angular_conditioning/gradient_present"] = float(angular_weight.grad is not None)
+        # Observed after the optimizer transaction; gradient may have been clipped.
+        out["train/angular_conditioning/grad_norm_post_clip"] = (
+            float(angular_weight.grad.detach().float().norm()) if angular_weight.grad is not None else 0.0
+        )
+    out.update(gradient_transfer_metrics)
+    conditioning = getattr(getattr(unwrap_for_state_dict(model), "TruthGeneration", None), "visible_conditioning", None)
+    if conditioning is not None and conditioning.log_diagnostics:
+        for name, value in conditioning.diagnostics.items():
+            out[f"train/visible_conditioning/{name}"] = float(value)
+        for group in ("encoder", "modulations", "token_readout"):
+            parameters = [p for name, p in conditioning.named_parameters()
+                          if (name.startswith(group + ".") if group != "encoder" else
+                              not name.startswith(("modulations.", "token_readout.")))]
+            grads = [p.grad.detach().float().square().sum() for p in parameters if p.grad is not None]
+            out[f"train/visible_conditioning/{group}_grad_norm_post_clip"] = float(torch.stack(grads).sum().sqrt()) if grads else 0.
+    if theta_old_snap is not None and bool(
+        _dgpo_cfg_get(global_config.dgpo, "log_parameter_update_rms", False)
+    ):
+        out["train/parameter_update_rms"] = (
+            _trainable_direction_rms(theta_old_snap, snapshot_params(model))
+            if optimizer_ran else 0.0
+        )
     if extragradient_optimizer_base_params is not None:
         out["reference_trust/extragradient/rebased_optimizer_params"] = float(
             extragradient_rebased_params
@@ -6125,6 +6581,33 @@ def train_step(
 
 
 
+def _resolve_dgpo_lr_schedule(
+    lr_schedule: Mapping[str, Any] | None, *, steps_per_epoch: int,
+) -> dict[str, Any]:
+    """Resolve a policy-epoch horizon, never a classifier-fit/data-pass clock."""
+    cfg = dict(lr_schedule or {})
+    kind = str(cfg.get("type", "constant"))
+    if kind not in {"constant", "cosine"}:
+        raise ValueError("DGPO lr_schedule.type must be constant or cosine")
+    resume_use_config = cfg.get("resume_use_config", False)
+    if not isinstance(resume_use_config, bool):
+        raise ValueError("lr_schedule.resume_use_config must be boolean")
+    if resume_use_config and kind != "cosine":
+        raise ValueError("lr_schedule.resume_use_config requires cosine")
+    epochs = cfg.get("total_epochs")
+    if epochs is not None:
+        if kind != "cosine":
+            raise ValueError("lr_schedule.total_epochs requires cosine")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
+            raise ValueError("lr_schedule.total_epochs must be a positive integer")
+        if cfg.get("total_steps") is not None:
+            raise ValueError("Set only lr_schedule.total_epochs or total_steps; clear the other with null")
+        if isinstance(steps_per_epoch, bool) or not isinstance(steps_per_epoch, int) or steps_per_epoch <= 0:
+            raise ValueError("Epoch-based cosine requires positive integer steps_per_epoch")
+        cfg["total_steps"] = epochs * steps_per_epoch
+    return cfg
+
+
 def build_optimizer(
     model: torch.nn.Module,
     *,
@@ -6132,6 +6615,7 @@ def build_optimizer(
     warmup_steps: int,
     is_rank0: bool = True,
     lr_schedule: Mapping[str, Any] | None = None,
+    conditioning_learning_rates: Mapping[str, float] | None = None,
 ) -> _DgpoOptimizerWithSchedule:
     """AdamW with grouped LR/WD and linear warmup, optionally followed by cosine decay.
 
@@ -6149,16 +6633,18 @@ def build_optimizer(
         Batches for linear LR ramp ``min(1, epoch / warmup_steps)`` on groups with ``warm_up: true``.
     is_rank0:
         When True, log one line per optimizer group on construction.
+    conditioning_learning_rates:
+        Optional LR overrides for the new PET ``angular_conditioning`` and
+        TruthGeneration ``visible_conditioning`` branches. Child parameters
+        are removed from their parent groups; WD and warmup stay inherited.
     """
     core = _unwrap_core_evenet(model)
     train_opt = global_config.options.Training
     components = train_opt.Components
     default_lr = float(train_opt.learning_rate)
     default_wd = float(train_opt.weight_decay)
-    schedule_cfg = dict(lr_schedule or {})
+    schedule_cfg = _resolve_dgpo_lr_schedule(lr_schedule, steps_per_epoch=steps_per_epoch)
     schedule_kind = str(schedule_cfg.get("type", "constant"))
-    if schedule_kind not in {"constant", "cosine"}:
-        raise ValueError("DGPO lr_schedule.type must be constant or cosine")
     if not math.isfinite(default_wd) or default_wd < 0:
         raise ValueError("DGPO weight_decay must be finite and nonnegative")
 
@@ -6190,6 +6676,33 @@ def build_optimizer(
                 "optimizer_type": opt_type,
             }
 
+    branch_paths = {
+        "angular_conditioning": "PET.angular_conditioning",
+        "visible_conditioning": "TruthGeneration.visible_conditioning",
+    }
+    branch_rates = {} if conditioning_learning_rates is None else conditioning_learning_rates
+    if not isinstance(branch_rates, Mapping) or set(branch_rates) - set(branch_paths):
+        raise ValueError("conditioning_learning_rates supports only angular_conditioning and visible_conditioning")
+    # Fixed ordering is independent of config serialization and identical on every rank.
+    for name, path in branch_paths.items():
+        if name not in branch_rates:
+            continue
+        rate = branch_rates[name]
+        if (isinstance(rate, bool) or not isinstance(rate, (int, float))
+                or not math.isfinite(rate) or rate <= 0):
+            raise ValueError(f"conditioning_learning_rates.{name} must be finite and positive")
+        try:
+            branch = core.get_submodule(path)
+        except AttributeError as exc:
+            raise ValueError(f"conditioning_learning_rates.{name} requires enabled {path}") from exc
+        if not any(p.requires_grad for p in branch.parameters()):
+            raise ValueError(f"conditioning_learning_rates.{name} requires trainable {path}")
+        parent_group = str(components.get(path.split('.')[0], {}).get("optimizer_group", ""))
+        if parent_group not in group_meta or name in group_meta:
+            raise ValueError(f"Cannot assign independent conditioning optimizer group {name!r}")
+        group_meta[name] = {**group_meta[parent_group], "lr": float(rate)}
+        group_modules[name] = [path]
+
     bad = [
         (g, m["optimizer_type"])
         for g, m in group_meta.items()
@@ -6205,18 +6718,12 @@ def build_optimizer(
     param_groups: list[dict[str, Any]] = []
     lr_lambdas: list[Any] = []
     nonempty_group_order: list[str] = []
+    all_module_paths = [path for paths in group_modules.values() for path in paths]
 
     for gname, meta in group_meta.items():
-        seen_ids: set[int] = set()
-        params: list[nn.Parameter] = []
-        for comp_key in group_modules[gname]:
-            mod = getattr(core, comp_key, None)
-            if mod is None:
-                continue
-            for p in mod.parameters():
-                if p.requires_grad and id(p) not in seen_ids:
-                    seen_ids.add(id(p))
-                    params.append(p)
+        params = [p for p in module_optimizer_parameters(
+            core, group_modules[gname], all_module_paths
+        ) if p.requires_grad]
         if not params:
             continue
         nonempty_group_order.append(gname)
@@ -6225,6 +6732,7 @@ def build_optimizer(
                 "params": params,
                 "lr": float(meta["lr"]),
                 "weight_decay": float(meta["weight_decay"]),
+                "group_name": gname,
             }
         )
         if meta["warm_up"]:
@@ -6262,6 +6770,7 @@ def build_optimizer(
                 "params": leftover,
                 "lr": default_lr,
                 "weight_decay": default_wd,
+                "group_name": "__fallback__",
             }
         )
         lr_lambdas.append(lambda epoch, _ws=ws: min(1.0, float(epoch) / float(_ws)))
@@ -6304,8 +6813,10 @@ def build_optimizer(
                        for g in nonempty_group_order],
     )
     if is_rank0 and wrapped.cosine_state is not None:
-        _log.info("[DGPO] Cosine LR enabled: end_scheduler_step=%s min_lr_ratio=%s; resume preserves its anchor/clock.",
-                  wrapped.cosine_state["total_steps"], wrapped.cosine_state["min_lr_ratio"])
+        _log.info("[DGPO] Cosine LR enabled: policy_epochs=%s steps/logical_epoch=%s end_scheduler_step=%s min_lr_ratio=%s groups=%s; refits/resume preserve its clock.",
+                  schedule_cfg.get("total_epochs"), steps_per_epoch,
+                  wrapped.cosine_state["total_steps"], wrapped.cosine_state["min_lr_ratio"],
+                  [name for name, enabled in zip(nonempty_group_order, wrapped.cosine_state["decay_groups"], strict=True) if enabled])
     return wrapped
 
 
@@ -6315,6 +6826,7 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "epoch": "Training epoch index (x-axis for most plots).",
         "train/lr/scheduled_max": "Largest DGPO group LR before this update, before round warmup and trust backtracking. Cosine resumes its saved scheduler clock.",
         "train/lr/scheduled_min": "Smallest DGPO group LR before this update, before round warmup and trust backtracking.",
+        "train/lr/scheduled/*": "Named optimizer-group LR before this update; before round warmup and trust backtracking. New conditioning groups exclude their parameters from the pretrained parent groups.",
         "staleness/global_best/improved": "1 when a global-best policy is registered/replaced; candidate replacements require the configured effect-size and paired confirmation gate.",
         "staleness/global_best/failed_rounds": "Consecutive completed plateau windows after refitting the same incumbent best; a confirmed new best resets this counter.",
         "staleness/global_best/stop_requested": "1 when repeated global-best refits fail to improve; save the consistent latest state and stop, preserving the separate best checkpoint. Not convergence.",
@@ -6386,7 +6898,11 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "reference_trust/preexisting_violation": "1 when the fixed pre-step probe was already outside delta, so no optimizer update was attempted.",
         "reference_trust/interior_saturated": "1 when the fixed probe remains inside hard delta but has exhausted the configured interior update budget; the policy is held until a later audit decision.",
         "reference_trust/step_accepted": "1 only when a feasible AdamW update was committed and the scheduler/EMA were advanced.",
-        "reference_trust/optimizer_state_advanced": "1 when AdamW state incorporated the current gradient; this can remain 1 for a safely rejected alpha=0 policy step while scheduler/EMA stay fixed, even if the convergence controller then clears first moments.",
+        "reference_trust/optimizer_state_advanced": "1 when the committed proposal advanced AdamW moments and step counters. With transactional_rejection=true this returns to 0 after an alpha=0 rejection.",
+        "reference_trust/optimizer_state_restored": "1 when an alpha=0 trust rejection restored the exact pre-proposal AdamW moments and step counters.",
+        "reference_trust/accepted_updates": "Cumulative committed optimizer updates in the current hard-boundary experiment; this differs from global_step when a proposal is rejected.",
+        "reference_trust/rejection_stop_requested": "1 after stop_after_rejection observes its first alpha=0 proposal and schedules the endpoint cold audit.",
+        "reference_trust/first_rejected_global_step": "One-indexed proposal clock of the first alpha=0 hard-boundary rejection, or -1 before rejection.",
         "reference_trust/zero_step_adam_first_moments_reset": "Number of Adam first-moment tensors cleared after a trust-boundary alpha=0 rejection; second moments and optimizer step counters remain intact.",
         "reference_trust/policy_lr/scale": "Per-round DGPO LR multiplier sqrt(delta_r/delta_0), clipped by the configured floor; classifier LRs are unaffected.",
         "reference_trust/policy_lr/effective_step_scale": "Product of the per-round policy LR scale and the within-round trust/backtracking scale.",
@@ -6516,7 +7032,9 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "parameter/w_e/min": "Min w_e in the batch.",
         "parameter/w_e/max": "Max w_e in the batch.",
         # --- val (epoch-end) ---
-        "val/reward/mean": "Mean combined reward over all valid (candidate × event) pairs. Used for top-k checkpoint selection.",
+        "val/reward/mean": "Legacy mean best-of-K reward per valid event. Used for top-k checkpoint selection; NOT all-sample mean.",
+        "val/reward/all_sample_mean": "Mean reward over ALL valid candidate × event pairs, without selecting the best candidate.",
+        "val/reward/best_of_k_mean": "Explicit alias of legacy val/reward/mean (best-of-K per event).",
         "val/reward/median": "Global median of per-event reward across valid events (with val_K=1: single prediction per event; with val_K>1: best-of-K per event). Epoch x-axis.",
         "val/reward/p10": "10th percentile of per-event reward (val_K=1: single pred; val_K>1: best-of-K per event).",
         "val/reward/p30": "30th percentile.",
@@ -6570,9 +7088,33 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "staleness/raw_auc": "Validation truth-vs-unweighted-current-policy classifier AUC; may be warm-started. Interpret changes with classifier saturation and accumulated training in mind.",
         "staleness/raw_classifier_warm_started": "1 when the raw monitor fine-tunes its previous saved weights. Optimizer/early stopping reset; trust monitor is always fresh.",
         "staleness/raw_auc_gap": "Absolute raw classifier gap |AUC-0.5|; lower is better and this is the primary stationary-run progress metric.",
+        "audit/raw_auc": "Clear alias of the fresh, unweighted truth-vs-current-policy audit AUC in measurement-only raw monitoring.",
+        "audit/raw_auc_gap": "Clear alias of abs(audit/raw_auc-0.5); lower is better. This audit cannot refit the reward or roll back the policy.",
+        "audit/saturated": "1 when the fresh audit classifier met its saturation criterion.",
+        "audit/training_ready": "1 when the fresh audit met the configured training-readiness rule.",
+        "audit/raw_auc_gap_change_from_step0": "Current measurement-only raw AUC gap minus the cold step-0 gap; negative means improvement.",
+        "audit/raw_auc_gap_slope_per_10_steps": "Least-squares slope of the measurement-only raw AUC-gap trajectory, scaled to ten policy updates; negative means improvement.",
+        "gradient_direction/installed_vs_fresh/cosine": "Cosine between the frozen installed-reward DGPO loss gradient and the fresh-audit substitute-reward DGPO loss gradient on one fixed panel. Positive means the two losses ask AdamW to descend in compatible directions.",
+        "gradient_direction/installed_vs_fresh/cross_dot_lcb": "Lower confidence bound for the cross-block installed-vs-fresh gradient dot product; values above zero are evidence of positive alignment.",
+        "gradient_direction/installed_vs_fresh/cross_dot_ucb": "Upper confidence bound for the cross-block installed-vs-fresh gradient dot product; values below zero are evidence of conflict.",
+        "gradient_direction/installed_vs_fresh/alignment": "1 only when both gradient estimates are reliable and the installed-vs-fresh cross-dot interval is strictly positive.",
+        "gradient_direction/installed_vs_fresh/conflict": "1 only when both gradient estimates are reliable and the installed-vs-fresh cross-dot interval is strictly negative.",
+        "gradient_direction/installed/reliable": "1 when the installed-reward gradient has nonzero self-signal and adequate split-half cosine.",
+        "gradient_direction/fresh/reliable": "1 when the fresh-audit gradient has nonzero self-signal and adequate split-half cosine.",
+        "gradient_direction/reference_trust_active": "0 in the no-reference diagnostic; confirms that reference trust contributed no applied gradient.",
+        "staleness/raw_audit_repeats": "Number of independent fresh H4 judges aggregated at this fixed policy boundary.",
+        "staleness/raw_auc_gap_stdev": "Between-judge sample standard deviation of raw |AUC-0.5| on the fixed event panel.",
+        "staleness/raw_auc_gap_se": "Between-judge standard error of the mean raw |AUC-0.5|.",
+        "staleness/fixed_schedule_diagnostic_raw_audit": "1 when a fresh repeated raw judge was measured at a deterministic reward boundary without controlling the refit decision.",
+        "staleness/diagnostic_selection_blind": "1 when the raw audit is logging-only and cannot change policy updates, reward timing, rollback, or endpoint selection.",
+        "staleness/raw_auc_gap_slope_per_10_steps": "Least-squares slope of the repeated-audit mean |AUC-0.5| trajectory, scaled to ten DGPO updates; negative is improvement.",
+        "staleness/raw_auc_gap_change_from_step0": "Current repeated-audit mean |AUC-0.5| minus the fixed step-0 baseline; negative is improvement.",
+        "staleness/fixed_schedule_without_audit": "1 when an age-scheduled reward refit bypasses classifier staleness decisions; the fresh reward's held-out cross-fit validation still runs.",
+        "staleness/incumbent_weighted_audit_skipped": "1 when the installed reward's weighted staleness classifier is omitted at a deterministic refit boundary.",
+        "staleness/independent_raw_audit_skipped": "1 when the truth-vs-policy raw judge is omitted at a deterministic refit boundary.",
         "staleness/raw_best_auc_gap": "Lowest saturated raw |AUC-0.5| observed in the current reward round.",
         "staleness/raw_no_improvement_streak": "Consecutive saturated raw monitors that did not improve the reward-round best by raw_improvement_min_delta.",
-        "staleness/raw_no_improvement_patience": "Number of consecutive non-improving raw monitors required before forward OmniFold recentering.",
+        "staleness/raw_no_improvement_patience": "Effective number of consecutive eligible non-improving raw monitors required before OmniFold refit (with configured rollback). Optional patience_schedule follows persisted DGPO global_step, never the rollback checkpoint step or classifier step.",
         "classifier_trust/balanced_accuracy": "Fresh held-out balanced accuracy for distinguishing the current policy from the installed round reference.",
         "classifier_trust/balanced_accuracy_upper": "Normal-approximation upper confidence bound used by the conservative classifier trust trigger.",
         "classifier_trust/max_balanced_accuracy": "Configured classifier trust ceiling; ideal equal-prior BA 0.525 corresponds to total variation 0.05.",
@@ -6637,8 +7179,10 @@ def _dgpo_wandb_metric_definition_map() -> dict[str, str]:
         "reference_trust/extragradient/rejected": "1 when either classifier gate fails, the corrector is zero/non-finite, or trust backtracking fails; the complete incumbent pair is restored.",
         "omnifold/fit/iter*/saturated": "1 when that residual classifier fit reached its configured validation saturation/early-stop condition.",
         "omnifold/fit/iter*/stored_in_reward": "1 when that saturated classifier snapshot was stored as a cumulative log-ratio increment; 0 for the final closure-only classifier.",
-        "omnifold/fit/iter*/warm_started_folds": "Number of fold classifiers initialized from the previous installed round's matching iteration. 0 means fresh initialization; 2 means both folds were reused.",
+        "omnifold/fit/iter*/warm_started_folds": "Number of repeat/fold classifiers initialized from the previous installed round's matching iteration. 0 means fresh initialization; the complete count is crossfit_repeats * crossfit_folds.",
         "omnifold/fit/iter*/validation_balanced_accuracy": "Held-out balanced accuracy for this residual fit. The next iteration begins only after saturation; closure is assessed against the configured chance band.",
+        "reward_rank_audit/fixed_panel/*": "Candidate-ordering agreement on the checkpointed K=8 policy-update panel. Current-member metrics measure within-round ensemble agreement; temporal metrics compare adjacent fresh reward rounds on identical candidates.",
+        "reward_consensus/live/*": "Live policy-update candidate-consensus diagnostics. The hard gate requires the configured member sign agreement; relative MAD is computed after removing each member's positive per-event scale.",
         "val_ztautau/target/*": "Truth/current/reference 1D density overlays for the four diffusion targets. Current and reference use candidate 0, never reward-best selection.",
         "val_ztautau/reco/*": "Truth/current/reference 1D density overlays for reconstructed tau theta/phi directions, using the shared Ztautau direction reconstruction.",
         "val_ztautau/topology/*": "Truth/current/reference 1D density overlays for tau-pair opening, acoplanarity, back-to-back loss, and post-calibration direction-change magnitudes.",
@@ -6692,8 +7236,13 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.train_dist_by_class_every_n_epochs": "Cadence for representative per-class train_dist matrices. Epoch 0 is always logged; later panels follow this logical-epoch cadence to bound W&B/Matplotlib overhead.",
         "dgpo.train_dist_every_n_epochs": "Cadence for collecting, cross-rank gathering, and plotting pooled train_dist arrays. Epoch 0 is included. Outside this cadence, train_step does not materialize the large CPU truth/pred arrays.",
         "dgpo.steps_per_epoch": "Optional positive optimizer-step budget for one logical DGPO epoch. When set, the Ray training iterator remains open across epoch boundaries and is restarted only after the shard is exhausted, so short logical epochs do not repeatedly consume the start of the dataset. When omitted, one epoch is one complete dataset pass.",
+        "dgpo.log_parameter_update_rms": "Snapshot trainable parameters around each optimizer step and log their actual RMS displacement. This short-run diagnostic consumes one additional trainable-parameter snapshot.",
+        "dgpo.parameter_update_rms_calibration": "Optional target-preserving global AdamW step-size controller. After the native AdamW proposal advances its moments, rescale the complete proposed parameter displacement to target_rms while keeping its direction and relative parameter-group geometry fixed. Incompatible with hard trust, post-AdamW projection, and extragradient.",
+        "dgpo.gradient_transfer_trace": "Read-only exact-production trace of the H4 loss gradient, unweighted soft-reference gradient, reconstructed total gradient, and native AdamW displacement on selected applied update endpoints. It does not change the configured objective.",
+        "dgpo.fail_on_skipped_optimizer_step": "Abort when a logical DGPO step does not commit an optimizer update. Intended for short fixed-update experiments whose round length must count actual updates.",
         "dgpo.validation_every_n_epochs": "Cadence for the cheap scalar-only validation tier. Epoch -1 baseline remains a full validation; a coincident full validation replaces rather than duplicates the cheap pass.",
         "dgpo.validation_full_every_n_epochs": "Cadence for full validation_K monitoring with reference rollout, response/profile arrays, 2D panels, Ztautau metrics, TARP, and top-K checkpoint selection. A coincident full validation replaces the cheap tier.",
+        "dgpo.validation_initial_enabled": "Run the full epoch -1 validation baseline when starting at policy step zero. Disable only for short causal diagnostics whose endpoint is an independent classifier audit.",
         "dgpo.validation_cheap_max_batches": "Per-rank batch cap for the scalar-only cheap validation tier. Separate from validation_max_batches used by full monitoring.",
         "dgpo.validation_max_batches": "If set (e.g. 20): stop validation after this many batches per epoch (faster validation for debugging). If null: run full validation set. Typical: null for real training, 5-20 for smoke tests.",
         "dgpo.validation_compute_winrate": "Full-validation-only switch: generate one extra reference-policy DDIM sample for reward-based val/winrate. Cheap validation never runs the reference policy.",
@@ -6715,7 +7264,13 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.adaptive_omnifold.classifier_trust.unsafe_early_stop": "Optional one-sided classifier-trust early exit. It stops an otherwise unsaturated trust classifier only after the oriented validation balanced-accuracy lower confidence bound exceeds max_balanced_accuracy for the configured number of consecutive validations; that positive unsafe witness immediately triggers recalibration.",
         "dgpo.adaptive_omnifold.trigger.retrain_auc_margin": "AUC-based retraining threshold. Refit when weighted |AUC-0.5| is strictly greater than installed baseline_auc_gap plus this margin.",
         "dgpo.adaptive_omnifold.trigger.max_reward_age_epochs": "Optional maximum installed reward age. At the next regular audit, reaching this age forces a fresh cross-fit candidate; configured residual closure is still required before installation.",
+        "dgpo.adaptive_omnifold.trigger.fixed_schedule_skip_staleness_audit": "When every age boundary deterministically refits the reward, skip the incumbent weighted and independent raw classifiers because they cannot change that decision. Reward cross-fit validation remains mandatory.",
+        "dgpo.adaptive_omnifold.trigger.fixed_schedule_log_raw_audit": "With deterministic refits, fit fresh repeated raw truth-vs-policy judges at step 0 and every reward boundary for selection-blind trajectory measurement.",
+        "dgpo.adaptive_omnifold.audit_fit.repeats": "Independent fresh raw-audit seeds and identity splits per policy boundary; their mean |AUC-0.5| is the primary trajectory statistic.",
+        "dgpo.adaptive_omnifold.audit_fit.training_population": "probe_split retains the legacy internal audit split. omnifold_fold trains a cold diagnostic judge on one fixed repeat-1 OmniFold training fold with newly generated current-policy samples, splitting external validation 50/50 into early-stop and final-test.",
+        "dgpo.adaptive_omnifold.audit_fit.training_fold": "One-based OmniFold training fold for the matched raw audit; uses the same identity hash and recalibration seed as reward repeat 1. Does not inherit classifier weights or generated samples.",
         "dgpo.adaptive_omnifold.trigger.required_consecutive_epochs": "Number of consecutive eligible routine audits that must exceed the installed-round threshold before AUC-based refitting.",
+        "dgpo.adaptive_omnifold.trigger.patience_schedule": "Optional monotone list of {start_step, required_consecutive_checks}. Step-based raw plateau monitoring uses the latest stage reached by persisted DGPO global_step; no schedule retains fixed patience. Warmup pause and saturation eligibility are unchanged.",
         "dgpo.adaptive_omnifold.trigger.retrain_cooldown_epochs": "Minimum epochs after an accepted reward installation before another routine AUC- or age-triggered refit is allowed; audits continue during cooldown.",
         "dgpo.adaptive_omnifold.fixed_audit_panel": "Reuse the same event-selection, rollout, and classifier seeds at every raw audit so epoch-to-epoch AUC changes are paired rather than panel noise.",
         "dgpo.adaptive_omnifold.recalibration.reset_adam_first_moment_on_install": "After an accepted atomic reward/reference install, clear AdamW exp_avg only; preserve exp_avg_sq, step counters, scheduler, and LR.",
@@ -6723,6 +7278,8 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.reference_trust.objective": "Round-reference trust objective: legacy dimension-mean velocity_mse or the separately sampled full-time cosine-VP reverse-path estimator vp_path_kl.",
         "dgpo.reference_trust.vp_path_kl.diagnostic": "When objective=velocity_mse, run an additional graph-free full-time VP path-KL measurement without changing backward. Ignored as a backward switch when objective=vp_path_kl.",
         "dgpo.reference_trust.adaptive_boundary.reset_adam_first_moment_on_zero_step": "Clear AdamW first moments after an alpha=0 trust rejection so outward momentum is not carried across rejected policy steps.",
+        "dgpo.reference_trust.adaptive_boundary.transactional_rejection": "Snapshot AdamW state before a hard-boundary proposal and restore every moment and step counter when no positive backtracking scale is feasible.",
+        "dgpo.reference_trust.adaptive_boundary.stop_after_rejection": "After the first transactional alpha=0 rejection, run the endpoint cold audit and end the experiment at that policy boundary.",
         "dgpo.reference_trust.adaptive_boundary.round_decay_factor": "With radius_mode=round_decay, multiply the hard radius by this factor only after a successful new reward/reference installation, down to delta_floor. The KL coefficient and policy weight decay are independent.",
         "dgpo.reference_trust.adaptive_boundary.radius_calibration.cross_round_nonexpanding": "Cap each newly installed reward round radius by the previous installed radius.",
         "dgpo.reference_trust.adaptive_boundary.radius_calibration.scale_policy_lr": "Multiply only the DGPO policy LR by sqrt(delta_r/delta_0); OmniFold classifier LRs are unchanged.",
@@ -6742,7 +7299,10 @@ def _dgpo_wandb_hyperparameter_definitions() -> dict[str, str]:
         "dgpo.adaptive_omnifold.recalibration.score_pool_events": "Held-out K=1 population used for cross-fit residual gating. Kept separate from the routine staleness probe.",
         "dgpo.adaptive_omnifold.recalibration.fit.train_microbatch_size_per_rank": "Per-GPU gradient-bearing residual-classifier rows per class and forward. Gradients accumulate across these chunks before one optimizer step and one distributed gradient average.",
         "dgpo.adaptive_omnifold.recalibration.fit.gradient_clip_norm": "Optional global-norm clip applied to the distributed residual-classifier gradient before AdamW. Non-finite local loss/gradients and post-step parameters always fail before they can propagate further.",
-        "dgpo.adaptive_omnifold.recalibration.warm_start_iterations": "One-based residual iterations to fine-tune from previous-round fold weights. Uses stable condition-hash folds, fresh AdamW state and recomputed log weights. Legacy checkpoints without fold provenance fit fresh once. Raw and trust monitors remain fresh.",
+        "dgpo.adaptive_omnifold.recalibration.crossfit_repeats": "Independent identity-stable K-fold partitions per residual iteration. Default 1 preserves the existing protocol. Each event receives one unseen OOF logit per repeat; those logits are averaged before tempering. Outer validation and frozen reward average all repeat/fold models. Five held-out trainings use crossfit_folds=5 with repeats=1, not five two-fold repeats.",
+        "dgpo.adaptive_omnifold.recalibration.max_reward_rounds": "Optional cap on installed reward rounds, including bootstrap. Monitoring continues after the cap but cannot trigger another classifier fit or reward installation.",
+        "dgpo.adaptive_omnifold.recalibration.scheduled_refit_fail_closed": "Abort when an age-scheduled fresh reward fails its classifier gate, instead of continuing a fixed-round experiment with the prior stale reward.",
+        "dgpo.adaptive_omnifold.recalibration.warm_start_iterations": "One-based residual iterations to fine-tune from previous-round repeat/fold weights. Uses stable condition-hash partitions, fresh AdamW state and recomputed log weights. Legacy single-repeat checkpoints remain compatible when crossfit_repeats=1. Raw and trust monitors remain fresh.",
         "dgpo.adaptive_omnifold.recalibration.residual_min_auc_gain": "The sole outer-iteration usefulness gate: a residual classifier is stored only when held-out AUC is strictly greater than 0.5 plus this value. Held-out BCE remains diagnostic. Larger values widen the closure band and stop residual iterations earlier.",
         "dgpo.adaptive_omnifold.recalibration.acceptance_audit_enabled": "Enable a second fresh-classifier candidate gate after cross-fit residual closure. Disable it to install directly at residual closure.",
         "dgpo.adaptive_omnifold.recalibration.acceptance_max_balanced_accuracy": "When the optional candidate acceptance audit is enabled, require its fresh held-out weighted balanced accuracy to be strictly below this value.",
@@ -6833,6 +7393,7 @@ def _wandb_is_media_value(v: Any) -> bool:
     mod = getattr(type(v), "__module__", "") or ""
     name = getattr(type(v), "__name__", "")
     return mod.startswith("wandb") and name in (
+        "CustomChart",
         "Histogram",
         "Image",
         "Plotly",
@@ -6855,8 +7416,65 @@ def _wandb_critical_enabled() -> bool:
 
 # An explicit allowlist avoids hundreds of automatic panels from dormant
 # ablations, duplicate residual statistics and per-process response matrices.
+_WANDB_CLASSIFIER_TRAINING_CHARTS = frozenset(
+    f"Classifier training/{role}/{metric}"
+    for role in ("Reward", "Fresh audit")
+    for metric in (
+        "Train loss",
+        "Validation loss",
+        "Validation AUC",
+        "Validation accuracy",
+        "Learning rate",
+        "Base learning rate",
+        "Fixed probe BCE before update",
+        "Fixed probe BCE after update",
+        "Fixed probe BCE change",
+        "Fixed probe separation before update",
+        "Fixed probe separation after update",
+        "Fixed probe logit change RMS",
+        "Largest rank-local gradient norm",
+        "Gradient spike trigger",
+        *(f"Fixed representation probe: {branch} holdout AUC"
+          for branch in ("raw_fourier", "normalized_fourier", "fourier", "decoder", "concat", "fusion", "current_head")),
+        *(f"CV representation probe: {branch} holdout AUC"
+          for branch in ("raw_fourier", "normalized_fourier", "fourier", "decoder", "concat", "fusion")),
+        *(f"{branch} {metric}" for branch in ("fourier", "decoder", "fusion")
+          for metric in ("activation_rms", "gradient_rms")),
+        *(f"Decoder {branch} gate RMS" for branch in ("self", "cross", "ffn")),
+        *(f"{label} {description}"
+          for label in ("Adapter", "Decoder", "Backbone", "Fourier context", "Output head")
+          for description in ("AdamW update RMS", "relative AdamW update RMS")),
+        "Pre-clip gradient norm",
+        "Gradient clip scale",
+        "Gradient clip fraction",
+        "Direct topology head gradient norm",
+        "Topology context gradient norm",
+        "Context output head gradient norm",
+        "Decoder gradient norm",
+        "Adapter gradient norm",
+        "Input projector gradient norm",
+        "Truth logit mean",
+        "Generated logit mean",
+        "Logit class separation",
+        "Logit RMS",
+        "Saturated-logit fraction",
+        "Direct head parameter RMS",
+        "Direct head gradient RMS",
+        "Direct head relative gradient RMS",
+        "Topology context parameter RMS",
+        "Topology context gradient RMS",
+        "Topology context relative gradient RMS",
+    )
+)
 _WANDB_CRITICAL_CHARTS = frozenset({
+    "val/reward/all_sample_mean", "val/reward/best_of_k_mean",
+    "val_cheap/reward/all_sample_mean", "val_cheap/reward/best_of_k_mean",
+    "frozen_classifier/events",
+    "frozen_classifier/ensemble/auc", "frozen_classifier/ensemble/auc_gap",
+    "frozen_classifier/fold01/auc", "frozen_classifier/fold01/auc_gap",
+    "frozen_classifier/fold02/auc", "frozen_classifier/fold02/auc_gap",
     "train/loss/total", "train/loss/dgpo", "train/grad/global_norm_pre_clip",
+    "train/parameter_update_rms",
     "train/grad/clip_active", "train/memory/peak_allocated_gib",
     "train/round_warmup/lr_scale", "train/round_warmup/completed_updates",
     "train/lr/scheduled_max", "train/lr/scheduled_min",
@@ -6869,8 +7487,18 @@ _WANDB_CRITICAL_CHARTS = frozenset({
     "reference_trust/best_decay/feasibility_limited",
     "reference_trust/best_decay/global_best_auc_gap",
     "reference_trust/adam_full_state_reset", "reference_trust/adam_states_cleared",
-    "staleness/raw_auc", "staleness/raw_balanced_accuracy",
+        "staleness/raw_auc", "staleness/raw_balanced_accuracy",
+        "staleness/raw_audit_repeats", "staleness/raw_auc_gap_stdev",
+        "staleness/raw_auc_gap_se",
+        "staleness/fixed_schedule_diagnostic_raw_audit",
+        "staleness/diagnostic_selection_blind",
+        "staleness/raw_auc_gap_slope_per_10_steps",
+        "staleness/raw_auc_gap_change_from_step0",
+    "staleness/fixed_schedule_without_audit",
+    "staleness/incumbent_weighted_audit_skipped",
+    "staleness/independent_raw_audit_skipped",
     "staleness/raw_best_auc_gap", "staleness/raw_no_improvement_streak",
+    "staleness/raw_no_improvement_patience",
     "staleness/patience_paused_for_warmup",
     "staleness/global_best/candidate_gap", "staleness/global_best/incumbent_gap",
     "staleness/global_best/improved", "staleness/global_best/failed_rounds",
@@ -6878,11 +7506,23 @@ _WANDB_CRITICAL_CHARTS = frozenset({
     "staleness/global_best/confirmation_valid", "staleness/global_best/confirmation_accepted",
     "staleness/raw_audit_saturated", "staleness/trigger_recalibration",
     "staleness/age_trigger_recalibration",
+    "staleness/reward_round_budget_exhausted",
     "staleness/raw_best_rollback_applied", "staleness/reward_round_id",
     "classifier_trust/balanced_accuracy", "classifier_trust/balanced_accuracy_lower",
     "classifier_trust/balanced_accuracy_upper", "classifier_trust/max_balanced_accuracy",
     "classifier_trust/trigger_recalibration", "classifier_trust/saturated",
     "omnifold/accepted", "omnifold/iterations_fitted",
+    "omnifold/iteration_one_only", "omnifold/closure_evaluated",
+    "omnifold/iteration1_monitor/raw_auc",
+    "omnifold/iteration1_monitor/validation_bce",
+    "omnifold/iteration1_monitor/train_bce",
+    "omnifold/iteration1_monitor/warm_started_folds",
+    "omnifold/iteration1_monitor/train_oof/ess_fraction",
+    "omnifold/iteration1_monitor/train_oof/top_1pct_mass",
+    "omnifold/iteration1_monitor/train_oof/max_mean_one_weight",
+    "omnifold/iteration1_monitor/validation_ensemble/ess_fraction",
+    "omnifold/iteration1_monitor/validation_ensemble/top_1pct_mass",
+    "omnifold/iteration1_monitor/validation_ensemble/max_mean_one_weight",
     "omnifold/candidate/residual_closure_auc",
     "omnifold/fit/iter01/validation_auc",
     "val_ztautau/jsd/current/topology/cos_opening",
@@ -6905,20 +7545,76 @@ def _wandb_critical_keep(key: str) -> bool:
     # Keep fit diagnostics searchable but hidden, not connected into a fake
     # training curve across independent folds/refits. Console progress remains.
     return (
-        key in _WANDB_CRITICAL_CHARTS or key in _WANDB_CLOCK_KEYS
+        key.startswith(("endpoint_kl/", "train/visible_conditioning/", "train/lr/scheduled/")) or key in _WANDB_CRITICAL_CHARTS or key in _WANDB_CLOCK_KEYS
+        or key in _WANDB_CLASSIFIER_TRAINING_CHARTS
+        or key.startswith("classifier_fit/")
+        or key.startswith("gradient_conflict/")
+        or key.startswith("gradient_direction/")
+        or key.startswith("audit/")
+        or key.startswith("gradient_transfer/")
+        or key.startswith("classifier_only/")
+        or key.startswith("parameter_update_rms_calibration/")
+        or key.startswith("reward_consensus/")
+        or key.startswith("reward_rank_audit/")
+        or key.startswith("omnifold/iteration1_monitor/")
+        or key.startswith("omnifold/weight_guard/")
+        or key.startswith("omnifold/adaptive_tempering/")
+        or key.startswith("omnifold/minimum_sufficient/")
+        or key.startswith("staleness/raw_audit_repeat_")
         or key.startswith("omnifold_live/meta/")
-        or (key.startswith("omnifold_live/") and key.rsplit("/", 1)[-1] in {
-            "training_loss", "validation_loss", "validation_auc",
-            "validation_balanced_accuracy", "saturated",
-        })
+        or (key.startswith("omnifold_live/") and ("/stability/" in key or "/visible_conditioning/" in key))
+        or (
+            key.startswith("omnifold_live/")
+            and (
+                key.rsplit("/", 1)[-1] in {
+                    "training_loss", "training_balanced_accuracy",
+                    "validation_loss", "validation_auc",
+                    "validation_balanced_accuracy", "saturated",
+                    "learning_rate", "topology_training_stage",
+                    "fit_stage", "selected_stage", "stage_a_validation_loss",
+                    "stage_b_validation_loss", "accepted",
+                    "threshold_reached", "validation_oriented_balanced_accuracy",
+                    "validation_balanced_accuracy_lcb",
+                    "validation_balanced_accuracy_lcb_standard_error",
+                    "validation_balanced_accuracy_lcb_streak",
+                    "train_ess_fraction", "validation_ess_fraction",
+                    "applied_tempering", "ess_target_reached",
+                    "gradient_norm", "gradient_clipped",
+                    "gradient_clip_scale", "gradient_clip_fraction",
+                }
+                or key.rsplit("/", 1)[-1].startswith(
+                    (
+                        "gradient_norm_",
+                        "parameter_rms_",
+                        "gradient_rms_",
+                        "gradient_to_parameter_rms_ratio_",
+                        "parameter_update_rms_",
+                        "update_to_parameter_rms_ratio_",
+                        "optimizer_group_lr_",
+                        "scheduler_",
+                        "logit_",
+                    )
+                )
+            )
+        )
         or key in {
             "staleness/global_step", "staleness/epoch",
             "staleness/reward_age_epochs", "staleness/max_reward_age_epochs",
+            "staleness/max_reward_rounds", "staleness/reward_round_budget_exhausted",
             "staleness/age_refit_due", "staleness/trigger_reason",
             "staleness/raw_best_global_step", "staleness/raw_best_epoch",
             "staleness/raw_best_rollback_global_step", "classifier_trust/epoch",
             "omnifold/reward_round_id", "omnifold/all_fits_saturated",
+            "omnifold/all_fits_ready",
+            "omnifold/accept_reason", "omnifold/recalibrations_rejected",
+            "omnifold/residual_closure_auc_limit", "omnifold/residual_closure_schedule_enabled",
+            "omnifold/refit_global_step",
+            "staleness/decision", "staleness/raw_best_rollback_applied",
             "staleness/raw_audit_fit_events", "staleness/raw_audit_test_events",
+            "staleness/raw_audit_early_stop_events", "staleness/raw_audit_probe_events",
+            "staleness/raw_audit_steps_per_epoch", "staleness/raw_audit_validation_interval_steps",
+            "staleness/raw_audit_patience_evaluations", "staleness/raw_audit_uses_omnifold_fold",
+            "staleness/raw_audit_training_fold",
             "staleness/raw_classifier_warm_started", "staleness/raw_audit_training_ready",
             "staleness/raw_audit_training_min_steps", "staleness/raw_audit_training_steps",
             "staleness/raw_audit_training_epochs",
@@ -6941,6 +7637,7 @@ _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
         "train/loss/delta",
         "train/grad/global_norm_pre_clip",
         "train/grad/clip_active",
+        "train/parameter_update_rms",
         "train/memory/peak_allocated_gib",
         "train/memory/peak_reserved_gib",
         "reward/raw/mean",
@@ -6956,17 +7653,22 @@ _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
         "reference_trust/objective_vp_path_kl",
         "reference_trust/velocity_mse_ratio",
         "val/reward/mean",
+        "val/reward/all_sample_mean",
+        "val/reward/best_of_k_mean",
         "val/reward/median",
         "val/reward/p10",
         "val/reward/p90",
         "val/winrate",
         "val_cheap/reward/mean",
+        "val_cheap/reward/all_sample_mean",
+        "val_cheap/reward/best_of_k_mean",
         "val_cheap/reward/median",
         "val_cheap/reward/p10",
         "val_cheap/reward/p90",
         "omnifold/accepted",
         "omnifold/iterations_fitted",
         "omnifold/all_fits_saturated",
+        "omnifold/all_fits_ready",
         "omnifold/bootstrap_on_start",
         "omnifold/resume_refit_once_completed",
         "omnifold/resume_refit_once_accepted",
@@ -6990,18 +7692,42 @@ _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
         "staleness/raw_audit_training_min_steps",
         "staleness/raw_audit_training_steps",
         "staleness/raw_audit_training_epochs",
+        "staleness/raw_audit_fit_events",
+        "staleness/raw_audit_early_stop_events",
+        "staleness/raw_audit_test_events",
+        "staleness/raw_audit_probe_events",
+        "staleness/raw_audit_steps_per_epoch",
+        "staleness/raw_audit_validation_interval_steps",
+        "staleness/raw_audit_patience_evaluations",
+        "staleness/raw_audit_uses_omnifold_fold",
+        "staleness/raw_audit_training_fold",
         "staleness/raw_audit_saturated",
         "staleness/raw_audit_validation_loss",
         "staleness/raw_audit_validation_auc",
         "staleness/raw_auc_null_se_approx",
         "staleness/raw_auc_gap_z_approx",
         "staleness/raw_auc_gap_pvalue_approx",
+        "staleness/raw_audit_repeats",
+        "staleness/raw_auc_gap_stdev",
+        "staleness/raw_auc_gap_se",
         "staleness/monitor_mode_raw_only",
         "staleness/audit_saturated",
         "staleness/audit_threshold_reached",
         "staleness/trigger_threshold",
         "staleness/trigger_recalibration",
         "staleness/reward_round_id",
+        "staleness/fixed_schedule_without_audit",
+        "staleness/incumbent_weighted_audit_skipped",
+        "staleness/independent_raw_audit_skipped",
+        "staleness/fixed_schedule_diagnostic_raw_audit",
+        "staleness/fixed_schedule_with_diagnostic_audit",
+        "staleness/diagnostic_selection_blind",
+        "staleness/raw_audit_trajectory_points",
+        "staleness/raw_auc_gap_step0",
+        "staleness/raw_auc_gap_change_from_step0",
+        "staleness/raw_auc_gap_slope_per_10_steps",
+        "staleness/max_reward_rounds",
+        "staleness/reward_round_budget_exhausted",
     }
 )
 
@@ -7009,7 +7735,36 @@ _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
 def _wandb_simplified_keep(key: str, value: Any) -> bool:
     """Keep only non-redundant metrics used to judge training or acceptance."""
 
+    if key.startswith(("endpoint_kl/", "train/visible_conditioning/", "train/lr/scheduled/")):
+        return True
+
+    if (
+        key.startswith(
+            (
+                "omnifold/iteration1_monitor/",
+                "frozen_classifier/",
+                "omnifold/weight_guard/",
+                "omnifold/adaptive_tempering/",
+                "omnifold/minimum_sufficient/",
+            )
+        )
+        or key in {"omnifold/iteration_one_only", "omnifold/closure_evaluated"}
+    ):
+        return True
     if key in _WANDB_SIMPLIFIED_EXACT_KEYS:
+        return True
+    if key.startswith((
+        "Classifier training/",
+        "classifier_fit/",
+        "gradient_conflict/",
+        "gradient_transfer/",
+        "classifier_only/",
+        "parameter_update_rms_calibration/",
+    )):
+        return True
+    if key.startswith(("reward_consensus/", "reward_rank_audit/")):
+        return True
+    if key.startswith("staleness/raw_audit_repeat_"):
         return True
     if key.startswith("reference_trust/"):
         return True
@@ -7026,27 +7781,68 @@ def _wandb_simplified_keep(key: str, value: Any) -> bool:
             "fit_step",
             "iteration",
             "crossfit_fold",
+            "repeat",
+            "audit_repeat",
+            "phase_id",
             "dgpo_epoch",
             "global_step",
             "signed_scale",
         }
     if key.startswith("omnifold_live/"):
-        return key.rsplit("/", 1)[-1] in {
+        if "/stability/" in key or "/visible_conditioning/" in key:
+            return True
+        metric_name = key.rsplit("/", 1)[-1]
+        return metric_name in {
+            "fit_stage", "selected_stage", "stage_a_validation_loss",
+            "stage_b_validation_loss",
             "validation_auc",
             "validation_balanced_accuracy",
+            "learning_rate",
+            "topology_training_stage",
             "accepted",
             "saturated",
             "threshold_reached",
+            "validation_oriented_balanced_accuracy",
+            "validation_balanced_accuracy_lcb",
+            "validation_balanced_accuracy_lcb_standard_error",
+            "validation_balanced_accuracy_lcb_streak",
             "warm_started",
             "warm_started_folds",
-        }
+            "train_ess_fraction",
+            "validation_ess_fraction",
+            "applied_tempering",
+            "ess_target_reached",
+            "gradient_norm", "gradient_clipped",
+            "gradient_clip_scale", "gradient_clip_fraction",
+        } or metric_name.startswith(
+            (
+                "gradient_norm_",
+                "parameter_rms_",
+                "gradient_rms_",
+                "gradient_to_parameter_rms_ratio_",
+                "parameter_update_rms_",
+                "update_to_parameter_rms_ratio_",
+                "optimizer_group_lr_",
+                "scheduler_",
+                "logit_",
+            )
+        )
     if key.startswith("omnifold/fit/iter"):
         return key.rsplit("/", 1)[-1] in {
             "saturated",
+            "minimum_sufficient",
+            "threshold_reached_folds",
+            "fit_steps_min",
+            "fit_steps_mean",
+            "fit_steps_max",
             "stored_in_reward",
             "warm_started_folds",
             "validation_auc",
             "validation_balanced_accuracy",
+            "applied_tempering",
+            "train_ess_fraction",
+            "validation_ess_fraction",
+            "ess_target_reached",
         }
     if key.startswith("omnifold/candidate/"):
         suffix = key.rsplit("/", 1)[-1]
@@ -7141,8 +7937,9 @@ def _wandb_train_payload(metrics: dict[str, Any]) -> dict[str, Any]:
 
     Passes through ``wandb.Histogram`` / ``wandb.Image`` values under ``reward/`` or ``val/``.
     Known prefixes ``train/``, ``val/``, ``reward/``, ``parameter/``, ``components/``,
-    and ``diagnostics/`` are logged as-is. ``components/`` is the per-component reward
-    breakdown panel; ``diagnostics/`` is for monitoring-only reward-hacking checks.
+    ``diagnostics/``, and gradient diagnostic namespaces are logged as-is.
+    ``components/`` is the per-component reward breakdown panel; ``diagnostics/``
+    is for monitoring-only reward-hacking checks.
     Keys starting with ``_`` are internal (e.g. ``_kin_h_*`` histogram arrays) and are skipped.
     """
     out: dict[str, Any] = {}
@@ -7171,6 +7968,9 @@ def _wandb_train_payload(metrics: dict[str, Any]) -> dict[str, Any]:
             "diagnostics/",
             "dgpo/",
             "reference_trust/",
+            "gradient_conflict/",
+            "gradient_transfer/",
+            "endpoint_kl/",
         )):
             out[k] = v
         elif _wandb_is_media_value(v):
@@ -7305,6 +8105,9 @@ def _wandb_sanitize_log_dict(data: dict[str, Any]) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     for k, v in data.items():
+        if k.startswith("gradient_conflict/") and k.endswith("/panel_sha256") and isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v):
+            out[k] = v
+            continue
         if _wandb_is_media_value(v):
             out[k] = v
             continue
@@ -7398,6 +8201,312 @@ def _wandb_log_validation(
     _wandb_log_with_step(wandb_mod, clean, step=wandb_step)
 
 
+class _ClassifierFitLossTracker:
+    """Independent loss curves on local optimizer steps, never DGPO/log steps.
+
+    Fits execute serially. A fold/refit/phase change or restarted fit counter
+    starts a distinct series; only the active series is kept in Python memory.
+    """
+
+    def __init__(self) -> None:
+        self.fit_id = 0
+        self.key: tuple[Any, ...] | None = None
+        self.last_step = -1
+        self.prefix = ""
+
+    def payload(self, wandb_mod: Any, phase: str, row: Mapping[str, Any], *,
+                global_step: int, epoch: int) -> dict[str, Any]:
+        step = int(float(row.get("step", 0)))
+        if step < 1 or "training_loss" not in row:
+            return {}
+        iteration, fold, repeat = (int(float(row.get(k, default)))
+                                   for k, default in (("iteration", 1), ("fold", 0), ("repeat", 1)))
+        stage = int(float(row.get("fit_stage", 0)))
+        key = (phase, global_step, epoch, iteration, fold, repeat, stage)
+        if key != self.key or step <= self.last_step:
+            self.fit_id += 1
+            self.key = key
+            self.prefix = (f"classifier_fit/{phase}/fit{self.fit_id:05d}"
+                           f"_g{global_step:06d}_i{iteration:02d}_f{fold:02d}_r{repeat:02d}")
+            if stage:
+                self.prefix += f"_stage{stage}"
+            axis = f"{self.prefix}/step"
+            wandb_mod.define_metric(axis, hidden=True)
+            for metric in (
+                "training_loss",
+                "training_balanced_accuracy",
+                "validation_loss",
+                "validation_balanced_accuracy",
+                "validation_auc",
+                "learning_rate",
+                "topology_training_stage",
+            ):
+                wandb_mod.define_metric(
+                    f"{self.prefix}/{metric}",
+                    step_metric=axis,
+                    step_sync=False,
+                    hidden=False,
+                )
+        self.last_step = step
+        payload = {
+            f"{self.prefix}/step": step,
+            f"{self.prefix}/training_loss": row["training_loss"],
+        }
+        if "training_balanced_accuracy" in row:
+            payload[f"{self.prefix}/training_balanced_accuracy"] = row[
+                "training_balanced_accuracy"
+            ]
+        for metric in ("learning_rate", "topology_training_stage"):
+            if metric in row:
+                payload[f"{self.prefix}/{metric}"] = row[metric]
+        # The live callback otherwise repeats the last validation result
+        # between evaluations; do not place stale values at a new fit step.
+        if row.get("validation_evaluated", False):
+            for metric in (
+                "validation_loss",
+                "validation_balanced_accuracy",
+                "validation_auc",
+            ):
+                if metric in row:
+                    payload[f"{self.prefix}/{metric}"] = row[metric]
+        return payload
+
+
+class _ClassifierTrainingPlotTracker:
+    """Build compact W&B charts from repeat 1 / fold 1 of every iteration.
+
+    The plotted x values are the exact local optimizer steps reported by the
+    classifier callback. Other cross-fit and ensemble members remain available
+    in ``omnifold_live`` history, but do not create W&B panels. A fixed chart key
+    is reused at every refit; the chart title identifies the current DGPO step.
+    """
+
+    _PHASE_ROLES = {
+        "residual_reward": "Reward",
+        "raw_staleness_audit": "Fresh audit",
+    }
+    _METRICS = (
+        ("training_loss", "Train loss", False),
+        ("validation_loss", "Validation loss", True),
+        ("validation_auc", "Validation AUC", True),
+        (
+            "validation_balanced_accuracy",
+            "Validation accuracy",
+            True,
+        ),
+        ("learning_rate", "Base learning rate", False),
+        ("gradient_norm", "Pre-clip gradient norm", False),
+        ("gradient_clip_scale", "Gradient clip scale", False),
+        ("gradient_clip_fraction", "Gradient clip fraction", False),
+        ("stability/probe/bce_before", "Fixed probe BCE before update", False),
+        ("stability/probe/bce_after", "Fixed probe BCE after update", False),
+        ("stability/probe/bce_delta", "Fixed probe BCE change", False),
+        ("stability/probe/separation_before", "Fixed probe separation before update", False),
+        ("stability/probe/separation_after", "Fixed probe separation after update", False),
+        ("stability/probe/logit_change_rms", "Fixed probe logit change RMS", False),
+        ("stability/local_gradient_norm_rankmax", "Largest rank-local gradient norm", False),
+        ("stability/gradient_spike", "Gradient spike trigger", False),
+        *(
+            (f"stability/representation_probe/{branch}/holdout_auc",
+             f"Fixed representation probe: {branch} holdout AUC", False)
+            for branch in ("raw_fourier", "normalized_fourier", "fourier", "decoder", "concat", "fusion", "current_head")
+        ),
+        *(
+            (f"stability/representation_probe/{branch}/cv/holdout_auc",
+             f"CV representation probe: {branch} holdout AUC", False)
+            for branch in ("raw_fourier", "normalized_fourier", "fourier", "decoder", "concat", "fusion")
+        ),
+        *(
+            (f"stability/layer/representation/{branch}/{metric}/rankmean",
+             f"{branch} {metric}", False)
+            for branch in ("fourier", "decoder", "fusion")
+            for metric in ("activation_rms", "gradient_rms")
+        ),
+        *(
+            (f"stability/layer/representation/bank.decoder.blocks.0.modulation/gate_{branch}_rms/rankmean",
+             f"Decoder {branch} gate RMS", False)
+            for branch in ("self", "cross", "ffn")
+        ),
+        *(
+            (f"{metric}_{group}", f"{label} {description}", False)
+            for group, label in (
+                ("adapter", "Adapter"), ("decoder", "Decoder"),
+                ("backbone_other", "Backbone"),
+                ("topology_context", "Fourier context"),
+                ("context_output_head", "Output head"),
+            )
+            for metric, description in (
+                ("parameter_update_rms", "AdamW update RMS"),
+                ("update_to_parameter_rms_ratio", "relative AdamW update RMS"),
+            )
+        ),
+        (
+            "gradient_norm_direct_topology_head",
+            "Direct topology head gradient norm",
+            False,
+        ),
+        (
+            "gradient_norm_topology_context",
+            "Topology context gradient norm",
+            False,
+        ),
+        (
+            "gradient_norm_context_output_head",
+            "Context output head gradient norm",
+            False,
+        ),
+        ("gradient_norm_decoder", "Decoder gradient norm", False),
+        ("gradient_norm_adapter", "Adapter gradient norm", False),
+        (
+            "gradient_norm_input_projector",
+            "Input projector gradient norm",
+            False,
+        ),
+        ("logit_mean_positive", "Truth logit mean", False),
+        ("logit_mean_negative", "Generated logit mean", False),
+        ("logit_class_mean_separation", "Logit class separation", False),
+        ("logit_rms", "Logit RMS", False),
+        ("logit_abs_gt_5_fraction", "Saturated-logit fraction", False),
+        (
+            "parameter_rms_direct_topology_head",
+            "Direct head parameter RMS",
+            False,
+        ),
+        (
+            "gradient_rms_direct_topology_head",
+            "Direct head gradient RMS",
+            False,
+        ),
+        (
+            "gradient_to_parameter_rms_ratio_direct_topology_head",
+            "Direct head relative gradient RMS",
+            False,
+        ),
+        (
+            "parameter_rms_topology_context",
+            "Topology context parameter RMS",
+            False,
+        ),
+        (
+            "gradient_rms_topology_context",
+            "Topology context gradient RMS",
+            False,
+        ),
+        (
+            "gradient_to_parameter_rms_ratio_topology_context",
+            "Topology context relative gradient RMS",
+            False,
+        ),
+    )
+
+    def __init__(self) -> None:
+        self._states: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _new_state(*, global_step: int, epoch: int) -> dict[str, Any]:
+        return {
+            "cycle": (int(global_step), int(epoch)),
+            "iterations": {},
+        }
+
+    @staticmethod
+    def _finite_float(value: Any) -> float | None:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    def payload(
+        self,
+        wandb_mod: Any,
+        phase: str,
+        row: Mapping[str, Any],
+        *,
+        global_step: int,
+        epoch: int,
+    ) -> dict[str, Any]:
+        role = self._PHASE_ROLES.get(str(phase))
+        step = int(float(row.get("step", 0)))
+        if role is None or step < 1 or "training_loss" not in row:
+            return {}
+
+        cycle = (int(global_step), int(epoch))
+        state = self._states.get(phase)
+        if state is None or state["cycle"] != cycle:
+            state = self._new_state(global_step=global_step, epoch=epoch)
+            self._states[phase] = state
+
+        iteration = int(float(row.get("iteration", 1)))
+        repeat = int(float(row.get("repeat", 1)))
+        fold = int(float(row.get("fold", 1)))
+        if repeat != 1 or fold != 1:
+            return {}
+
+        iteration_state = state["iterations"].setdefault(
+            iteration,
+            {
+                "stage": int(float(row.get("fit_stage", 0))),
+                "last_raw_step": 0,
+                "metrics": {metric: [] for metric, _label, _validation in self._METRICS},
+            },
+        )
+        stage = int(float(row.get("fit_stage", 0)))
+        if stage != iteration_state["stage"]:
+            iteration_state["stage"] = stage
+            iteration_state["last_raw_step"] = 0
+        elif step <= int(iteration_state["last_raw_step"]):
+            # Ignore duplicate/out-of-order callbacks within the same fit
+            # stage; a stage change is handled above with its reported step.
+            return {}
+
+        # Keep the exact step published by this classifier fit. W&B transport
+        # rows, DGPO steps, other members, and stage counters never alter x.
+        plot_step = step
+        iteration_state["last_raw_step"] = step
+        validation_evaluated = bool(float(row.get("validation_evaluated", 0.0)))
+        for metric, _label, validation_only in self._METRICS:
+            if validation_only and not validation_evaluated:
+                continue
+            value = self._finite_float(row.get(metric))
+            if value is not None:
+                iteration_state["metrics"][metric].append((plot_step, value))
+
+        should_publish = (
+            validation_evaluated
+            or bool(float(row.get("saturated", 0.0)))
+            or bool(float(row.get("threshold_reached", 0.0)))
+        )
+        if not should_publish:
+            return {}
+
+        payload: dict[str, Any] = {}
+        for metric, label, _validation_only in self._METRICS:
+            xs: list[list[int]] = []
+            ys: list[list[float]] = []
+            keys: list[str] = []
+            for iteration_id in sorted(state["iterations"]):
+                points = state["iterations"][iteration_id]["metrics"][metric]
+                if not points:
+                    continue
+                xs.append([point[0] for point in points])
+                ys.append([point[1] for point in points])
+                keys.append(f"Iteration {iteration_id}")
+            if not xs:
+                continue
+            payload[f"Classifier training/{role}/{label}"] = (
+                wandb_mod.plot.line_series(
+                    xs,
+                    ys,
+                    keys=keys,
+                    title=f"{role} classifier · {label} · DGPO step {global_step}",
+                    xname="Classifier step",
+                    split_table=True,
+                )
+            )
+        return payload
+
+
 def _wandb_define_axes(wandb_mod: Any, *, critical: bool) -> None:
     """Never fall back to the classifier-inflated internal W&B Step axis."""
     wandb_mod.define_metric("*", step_metric="global_step", step_sync=False, hidden=critical)
@@ -7405,13 +8514,92 @@ def _wandb_define_axes(wandb_mod: Any, *, critical: bool) -> None:
         wandb_mod.define_metric(key, hidden=True)
     for prefix in _WANDB_EPOCH_PREFIXES:
         wandb_mod.define_metric(prefix + "*", step_metric="epoch", step_sync=False, hidden=critical)
+    # Raw per-member progress stays queryable but does not create hundreds of
+    # misleading connected panels.  Compact representative charts below are
+    # the visible classifier-training view.
     wandb_mod.define_metric("omnifold_live/*", step_metric="omnifold_live/log_index",
-                          step_sync=False, hidden=critical)
+                          step_sync=False, hidden=True)
+    wandb_mod.define_metric("train/visible_conditioning/*", step_metric="global_step",
+                          step_sync=False, hidden=False)
+    wandb_mod.define_metric("train/lr/scheduled/*", step_metric="global_step",
+                          step_sync=False, hidden=False)
+    for key in sorted(_WANDB_CLASSIFIER_TRAINING_CHARTS):
+        wandb_mod.define_metric(key, hidden=False)
+    wandb_mod.define_metric("gradient_conflict/*", step_metric="global_step", step_sync=False, hidden=True)
+    wandb_mod.define_metric("gradient_direction/*", step_metric="global_step", step_sync=False, hidden=True)
+    wandb_mod.define_metric("audit/*", step_metric="global_step", step_sync=False, hidden=True)
+    for key in (
+        "installed_vs_fresh/cosine",
+        "installed_vs_fresh/cross_dot_lcb",
+        "installed_vs_fresh/cross_dot_ucb",
+        "installed_vs_fresh/conflict",
+        "installed_vs_fresh/alignment",
+        "installed/reliable",
+        "fresh/reliable",
+    ):
+        wandb_mod.define_metric(
+            "gradient_direction/" + key,
+            step_metric="global_step",
+            step_sync=False,
+            hidden=False,
+        )
+    for key in (
+        "raw_auc",
+        "raw_auc_gap",
+        "saturated",
+        "training_ready",
+        "raw_auc_gap_change_from_step0",
+        "raw_auc_gap_slope_per_10_steps",
+    ):
+        wandb_mod.define_metric(
+            "audit/" + key,
+            step_metric="global_step",
+            step_sync=False,
+            hidden=False,
+        )
+    wandb_mod.define_metric(
+        "gradient_transfer/*",
+        step_metric="global_step",
+        step_sync=False,
+        hidden=True,
+    )
+    for key in ("omnifold_staleness/cosine", "omnifold_staleness/conflict",
+                "omnifold/norm", "staleness/norm", "trust/norm",
+                "omnifold_staleness/conclusive", "omnifold_trust/cosine",
+                "omnifold/split_cosine", "staleness/split_cosine", "ran",
+                "total_on_omnifold/projection_ratio", "total_on_staleness/projection_ratio"):
+        wandb_mod.define_metric("gradient_conflict/" + key, step_metric="global_step", step_sync=False, hidden=False)
+    for phase in ("pre_refit", "post_install", "post_warmup"):
+        for key in ("omnifold_trust/cosine", "trust/norm", "total_on_omnifold/projection_ratio"):
+            wandb_mod.define_metric(f"gradient_conflict/{phase}/{key}", step_metric="global_step", step_sync=False, hidden=False)
+    wandb_mod.define_metric("frozen_classifier/*", step_metric="global_step", step_sync=False, hidden=False)
+    for key in (
+        "ran",
+        "h4/norm",
+        "reference_unweighted/norm",
+        "h4_reference/cosine",
+        "total_on_h4/projection_ratio",
+        "critical_lambda/value",
+        "adamw_descent_on_h4/cosine",
+        "adamw_descent_on_total/cosine",
+        "reconstruction_actual/relative_error",
+    ):
+        wandb_mod.define_metric(
+            "gradient_transfer/" + key,
+            step_metric="global_step",
+            step_sync=False,
+            hidden=False,
+        )
     # Exact definitions override the hidden default; no auto-plots for control
     # metadata or unrelated diagnostics. Users can still query hidden fit rows.
     if critical:
         for key in sorted(_WANDB_CRITICAL_CHARTS):
-            axis = "epoch" if key.startswith(_WANDB_EPOCH_PREFIXES) else "global_step"
+            if key.startswith("omnifold_live/"):
+                axis = "omnifold_live/log_index"
+            elif key.startswith(_WANDB_EPOCH_PREFIXES):
+                axis = "epoch"
+            else:
+                axis = "global_step"
             wandb_mod.define_metric(key, step_metric=axis, step_sync=False, hidden=False)
 
 
@@ -7459,6 +8647,7 @@ def _start_wandb_run(*, disable: bool = False) -> bool:
         "project": str(project),
         "entity": wb.get("entity"),
         "name": run_name,
+        "group": wb.get("group"),
         "tags": tags,
         "id": run_id,
         "config": global_config.to_logger(),
@@ -8611,6 +9800,22 @@ def _restore_policy_from_dgpo_checkpoint(
     return len(clean_state)
 
 
+def _raw_refit_failure_decision(*, rollback_applied: bool) -> str:
+    """Global-best bookkeeping alone does not mean the policy was rewound.
+
+    A rejected candidate never installs a new reward/reference. With no actual
+    rollback, the existing pair remains valid and the next normal monitor can
+    retry. A rewound policy instead requires recovery from a complete checkpoint.
+    """
+    if rollback_applied:
+        raise RuntimeError(
+            "OmniFold refit was not accepted after policy rollback; refusing to "
+            "train the rolled-back policy with the old reward/reference. "
+            "Resume the last complete checkpoint."
+        )
+    return "forward_recenter_deferred"
+
+
 def _reset_optimizer_after_reward_install(
     optimizer: torch.optim.Optimizer,
     *,
@@ -8795,6 +10000,45 @@ def _confirm_global_raw_candidate(
     }
 
 
+class _FixedEventInputShard:
+    """Cache CPU event inputs once; never cache policy-generated candidates.
+
+    This pins event order as well as membership despite Ray re-iteration order
+    changes. Classifier minibatch shuffling happens later, after identity splits.
+    The cache is process-local; persistent split provenance remains seed/hash
+    based. Generation uses one fixed batch size throughout a run.
+    """
+
+    def __init__(self, source: Any) -> None:
+        self.source = source
+        self.batches: list[dict[str, Any]] | None = None
+        self.loader_config: dict[str, Any] | None = None
+
+    @staticmethod
+    def _copy_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
+        return {key: value.detach().cpu().clone() if isinstance(value, Tensor)
+                else copy.deepcopy(value) for key, value in batch.items()}
+
+    def iter_torch_batches(self, **kwargs: Any) -> Any:
+        if self.batches is None:
+            # Finish the read before yielding: a capped monitor must not leave
+            # a live Ray iterator whose next pass chooses a different prefix.
+            batches = [self._copy_batch(batch)
+                       for batch in self.source.iter_torch_batches(**kwargs)]
+            self.batches = batches
+            self.loader_config = dict(kwargs)
+            events = sum(int(batch["x"].shape[0]) for batch in batches)
+            size = sum(v.numel() * v.element_size() for batch in batches
+                       for v in batch.values() if isinstance(v, Tensor))
+            _log.info("[DGPO/omnifold] Fixed CPU event cache: events=%s batches=%s MiB=%.1f; candidates regenerated per policy.",
+                      events, len(batches), size / (1024 ** 2))
+        elif self.loader_config != kwargs:
+            raise ValueError("fixed classifier input cache requires unchanged generation loader settings")
+        for batch in self.batches:
+            # CPU inference/test paths may mutate their input; preserve cache.
+            yield self._copy_batch(batch)
+
+
 @torch.no_grad()
 def _materialize_adaptive_omnifold_pool(
     data_shard: Any,
@@ -8811,6 +10055,9 @@ def _materialize_adaptive_omnifold_pool(
     num_ddim_steps: int,
     seed: int,
     include_pairwise_context: bool = False,
+    include_visible_pair_rest_frame: bool = False,
+    collect_policy_noise_mask: bool = False,
+    training_crossfit_fold: tuple[int, int, int] | None = None,
 ) -> Any:
     """Generate and all-gather one or a paired pair of K=1 pools.
 
@@ -8830,9 +10077,15 @@ def _materialize_adaptive_omnifold_pool(
     )
     from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import (
         EventPackingSpec,
+        _local_identity_fold_labels,
+        event_identity_inputs,
         pack_event_inputs,
     )
 
+    if training_crossfit_fold is not None:
+        folds, fold, fold_seed = training_crossfit_fold
+        if not 1 <= fold <= folds or folds < 2 or quota_events is not None or paired_reference_model is not None:
+            raise ValueError("training fold selection needs an uncapped, unpaired crossfit pool")
     core = _unwrap_core_evenet(model)
     paired_core = (
         None
@@ -8849,6 +10102,7 @@ def _materialize_adaptive_omnifold_pool(
     packed_chunks: list[Tensor] = []
     truth_chunks: list[Tensor] = []
     candidate_chunks: list[Tensor] = []
+    policy_mask_chunks: list[Tensor] = []
     paired_packed_chunks: list[Tensor] = []
     paired_truth_chunks: list[Tensor] = []
     paired_current_candidate_chunks: list[Tensor] = []
@@ -8919,6 +10173,24 @@ def _materialize_adaptive_omnifold_pool(
                         device,
                         torch.float32,
                     ) > 0
+                    if training_crossfit_fold is not None:
+                        # Match repeat-1 reward fit identities BEFORE generation.
+                        # No collectives here: per-rank input sizes may differ.
+                        packed, packing_spec = pack_event_inputs(
+                            batch, packing_spec,
+                            include_pairwise_context=include_pairwise_context,
+                            include_visible_pair_rest_frame=include_visible_pair_rest_frame,
+                        )
+                        labels = _local_identity_fold_labels(
+                            event_identity_inputs(packed, packing_spec), folds=folds, seed=fold_seed,
+                        )
+                        keep_fold = valid & (labels != fold - 1)
+                        batch = {
+                            key: value[keep_fold] if isinstance(value, Tensor)
+                            and value.ndim > 0 and len(value) == batch_size else value
+                            for key, value in batch.items()
+                        }
+                        valid = valid[keep_fold]
                     if bool(valid.any().item()):
                         # Snapshot the process-local RNG immediately before
                         # current-policy DDIM. Restoring it for the paired
@@ -8988,6 +10260,7 @@ def _materialize_adaptive_omnifold_pool(
                             batch,
                             packing_spec,
                             include_pairwise_context=include_pairwise_context,
+                            include_visible_pair_rest_frame=include_visible_pair_rest_frame,
                         )
                         keep = valid.nonzero(as_tuple=True)[0]
                         if per_rank_quota is not None:
@@ -8995,6 +10268,8 @@ def _materialize_adaptive_omnifold_pool(
                             keep = keep[:remaining]
                         if int(keep.numel()) > 0:
                             packed_chunks.append(packed[keep].detach().cpu())
+                            if collect_policy_noise_mask:
+                                policy_mask_chunks.append(batch["x_invisible_mask"][keep].detach().cpu())
                             truth_chunks.append(
                                 invisible[keep, :2, :2]
                                 .reshape(len(keep), 4)
@@ -9061,6 +10336,14 @@ def _materialize_adaptive_omnifold_pool(
         if paired_core is not None and paired_was_training is not None:
             paired_core.train(paired_was_training)
 
+    if training_crossfit_fold is not None and packing_spec is not None and not packed_chunks:
+        # A small local shard can contain only the other fold. It must still
+        # join all-gather; otherwise the remaining ranks could hang.
+        packed_chunks.append(torch.empty((0, packing_spec.width)))
+        truth_chunks.append(torch.empty((0, 4)))
+        candidate_chunks.append(torch.empty((0, 1, 4)))
+        if collect_policy_noise_mask:
+            policy_mask_chunks.append(torch.empty((0, 2)))
     if not packed_chunks or packing_spec is None:
         raise RuntimeError("adaptive OmniFold pool collected no valid events")
     local = {
@@ -9069,6 +10352,8 @@ def _materialize_adaptive_omnifold_pool(
         "candidates": torch.cat(candidate_chunks, dim=0),
         "packing_spec": packing_spec.to_dict(),
     }
+    if collect_policy_noise_mask:
+        local["policy_noise_mask"] = torch.cat(policy_mask_chunks, dim=0)
     if paired_core is not None:
         if not paired_candidate_chunks:
             raise RuntimeError(
@@ -9094,6 +10379,7 @@ def _materialize_adaptive_omnifold_pool(
             "packed_event",
             "truth",
             "candidates",
+            "policy_noise_mask",
         ):
             if key not in gathered:
                 continue
@@ -9120,6 +10406,7 @@ def _materialize_adaptive_omnifold_pool(
         truth=gathered["truth"],
         candidates=gathered["candidates"],
         packing_spec=EventPackingSpec.from_dict(gathered["packing_spec"]),
+        policy_noise_mask=gathered.get("policy_noise_mask"),
     )
     if pool.n_events < 30:
         raise RuntimeError(
@@ -9148,7 +10435,41 @@ def _materialize_adaptive_omnifold_pool(
     return pool, paired_current_pool, reference_pool
 
 
+def _materialize_raw_audit_training_pool(
+    training_shard, loader_cfg, *, cfg, model, sampler, device,
+    world_size, rank, num_ddim_steps, panel_seed, evaluation_events,
+):
+    """Share the exact original fold and generation seeds across both audit paths."""
+    if cfg.audit_fit.get("training_population", "probe_split") != "omnifold_fold":
+        return None
+    from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import _crossfit_repeat_seed
+
+    fold = int(cfg.audit_fit.get("training_fold", 1))
+    pool = _materialize_adaptive_omnifold_pool(
+        training_shard, loader_cfg, model=model, sampler=sampler, device=device,
+        world_size=world_size, rank=rank, quota_events=None,
+        num_ddim_steps=num_ddim_steps, seed=int(panel_seed) + 2_000_003,
+        include_pairwise_context=cfg.periodic_pair_features_enabled,
+        include_visible_pair_rest_frame=cfg.visible_pair_rest_frame_enabled,
+        training_crossfit_fold=(cfg.crossfit_folds, fold, _crossfit_repeat_seed(cfg.seed, 1)),
+    )
+    if rank == 0:
+        _log.info(
+            "[DGPO/omnifold] raw audit data: train=OmniFold repeat=1 fold=%s "
+            "fit_events=%s external_validation_events=%s (50/50 early-stop/final-test); "
+            "fresh current-policy K=1 samples, fresh classifier",
+            fold, pool.n_events, evaluation_events,
+        )
+    return pool
+
+
 @torch.no_grad()
+def _validation_reward_sample_stats(rewards: Tensor, valid: Tensor) -> tuple[Tensor, float, int]:
+    """Best per event plus all-sample sum/count; padded events never contribute."""
+    selected = rewards[:, valid.reshape(-1).bool()]
+    return selected.max(dim=0).values, float(selected.detach().double().sum().cpu().item()), selected.numel()
+
+
 def run_validation_epoch(
     model: torch.nn.Module,
     ref_model: torch.nn.Module,
@@ -9227,6 +10548,8 @@ def run_validation_epoch(
     n_val_batches = 0
     sum_r = 0.0
     cnt_r = 0
+    sum_all_r = 0.0
+    cnt_all_r = 0
     sum_win = 0.0
     cnt_win = 0
 
@@ -9327,6 +10650,8 @@ def run_validation_epoch(
             _log.warning("[DGPO] val: rank=%s has no val shard; returning empty metrics.", rank)
         empty_metrics = {
             f"{metric_prefix}/reward/mean": float("nan"),
+            f"{metric_prefix}/reward/all_sample_mean": float("nan"),
+            f"{metric_prefix}/reward/best_of_k_mean": float("nan"),
             f"{metric_prefix}/reward/median": float("nan"),
             f"{metric_prefix}/reward/p10": float("nan"),
             f"{metric_prefix}/reward/p30": float("nan"),
@@ -9400,10 +10725,9 @@ def run_validation_epoch(
         vb = m_sel
 
         if bool(vb.any().item()):
-            if val_K == 1:
-                r_per_event = rewards[0, vb]
-            else:
-                r_per_event = rewards[:, vb].max(dim=0).values
+            r_per_event, all_sum, all_count = _validation_reward_sample_stats(rewards, vb)
+            sum_all_r += all_sum
+            cnt_all_r += all_count
             sum_r += float(r_per_event.sum().detach().cpu().item())
             cnt_r += int(vb.sum().item())
             r_per_event_np = r_per_event.detach().float().cpu().numpy()
@@ -9673,7 +10997,7 @@ def run_validation_epoch(
     # All-reduce accumulators so every rank has the global totals.
     if world_size > 1:
         acc = torch.tensor(
-            [sum_r, cnt_r, sum_win, cnt_win],
+            [sum_r, cnt_r, sum_win, cnt_win, sum_all_r, cnt_all_r],
             dtype=torch.float64,
             device=device,
         )
@@ -9681,6 +11005,7 @@ def run_validation_epoch(
         a = acc.cpu().tolist()
         sum_r, cnt_r = a[0], int(a[1])
         sum_win, cnt_win = a[2], int(a[3])
+        sum_all_r, cnt_all_r = a[4], int(a[5])
 
     hist_stack = np.stack(
         [
@@ -9846,6 +11171,8 @@ def run_validation_epoch(
 
     out: dict[str, Any] = {
         f"{metric_prefix}/reward/mean": _mean(sum_r, cnt_r),
+        f"{metric_prefix}/reward/all_sample_mean": _mean(sum_all_r, cnt_all_r),
+        f"{metric_prefix}/reward/best_of_k_mean": _mean(sum_r, cnt_r),
         f"{metric_prefix}/reward/median": p50,
         f"{metric_prefix}/reward/p10": p10,
         f"{metric_prefix}/reward/p30": p30,
@@ -10206,6 +11533,23 @@ def _should_log_pretraining_baseline(start_epoch: int, global_step: int) -> bool
     return int(start_epoch) == 0 and int(global_step) == 0
 
 
+def _clear_unused_raw_monitor_baseline(state: Any, cfg: Any) -> bool:
+    """Honor disabled audits when inheriting a pre-audit bootstrap snapshot.
+
+    Clear only the pending diagnostic; installed reward/reference and counters
+    are untouched. Required controller baselines retain their previous path.
+    """
+    skip = (
+        cfg.fixed_schedule_skip_staleness_audit and not cfg.fixed_schedule_log_raw_audit
+    ) or (
+        cfg.log_only and not cfg.raw_audit_enabled and not cfg.baseline_probe_on_start
+    )
+    if state.raw_monitor_baseline_pending and skip:
+        state.raw_monitor_baseline_pending = False
+        return True
+    return False
+
+
 def _resume_logical_epoch_step(checkpoint: dict[str, Any] | None, budget: int | None) -> int:
     """Restore progress inside a logical epoch without replaying its step budget."""
     progress = int((checkpoint or {}).get("dgpo_epoch_step", 0))
@@ -10218,6 +11562,26 @@ def _resume_logical_epoch_step(checkpoint: dict[str, Any] | None, budget: int | 
     return progress
 
 
+
+
+def _should_apply_pinned_classifier_restart(
+    *,
+    pinned: bool,
+    load_mode: str,
+    auto_resume_checkpoint: Path | str | None,
+    best_source_dir: Any,
+) -> bool:
+    """Inherit classifiers on first start; skip when this run already has last.ckpt."""
+    if not pinned:
+        return False
+    if auto_resume_checkpoint is not None:
+        return False
+    if str(load_mode).strip().lower() != "resume" or best_source_dir:
+        raise ValueError(
+            "pinned_classifier_restart requires explicit resume source without "
+            "auto-resume selection"
+        )
+    return True
 
 
 def _prepare_best_point_restart(checkpoint: dict[str, Any]) -> dict[str, Any]:
@@ -10244,6 +11608,103 @@ def _prepare_best_point_restart(checkpoint: dict[str, Any]) -> dict[str, Any]:
         result.pop(key, None)
     result.update(epoch=-1, global_step=0, dgpo_next_epoch=0, dgpo_epoch_step=0,
                   dgpo_adaptive_omnifold_state=state.to_dict())
+    return result
+
+
+def _prepare_pinned_classifier_restart(checkpoint: dict[str, Any], dgpo: Mapping[str, Any]) -> dict[str, Any]:
+    """Inherit a pinned reward stack and rebuild only a missing raw judge."""
+    required = {"state_dict", "dgpo_adaptive_omnifold_state", "dgpo_ref_state_dict",
+                "dgpo_round_ref_state_dict", "dgpo_round_ref_sha256",
+                "dgpo_omnifold_reward_stack", "dgpo_omnifold_reward_metadata"}
+    if checkpoint is None or required.difference(checkpoint):
+        raise ValueError("Pinned classifier restart requires a complete policy/reward/reference checkpoint")
+    a = dgpo["adaptive_omnifold"]
+    r = a["recalibration"]
+    stack = checkpoint.get("dgpo_omnifold_reward_stack", {})
+    reward_payload = stack.get("reward", {})
+    cache = reward_payload.get("warm_start_state", {})
+    expected_outer = (
+        {
+            "schema": "condition-hash-80-20-v1",
+            "seed": a["single_pool_split_seed"],
+        }
+        if bool(a.get("single_pool_train_validation", False))
+        else None
+    )
+    protocol = cache.get("protocol", {})
+    repeats = int(r.get("crossfit_repeats", 1))
+    if (cache.get("outer_partition") != expected_outer
+            or protocol.get("scheme") != "condition_sha256_v1"
+            or protocol.get("seed") != r["seed"]
+            or protocol.get("folds") != r["crossfit_folds"]
+            or int(protocol.get("repeats", 1)) != repeats):
+        raise ValueError("Pinned classifier restart requires matching saved OmniFold fold/split provenance")
+    expected_member_count = repeats * int(r["crossfit_folds"])
+    increments = list(reward_payload.get("increments") or [])
+    coefficients = list(reward_payload.get("increment_coefficients") or [])
+    iterations = list(reward_payload.get("increment_iterations") or [])
+    if (
+        len(increments) != expected_member_count
+        or iterations != [1] * expected_member_count
+        or len(coefficients) != expected_member_count
+        or any(
+            not math.isclose(
+                float(value), 1.0 / expected_member_count,
+                rel_tol=1.0e-6, abs_tol=1.0e-6,
+            )
+            for value in coefficients
+        )
+        or any(not item.get("state") for item in increments)
+    ):
+        raise ValueError(
+            "Pinned classifier restart requires every serialized iteration-1 "
+            "reward ensemble member with equal coefficients"
+        )
+    base_digests = {item.get("base_digest") for item in increments}
+    packing_specs = [item.get("packing_spec") for item in increments]
+    if (
+        len(base_digests) != 1
+        or None in base_digests
+        or any(spec != packing_specs[0] for spec in packing_specs)
+    ):
+        raise ValueError(
+            "Pinned classifier restart found inconsistent reward ensemble metadata"
+        )
+    monitor = checkpoint.get("dgpo_adaptive_omnifold_state", {}).get("raw_monitor_state", {})
+    monitor_complete = bool(monitor.get("state") and monitor.get("protocol"))
+    if monitor and not monitor_complete:
+        raise ValueError(
+            "Pinned classifier restart found an incomplete saved raw monitor"
+        )
+    if (
+        not monitor_complete
+        and bool(a.get("trigger", {}).get("warm_start_classifier", False))
+    ):
+        raise ValueError(
+            "Pinned classifier restart requires a saved raw monitor when "
+            "warm_start_classifier=true"
+        )
+    saved_states = [item["state"] for item in increments]
+    if monitor_complete:
+        saved_states.insert(0, monitor["state"])
+    for saved in saved_states:
+        if any(not isinstance(value, torch.Tensor) or not torch.isfinite(value).all()
+               for value in saved.values()):
+            raise ValueError("Pinned classifier restart found invalid saved classifier weights")
+    result = _prepare_best_point_restart(checkpoint)
+    state = result["dgpo_adaptive_omnifold_state"]
+    if monitor_complete:
+        state["raw_monitor_state"] = copy.deepcopy(monitor)
+        # A fitted judge from this exact policy can be reused as-is.
+        state["raw_monitor_baseline_pending"] = False
+        state["raw_monitor_state"].pop("recertify_inherited_weights", None)
+        state["raw_monitor_state"]["inherit_monitor_as_is"] = True
+    else:
+        # Older snapshots with warm_start_classifier=false intentionally do
+        # not serialize judge weights. Refit only the diagnostic baseline at
+        # step 0; the six-member reward stack remains installed and untouched.
+        state["raw_monitor_state"] = {}
+        state["raw_monitor_baseline_pending"] = True
     return result
 
 
@@ -10346,6 +11807,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
 
     global_config.load_yaml(config_path)
     _assert_rl_enabled()
+    endpoint_config = EndpointKLConfig.parse(_dgpo_cfg_get(global_config.dgpo, "endpoint_kl", None))
+    validate_endpoint_protocol(endpoint_config, global_config.dgpo,
+        generation_uses_ema=generation_uses_ema_shadow(global_config.options.Training.get("EMA", None)))
     platform_info = global_config.platform
 
     matmul_precision = str(
@@ -10478,6 +11942,28 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         and best_source_dir and auto_resume_checkpoint is not None
         and auto_resume_checkpoint.parent == Path(str(best_source_dir)).expanduser().resolve()
     )
+    pinned_restart = _should_apply_pinned_classifier_restart(
+        pinned=bool(_dgpo_cfg_get(global_config.dgpo, "pinned_classifier_restart", False)),
+        load_mode=checkpoint_load_mode,
+        auto_resume_checkpoint=auto_resume_checkpoint,
+        best_source_dir=best_source_dir,
+    )
+    if pinned_restart:
+        ckpt_dict = _prepare_pinned_classifier_restart(ckpt_dict, global_config.dgpo)
+        rebuild_raw_monitor = bool(
+            ckpt_dict["dgpo_adaptive_omnifold_state"].get(
+                "raw_monitor_baseline_pending", False
+            )
+        )
+        _log.info(
+            "[DGPO] PINNED CLASSIFIER RESTART: inherited installed OmniFold; "
+            "reset epoch/step/optimizer and historical best; raw monitor=%s.",
+            (
+                "fresh step-0 diagnostic baseline before the first policy update"
+                if rebuild_raw_monitor
+                else "inherited as-is"
+            ),
+        )
     if best_point_restart:
         ckpt_dict = _prepare_best_point_restart(ckpt_dict)
         if is_rank0:
@@ -10485,6 +11971,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 "[DGPO] New experiment from best point: epoch/step=0, fresh AdamW/scheduler/EMA, "
                 "trust schedule age=0; preserve installed OmniFold + matching reference."
             )
+    architecture_bootstrap = bool(_dgpo_cfg_get(global_config.dgpo, "step_zero_architecture_bootstrap", False))
+    if architecture_bootstrap:
+        if checkpoint_load_mode != "resume" or pinned_restart or best_point_restart or auto_resume_checkpoint is not None:
+            raise ValueError("step_zero_architecture_bootstrap requires explicit step-zero resume without auto-resume/restart")
+        from RL.DGPO_neutrino.model_utils import prepare_step_zero_architecture_bootstrap
+        ckpt_dict = prepare_step_zero_architecture_bootstrap(ckpt_dict)
+        _log.info("[DGPO] Architecture A/B bootstrap: empty Adam groups rebuilt; saved policy, reward, references and step 0 retained.")
     if is_rank0:
         if checkpoint_load_mode == "weights_only" and loaded_ckpt_dict is not None:
             _log.info(
@@ -10550,6 +12043,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         adaptive_trust_policy_lr_scale,
         policy_round_warmup_metrics,
         migrate_unstarted_policy_warmup_after_resume,
+        start_inherited_round_policy_warmup,
         advance_policy_round_warmup,
         clamp_fixed_trust_radius_after_resume,
         record_reference_trust_attempt,
@@ -10565,7 +12059,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         validate_omnifold_reward_startup,
     )
 
-    adaptive_cfg = resolve_adaptive_config(dg)
+    adaptive_cfg = resolve_adaptive_config(
+        dg, classifier_only=bool(_dgpo_cfg_get(
+            getattr(global_config, "experiment", {}), "classifier_only", False,
+        )),
+    )
     omnifold_pool_batch_size = int(
         adaptive_cfg.pool_generation_batch_size
         if adaptive_cfg.pool_generation_batch_size is not None
@@ -10580,6 +12078,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         "batch_size": omnifold_pool_batch_size,
         "prefetch_batches": prefetch,
     }
+    omnifold_val_shard = val_shard
+    if adaptive_cfg.enabled and adaptive_cfg.cache_event_inputs:
+        omnifold_train_loader_cfg["local_shuffle_seed"] = adaptive_cfg.pool_selection_seed
+        omnifold_train_shard = _FixedEventInputShard(omnifold_train_shard)
+        if val_shard is not None:
+            omnifold_val_shard = _FixedEventInputShard(val_shard)
     if is_rank0 and adaptive_cfg.enabled:
         _log.info(
             "[DGPO/omnifold] K=1 pool generation batch/worker=%s "
@@ -10663,6 +12167,17 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         if migrate_unstarted_policy_warmup_after_resume(adaptive_state, cfg=adaptive_cfg) and is_rank0:
             _log.info("[DGPO/resume] Unstarted round warmup changed: %s -> %s; saved clocks and reward stack preserved.",
                       old_warmup_protocol, adaptive_state.policy_warmup_protocol)
+        inherited_warmup = start_inherited_round_policy_warmup(
+            adaptive_state,
+            cfg=adaptive_cfg,
+            global_step=int((ckpt_dict or {}).get("global_step", 0) or 0),
+            restart=bool(pinned_restart or best_point_restart),
+        )
+        if inherited_warmup and is_rank0:
+            _log.info(
+                "[DGPO] inherited installed round %s without a new install; starting policy warmup %s",
+                adaptive_state.reward_round_id, adaptive_state.policy_warmup_protocol,
+            )
     pending_resume_trust_diagnostics = clamp_fixed_trust_radius_after_resume(
         adaptive_state,
         cfg=adaptive_cfg,
@@ -10769,6 +12284,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         else ref_model
     )
     reference_trust_probe_cache: dict[str, Any] = {}
+    if endpoint_config.enabled:
+        endpoint_saved = None if ckpt_dict is None else ckpt_dict.get(ENDPOINT_KL_CHECKPOINT_KEY)
+        _unwrap_core_evenet(model)._endpoint_kl_controller = EndpointKLController(endpoint_config, endpoint_saved)
+        _log.info("[DGPO/endpoint-KL] enabled coefficient=%g; online current/reference H4 critic; full DDIM pathwise gradient; raw endpoints", endpoint_config.coefficient)
     restore_fixed_probe = bool(
         adaptive_cfg.trust_boundary_enabled
         and adaptive_cfg.trust_fixed_probe_per_reward_round
@@ -10861,10 +12380,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         warmup_steps=warmup_steps,
         is_rank0=is_rank0,
         lr_schedule=dg.get("lr_schedule"),
+        conditioning_learning_rates=dg.get("conditioning_learning_rates"),
     )
 
     start_epoch, global_step = parse_dgpo_resume_from_checkpoint(ckpt_dict)
-    if checkpoint_load_mode == "resume" and optimizer.cosine_state is not None and (
+    if checkpoint_load_mode == "resume" and not (best_point_restart or pinned_restart or architecture_bootstrap) and optimizer.cosine_state is not None and (
         ckpt_dict is None or "dgpo_optimizer_state_dict" not in ckpt_dict
     ):
         raise ValueError("cosine full resume requires checkpointed DGPO optimizer/scheduler state")
@@ -10877,18 +12397,40 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 "resume/epoch_step": int((ckpt_dict or {}).get("dgpo_epoch_step", 0)),
                 "resume/checkpoint_load_mode": checkpoint_load_mode,
                 "resume/source_checkpoint": str(bundle.checkpoint_path or ""),
+                "resume/pinned_classifier_restart": int(pinned_restart),
+                "resume/step_zero_architecture_bootstrap": int(architecture_bootstrap),
             })
         except Exception as exc:
             _log.warning("[DGPO] W&B resume metadata could not be published: %s", exc)
     if ckpt_dict is not None and "dgpo_optimizer_state_dict" in ckpt_dict:
         try:
-            optimizer.load_state_dict(ckpt_dict["dgpo_optimizer_state_dict"])
+            use_config_lr_schedule = (dg.get("lr_schedule") or {}).get("resume_use_config", False)
+            optimizer.load_state_dict(
+                ckpt_dict["dgpo_optimizer_state_dict"],
+                use_config_lr_schedule=use_config_lr_schedule,
+            )
             if is_rank0:
                 _log.info(
                     "[DGPO] Restored optimizer state from checkpoint; effective "
                     "AdamW weight_decay per group (current config): %s",
                     [pg["weight_decay"] for pg in optimizer.param_groups],
                 )
+            if is_rank0 and wandb_active:
+                import wandb
+                try:
+                    wandb.run.summary.update({
+                        "resume/lr_schedule_use_config": int(use_config_lr_schedule),
+                        "resume/lr_scheduler_step": int(optimizer.scheduler.last_epoch),
+                        "resume/lr_base_by_group": {
+                            pg["group_name"]: float(base) for pg, base in
+                            zip(optimizer.param_groups, optimizer.scheduler.base_lrs, strict=True)
+                        },
+                        "resume/lr_effective_by_group": {
+                            pg["group_name"]: float(pg["lr"]) for pg in optimizer.param_groups
+                        },
+                    })
+                except Exception as exc:
+                    _log.warning("[DGPO] W&B resume LR metadata could not be published: %s", exc)
         except (ValueError, RuntimeError) as ex:
             if optimizer.cosine_state is not None or ckpt_dict["dgpo_optimizer_state_dict"].get("lr_schedule") is not None:
                 raise RuntimeError("Cannot safely resume DGPO cosine optimizer/scheduler state") from ex
@@ -11090,6 +12632,32 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             f"{reference_trust_objective!r}"
         )
     vp_path_kl_cfg = _dgpo_cfg_get(trust_cfg, "vp_path_kl", None) or {}
+    from RL.DGPO_neutrino.gradient_conflict import resolve_gradient_conflict_config
+    gradient_conflict_cfg = resolve_gradient_conflict_config(dg.get("gradient_conflict"))
+    if gradient_conflict_cfg.enabled:
+        if not (adaptive_cfg.enabled and adaptive_cfg.monitor_mode in {"raw_plateau_refit", "raw_only"}
+                and adaptive_cfg.fixed_audit_panel and adaptive_cfg.cache_event_inputs):
+            raise ValueError(
+                "gradient conflict monitor requires fixed-input, identity-split "
+                "raw_plateau_refit or raw_only monitoring"
+            )
+        if gradient_conflict_cfg.monitor_refit_lifecycle and not adaptive_cfg.raw_monitor_warm_start:
+            raise ValueError(
+                "gradient conflict refit-lifecycle probes require a persistent warm-start raw monitor"
+            )
+        cadence = adaptive_cfg.staleness_every_n_steps
+        if cadence is None:
+            cadence = int(steps_per_epoch) * int(
+                adaptive_cfg.staleness_every_n_epochs
+            )
+        if gradient_conflict_cfg.every_n_steps % cadence:
+            raise ValueError(
+                "gradient conflict cadence must be a multiple of the raw-audit cadence"
+            )
+        if reference_trust_objective != REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE:
+            raise ValueError("gradient conflict monitor currently supports velocity_mse trust only")
+        if not bool(dg.get("require_deterministic_policy", False)) or generation_uses_ema_shadow(global_config.options.Training.get("EMA", None) or {}):
+            raise ValueError("gradient conflict monitor requires deterministic live-policy generation (no EMA)")
     reference_trust_vp_path_kl_diagnostic = bool(
         _dgpo_cfg_get(vp_path_kl_cfg, "diagnostic", False)
     )
@@ -11138,6 +12706,69 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     # follows EMA.use_for_generation (live policy in the memory ablation).
 
     proj_cfg_startup = resolve_projection_constraint_config(dg)
+    gradient_transfer_cfg_startup = resolve_gradient_transfer_trace_config(
+        dg.get("gradient_transfer_trace")
+    )
+    (
+        parameter_update_rms_target_cfg,
+        parameter_update_rms_min_scale_cfg,
+        parameter_update_rms_max_scale_cfg,
+    ) = resolve_parameter_update_rms_calibration(dg)
+    if parameter_update_rms_target_cfg is not None:
+        if proj_cfg_startup.active or adaptive_cfg.trust_boundary_enabled:
+            raise ValueError(
+                "parameter-update RMS calibration requires no projection or "
+                "hard trust boundary"
+            )
+        if adaptive_cfg.trust_extragradient_enabled:
+            raise ValueError(
+                "parameter-update RMS calibration requires ordinary AdamW, "
+                "not extragradient"
+            )
+        if is_rank0:
+            _log.info(
+                "[DGPO/RMS calibration] target=%.9g scale_bounds=[%.6g, %.6g]",
+                parameter_update_rms_target_cfg,
+                parameter_update_rms_min_scale_cfg,
+                parameter_update_rms_max_scale_cfg,
+            )
+    if gradient_transfer_cfg_startup.enabled:
+        if reference_trust_objective != REFERENCE_TRUST_OBJECTIVE_VELOCITY_MSE:
+            raise ValueError(
+                "gradient transfer trace requires reference_trust.objective=velocity_mse"
+            )
+        if reference_trust_coefficient <= 0.0:
+            raise ValueError(
+                "gradient transfer trace requires a positive reference trust coefficient"
+            )
+        if float(_dgpo_cfg_get(dg, "beta_kl", 0.0)) != 0.0:
+            raise ValueError("gradient transfer trace requires dgpo.beta_kl=0")
+        variance_cfg = dg.get("variance_regularization") or {}
+        if bool(variance_cfg.get("enabled", False)) and float(
+            variance_cfg.get("weight", 0.0)
+        ) != 0.0:
+            raise ValueError(
+                "gradient transfer trace requires inactive variance regularization"
+            )
+        if proj_cfg_startup.active or adaptive_cfg.trust_boundary_enabled:
+            raise ValueError(
+                "gradient transfer trace requires no projection or hard trust boundary"
+            )
+        if adaptive_cfg.trust_extragradient_enabled:
+            raise ValueError(
+                "gradient transfer trace requires the ordinary native AdamW path"
+            )
+        if bool(dg.get("sequential_vp_trust_backward", False)):
+            raise ValueError(
+                "gradient transfer trace is incompatible with sequential VP backward"
+            )
+        if is_rank0:
+            _log.info(
+                "[DGPO/gradient_transfer] exact production trace at update endpoints=%s; "
+                "counterfactual trust coefficients=%s (read-only).",
+                gradient_transfer_cfg_startup.update_end_steps,
+                gradient_transfer_cfg_startup.counterfactual_trust_coefficients,
+            )
     constraint_ckpt_blob = (
         (
             ckpt_dict.get(_DGPO_CONSTRAINT_CKPT_KEY)
@@ -11220,7 +12851,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         dist.barrier()
 
     save_dir_raw = global_config.options.Training.get("model_checkpoint_save_path", None)
-    if adaptive_cfg.raw_rollback_to_best_on_plateau and not save_dir_raw:
+    if (adaptive_cfg.raw_rollback_to_best_on_plateau or adaptive_cfg.raw_best_scope == "global") and not save_dir_raw:
         raise ValueError(
             "raw-AUC best-point rollback requires "
             "options.Training.model_checkpoint_save_path"
@@ -11240,7 +12871,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                           adaptive_state.raw_best_auc_gap, adaptive_state.raw_best_epoch,
                           adaptive_state.raw_best_global_step, best_path)
         if adaptive_state.raw_global_stop_requested:
-            if adaptive_state.raw_global_failed_rounds >= adaptive_cfg.raw_global_max_failed_rounds:
+            if (adaptive_cfg.raw_global_max_failed_rounds > 0
+                    and adaptive_state.raw_global_failed_rounds >= adaptive_cfg.raw_global_max_failed_rounds):
                 raise ValueError("global-best stagnation stop is checkpointed; review results and explicitly raise global_max_failed_rounds to continue")
             adaptive_state.raw_global_stop_requested = False
     top_k_ckpt = int(global_config.options.Training.get("model_checkpoint_save_top_k", 5))
@@ -11295,7 +12927,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             ckpt_every_n_epochs,
         )
 
-    epochs = int(global_config.options.Training.epochs)
+    epochs = (
+        None if bool(dg.get("unbounded_training", False))
+        else int(global_config.options.Training.epochs)
+    )
 
     if start_epoch > 0 or global_step > 0:
         if is_rank0:
@@ -11305,7 +12940,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 global_step,
                 epochs,
             )
-    if start_epoch >= epochs:
+    if epochs is not None and start_epoch >= epochs:
         if is_rank0:
             _log.info(
                 "[DGPO] start_epoch=%s >= epochs=%s; nothing to train. Check config or checkpoint.",
@@ -11348,6 +12983,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
 
     omnifold_live_log_index = 0
     omnifold_phase_ids = _OMNIFOLD_LIVE_PHASE_IDS
+    classifier_loss_tracker = _ClassifierFitLossTracker()
+    classifier_plot_tracker = _ClassifierTrainingPlotTracker()
+    last_gradient_conflict_snapshot = None
 
     def _log_omnifold_fit_progress(
         phase: str,
@@ -11396,36 +13034,85 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             "accepted",
             "saturated",
             "threshold_reached",
+            "validation_oriented_balanced_accuracy",
+            "validation_balanced_accuracy_lcb",
+            "validation_balanced_accuracy_lcb_standard_error",
+            "validation_balanced_accuracy_lcb_streak",
             "warm_started",
             "warm_started_folds",
+            "learning_rate",
+            "topology_training_stage",
+            "fit_stage",
+            "selected_stage",
+            "stage_a_validation_loss",
+            "stage_b_validation_loss",
         ):
             if metric_name in row:
                 payload[f"{prefix}/{metric_name}"] = row[metric_name]
+        for metric_name, metric_value in row.items():
+            if metric_name.startswith(
+                (
+                    "gradient_norm_",
+                    "parameter_rms_",
+                    "gradient_rms_",
+                    "gradient_to_parameter_rms_ratio_",
+                    "parameter_update_rms_",
+                    "update_to_parameter_rms_ratio_",
+                    "optimizer_group_lr_",
+                    "scheduler_",
+                    "stability/",
+                    "visible_conditioning/",
+                    "ratio_health/",
+                    "logit_",
+                )
+            ) or metric_name in {
+                "gradient_clip_scale",
+                "gradient_clip_fraction",
+            }:
+                payload[f"{prefix}/{metric_name}"] = metric_value
         _log.info(
             "[DGPO/omnifold/live] phase=%s repeat=%s epoch=%s iteration=%s fold=%s "
-            "signed_scale=%s "
+            "signed_scale=%s fit_stage=%s topology_stage=%s base_lr=%.6g actual_lrs=[%s] "
             "step=%s train_loss=%.6g grad_norm=%.6g grad_clipped=%s "
             "val_loss=%.6g val_bal_acc=%.6g "
-            "val_auc=%.6g accepted=%s saturated=%s",
+            "val_auc=%s accepted=%s saturated=%s",
             phase_name,
             repeat_index,
             epoch_value,
             iteration,
             crossfit_fold,
             "n/a" if not math.isfinite(signed_scale) else f"{signed_scale:+.6g}",
+            int(float(row.get("fit_stage", 0))),
+            int(float(row.get("topology_training_stage", 0))),
+            float(row.get("learning_rate", float("nan"))),
+            ", ".join(
+                f"{key.removeprefix('optimizer_group_lr_')}={float(value):.6g}"
+                for key, value in row.items()
+                if key.startswith("optimizer_group_lr_")
+                and not key.removeprefix("optimizer_group_lr_").isdigit()
+            ) or "unavailable",
             fit_step,
             float(row.get("training_loss", float("nan"))),
             float(row.get("gradient_norm", float("nan"))),
             bool(float(row.get("gradient_clipped", 0.0))),
             float(row.get("validation_loss", float("nan"))),
             float(row.get("validation_balanced_accuracy", float("nan"))),
-            float(row.get("validation_auc", float("nan"))),
+            "n/a" if "validation_auc" not in row else str(row["validation_auc"]),
             "n/a"
             if accepted_value is None
             else bool(float(accepted_value)),
             bool(float(row.get("saturated", 0.0))),
         )
         if wandb_mod is not None:
+            wandb_settings, _ = _dgpo_wandb_yaml_section()
+            if _dgpo_cfg_get(wandb_settings, "classifier_loss_curves", False):
+                payload.update(classifier_plot_tracker.payload(
+                    wandb_mod, phase_name, row, global_step=int(global_step), epoch=int(epoch_value),
+                ))
+            if _dgpo_cfg_get(wandb_settings, "classifier_loss_curves_raw", False):
+                payload.update(classifier_loss_tracker.payload(
+                    wandb_mod, phase_name, row, global_step=int(global_step), epoch=int(epoch_value),
+                ))
             _wandb_log_auxiliary(
                 wandb_mod,
                 payload,
@@ -11740,7 +13427,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     signed_scale,
                 )
                 candidate_pool = _materialize_adaptive_omnifold_pool(
-                    val_shard,
+                    omnifold_val_shard,
                     omnifold_val_loader_cfg,
                     model=model,
                     sampler=sampler,
@@ -11753,6 +13440,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     include_pairwise_context=(
                         adaptive_cfg.periodic_pair_features_enabled
                     ),
+                    include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                 )
                 log_reward = score_reward_on_pool(
                     omnifold_source.frozen_reward,
@@ -11872,12 +13560,16 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         force_refit: bool = False,
         force_reason: str | None = None,
         extragradient_batch: dict[str, Any] | None = None,
+        diagnostic_raw_only: bool = False,
+        force_gradient_conflict: bool = False,
     ) -> dict[str, Any]:
         nonlocal global_step, reward_checkpoint_metadata
         nonlocal pending_resume_trust_diagnostics
+        nonlocal last_gradient_conflict_snapshot
         if not adaptive_cfg.enabled or omnifold_source is None:
             return {}
         from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+            baseline_probe_auc_gap,
             build_reference_trust_pool,
             evaluate_signed_direction_recovery,
             fit_reference_trust_audit,
@@ -11885,6 +13577,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             probe_installed_reward,
             record_extragradient_rejection,
             reward_refit_due_to_age,
+            reward_round_budget_exhausted,
             run_adaptive_refit,
             scheduled_raw_refit_due,
             should_probe_epoch,
@@ -11919,11 +13612,26 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             if fixed_audit_panel
             else int(adaptive_cfg.probe_seed) + 10000 * max(int(epoch), 0)
         )
+        fixed_schedule_age_trigger, fixed_schedule_age_diagnostics = (
+            scheduled_raw_refit_due(
+                adaptive_state,
+                cfg=adaptive_cfg,
+                epoch=int(epoch),
+                baseline_only=bool(raw_baseline_only or baseline_only),
+            )
+        )
+        direct_fixed_schedule_refit = bool(
+            adaptive_cfg.fixed_schedule_skip_staleness_audit
+            and not baseline_only
+            and not raw_baseline_only
+            and (force_refit or fixed_schedule_age_trigger)
+        )
         raw_plateau_cycle = bool(
             adaptive_cfg.monitor_mode == "raw_plateau_refit"
             and adaptive_state.calibrated
-            and not baseline_only
+            and (raw_baseline_only or not baseline_only)
             and not force_refit
+            and not direct_fixed_schedule_refit
         )
         classifier_trust_due = bool(
             raw_plateau_cycle
@@ -11944,7 +13652,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 "pool from one event pass with common DDIM noise."
             )
         materialized_score_pool = _materialize_adaptive_omnifold_pool(
-            val_shard,
+            omnifold_val_shard,
             omnifold_val_loader_cfg,
             model=model,
             paired_reference_model=(
@@ -11963,6 +13671,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             num_ddim_steps=num_ddim_val,
             seed=probe_panel_seed,
             include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+            include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
+            collect_policy_noise_mask=gradient_conflict_cfg.enabled,
         )
         reference_pool = None
         classifier_trust_current_pool = None
@@ -11978,11 +13688,15 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             ) = materialized_score_pool
         else:
             score_pool = materialized_score_pool
-        if raw_plateau_cycle:
-            # Capture before the routine monitor adapts to the current candidate.
-            confirmation_start_cache = (
-                copy.deepcopy(adaptive_state.raw_monitor_state)
-                if adaptive_cfg.raw_global_confirmation_warm_start else None
+
+        def _selection_blind_fixed_schedule_audit() -> dict[str, Any]:
+            """Measure the live policy without changing any refit decision."""
+
+            training_pool = _materialize_raw_audit_training_pool(
+                omnifold_train_shard, omnifold_train_loader_cfg, cfg=adaptive_cfg,
+                model=model, sampler=sampler, device=device, world_size=world_size,
+                rank=rank, num_ddim_steps=num_ddim_val, panel_seed=probe_panel_seed,
+                evaluation_events=score_pool.n_events,
             )
             raw_probe = fit_raw_policy_audit(
                 pool=score_pool,
@@ -11990,16 +13704,425 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 cfg=adaptive_cfg,
                 device=device,
                 seed=int(adaptive_cfg.probe_seed),
-                warm_start_cache=(adaptive_state.raw_monitor_state
-                                  if adaptive_cfg.raw_monitor_warm_start else None),
+                warm_start_cache=None,
+                **({"training_pool": training_pool} if training_pool is not None else {}),
+                progress_callback=lambda row: _log_omnifold_fit_progress(
+                    "raw_staleness_audit",
+                    row,
+                    epoch_value=int(epoch),
+                ),
+            )
+            history_row = {
+                "epoch": float(epoch),
+                "global_step": float(global_step),
+                "reward_round_id": float(adaptive_state.reward_round_id),
+                "decision_recalibrate": 0.0,
+                "fixed_schedule_diagnostic_only": 1.0,
+                "measurement_only_raw_audit": 1.0,
+                **{key: float(value) for key, value in raw_probe.items()},
+            }
+            adaptive_state.probe_history.append(history_row)
+            if len(adaptive_state.probe_history) > 256:
+                del adaptive_state.probe_history[:-256]
+            trajectory_rows = [
+                row
+                for row in adaptive_state.probe_history
+                if float(
+                    row.get("fixed_schedule_diagnostic_only", 0.0)
+                )
+                >= 0.5
+                and math.isfinite(float(row.get("raw_auc_gap", float("nan"))))
+                # An old small-pool audit is not a baseline for the larger
+                # matched-fold protocol after a resume/config update.
+                and float(row.get("raw_audit_uses_omnifold_fold", 0.0))
+                == float(raw_probe.get("raw_audit_uses_omnifold_fold", 0.0))
+                and float(row.get("raw_audit_training_fold", 0.0))
+                == float(raw_probe.get("raw_audit_training_fold", 0.0))
+            ]
+            trajectory_rows.sort(key=lambda row: float(row["global_step"]))
+            trajectory_steps = [float(row["global_step"]) for row in trajectory_rows]
+            trajectory_gaps = [float(row["raw_auc_gap"]) for row in trajectory_rows]
+            gap_slope_per_10 = float("nan")
+            if len(trajectory_rows) >= 2:
+                step_mean = sum(trajectory_steps) / len(trajectory_steps)
+                gap_mean = sum(trajectory_gaps) / len(trajectory_gaps)
+                step_variance = sum(
+                    (value - step_mean) ** 2 for value in trajectory_steps
+                )
+                if step_variance > 0.0:
+                    gap_slope_per_10 = 10.0 * sum(
+                        (step - step_mean) * (gap - gap_mean)
+                        for step, gap in zip(trajectory_steps, trajectory_gaps)
+                    ) / step_variance
+            return {
+                **{
+                    f"staleness/{key}": value
+                    for key, value in history_row.items()
+                },
+                "staleness/decision": "fixed_schedule_diagnostic_only",
+                "staleness/trigger_recalibration": 0.0,
+                "staleness/fixed_schedule_diagnostic_raw_audit": 1.0,
+                "staleness/diagnostic_selection_blind": 1.0,
+                "staleness/raw_audit_trajectory_points": float(
+                    len(trajectory_rows)
+                ),
+                "staleness/raw_auc_gap_step0": float(trajectory_gaps[0]),
+                "staleness/raw_auc_gap_change_from_step0": float(
+                    trajectory_gaps[-1] - trajectory_gaps[0]
+                ),
+                "staleness/raw_auc_gap_slope_per_10_steps": float(
+                    gap_slope_per_10
+                ),
+                "audit/raw_auc": float(raw_probe["raw_auc"]),
+                "audit/raw_auc_gap": float(raw_probe["raw_auc_gap"]),
+                "audit/saturated": float(raw_probe["raw_audit_saturated"]),
+                "audit/training_ready": float(
+                    raw_probe["raw_audit_training_ready"]
+                ),
+                "audit/epoch": float(epoch),
+                "audit/policy_step": float(global_step),
+                "audit/trajectory_points": float(len(trajectory_rows)),
+                "audit/raw_auc_gap_change_from_step0": float(
+                    trajectory_gaps[-1] - trajectory_gaps[0]
+                ),
+                "audit/raw_auc_gap_slope_per_10_steps": float(
+                    gap_slope_per_10
+                ),
+            }
+
+        if diagnostic_raw_only or (
+            adaptive_cfg.audit_fit.get("training_population") == "omnifold_fold"
+            and not direct_fixed_schedule_refit
+        ):
+            if not (
+                adaptive_cfg.fixed_schedule_log_raw_audit
+                or adaptive_cfg.monitor_mode == "raw_only"
+            ):
+                raise ValueError(
+                    "diagnostic_raw_only requires "
+                    "trigger.fixed_schedule_log_raw_audit=true or "
+                    "monitor_mode=raw_only"
+                )
+            _assert_current_reward_reference_pairing(
+                "adaptive_cycle_fixed_schedule_diagnostic"
+            )
+            return _selection_blind_fixed_schedule_audit()
+        if direct_fixed_schedule_refit:
+            if gradient_conflict_cfg.enabled:
+                raise RuntimeError(
+                    "fixed-schedule audit skipping is incompatible with the "
+                    "gradient-conflict monitor"
+                )
+            round_budget_exhausted = reward_round_budget_exhausted(
+                adaptive_state,
+                max_reward_rounds=adaptive_cfg.max_reward_rounds,
+            )
+            diagnostics: dict[str, Any] = {
+                **fixed_schedule_age_diagnostics,
+                "staleness/decision": "fixed_schedule_refit",
+                "staleness/trigger_recalibration": float(
+                    not round_budget_exhausted
+                ),
+                "staleness/trigger_reason": (
+                    str(force_reason or "forced_protocol_refit")
+                    if force_refit
+                    else "max_reward_age"
+                ),
+                "staleness/reward_round_id": float(
+                    adaptive_state.reward_round_id
+                ),
+                "staleness/max_reward_rounds": float(
+                    adaptive_cfg.max_reward_rounds
+                    if adaptive_cfg.max_reward_rounds is not None
+                    else 0
+                ),
+                "staleness/reward_round_budget_exhausted": float(
+                    round_budget_exhausted
+                ),
+                "staleness/incumbent_weighted_audit_skipped": 1.0,
+                "staleness/independent_raw_audit_skipped": 1.0,
+                "staleness/fixed_schedule_without_audit": 1.0,
+            }
+            if adaptive_cfg.fixed_schedule_log_raw_audit:
+                diagnostics.update(_selection_blind_fixed_schedule_audit())
+                diagnostics.update(
+                    {
+                        "staleness/decision": "fixed_schedule_refit",
+                        "staleness/trigger_recalibration": float(
+                            not round_budget_exhausted
+                        ),
+                        "staleness/independent_raw_audit_skipped": 0.0,
+                        "staleness/fixed_schedule_without_audit": 0.0,
+                        "staleness/fixed_schedule_with_diagnostic_audit": 1.0,
+                    }
+                )
+            if round_budget_exhausted:
+                adaptive_state.last_decision = "reward_round_budget_complete"
+                diagnostics["staleness/decision"] = adaptive_state.last_decision
+                diagnostics["staleness/trigger_recalibration"] = 0.0
+                diagnostics["staleness/trigger_reason"] = "reward_round_budget"
+                _assert_current_reward_reference_pairing(
+                    "adaptive_cycle_fixed_schedule_budget_complete"
+                )
+                return diagnostics
+
+            if is_rank0:
+                _log.info(
+                    "[DGPO/omnifold] fixed-schedule refit at epoch=%s step=%s; "
+                    "%s",
+                    epoch,
+                    global_step,
+                    (
+                        "logging selection-blind repeated raw audit and "
+                        "skipping the incumbent weighted audit"
+                        if adaptive_cfg.fixed_schedule_log_raw_audit
+                        else "skipping incumbent weighted and independent raw audits"
+                    ),
+                )
+            policy_snapshot = _snapshot_policy_state_dict(model)
+            fit_pool_seed = int(adaptive_cfg.seed) + int(
+                adaptive_state.recalibration_count
+            )
+            fit_pool = _materialize_adaptive_omnifold_pool(
+                omnifold_train_shard,
+                omnifold_train_loader_cfg,
+                model=model,
+                sampler=sampler,
+                device=device,
+                world_size=world_size,
+                rank=rank,
+                quota_events=(
+                    None if fixed_omnifold_pool else adaptive_cfg.pool_events
+                ),
+                num_ddim_steps=num_ddim,
+                seed=fit_pool_seed,
+                include_pairwise_context=(
+                    adaptive_cfg.periodic_pair_features_enabled
+                ),
+                include_visible_pair_rest_frame=(
+                    adaptive_cfg.visible_pair_rest_frame_enabled
+                ),
+            )
+            if adaptive_cfg.single_pool_train_validation:
+                score_pool = fit_pool
+            if adaptive_cfg.refit_score_events == adaptive_cfg.probe_max_events:
+                refit_score_pool = score_pool
+            else:
+                refit_score_pool = _materialize_adaptive_omnifold_pool(
+                    omnifold_val_shard,
+                    omnifold_val_loader_cfg,
+                    model=model,
+                    sampler=sampler,
+                    device=device,
+                    world_size=world_size,
+                    rank=rank,
+                    quota_events=adaptive_cfg.refit_score_events,
+                    num_ddim_steps=num_ddim_val,
+                    seed=int(probe_panel_seed) + 1_000_003,
+                    include_pairwise_context=(
+                        adaptive_cfg.periodic_pair_features_enabled
+                    ),
+                    include_visible_pair_rest_frame=(
+                        adaptive_cfg.visible_pair_rest_frame_enabled
+                    ),
+                )
+            refit_diagnostics = run_adaptive_refit(
+                global_step=int(global_step),
+                state=adaptive_state,
+                cfg=adaptive_cfg,
+                reward_source=omnifold_source,
+                round_ref_model=round_ref_model,
+                policy_snapshot_state_dict=policy_snapshot,
+                fit_pool=fit_pool,
+                score_pool=refit_score_pool,
+                baseline_pool=None,
+                epoch=int(epoch),
+                device=device,
+                world_size=world_size,
+                enforce_round_acceptance=False,
+                progress_callback=lambda phase, row: _log_omnifold_fit_progress(
+                    phase,
+                    row,
+                    epoch_value=int(epoch),
+                ),
+            )
+            diagnostics.update(refit_diagnostics)
+            refit_accepted = bool(
+                float(refit_diagnostics.get("omnifold/accepted", 0.0)) >= 0.5
+            )
+            if not refit_accepted and (
+                adaptive_cfg.scheduled_refit_fail_closed
+                or (force_refit and adaptive_cfg.refit_once_fail_closed)
+            ):
+                raise RuntimeError(
+                    "fixed-schedule fresh reward refit failed; refusing to "
+                    "continue with a stale reward: "
+                    + str(
+                        refit_diagnostics.get(
+                            "omnifold/accept_reason",
+                            "unspecified classifier gate",
+                        )
+                    )
+                )
+            if refit_accepted:
+                reference_trust_probe_cache.clear()
+                adaptive_state.trust_probe_payload = None
+                adaptive_state.trust_probe_round_id = -1
+                diagnostics.update(
+                    _reset_optimizer_after_reward_install(
+                        optimizer,
+                        cfg=adaptive_cfg,
+                        accepted=True,
+                        adaptive_state=adaptive_state,
+                    )
+                )
+                adaptive_state.audit_protocol_signature = current_audit_signature
+                adaptive_state.last_decision = "fixed_schedule_refit_installed"
+                diagnostics["staleness/decision"] = adaptive_state.last_decision
+            else:
+                adaptive_state.last_decision = "fixed_schedule_refit_rejected"
+                diagnostics["staleness/decision"] = adaptive_state.last_decision
+            reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+            if pending_resume_trust_diagnostics:
+                diagnostics.update(pending_resume_trust_diagnostics)
+                pending_resume_trust_diagnostics = {}
+            _assert_current_reward_reference_pairing(
+                "adaptive_cycle_fixed_schedule_refit"
+            )
+            return diagnostics
+        if raw_plateau_cycle:
+            # Capture before the routine monitor adapts to the current candidate.
+            confirmation_start_cache = (
+                copy.deepcopy(adaptive_state.raw_monitor_state)
+                if adaptive_cfg.raw_global_confirmation_warm_start else None
+            )
+            # A periodic gradient probe needs the fitted judge weights.  When
+            # the scientific audit is configured cold, capture those weights
+            # in a transient cache and discard it after this boundary; never
+            # feed them into the next audit.
+            current_raw_monitor_cache = (
+                adaptive_state.raw_monitor_state
+                if adaptive_cfg.raw_monitor_warm_start
+                else ({} if gradient_conflict_cfg.enabled else None)
+            )
+            raw_probe = fit_raw_policy_audit(
+                pool=score_pool,
+                model_builder=omnifold_source.model_builder,
+                cfg=adaptive_cfg,
+                device=device,
+                seed=int(adaptive_cfg.probe_seed),
+                warm_start_cache=current_raw_monitor_cache,
                 progress_callback=lambda row: _log_omnifold_fit_progress(
                     "raw_staleness_monitor",
                     row,
                     epoch_value=int(epoch),
                 ),
             )
+            # Keep the same event panel for pre/post install. Pool candidates
+            # are not reused: the probe generates from the live policy with CRN.
+            gradient_panel = score_pool if gradient_conflict_cfg.monitor_refit_lifecycle else None
+            gradient_cache = {}
+
+            def _measure_gradient_phase(phase, panel):
+                nonlocal last_gradient_conflict_snapshot
+                from RL.DGPO_neutrino.gradient_conflict import probe_gradients, phase_metrics
+                from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import peft_bank_factory
+                round_id = int(adaptive_state.reward_round_id)
+                reused_judge = bool(phase == "post_warmup"
+                                    and adaptive_state.gradient_post_install_probe_round_id == round_id
+                                    and adaptive_state.gradient_lifecycle_monitor_state)
+                judge_cache = (
+                    adaptive_state.gradient_lifecycle_monitor_state
+                    if reused_judge
+                    else current_raw_monitor_cache
+                )
+                if judge_cache is None:
+                    judge_cache = {}
+                judge_step = adaptive_state.gradient_lifecycle_monitor_step if reused_judge else int(global_step)
+                judge_auc = adaptive_state.gradient_lifecycle_raw_auc if reused_judge else raw_probe["raw_auc"]
+                snapshot = (int(global_step), round_id, judge_step, reused_judge)
+                overrides = {key: adaptive_cfg.audit_fit[key] for key in (
+                    "head_dropout", "topology_dropout", "decoder_hidden_dim", "decoder_layers",
+                    "decoder_heads", "periodic_pair_features", "topology_fourier_embedding",
+                    "topology_direct_logit", "topology_context_residual_scale",
+                    "topology_conditioning", "topology_pair_token", "relation_token_count", "visible_pair_rest_frame",
+                    "topology_max_harmonic", "topology_include_theta_pair", "topology_theta_fourier",
+                    "topology_hidden_dim", "topology_embedding_dim",
+                    "topology_fusion_hidden_dim",
+                    "train_layernorm", "train_encoder",
+                    "train_grouped_sequential_embedding", "train_invisible_projector",
+                    "train_angular_conditioning",
+                    "train_backbone", "train_last_pet_block", "asymmetric_attention",
+                ) if adaptive_cfg.audit_fit.get(key) is not None}
+                if is_rank0:
+                    _log.info("[DGPO/gradient_conflict] phase=%s step=%s round=%s blocks=%s global_events/block=%s K=%s timesteps=%s (diagnostic only)",
+                              phase, global_step, round_id, gradient_conflict_cfg.blocks,
+                              gradient_conflict_cfg.events_per_block, K, num_train_timesteps)
+                gradient_metrics = gradient_cache.get(snapshot)
+                if gradient_metrics is None:
+                    gradient_metrics = probe_gradients(
+                        cfg=gradient_conflict_cfg, model=model, core=_unwrap_core_evenet(model),
+                        reference=round_ref_model, pool=panel,
+                        monitor_factory=peft_bank_factory(omnifold_source.model_builder, panel.packing_spec,
+                                                          classifier_overrides=overrides),
+                        monitor_cache=judge_cache,
+                        reward_compute=lambda candidates, batch: reward_agg.compute(candidates, batch)[0],
+                        generate=generate_neutrino_candidates, evaluate=policy_evaluation_step,
+                        sampler=sampler, device=device, dtype=dtype, rank=rank, world_size=world_size,
+                        K=K, beta=beta, num_ddim_steps=num_ddim, rollout_parallel_chains=rollout_parallel_chains,
+                        num_train_timesteps=num_train_timesteps, t_min=policy_eval_t_min_cfg, t_max=policy_eval_t_max_cfg,
+                        advantage_estimator=advantage_estimator, adv_clip_max=adv_clip_max_cfg,
+                        trust_coefficient=reference_trust_coefficient, global_step=global_step,
+                        reward_round_id=round_id, raw_auc=judge_auc,
+                        raw_ready=bool(
+                            raw_probe["raw_audit_training_ready"]
+                            if adaptive_cfg.audit_fit.get("training_readiness")
+                            is not None
+                            else raw_probe["raw_audit_saturated"]
+                        ),
+                    )
+                    gradient_cache[snapshot] = gradient_metrics
+                gradient_metrics = dict(gradient_metrics)
+                gradient_metrics["gradient_conflict/judge_fit_global_step"] = judge_step
+                gradient_metrics["gradient_conflict/judge_reused_from_install"] = float(reused_judge)
+                gradient_metrics["gradient_conflict/raw_auc_is_current"] = float(
+                    not reused_judge and not (phase == "post_install" and adaptive_cfg.raw_rollback_to_best_on_plateau)
+                )
+                gradient_metrics["gradient_conflict/warmup_completed_updates"] = adaptive_state.policy_warmup_completed_updates
+                if phase == "periodic":
+                    last_gradient_conflict_snapshot = (int(global_step), round_id)
+                ran = gradient_metrics.get("gradient_conflict/ran", 0) >= .5
+                if ran and phase == "post_install":
+                    adaptive_state.gradient_post_install_probe_round_id = round_id
+                    adaptive_state.gradient_lifecycle_monitor_state = copy.deepcopy(judge_cache)
+                    adaptive_state.gradient_lifecycle_monitor_step = judge_step
+                    adaptive_state.gradient_lifecycle_raw_auc = judge_auc
+                if ran and phase == "post_warmup":
+                    adaptive_state.gradient_warmup_probe_round_id = round_id
+                    adaptive_state.gradient_lifecycle_monitor_state = {}
+                logged_metrics = phase_metrics(gradient_metrics, phase)
+                logged_metrics["epoch"] = int(epoch)
+                if is_rank0:
+                    _log.info("[DGPO/gradient_conflict] %s", logged_metrics)
+                    if wandb_mod is not None:
+                        _wandb_log_auxiliary(wandb_mod, logged_metrics, current_global_step=int(global_step))
+
+            gradient_snapshot = (int(global_step), int(adaptive_state.reward_round_id))
+            if (gradient_conflict_cfg.enabled and global_step > 0
+                    and (
+                        force_gradient_conflict
+                        or global_step % gradient_conflict_cfg.every_n_steps == 0
+                    )
+                    and gradient_snapshot != last_gradient_conflict_snapshot):
+                _measure_gradient_phase("periodic", score_pool)
+            from RL.DGPO_neutrino.gradient_conflict import lifecycle_probe_due
+            lifecycle_phase = lifecycle_probe_due(
+                gradient_conflict_cfg, adaptive_state, warmup_steps=adaptive_cfg.policy_warmup_steps,
+            )
+            if lifecycle_phase is not None:
+                _measure_gradient_phase(lifecycle_phase, score_pool)
             raw_checkpoint_path = ""
-            if adaptive_cfg.raw_rollback_to_best_on_plateau:
+            if adaptive_cfg.raw_rollback_to_best_on_plateau or adaptive_cfg.raw_best_scope == "global":
                 assert save_dir_raw
                 raw_checkpoint_path = str(
                     Path(str(save_dir_raw)).expanduser().resolve()
@@ -12020,11 +14143,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     min_delta=adaptive_cfg.raw_improvement_min_delta,
                     initial_judge_cache=confirmation_start_cache,
                     materialize_pair=lambda candidate, incumbent: _materialize_adaptive_omnifold_pool(
-                        val_shard, omnifold_val_loader_cfg, model=candidate,
+                        omnifold_val_shard, omnifold_val_loader_cfg, model=candidate,
                         paired_reference_model=incumbent, sampler=sampler, device=device,
                         world_size=world_size, rank=rank, quota_events=adaptive_cfg.probe_max_events,
                         num_ddim_steps=num_ddim_val, seed=probe_panel_seed,
                         include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+                        include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                     ),
                     fit_judge=lambda pool, phase, warm_start_cache=None: fit_raw_policy_audit(
                         pool=pool, model_builder=omnifold_source.model_builder,
@@ -12163,6 +14287,32 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     }
                 )
                 adaptive_state.last_decision = "classifier_trust_recalibrate"
+            round_budget_exhausted = reward_round_budget_exhausted(
+                adaptive_state,
+                max_reward_rounds=adaptive_cfg.max_reward_rounds,
+            )
+            diagnostics.update(
+                {
+                    "staleness/max_reward_rounds": float(
+                        adaptive_cfg.max_reward_rounds
+                        if adaptive_cfg.max_reward_rounds is not None
+                        else 0
+                    ),
+                    "staleness/reward_round_budget_exhausted": float(
+                        round_budget_exhausted
+                    ),
+                }
+            )
+            if round_budget_exhausted and trigger_refit:
+                trigger_refit = False
+                adaptive_state.last_decision = "reward_round_budget_complete"
+                diagnostics.update(
+                    {
+                        "staleness/decision": adaptive_state.last_decision,
+                        "staleness/trigger_recalibration": 0.0,
+                        "staleness/trigger_reason": "reward_round_budget",
+                    }
+                )
             if not trigger_refit:
                 if pending_resume_trust_diagnostics:
                     diagnostics.update(pending_resume_trust_diagnostics)
@@ -12178,11 +14328,14 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         float(raw_probe["raw_auc_gap"]),
                         float(adaptive_state.raw_best_auc_gap),
                         adaptive_state.raw_no_improvement_streak,
-                        adaptive_cfg.required_consecutive_epochs,
+                        int(diagnostics["staleness/raw_no_improvement_patience"]),
                         classifier_trust_trigger,
                         adaptive_state.reward_round_id,
                     )
                 return diagnostics
+
+            if gradient_conflict_cfg.enabled and gradient_conflict_cfg.monitor_refit_lifecycle:
+                _measure_gradient_phase("pre_refit", gradient_panel)
 
             if raw_trigger and adaptive_cfg.raw_rollback_to_best_on_plateau:
                 selected_checkpoint = _resolve_raw_best_policy_checkpoint(
@@ -12272,13 +14425,14 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 num_ddim_steps=num_ddim,
                 seed=fit_pool_seed,
                 include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+                include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
             )
             if adaptive_cfg.single_pool_train_validation:
                 score_pool = fit_pool  # run_adaptive_refit performs the disjoint 80/20 split
             if adaptive_cfg.refit_score_events == adaptive_cfg.probe_max_events:
                 if score_pool is None:
                     score_pool = _materialize_adaptive_omnifold_pool(
-                        val_shard,
+                        omnifold_val_shard,
                         omnifold_val_loader_cfg,
                         model=model,
                         sampler=sampler,
@@ -12291,11 +14445,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         include_pairwise_context=(
                             adaptive_cfg.periodic_pair_features_enabled
                         ),
+                        include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                     )
                 refit_score_pool = score_pool
             else:
                 refit_score_pool = _materialize_adaptive_omnifold_pool(
-                    val_shard,
+                    omnifold_val_shard,
                     omnifold_val_loader_cfg,
                     model=model,
                     sampler=sampler,
@@ -12308,8 +14463,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     include_pairwise_context=(
                         adaptive_cfg.periodic_pair_features_enabled
                     ),
+                    include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                 )
             refit_diagnostics = run_adaptive_refit(
+                global_step=int(global_step),
                 state=adaptive_state,
                 cfg=adaptive_cfg,
                 reward_source=omnifold_source,
@@ -12318,7 +14475,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 fit_pool=fit_pool,
                 score_pool=refit_score_pool,
                 # This controller intentionally has no acceptance/baseline
-                # audit.  The held-out residual AUC <= 0.505 is the sole gate.
+                # audit. The scheduled held-out residual AUC is the closure gate.
                 baseline_pool=None,
                 epoch=int(epoch),
                 device=device,
@@ -12334,6 +14491,16 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             refit_accepted = bool(
                 float(refit_diagnostics.get("omnifold/accepted", 0.0)) >= 0.5
             )
+            if not refit_accepted and adaptive_cfg.scheduled_refit_fail_closed:
+                raise RuntimeError(
+                    "scheduled fresh reward refit failed; refusing to continue "
+                    "the fixed-round experiment with a stale reward: "
+                    + str(
+                        refit_diagnostics.get(
+                            "omnifold/accept_reason", "unspecified classifier gate"
+                        )
+                    )
+                )
             if refit_accepted:
                 if adaptive_cfg.raw_best_scope == "global":
                     adaptive_state.raw_global_refit_pending = True
@@ -12345,10 +14512,19 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 ))
                 adaptive_state.audit_protocol_signature = current_audit_signature
                 diagnostics["staleness/decision"] = "forward_recenter_installed"
+                if gradient_conflict_cfg.enabled and gradient_conflict_cfg.monitor_refit_lifecycle:
+                    _measure_gradient_phase("post_install", gradient_panel)
             else:
-                if adaptive_cfg.raw_best_scope == "global":
-                    raise RuntimeError("global-best OmniFold refit was not accepted; refusing to train the rolled-back policy with the old reward/reference. Resume the last complete checkpoint.")
-                diagnostics["staleness/decision"] = "forward_recenter_deferred"
+                diagnostics["staleness/decision"] = _raw_refit_failure_decision(
+                    rollback_applied=bool(diagnostics.get("staleness/raw_best_rollback_applied", 0.0)),
+                )
+                if is_rank0:
+                    _log.warning(
+                        "[DGPO/omnifold] refit rejected without rollback; preserving "
+                        "current policy, installed reward/reference and optimizer. "
+                        "Retry remains governed by the existing raw monitor: %s",
+                        refit_diagnostics.get("omnifold/accept_reason", "unspecified"),
+                    )
             reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
             if pending_resume_trust_diagnostics:
                 diagnostics.update(pending_resume_trust_diagnostics)
@@ -12364,6 +14540,21 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             force_refit=force_refit,
         )
         if routine_raw_only:
+            frozen_metrics = {}
+            if adaptive_cfg.iteration_one_only:
+                from RL.DGPO_neutrino.omnifold_ztautau.adaptive import frozen_classifier_metrics
+                frozen_metrics = frozen_classifier_metrics(
+                    omnifold_source.frozen_reward, score_pool,
+                    row_budget=adaptive_cfg.score_row_budget,
+                )
+            # A cold audit normally discards its fitted judge. Keep it only for
+            # this boundary when the read-only gradient-direction probe needs
+            # the judge weights; it is never reused by the next audit.
+            current_raw_monitor_cache = (
+                adaptive_state.raw_monitor_state
+                if adaptive_cfg.raw_monitor_warm_start
+                else ({} if gradient_conflict_cfg.enabled else None)
+            )
             raw_probe = fit_raw_policy_audit(
                 pool=score_pool,
                 model_builder=omnifold_source.model_builder,
@@ -12374,13 +14565,48 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     if fixed_audit_panel
                     else adaptive_cfg.probe_seed + max(int(epoch), 0)
                 ),
+                warm_start_cache=current_raw_monitor_cache,
                 progress_callback=lambda row: _log_omnifold_fit_progress(
                     "raw_staleness_audit",
                     row,
                     epoch_value=int(epoch),
                 ),
             )
+            history_row = {
+                "epoch": float(epoch),
+                "global_step": float(global_step),
+                "reward_round_id": float(adaptive_state.reward_round_id),
+                "decision_recalibrate": 0.0,
+                "measurement_only_raw_audit": 1.0,
+                **frozen_metrics,
+                **{key: float(value) for key, value in raw_probe.items()},
+            }
+            adaptive_state.probe_history.append(history_row)
+            if len(adaptive_state.probe_history) > 256:
+                del adaptive_state.probe_history[:-256]
+            trajectory_rows = [
+                row
+                for row in adaptive_state.probe_history
+                if float(row.get("measurement_only_raw_audit", 0.0)) >= 0.5
+                and math.isfinite(float(row.get("raw_auc_gap", float("nan"))))
+            ]
+            trajectory_rows.sort(key=lambda row: float(row["global_step"]))
+            trajectory_steps = [float(row["global_step"]) for row in trajectory_rows]
+            trajectory_gaps = [float(row["raw_auc_gap"]) for row in trajectory_rows]
+            gap_slope_per_10 = float("nan")
+            if len(trajectory_rows) >= 2:
+                step_mean = sum(trajectory_steps) / len(trajectory_steps)
+                gap_mean = sum(trajectory_gaps) / len(trajectory_gaps)
+                step_variance = sum(
+                    (value - step_mean) ** 2 for value in trajectory_steps
+                )
+                if step_variance > 0.0:
+                    gap_slope_per_10 = 10.0 * sum(
+                        (step - step_mean) * (gap - gap_mean)
+                        for step, gap in zip(trajectory_steps, trajectory_gaps)
+                    ) / step_variance
             diagnostics: dict[str, Any] = {
+                **frozen_metrics,
                 **{
                     f"staleness/{key}": float(value)
                     for key, value in raw_probe.items()
@@ -12393,7 +14619,136 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 "staleness/trigger_recalibration": 0.0,
                 "staleness/monitor_mode_raw_only": 1.0,
                 "staleness/log_only": 1.0,
+                "audit/raw_auc": float(raw_probe["raw_auc"]),
+                "audit/raw_auc_gap": float(raw_probe["raw_auc_gap"]),
+                "audit/saturated": float(raw_probe["raw_audit_saturated"]),
+                "audit/training_ready": float(
+                    raw_probe["raw_audit_training_ready"]
+                ),
+                "audit/epoch": float(epoch),
+                "audit/policy_step": float(global_step),
+                "audit/trajectory_points": float(len(trajectory_rows)),
+                "audit/raw_auc_gap_change_from_step0": float(
+                    trajectory_gaps[-1] - trajectory_gaps[0]
+                ),
+                "audit/raw_auc_gap_slope_per_10_steps": float(
+                    gap_slope_per_10
+                ),
             }
+            gradient_snapshot = (
+                int(global_step),
+                int(adaptive_state.reward_round_id),
+            )
+            if (
+                gradient_conflict_cfg.enabled
+                and global_step > 0
+                and global_step % gradient_conflict_cfg.every_n_steps == 0
+                and gradient_snapshot != last_gradient_conflict_snapshot
+            ):
+                from RL.DGPO_neutrino.gradient_conflict import (
+                    phase_metrics,
+                    probe_gradients,
+                )
+                from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import (
+                    peft_bank_factory,
+                )
+
+                overrides = {
+                    key: adaptive_cfg.audit_fit[key]
+                    for key in (
+                        "head_dropout", "topology_dropout", "decoder_hidden_dim",
+                        "decoder_layers", "decoder_heads", "periodic_pair_features",
+                        "topology_fourier_embedding", "topology_direct_logit",
+                        "topology_context_residual_scale", "topology_conditioning", "topology_pair_token", "relation_token_count",
+                        "visible_pair_rest_frame", "topology_max_harmonic",
+                        "topology_include_theta_pair", "topology_theta_fourier", "topology_hidden_dim",
+                        "topology_embedding_dim", "topology_fusion_hidden_dim",
+                        "train_layernorm", "train_encoder",
+                        "train_grouped_sequential_embedding",
+                        "train_invisible_projector", "train_backbone",
+                        "train_angular_conditioning",
+                        "train_last_pet_block",
+                        "asymmetric_attention",
+                    )
+                    if adaptive_cfg.audit_fit.get(key) is not None
+                }
+                gradient_metrics = probe_gradients(
+                    cfg=gradient_conflict_cfg,
+                    model=model,
+                    core=_unwrap_core_evenet(model),
+                    reference=round_ref_model,
+                    pool=score_pool,
+                    monitor_factory=peft_bank_factory(
+                        omnifold_source.model_builder,
+                        score_pool.packing_spec,
+                        classifier_overrides=overrides,
+                    ),
+                    monitor_cache=current_raw_monitor_cache or {},
+                    reward_compute=lambda candidates, batch: reward_agg.compute(
+                        candidates, batch
+                    )[0],
+                    generate=generate_neutrino_candidates,
+                    evaluate=policy_evaluation_step,
+                    sampler=sampler,
+                    device=device,
+                    dtype=dtype,
+                    rank=rank,
+                    world_size=world_size,
+                    K=K,
+                    beta=beta,
+                    num_ddim_steps=num_ddim,
+                    rollout_parallel_chains=rollout_parallel_chains,
+                    num_train_timesteps=num_train_timesteps,
+                    t_min=policy_eval_t_min_cfg,
+                    t_max=policy_eval_t_max_cfg,
+                    advantage_estimator=advantage_estimator,
+                    adv_clip_max=adv_clip_max_cfg,
+                    trust_coefficient=reference_trust_coefficient,
+                    global_step=global_step,
+                    reward_round_id=int(adaptive_state.reward_round_id),
+                    raw_auc=raw_probe["raw_auc"],
+                    raw_ready=bool(
+                        raw_probe["raw_audit_training_ready"]
+                        if adaptive_cfg.audit_fit.get("training_readiness")
+                        is not None
+                        else raw_probe["raw_audit_saturated"]
+                    ),
+                )
+                gradient_metrics = phase_metrics(gradient_metrics, "periodic")
+                gradient_metrics.update(
+                    {
+                        "gradient_conflict/judge_fit_global_step": int(global_step),
+                        "gradient_conflict/judge_reused_from_install": 0.0,
+                        "gradient_conflict/raw_auc_is_current": 1.0,
+                        "gradient_conflict/warmup_completed_updates": (
+                            adaptive_state.policy_warmup_completed_updates
+                        ),
+                    }
+                )
+                last_gradient_conflict_snapshot = gradient_snapshot
+                diagnostics.update(gradient_metrics)
+                direction_aliases = {
+                    "installed/norm": "omnifold/norm",
+                    "installed/split_cosine": "omnifold/split_cosine",
+                    "installed/reliable": "omnifold/reliable",
+                    "fresh/norm": "staleness/norm",
+                    "fresh/split_cosine": "staleness/split_cosine",
+                    "fresh/reliable": "staleness/reliable",
+                    "installed_vs_fresh/cosine": "omnifold_staleness/cosine",
+                    "installed_vs_fresh/cross_dot": "omnifold_staleness/cross_dot",
+                    "installed_vs_fresh/cross_dot_lcb": "omnifold_staleness/cross_dot_lcb",
+                    "installed_vs_fresh/cross_dot_ucb": "omnifold_staleness/cross_dot_ucb",
+                    "installed_vs_fresh/conclusive": "omnifold_staleness/conclusive",
+                    "installed_vs_fresh/conflict": "omnifold_staleness/conflict",
+                    "installed_vs_fresh/alignment": "omnifold_staleness/alignment",
+                }
+                for alias, source in direction_aliases.items():
+                    source_key = "gradient_conflict/" + source
+                    if source_key in gradient_metrics:
+                        diagnostics["gradient_direction/" + alias] = (
+                            gradient_metrics[source_key]
+                        )
+                diagnostics["gradient_direction/reference_trust_active"] = 0.0
             if pending_resume_trust_diagnostics:
                 diagnostics.update(pending_resume_trust_diagnostics)
                 pending_resume_trust_diagnostics = {}
@@ -12423,6 +14778,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     if fixed_audit_panel
                     else adaptive_cfg.probe_seed + max(int(epoch), 0)
                 ),
+                warm_start_cache=(
+                    adaptive_state.raw_monitor_state
+                    if adaptive_cfg.raw_monitor_warm_start
+                    else None
+                ),
                 progress_callback=lambda row: _log_omnifold_fit_progress(
                     "raw_staleness_audit",
                     row,
@@ -12443,6 +14803,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 early_stop_auc_gap=(
                     float(adaptive_state.trigger_threshold)
                     if adaptive_state.calibrated and not baseline_only
+                    else None
+                ),
+                raw_warm_start_cache=(
+                    adaptive_state.raw_monitor_state
+                    if adaptive_cfg.raw_monitor_warm_start
                     else None
                 ),
                 progress_callback=lambda phase, row: _log_omnifold_fit_progress(
@@ -12564,7 +14929,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     "to freeze an uncertified staleness threshold"
                 )
             adaptive_state.install(
-                baseline_auc_gap=float(probe["weighted_auc_gap"]),
+                baseline_auc_gap=baseline_probe_auc_gap(
+                    probe,
+                    cfg=adaptive_cfg,
+                ),
                 cfg=adaptive_cfg,
                 epoch=int(epoch),
                 round_id=int(omnifold_source.reward_round_id),
@@ -12768,7 +15136,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 # incumbent before fitting or auditing the replacement reward.
                 del score_pool
                 score_pool = _materialize_adaptive_omnifold_pool(
-                    val_shard,
+                    omnifold_val_shard,
                     omnifold_val_loader_cfg,
                     model=model,
                     sampler=sampler,
@@ -12781,6 +15149,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     include_pairwise_context=(
                         adaptive_cfg.periodic_pair_features_enabled
                     ),
+                    include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                 )
             if is_rank0:
                 _log.warning(
@@ -12793,6 +15162,32 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     adaptive_cfg.trust_failed_direction_patience,
                     signed_recovery_stop_requested,
                 )
+        round_budget_exhausted = reward_round_budget_exhausted(
+            adaptive_state,
+            max_reward_rounds=adaptive_cfg.max_reward_rounds,
+        )
+        diagnostics.update(
+            {
+                "staleness/max_reward_rounds": float(
+                    adaptive_cfg.max_reward_rounds
+                    if adaptive_cfg.max_reward_rounds is not None
+                    else 0
+                ),
+                "staleness/reward_round_budget_exhausted": float(
+                    round_budget_exhausted
+                ),
+            }
+        )
+        if round_budget_exhausted and trigger_refit:
+            trigger_refit = False
+            adaptive_state.last_decision = "reward_round_budget_complete"
+            diagnostics.update(
+                {
+                    "staleness/decision": adaptive_state.last_decision,
+                    "staleness/trigger_recalibration": 0.0,
+                    "staleness/trigger_reason": "reward_round_budget",
+                }
+            )
         if trigger_refit:
             if diagnostics_force_reason:
                 diagnostics["staleness/trigger_reason"] = diagnostics_force_reason
@@ -12870,7 +15265,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     # Rebuild the candidate population on the identical fixed
                     # panel so every later classifier sees the selected policy.
                     score_pool = _materialize_adaptive_omnifold_pool(
-                        val_shard,
+                        omnifold_val_shard,
                         omnifold_val_loader_cfg,
                         model=model,
                         sampler=sampler,
@@ -12883,6 +15278,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         include_pairwise_context=(
                             adaptive_cfg.periodic_pair_features_enabled
                         ),
+                        include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                     )
                     diagnostics.update(
                         {
@@ -12955,7 +15351,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 # distribution on the identical event/noise panel.
                 del score_pool
                 score_pool = _materialize_adaptive_omnifold_pool(
-                    val_shard,
+                    omnifold_val_shard,
                     omnifold_val_loader_cfg,
                     model=model,
                     sampler=sampler,
@@ -12968,6 +15364,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     include_pairwise_context=(
                         adaptive_cfg.periodic_pair_features_enabled
                     ),
+                    include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                 )
                 diagnostics.update(
                     {
@@ -13047,6 +15444,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 num_ddim_steps=num_ddim,
                 seed=fit_pool_seed,
                 include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+                include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
             )
             refit_score_pool = score_pool
             if adaptive_cfg.refit_score_events != adaptive_cfg.probe_max_events:
@@ -13058,7 +15456,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         adaptive_cfg.probe_max_events,
                     )
                 refit_score_pool = _materialize_adaptive_omnifold_pool(
-                    val_shard,
+                    omnifold_val_shard,
                     omnifold_val_loader_cfg,
                     model=model,
                     sampler=sampler,
@@ -13069,8 +15467,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     num_ddim_steps=num_ddim_val,
                     seed=(probe_panel_seed + 1_000_003),
                     include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+                    include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                 )
             refit_diagnostics = run_adaptive_refit(
+                global_step=int(global_step),
                 state=adaptive_state,
                 cfg=adaptive_cfg,
                 reward_source=omnifold_source,
@@ -13104,6 +15504,20 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             refit_accepted = (
                 float(refit_diagnostics.get("omnifold/accepted", 0.0)) >= 0.5
             )
+            if (
+                not refit_accepted
+                and adaptive_cfg.scheduled_refit_fail_closed
+                and not force_refit
+            ):
+                raise RuntimeError(
+                    "scheduled fresh reward refit failed; refusing to continue "
+                    "the fixed-round experiment with a stale reward: "
+                    + str(
+                        refit_diagnostics.get(
+                            "omnifold/accept_reason", "unspecified classifier gate"
+                        )
+                    )
+                )
             if extragradient_requested:
                 diagnostics.update(
                     {
@@ -13474,7 +15888,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         + 1009 * int(lookahead_round_id)
                     )
                     corrected_baseline_pool = _materialize_adaptive_omnifold_pool(
-                        val_shard,
+                        omnifold_val_shard,
                         omnifold_val_loader_cfg,
                         model=model,
                         sampler=sampler,
@@ -13487,6 +15901,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         include_pairwise_context=(
                             adaptive_cfg.periodic_pair_features_enabled
                         ),
+                        include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                     )
                     corrected_fit_pool = _materialize_adaptive_omnifold_pool(
                         omnifold_train_shard,
@@ -13506,6 +15921,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         include_pairwise_context=(
                             adaptive_cfg.periodic_pair_features_enabled
                         ),
+                        include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                     )
                     corrected_score_pool = corrected_baseline_pool
                     if (
@@ -13514,7 +15930,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     ):
                         corrected_score_pool = (
                             _materialize_adaptive_omnifold_pool(
-                                val_shard,
+                                omnifold_val_shard,
                                 omnifold_val_loader_cfg,
                                 model=model,
                                 sampler=sampler,
@@ -13527,9 +15943,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                                 include_pairwise_context=(
                                     adaptive_cfg.periodic_pair_features_enabled
                                 ),
+                                include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
                             )
                         )
                     final_refit_diagnostics = run_adaptive_refit(
+                        global_step=int(global_step),
                         state=adaptive_state,
                         cfg=adaptive_cfg,
                         reward_source=omnifold_source,
@@ -13858,6 +16276,282 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             )
         return diagnostics
 
+    experiment_cfg = getattr(global_config, "experiment", {}) or {}
+    classifier_only = bool(
+        experiment_cfg.get("classifier_only", False)
+        if isinstance(experiment_cfg, Mapping)
+        else getattr(experiment_cfg, "classifier_only", False)
+    )
+    if classifier_only:
+        # This is a terminal measurement path, not a shortened DGPO run.  It
+        # intentionally exits before reward bootstrap, baseline probes, policy
+        # validation, checkpointing, or the policy-training loop.
+        if not adaptive_cfg.enabled or omnifold_source is None:
+            raise ValueError(
+                "experiment.classifier_only requires adaptive OmniFold only "
+                "as the fixed-pool audit model builder"
+            )
+        if omnifold_val_shard is None:
+            raise RuntimeError(
+                "classifier-only audit needs a held-out validation shard"
+            )
+        if checkpoint_load_mode != "weights_only":
+            raise ValueError(
+                "classifier-only audit requires dgpo.checkpoint_load_mode=weights_only"
+            )
+        if start_epoch != 0 or global_step != 0:
+            raise ValueError(
+                "classifier-only audit must start from policy step 0"
+            )
+        if adaptive_cfg.bootstrap_on_start:
+            raise ValueError(
+                "classifier-only audit forbids adaptive_omnifold.recalibration."
+                "bootstrap_on_start"
+            )
+        if adaptive_cfg.baseline_probe_on_start:
+            raise ValueError(
+                "classifier-only audit forbids adaptive_omnifold."
+                "baseline_probe_on_start"
+            )
+        if int(adaptive_cfg.audit_fit.get("repeats", 1)) != 1:
+            raise ValueError("classifier-only probe requires exactly one cold fit")
+        classifier_lr_replay = _dgpo_cfg_get(
+            getattr(global_config, "experiment", {}), "classifier_design_arm", ""
+        ) in {"adapter_decoder_lr_stability", "warmup_cosine_scheduler"}
+        if classifier_lr_replay:
+            plateau_protocol = _dgpo_cfg_get(
+                getattr(global_config, "experiment", {}), "protocol", ""
+            ) in {"h4-frozen-readout-quick300-v1", "h4-output-scale300-v1"}
+            if plateau_protocol:
+                if (
+                    adaptive_cfg.audit_fit.get("steps") != 300
+                    or adaptive_cfg.audit_fit.get("min_steps") != 300
+                    or adaptive_cfg.audit_fit.get("require_saturation") is not False
+                    or adaptive_cfg.audit_fit.get("checkpoint_selection_metric", "loss") != "loss"
+                    or adaptive_cfg.audit_fit.get("lr_scheduler", "constant") != "constant"
+                ):
+                    raise ValueError("Plateau screen requires exactly 300 updates, constant LR, BCE selection and no saturation requirement")
+            elif _dgpo_cfg_get(
+                getattr(global_config, "experiment", {}), "protocol", ""
+            ) == "old-classifier-pretrain-v1":
+                fit = adaptive_cfg.audit_fit
+                if (
+                    fit.get("steps") != 3000 or fit.get("min_steps") != 1000
+                    or fit.get("validation_patience_epochs") != 10
+                    or fit.get("validation_min_delta") != 1e-3
+                    or any(fit.get(k) for k in (
+                        "periodic_pair_features", "topology_pair_token",
+                        "topology_fourier_embedding", "fourier_output_standardization",
+                        "topology_conditioning", "topology_direct_logit", "train_last_pet_block"))
+                    or fit.get("train_grouped_sequential_embedding") is not True
+                    or fit.get("train_invisible_projector") is not True
+                    or fit.get("checkpoint_selection_metric") != "loss"
+                    or fit.get("lr_scheduler") != "constant"
+                ):
+                    raise ValueError("Old-pretrain fit requires the historical no-pair classifier and 1000/3000 BCE budget")
+            elif _dgpo_cfg_get(
+                getattr(global_config, "experiment", {}), "protocol", ""
+            ) == "h4-candidate-only-v1":
+                fit = adaptive_cfg.audit_fit
+                if (fit.get("relation_token_count") != 0 or fit.get("decoder_layers") != 1
+                    or fit.get("decoder_hidden_dim") != 128 or fit.get("decoder_heads") != 4
+                    or fit.get("steps") != 3000 or fit.get("min_steps") != 1000
+                    or fit.get("validation_patience_epochs") != 10
+                    or fit.get("validation_min_delta") != 1e-3
+                    or any(fit.get(k) for k in ("periodic_pair_features", "topology_pair_token",
+                        "topology_fourier_embedding", "fourier_output_standardization",
+                        "topology_conditioning", "topology_direct_logit", "visible_pair_rest_frame",
+                        "conditional_residual_rank"))
+                    or fit.get("require_saturation") is not False
+                    or fit.get("checkpoint_selection_metric") != "loss"
+                    or fit.get("lr_scheduler") != "constant"):
+                    raise ValueError("Candidate-only fit requires two direct candidate tokens, one block and no engineered physics branches")
+            elif _dgpo_cfg_get(
+                getattr(global_config, "experiment", {}), "protocol", ""
+            ) == "h4-relation-tokens-v1":
+                fit = adaptive_cfg.audit_fit
+                if (fit.get("relation_token_count") != 4 or fit.get("decoder_layers") != 2
+                    or fit.get("steps") != 3000 or fit.get("min_steps") != 1000
+                    or fit.get("validation_patience_epochs") != 10
+                    or fit.get("validation_min_delta") != 1e-3
+                    or any(fit.get(k) for k in ("periodic_pair_features", "topology_pair_token",
+                        "topology_fourier_embedding", "fourier_output_standardization",
+                        "topology_conditioning", "topology_direct_logit", "visible_pair_rest_frame",
+                        "conditional_residual_rank"))
+                    or fit.get("checkpoint_selection_metric") != "loss"
+                    or fit.get("lr_scheduler") != "constant"):
+                    raise ValueError("Relation-token fit requires four learned latents, two rounds and no engineered physics branches")
+            elif _dgpo_cfg_get(
+                getattr(global_config, "experiment", {}), "protocol", ""
+            ) == "h4-pair-token-v1":
+                fit = adaptive_cfg.audit_fit
+                if (
+                    fit.get("steps") != 3000 or fit.get("min_steps") != 1000
+                    or fit.get("validation_patience_epochs") != 10
+                    or fit.get("validation_min_delta") != 1e-3
+                    or fit.get("topology_pair_token") is not True
+                    or fit.get("periodic_pair_features") is not True
+                    or fit.get("topology_fourier_embedding") is not False
+                    or fit.get("fourier_output_standardization") is not False
+                    or fit.get("topology_conditioning") is not False
+                    or fit.get("topology_direct_logit") is not False
+                    or fit.get("require_saturation") is not False
+                    or fit.get("checkpoint_selection_metric") != "loss"
+                    or fit.get("lr_scheduler") != "constant"
+                ):
+                    raise ValueError("Pair-token fit requires the matched 1000/3000 BCE protocol without Fourier fusion or standardization")
+            elif _dgpo_cfg_get(
+                getattr(global_config, "experiment", {}), "protocol", ""
+            ) == "h4-output-scale-long-v1":
+                if (
+                    adaptive_cfg.audit_fit.get("steps") != 3000
+                    or adaptive_cfg.audit_fit.get("min_steps") != 1000
+                    or adaptive_cfg.audit_fit.get("validation_patience_epochs") != 10.0
+                    or adaptive_cfg.audit_fit.get("fourier_output_standardization") is not True
+                    or adaptive_cfg.audit_fit.get("require_saturation") is not False
+                    or adaptive_cfg.audit_fit.get("checkpoint_selection_metric", "loss") != "loss"
+                    or adaptive_cfg.audit_fit.get("lr_scheduler", "constant") != "constant"
+                ):
+                    raise ValueError("Long scaling fit requires 1000 minimum / 3000 maximum updates, ten-epoch patience, fixed standardization, constant LR and BCE selection")
+            elif (
+                adaptive_cfg.audit_fit.get("steps") is not None
+                or adaptive_cfg.audit_fit.get("min_steps") != 1000
+                or adaptive_cfg.audit_fit.get("validation_patience_epochs") != 10.0
+            ):
+                raise ValueError("LR replay requires no maximum, minimum 1000 updates and ten-epoch patience")
+        token_conditioning_audit = _dgpo_cfg_get(
+            experiment_cfg, "protocol", ""
+        ) in {"h4-token-conditioning-fresh-audit-v1", "h4-matched-fold-fresh-audit-v1"}
+        if token_conditioning_audit:
+            fit = adaptive_cfg.audit_fit
+            if (fit.get("steps") is not None or fit.get("min_steps") != 0
+                    or fit.get("validation_patience_epochs") != 25
+                    or not fit.get("restore_best") or not fit.get("disjoint_final_audit")
+                    or fit.get("checkpoint_selection_metric") != "loss"):
+                raise ValueError("token-conditioning audit requires the matched 25-epoch patience, best-BCE/disjoint-test protocol")
+            if (_dgpo_cfg_get(experiment_cfg, "protocol", "") == "h4-matched-fold-fresh-audit-v1"
+                    and (fit.get("training_population") != "omnifold_fold"
+                         or fit.get("training_fold") != 1)):
+                raise ValueError("matched-fold audit requires the original OmniFold training fold 1")
+        if not classifier_lr_replay and not token_conditioning_audit and (
+            adaptive_cfg.audit_fit.get("steps") != 3000
+            or adaptive_cfg.audit_fit.get("min_steps") != 3000
+        ):
+            raise ValueError(
+                "classifier-only architecture probe requires one exact "
+                "3000-step cold audit"
+            )
+
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+            fit_raw_policy_audit,
+        )
+
+        if is_rank0:
+            _log.info(
+                "[classifier-only] frozen source policy step=%s (audit clock=0): "
+                "materializing K=1 samples with training_population=%s, fitting "
+                "one cold classifier, then exiting with zero reward fits/policy updates.",
+                _dgpo_cfg_get(experiment_cfg, "source_policy_step", None),
+                adaptive_cfg.audit_fit.get("training_population", "probe_split"),
+            )
+        classifier_pool = _materialize_adaptive_omnifold_pool(
+            omnifold_val_shard,
+            omnifold_val_loader_cfg,
+            model=model,
+            sampler=sampler,
+            device=device,
+            world_size=world_size,
+            rank=rank,
+            quota_events=adaptive_cfg.probe_max_events,
+            num_ddim_steps=num_ddim_val,
+            seed=int(adaptive_cfg.probe_seed),
+            # Keep geometry for held-out ratio diagnostics even when the old
+            # classifier does not consume engineered pair features.
+            include_pairwise_context=(adaptive_cfg.periodic_pair_features_enabled
+                                      or bool(adaptive_cfg.audit_fit.get("ratio_audit_export_dir"))),
+            include_visible_pair_rest_frame=(
+                adaptive_cfg.visible_pair_rest_frame_enabled
+            ),
+        )
+        classifier_training_pool = _materialize_raw_audit_training_pool(
+            omnifold_train_shard, omnifold_train_loader_cfg, cfg=adaptive_cfg,
+            model=model, sampler=sampler, device=device, world_size=world_size,
+            rank=rank, num_ddim_steps=num_ddim_val, panel_seed=adaptive_cfg.probe_seed,
+            evaluation_events=classifier_pool.n_events,
+        )
+        classifier_result = fit_raw_policy_audit(
+            pool=classifier_pool,
+            model_builder=omnifold_source.model_builder,
+            cfg=adaptive_cfg,
+            device=device,
+            seed=int(adaptive_cfg.probe_seed),
+            # Original step-50 audit retained an empty cache for gradient
+            # diagnostics, selecting the identity-based split. Replay it cold.
+            warm_start_cache={} if classifier_lr_replay else None,
+            **({"training_pool": classifier_training_pool} if classifier_training_pool is not None else {}),
+            progress_callback=lambda row: _log_omnifold_fit_progress(
+                "raw_staleness_audit",
+                row,
+                epoch_value=-1,
+            ),
+        )
+        final_metrics: dict[str, Any] = {
+            f"staleness/{key}": value
+            for key, value in classifier_result.items()
+        }
+        final_metrics.update(
+            {
+                "staleness/epoch": -1.0,
+                "staleness/global_step": 0.0,
+                "classifier_only/enabled": 1.0,
+                "classifier_only/policy_updates": 0.0,
+                "classifier_only/reward_fits": 0.0,
+                "classifier_only/classifier_fits": 1.0,
+                "classifier_only/completed": 1.0,
+            }
+        )
+        source_step = _dgpo_cfg_get(experiment_cfg, "source_policy_step", None)
+        if source_step is not None:
+            final_metrics["classifier_only/source_policy_step"] = int(source_step)
+        if is_rank0:
+            _log.info(
+                "[classifier-only] complete: AUC=%.6g balanced_accuracy=%.6g "
+                "classifier_steps=%s; reward_fits=0 policy_updates=0.",
+                float(classifier_result["raw_auc"]),
+                float(classifier_result["raw_balanced_accuracy"]),
+                int(classifier_result["raw_audit_training_steps"]),
+            )
+            if wandb_mod is not None:
+                _wandb_log_step(wandb_mod, final_metrics, step=0)
+                try:
+                    wandb_mod.run.summary.update(
+                        {
+                            "classifier_only/enabled": 1,
+                            "classifier_only/policy_updates": 0,
+                            "classifier_only/reward_fits": 0,
+                            "classifier_only/classifier_fits": 1,
+                            "classifier_only/completed": 1,
+                            "classifier_only/final_auc": float(
+                                classifier_result["raw_auc"]
+                            ),
+                            "classifier_only/final_balanced_accuracy": float(
+                                classifier_result["raw_balanced_accuracy"]
+                            ),
+                            "classifier_only/classifier_steps": int(
+                                classifier_result["raw_audit_training_steps"]
+                            ),
+                        }
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "[classifier-only] W&B summary could not be published: %s",
+                        exc,
+                    )
+        del classifier_pool, classifier_training_pool
+        _barrier()
+        _finish_wandb_run(wandb_active)
+        return
+
     need_initial_omnifold_bootstrap = bool(
         adaptive_cfg.enabled
         and adaptive_cfg.bootstrap_on_start
@@ -13866,7 +16560,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         and not bool(getattr(omnifold_source, "is_installed", True))
     )
     if need_initial_omnifold_bootstrap:
-        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import run_adaptive_refit
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import run_adaptive_refit, bootstrap_baseline_pool
 
         if val_shard is None:
             raise RuntimeError(
@@ -13880,7 +16574,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             )
         policy_snapshot = _snapshot_policy_state_dict(model)
         score_pool = None if adaptive_cfg.single_pool_train_validation else _materialize_adaptive_omnifold_pool(
-            val_shard,
+            omnifold_val_shard,
             omnifold_val_loader_cfg,
             model=model,
             sampler=sampler,
@@ -13891,6 +16585,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             num_ddim_steps=num_ddim_val,
             seed=adaptive_cfg.probe_seed,
             include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+            include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
         )
         fit_pool = _materialize_adaptive_omnifold_pool(
             omnifold_train_shard,
@@ -13904,10 +16599,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             num_ddim_steps=num_ddim,
             seed=adaptive_cfg.seed,
             include_pairwise_context=adaptive_cfg.periodic_pair_features_enabled,
+            include_visible_pair_rest_frame=adaptive_cfg.visible_pair_rest_frame_enabled,
         )
         if adaptive_cfg.single_pool_train_validation:
             score_pool = fit_pool
         bootstrap_metrics = run_adaptive_refit(
+            global_step=int(global_step),
             state=adaptive_state,
             cfg=adaptive_cfg,
             reward_source=omnifold_source,
@@ -13917,11 +16614,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             score_pool=score_pool,
             # Residual closure uses the full score pool; establish the trigger
             # baseline with the same cheap population used by routine audits.
-            baseline_pool=(
-                None
-                if adaptive_cfg.monitor_mode == "raw_plateau_refit"
-                else score_pool.prefix(adaptive_cfg.probe_max_events)
-            ),
+            baseline_pool=bootstrap_baseline_pool(adaptive_cfg, score_pool),
             epoch=-1,
             device=device,
             world_size=world_size,
@@ -13949,6 +16642,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         bootstrap_metrics.update(_reset_optimizer_after_reward_install(
             optimizer, cfg=adaptive_cfg, accepted=True, adaptive_state=adaptive_state,
         ))
+        if adaptive_cfg.iteration_one_only and adaptive_cfg.log_only:
+            from RL.DGPO_neutrino.omnifold_ztautau.adaptive import frozen_classifier_metrics
+            bootstrap_metrics.update(frozen_classifier_metrics(
+                omnifold_source.frozen_reward,
+                score_pool.prefix(adaptive_cfg.probe_max_events),
+                row_budget=adaptive_cfg.score_row_budget,
+            ))
         # Save the installed reward before the first raw-monitor fit. If that
         # long fit is interrupted, resume it without repeating OmniFold.
         adaptive_state.mark_bootstrap_complete(cfg=adaptive_cfg)
@@ -13994,6 +16694,79 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         # Bootstrap used the full train/validation pools. Release them before
         # allocating the configured raw-monitor panel.
         del fit_pool, score_pool, policy_snapshot
+
+    fixed_schedule_step_zero_audit_done = any(
+        int(row.get("global_step", -1)) == 0
+        and float(row.get("fixed_schedule_diagnostic_only", 0.0)) >= 0.5
+        and (
+            adaptive_cfg.audit_fit.get("training_population") != "omnifold_fold"
+            or (
+                float(row.get("raw_audit_uses_omnifold_fold", 0.0)) == 1.0
+                and int(row.get("raw_audit_training_fold", 0))
+                == int(adaptive_cfg.audit_fit.get("training_fold", 1))
+            )
+        )
+        for row in adaptive_state.probe_history
+    )
+    from RL.DGPO_neutrino.omnifold_ztautau.adaptive import step_zero_raw_audit_enabled
+    if (
+        adaptive_cfg.enabled
+        and step_zero_raw_audit_enabled(adaptive_cfg)
+        and start_epoch == 0
+        and global_step == 0
+        and bool(getattr(omnifold_source, "is_installed", False))
+        and not fixed_schedule_step_zero_audit_done
+    ):
+        if is_rank0:
+            _log.info(
+                "[DGPO/omnifold] fitting the selection-blind step-0 raw "
+                "audit before the first policy update"
+            )
+        step_zero_audit_metrics = _run_adaptive_cycle(
+            epoch=-1,
+            diagnostic_raw_only=True,
+        )
+        if float(
+            step_zero_audit_metrics.get(
+                "staleness/raw_audit_saturated", 0.0
+            )
+        ) < 0.5:
+            raise RuntimeError(
+                "selection-blind step-0 raw audit did not saturate"
+            )
+        # This fully trained audit replaces the controller-oriented bootstrap
+        # baseline for fixed-schedule runs. The reward schedule has no AUC
+        # threshold, so a second state-mutating raw-baseline fit is unnecessary.
+        adaptive_state.raw_monitor_baseline_pending = False
+        if is_rank0:
+            if wandb_mod is not None:
+                _wandb_log_step(
+                    wandb_mod,
+                    {"epoch": -1, **step_zero_audit_metrics},
+                    step=int(global_step),
+                )
+            # Persist the completed audit marker. A preemption after this point
+            # resumes directly into epoch 0 instead of fitting the baseline a
+            # second time.
+            _dgpo_save_last_ckpt(
+                model,
+                ema_save,
+                optimizer,
+                ref_model,
+                last_completed_epoch=-1,
+                dgpo_next_epoch=0,
+                global_step=int(global_step),
+                ema_rollout=ema_rollout,
+                round_ref_model=round_ref_model,
+                reward_round_id=int(adaptive_state.reward_round_id),
+                dgpo_projection_constraint_state=(
+                    _dgpo_constraint_checkpoint_payload(constraint_state)
+                ),
+                dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                dgpo_omnifold_reward_stack=_adaptive_stack_payload(),
+            )
+        _barrier()
 
     resume_refit_version_completed = bool(
         adaptive_state.resume_refit_once_completed
@@ -14090,6 +16863,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             )
         _barrier()
 
+    if _clear_unused_raw_monitor_baseline(adaptive_state, adaptive_cfg):
+        if is_rank0:
+            _log.info(
+                "[DGPO/omnifold] skipping unused startup raw-monitor baseline "
+                "disabled by monitoring config; inherited reward/reference unchanged"
+            )
+
     if adaptive_state.raw_monitor_baseline_pending:
         if adaptive_cfg.monitor_mode != "raw_plateau_refit":
             raise ValueError("new best-point experiment requires raw_plateau_refit monitoring")
@@ -14135,7 +16915,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     # iteration and hit the data pipeline simultaneously, avoiding NCCL barriers
     # that would otherwise busy-wait the GPU while rank 0 does cold-start work.
     ve_initial = int(val_events) if val_events is not None else 0
-    if _should_log_pretraining_baseline(start_epoch, global_step) and ve_initial > 0 and val_shard is not None:
+    if (
+        bool(dg.get("validation_initial_enabled", True))
+        and _should_log_pretraining_baseline(start_epoch, global_step)
+        and ve_initial > 0
+        and val_shard is not None
+    ):
         if is_rank0:
             _log.info(
                 "[DGPO] val: running pre-DGPO baseline validation (epoch=-1) for response diagnostics."
@@ -14227,6 +17012,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         return _dgpo_constraint_checkpoint_payload(constraint_state)
 
     adaptive_early_stop = False
+    trust_rejection_endpoint_requested = bool(
+        adaptive_state.trust_rejection_stop_requested
+    )
     try:
         legacy_train_kinematics = _supports_legacy_invisible_kinematics(
             cartesian=_truth_generation_cartesian(),
@@ -14242,7 +17030,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         train_it: Any | None = None
         completed_data_passes = 0
 
-        for epoch in range(start_epoch, epochs):
+        from itertools import count
+        epoch_iterator = count(start_epoch) if epochs is None else range(start_epoch, epochs)
+        for epoch in epoch_iterator:
             if train_it is None:
                 # ``local_shuffle_buffer_size`` provides per-shard shuffling for
                 # every complete data pass.
@@ -14434,6 +17224,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     reference_trust_reset_adam_first_moment_on_zero_step=(
                         adaptive_cfg.trust_reset_adam_first_moment_on_zero_step
                     ),
+                    reference_trust_transactional_rejection=(
+                        adaptive_cfg.trust_transactional_rejection
+                    ),
                     reference_trust_probe_cache=(
                         reference_trust_probe_cache
                         if adaptive_cfg.trust_fixed_probe_per_reward_round
@@ -14455,11 +17248,22 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     policy_eval_t_max=policy_eval_t_max_cfg,
                     constraint_state=constraint_state,
                     world_size=world_size,
+                    parameter_update_rms_target=(
+                        parameter_update_rms_target_cfg
+                    ),
+                    parameter_update_rms_min_scale=(
+                        parameter_update_rms_min_scale_cfg
+                    ),
+                    parameter_update_rms_max_scale=(
+                        parameter_update_rms_max_scale_cfg
+                    ),
                 )
                 metrics.update(trust_lr_diagnostics)
                 metrics.update(round_warmup_metrics)
                 metrics["train/lr/scheduled_max"] = max(scheduled_lrs)
                 metrics["train/lr/scheduled_min"] = min(scheduled_lrs)
+                for index, (group, rate) in enumerate(zip(optimizer.param_groups, scheduled_lrs, strict=True)):
+                    metrics[f"train/lr/scheduled/{group.get('group_name', index)}"] = rate
                 advance_policy_round_warmup(
                     adaptive_state, cfg=adaptive_cfg,
                     accepted=bool(metrics.get("train/optimizer_step_ran", 0.0) >= .5),
@@ -14534,6 +17338,41 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                                 )
                             ),
                         )
+                trust_step_accepted = bool(
+                    float(
+                        metrics.get("reference_trust/step_accepted", 0.0)
+                    )
+                    >= 0.5
+                )
+                if adaptive_cfg.trust_boundary_enabled and trust_step_accepted:
+                    adaptive_state.trust_accepted_updates += 1
+                trust_rejection_this_step = bool(
+                    adaptive_cfg.trust_boundary_enabled
+                    and adaptive_cfg.trust_stop_after_rejection
+                    and trust_boundary_this_step
+                    and not trust_step_accepted
+                )
+                if trust_rejection_this_step:
+                    adaptive_state.trust_rejection_stop_requested = True
+                    if adaptive_state.trust_first_rejected_global_step < 0:
+                        adaptive_state.trust_first_rejected_global_step = int(
+                            global_step
+                        ) + 1
+                    trust_rejection_endpoint_requested = True
+                if adaptive_cfg.trust_boundary_enabled:
+                    metrics.update(
+                        {
+                            "reference_trust/accepted_updates": float(
+                                adaptive_state.trust_accepted_updates
+                            ),
+                            "reference_trust/rejection_stop_requested": float(
+                                adaptive_state.trust_rejection_stop_requested
+                            ),
+                            "reference_trust/first_rejected_global_step": float(
+                                adaptive_state.trust_first_rejected_global_step
+                            ),
+                        }
+                    )
                 if adaptive_cfg.trust_boundary_enabled:
                     metrics["reference_trust/boundary_count"] = float(
                         adaptive_state.trust_boundary_count
@@ -14552,6 +17391,21 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     _wandb_log_step(wandb_mod, payload, step=global_step + 1)
                     _append_profile_accum(metrics)
                     _flush_profile_accum(step=global_step + 1)
+                if (
+                    bool(
+                        _dgpo_cfg_get(
+                            global_config.dgpo,
+                            "fail_on_skipped_optimizer_step",
+                            False,
+                        )
+                    )
+                    and float(metrics.get("train/optimizer_step_ran", 0.0)) < 0.5
+                ):
+                    raise RuntimeError(
+                        "fixed-update experiment encountered a skipped/nonfinite "
+                        f"optimizer step at global_step={global_step}; refusing "
+                        "to count it toward the round budget"
+                    )
 
                 if collect_train_dist_epoch and legacy_train_kinematics:
                     td_pt_p += metrics["_kin_h_pt_p"]
@@ -14595,6 +17449,16 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     )
                 global_step += 1
                 steps_this_epoch += 1
+
+                if trust_rejection_this_step:
+                    if is_rank0:
+                        _log.info(
+                            "[DGPO/trust] transactional proposal rejection at "
+                            "global_step=%s; running the cold endpoint audit and "
+                            "ending this boundary experiment.",
+                            global_step,
+                        )
+                    break
 
                 # Check the raw policy midway through the logical epoch without
                 # changing epoch length, LR schedule or epoch-end validation.
@@ -14933,7 +17797,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             adaptive_cycle_ran = False
             adaptive_stop_requested = False
             if adaptive_cfg.enabled:
-                if should_probe_training_boundary(
+                if trust_rejection_endpoint_requested or should_probe_training_boundary(
                     adaptive_state, cfg=adaptive_cfg, epoch=epoch,
                     global_step=global_step, epoch_end=True,
                 ):
@@ -14945,6 +17809,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                             if adaptive_cfg.trust_extragradient_enabled
                             else None
                         ),
+                        force_gradient_conflict=trust_rejection_endpoint_requested,
                     )
                     adaptive_stop_requested = bool(
                         float(
@@ -14955,6 +17820,22 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         )
                         >= 0.5
                     ) or adaptive_state.raw_global_stop_requested
+                    adaptive_stop_requested = bool(
+                        adaptive_stop_requested
+                        or trust_rejection_endpoint_requested
+                    )
+                    if trust_rejection_endpoint_requested:
+                        adaptive_metrics.update(
+                            {
+                                "reference_trust/endpoint/at_rejection": 1.0,
+                                "reference_trust/endpoint/proposal_step": float(
+                                    global_step
+                                ),
+                                "reference_trust/endpoint/accepted_updates": float(
+                                    adaptive_state.trust_accepted_updates
+                                ),
+                            }
+                        )
                     if adaptive_cfg.trust_boundary_enabled:
                         adaptive_metrics[
                             "reference_trust/boundary_count"
@@ -15028,7 +17909,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     and (epoch + 1) % ckpt_every_n_epochs == 0
                 )
                 or adaptive_cycle_ran
-                or epoch + 1 >= epochs
+                or (epochs is not None and epoch + 1 >= epochs)
             )
             if checkpoint_due:
                 if is_rank0:
@@ -15055,7 +17936,14 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             if adaptive_stop_requested:
                 adaptive_early_stop = True
                 if is_rank0:
-                    if adaptive_state.raw_global_stop_requested:
+                    if trust_rejection_endpoint_requested:
+                        _log.info(
+                            "[DGPO/trust] boundary endpoint saved after proposal "
+                            "step=%s (%s accepted update(s)).",
+                            global_step,
+                            adaptive_state.trust_accepted_updates,
+                        )
+                    elif adaptive_state.raw_global_stop_requested:
                         _log.info("[DGPO/global-best] stagnation: saved terminal state after %s failed refit rounds; best checkpoint=%s",
                                   adaptive_state.raw_global_failed_rounds, adaptive_state.raw_best_checkpoint)
                     elif bool(
@@ -15228,7 +18116,11 @@ def main() -> None:
     )
     process_fn = make_process_fn(base_dir)
     from RL.DGPO_neutrino.omnifold_ztautau.adaptive import resolve_adaptive_config
-    launch_adaptive_cfg = resolve_adaptive_config(global_config.dgpo)
+    launch_adaptive_cfg = resolve_adaptive_config(
+        global_config.dgpo, classifier_only=bool(_dgpo_cfg_get(
+            getattr(global_config, "experiment", {}), "classifier_only", False,
+        )),
+    )
     if launch_adaptive_cfg.single_pool_train_validation:
         train_ds, val_ds, total_events, val_events = _prepare_single_pool_datasets(
             base_dir=base_dir, base_val_dir=base_val_dir, process_fn=process_fn,

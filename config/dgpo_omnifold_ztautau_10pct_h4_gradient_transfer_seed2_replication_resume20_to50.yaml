@@ -1,0 +1,95 @@
+# Phase 2 of the independent-seed replication.  Resume the seed2 step-20
+# checkpoint with full state and extend the same installed reward to step 50.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_gradient_transfer_seed2_replication_20step.yaml
+
+experiment:
+  protocol: h4-gradient-transfer-seed2-replication-resume20-to50-v1
+  single_experimental_change: continue_independent_seed_replication_step20_to50
+  single_question: >-
+    Does the h4xfer01+h4xfer02 late-window classifier-closure pass reproduce
+    under the predeclared independent seed2 bundle?
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4xfer02
+  continuation_of: ytchou97-university-of-washington/nu2flow-RL/h4rep01
+  source_global_step: 20
+  source_reward_round_id: 1
+  rounds: 1
+  policy_updates_per_round: 50
+  continuation_policy_updates: 30
+  reward_lifetime_updates: 50
+  endpoint_selection: fixed_step_50
+  endpoint_global_step: 50
+  gradient_trace_update_end_steps: [30, 40, 50]
+  cold_h4_audit_policy_steps: [30, 40, 50]
+  primary_endpoint: late_window_mean_staleness_raw_auc_gap
+  primary_decision_rule: >-
+    Replication passes if mean(gap30,gap40,gap50)-gap0 is negative within
+    h4rep01. All four gaps must come from cold saturated H4 audits trained for
+    at least 1000 optimizer updates. Step-50 gap and monotonicity are secondary.
+
+nersc:
+  reproducibility:
+    note: >-
+      Phase 2 full-state resumes the seed2 step-20 boundary. Policy, EMA,
+      native AdamW moments, installed four-member H4 reward, paired reference,
+      adaptive state, and clocks are preserved. No bootstrap, refit, optimizer
+      reset, hard boundary, projection, or objective change occurs. The same
+      W&B run h4rep01 is resumed in real time.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_resume20_to50_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_seed_replication.py
+
+logger:
+  local:
+    name: c4a91e07_h4_seed2_replication_resume20_to50_v1
+    version: h4_seed2_replication_resume20_to50_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_resume20_to50_v1/logs
+  wandb:
+    id: h4rep01
+    run_name: c4a91e07_h4_seed2_replication_50step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - IndependentSeedReplication
+      - SeedBundle2
+      - ContinueSeed2Step20
+      - PreserveFullDGPOState
+      - PreserveInstalledH4Reward
+      - FourMemberEnsemble
+      - FixedH4RewardThroughStep50
+      - ExactProductionGradientTrace
+      - NativeAdamW
+      - ReferenceCoefficientOne
+      - ColdSaturatedH4Audit
+      - NoBootstrap
+      - NoRefit
+      - NoOptimizerReset
+      - NoObjectiveChange
+      - NoHardTrust
+      - NoProjection
+      - LiveWandb
+
+options:
+  Training:
+    total_epochs: 5
+    epochs: 5
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_20step_v1/checkpoints/last.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_resume20_to50_v1/checkpoints
+
+dgpo:
+  auto_resume_from_last: true
+  auto_resume_fallback_checkpoint_path: null
+  checkpoint_load_mode: resume
+  gradient_transfer_trace:
+    enabled: true
+    update_end_steps: [30, 40, 50]
+    counterfactual_trust_coefficients: [0.0, 0.1, 0.2, 0.5, 1.0]
+    norm_floor: 1.0e-12
+  adaptive_omnifold:
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      max_reward_rounds: 1

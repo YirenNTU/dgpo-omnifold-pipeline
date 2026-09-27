@@ -1,0 +1,56 @@
+# Weights-only continuation from the latest checkpoint of diffang10lr1.
+# Do not pass --resume_checkpoint: optimizer and cosine schedule start fresh.
+extends_overlay: train_diffusion_angular_10pct_highlr.yaml
+
+experiment:
+  question: Does a peak LR of 5e-4 with a longer decay improve angular diffusion?
+  intervention: body_lr2p5e4_head_lr5e4_five_epoch_warmup_cosine_500_epochs_patience50
+  source_stage: angular_diffusion_highlr_last_checkpoint
+  parent_wandb_run: diffang10lr1
+  comparison_wandb_run: diffang10lr1
+  interpretation: Sequential fine-tuning from the prior high-LR run, not a matched LR ablation.
+
+logger:
+  wandb:
+    id: diffang10lr5e4
+    run_name: "Higher peak LR | Fourier diffusion 10% | 5e-4 cosine 500 epochs | last high-LR weights"
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_lr5e4/logs
+    name: diffusion-angular-lr5e4
+
+options:
+  Training:
+    pretrain_model_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_highlr/checkpoints/last.ckpt
+    model_checkpoint_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_lr5e4/checkpoints
+    epochs: 500
+    total_epochs: 500
+    EarlyStopping:
+      patience: 50
+    learning_rate: 0.0005
+    learning_rate_body: 0.00025
+    learning_rate_median: 0.00025
+    Components:
+      PET:
+        learning_rate: 0.00025
+      GlobalEmbedding:
+        learning_rate: 0.00025
+      ObjectEncoder:
+        learning_rate: 0.00025
+      GroupedSequentialEmbedding:
+        learning_rate: 0.0005
+      InvisibleInputProjector:
+        learning_rate: 0.0005
+      TruthGeneration:
+        learning_rate: 0.0005
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_lr5e4/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_angular_10pct_lr5e4.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_lr5e4/ray_results

@@ -1,0 +1,159 @@
+# One-question ablation on the failed h4rep01 seed-2 lineage.
+#
+# Reuse the exact installed step-0 H4 reward/reference pair and replace the
+# coefficient-1 additive velocity-MSE penalty by a hard cumulative functional
+# constraint.  The H4 candidate objective, ESS15 tempering, K=8 sampling,
+# native AdamW state, data panels, and stochastic seed bundle stay fixed.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_gradient_transfer_seed2_replication_20step.yaml
+
+experiment:
+  protocol: h4-seed2-function-trust-10proposal-v1
+  single_experimental_change: additive_reference_penalty_to_function_space_constraint
+  single_question: >-
+    Can the fixed seed-2 H4 reward lower a cold fresh-H4 AUC gap before the
+    policy leaves velocity_mse_ratio <= 1e-4 when the paired reference acts as
+    a hard constraint instead of a coefficient-1 opposing gradient?
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4rep01
+  source_policy_step: 1110
+  source_replication_global_step: 0
+  source_reward_round_id: 1
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4rep01
+  control_step10_gap: 0.4083256
+  fixed_baseline_gap: 0.3711905
+  max_policy_proposals: 10
+  primary_endpoint: cold_h4_gap_at_boundary_minus_fixed_baseline_gap
+  primary_decision_rule: >-
+    Pass when the first-rejection boundary (or proposal 10 if no rejection)
+    has a cold saturated H4 gap below 0.3711905. Every endpoint audit must use
+    at least 1000 classifier optimizer updates.
+  h4_reward_formula_changed: false
+  dgpo_candidate_objective_changed: false
+  reference_formulation_changed: true
+  objective_formulation: constrained_h4_minimization
+  proposal_clock_is_not_accepted_update_clock: true
+  wandb_required: true
+
+nersc:
+  reproducibility:
+    note: >-
+      Full-state branch from h4rep01 seed-2 step 0 after its four-member H4
+      reward and cold baseline audit were saved. The additive reference
+      coefficient is zero. A fixed 4096-event shared-noise probe enforces the
+      cumulative velocity_mse_ratio radius 1e-4. Each AdamW proposal is tested
+      at scales 1, 1/2, ..., 1/64. An alpha=0 rejection restores policy,
+      complete AdamW state, scheduler, and EMA transactionally, then triggers
+      one cold saturated endpoint audit and stops. No reward refit occurs.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_function_trust_10proposal_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_function_trust.py
+
+logger:
+  local:
+    name: c4a91e07_h4_seed2_function_trust_10proposal_v1
+    version: h4_seed2_function_trust_10proposal_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_function_trust_10proposal_v1/logs
+  wandb:
+    id: h4trust01
+    run_name: c4a91e07_h4_seed2_function_trust_10proposal_v1
+    resume: allow
+    fresh_run: false
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceH4rep01Seed2Step0
+      - FourMemberH4
+      - FixedH4Reward
+      - ESS15
+      - K8CalibratedLOO
+      - NativeAdamW
+      - H4OnlyObjective
+      - FunctionSpaceTrustRegion
+      - VelocityMSERatio1e4
+      - TransactionalBacktracking
+      - StopAtFirstRejection
+      - ColdSaturatedH4Audit
+      - NoRefit
+      - LiveWandb
+
+options:
+  Training:
+    total_epochs: 1
+    epochs: 1
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_20step_v1/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_function_trust_10proposal_v1/checkpoints
+
+dgpo:
+  auto_resume_from_last: true
+  auto_resume_fallback_checkpoint_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_20step_v1/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+  checkpoint_load_mode: resume
+  steps_per_epoch: 10
+  fail_on_skipped_optimizer_step: false
+  train_dist_enabled: false
+  validation_initial_enabled: false
+  validation_every_n_epochs: 2
+  validation_full_every_n_epochs: 2
+  gradient_transfer_trace:
+    enabled: false
+    update_end_steps: [1, 2, 5, 10, 20]
+    counterfactual_trust_coefficients: [0.0, 0.1, 0.2, 0.5, 1.0]
+    norm_floor: 1.0e-12
+  reference_trust:
+    enabled: true
+    coefficient: 0.0
+    objective: velocity_mse
+    adaptive_boundary:
+      enabled: true
+      radius_mode: fixed
+      distance: velocity_mse_ratio
+      delta_max: 1.0e-4
+      delta_floor: 1.0e-4
+      warning_fraction: 0.999999
+      reset_adam_first_moment_on_install: false
+      reset_adam_first_moment_on_zero_step: false
+      transactional_rejection: true
+      stop_after_rejection: true
+      enforcement: post_step_backtracking
+      backtrack_factor: 0.5
+      max_backtracks: 6
+      probe_events_per_rank: 256
+      fixed_probe_per_reward_round: true
+      interior_fraction: 1.0
+      radius_calibration:
+        enabled: false
+        bidirectional: false
+        allow_expansion: false
+        cross_round_nonexpanding: false
+        scale_policy_lr: false
+        refit_on_exhaustion: false
+        round_acceptance_enabled: false
+        trajectory_search_enabled: false
+        signed_direction_probe:
+          enabled: false
+          recover_reverse_only: false
+        lookahead_extragradient:
+          enabled: false
+  projection_constraint:
+    type: none
+  adaptive_omnifold:
+    staleness_every_n_epochs: 1
+    staleness_every_n_steps: null
+    trigger:
+      warm_start_classifier: false
+      require_audit_saturation: true
+      required_consecutive_checks: 999
+      rollback_to_best_on_plateau: false
+    audit_fit:
+      min_steps: 1000
+      require_saturation: false
+      fail_if_unsaturated: true
+      training_readiness: null
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      max_reward_rounds: 1
+      reset_optimizer_state_on_install: false
+      reset_adam_first_moment_on_install: false

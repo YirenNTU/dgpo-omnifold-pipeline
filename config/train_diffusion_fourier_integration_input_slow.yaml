@@ -1,0 +1,11 @@
+extends_overlay: train_diffusion_fourier_integration_input.yaml
+experiment:
+  intervention: input_linear_branch_lr_0p1x
+logger:
+  wandb:
+    run_name: "Slower Fourier learning | pretrained diffusion | branch LR 2e-6"
+options:
+  Training:
+    Components:
+      PET.angular_conditioning:
+        learning_rate: 0.000002

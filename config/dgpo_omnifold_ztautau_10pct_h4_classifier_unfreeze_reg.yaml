@@ -1,0 +1,57 @@
+# One fixed-policy classifier fit: full backbone fine-tuning with stronger
+# MLP regularization. This is a bundled intervention, not unfreeze-only.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_classifier_fourier.yaml
+
+experiment:
+  protocol: h4-classifier-unfreeze-regularized-v1
+  classifier_design_arm: fourier_unfreeze_regularized
+  intervention: unfreeze_backbone_with_stronger_mlp_regularization
+  single_question: >-
+    Can full classifier backbone fine-tuning with stronger regularization
+    learn the fixed policy's remaining joint structure faster and generalize?
+  primary_decision_rule: >-
+    At the same 3000-update budget, report validation BCE and AUC, first AUC
+    0.70/0.85 crossing, gradient clipping and final disjoint test AUC. Compare
+    descriptively with h4clf02; unfreezing and regularization change together,
+    so do not attribute differences to unfreezing alone.
+
+nersc:
+  reproducibility:
+    note: >-
+      Same pinned step-1110 policy, classifier backbone checkpoint and held-out
+      event/noise protocol. One Fourier late-fusion classifier fit; full
+      backbone training, head/topology dropout 0.25, AdamW weight decay 0.001.
+      Zero policy updates and zero reward fits; 16 GPUs and 3000 fit updates.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_unfreeze_reg_10pct/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_classifier_design_ablation.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_classifier_unfreeze_reg.yaml
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_classifier_unfreeze_reg_10pct/ray_results
+
+logger:
+  local:
+    name: h4_classifier_unfreeze_reg_10pct
+    version: h4_classifier_unfreeze_reg_10pct_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_unfreeze_reg_10pct/logs
+  wandb:
+    id: h4clfur1
+    run_name: Does regularized backbone tuning learn faster? | H4 Fourier | classifier only
+    tags: [ClassifierDesign, FourierLateFusion, H4, FullBackbone, StrongerRegularization, ClassifierOnly, NoPolicyUpdate, SixteenGPU, Fixed3000StepAudit, ClassifierBottleneckDiagnostics]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_unfreeze_reg_10pct/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      train_backbone: true
+      learning_rate: 0.0002
+      backbone_learning_rate: 0.00001
+      head_dropout: 0.25
+      topology_dropout: 0.25
+      weight_decay: 0.001
+      restore_best: true
+      disjoint_final_audit: true

@@ -218,6 +218,12 @@ network:
 
     PET:
       feature_drop: 0.0
+      # Observed x only, before normalization. Fixed harmonics k=1,2,3,4.
+      # Neutrino generation only: no clean invisible/target angles are read.
+      visible_angular_fourier:
+        enabled: false  # Opt in per experiment; preserve historical baselines.
+        theta_source: Part_eta
+        phi_source: Part_phi
 
   TruthGeneration:
     feature_drop: 0.0

@@ -1,0 +1,406 @@
+# 10% ablation that recreates the original 5% "hard" DGPO recipe (nc4shnpg /
+# config/dgpo_omnifold_ztautau.yaml), without hard trust region or classifier
+# inherit. Soft trust coefficient stays 1.0 (velocity-MSE). Fixed tempering
+# 0.75; no ESS tempering, no log-ratio clip, no warm-start / pinned inherit.
+# Weighted-gap retrain every 5 epochs (margin 0.005, consecutive 1) plus
+# max_reward_age_epochs=20. Legacy 128x1 decoder; no Fourier / rest features.
+# Deliberate classifier tweaks vs nc4shnpg: open GroupedSequentialEmbedding
+# (same fast LR as InvisibleInputProjector) and head_dropout 0.25.
+# Cold OmniFold bootstrap from the matched 10% diffusion pretrain last.ckpt.
+# Dropout-0.15 fork lives in the separate dropout015 overlay (new output/W&B).
+nersc:
+  reproducibility:
+    diffusion_pretrain_fraction: 0.1
+    dgpo_training_fraction: 0.1
+    classifier_backbone_protocol: matched_10pct_pretrain
+    note: >-
+      10% recreation of the original 5% bestdiff hard method (W&B nc4shnpg),
+      with deliberate classifier tweaks vs nc4shnpg - open
+      GroupedSequentialEmbedding (same fast LR as InvisibleInputProjector)
+      and head_dropout 0.25. Soft trust coefficient 1.0 only;
+      adaptive_boundary disabled. Fixed alpha 0.75; residuals 2..5 with
+      acceptance BA<0.52; fresh classifiers on every refit (no warm-start
+      inherit). Weighted |AUC-0.5| retrain vs installed baseline with margin
+      0.005, consecutive 1, probe every 5 epochs, and age-20 forced candidate.
+      Raw audit is also fit each probe for W&B staleness/raw_auc monitoring only
+      (does not drive refit). Probe and score panels are 250k. Cold start from
+      diffusion_pretrain_10pct last.ckpt; later launches auto-resume this run's
+      last.ckpt (no re-bootstrap, no refit_once_on_resume). Acceptance gate is
+      0.52 (not nc4shnpg 0.51) for 10%+group-embed headroom. Padded visible
+      queries receive one masked-path safety key; valid-token attention and all
+      trainable classifier capacity, including position_encoder, are unchanged.
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    source_dgpo_global_step: 0
+    source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/nc4shnpg
+    control_overlay: config/dgpo_omnifold_ztautau.yaml
+    diagnostic_wandb_run: ytchou97-university-of-washington/nu2flow-RL/nc4shnpg
+    source_policy_sha256: null
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/ray_results
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: shifter python3 scripts/train_dgpo_old_method_10pct.py --config
+      config/dgpo_omnifold_ztautau_10pct_old_method_hard_ablation.yaml
+platform:
+  # Fit OmniFold on the same STIC-filtered 10% train pool as other 10% arms.
+  # Keep a true held-out score pool (old 5% used diffusion_val_20pct) so
+  # residual closure + acceptance audit are not scored on the fit identities.
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42/val
+  batch_size: 512
+  number_of_workers: 16
+  use_gpu: true
+  resources_per_worker:
+    CPU: 15
+    GPU: 1
+logger:
+  wandb:
+    profile: critical
+    classifier_loss_curves: true
+    simplified: true
+    # Fixed id so NERSC preempt / auto-resume keeps one W&B run.
+    resume: allow
+    fresh_run: false
+    id: c4a91e07
+    project: nu2flow-RL
+    entity: ytchou97-university-of-washington
+    run_name: dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42
+    tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - ScalingLawAllData10pct
+    - OldMethodHardAblation
+    - RecreateNc4shnpg
+    - WeightedGapRetrain
+    - RawAucDiagnosticMonitor
+    - SoftTrustCoefficient1
+    - NoHardTrustBoundary
+    - NoClassifierInherit
+    - FixedTempering075
+    - NoESSTempering
+    - NoLogRatioClip
+    - AcceptanceAuditBA052
+    - Residuals2to5
+    - HeldOutVal20pctScorePool
+    - LegacyDecoder128Layers1
+    - TrainableGroupedSequentialEmbedding
+    - TrainableInvisibleProjector
+    - HeadDropout025
+    - NoFourierNoRest
+    - DiffusionPretrain10pctColdStart
+    - AutoResumeFromLast
+    - BetaKLZero
+    - TARP
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/logs
+    name: dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42
+    version: old_method_hard_nc4shnpg_10pct_t075_trust1_nohardtrust
+options:
+  Dataset:
+    dataset_limit: 1.0
+    val_dataset_limit: 1.0
+  Training:
+    # Match nc4shnpg policy LR (base train_diffusion_nersc.yaml is 2e-4).
+    total_epochs: 150
+    epochs: 150
+    learning_rate: 0.0001
+    learning_rate_body: 1.0e-05
+    weight_decay: 0.001
+    decoupled_weight_decay: true
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    pretrain_model_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints
+    model_checkpoint_save_top_k: 0
+    Components:
+      InvisibleInputProjector:
+        learning_rate: 0.0001
+        weight_decay: 0.001
+      GroupedSequentialEmbedding:
+        learning_rate: 0.0001
+        weight_decay: 0.001
+      GlobalEmbedding:
+        learning_rate: 0.0001
+        weight_decay: 0.001
+      PET:
+        learning_rate: 1.0e-05
+        weight_decay: 0.001
+      TruthGeneration:
+        learning_rate: 0.0001
+        weight_decay: 0.001
+      ObjectEncoder:
+        freeze:
+          type: full
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+    EMA:
+      replace_model_after_load: false
+      use_for_generation: false
+network:
+  Body:
+    GroupedSequentialEmbedding:
+      dropout: 0.0
+    GlobalEmbedding:
+      dropout: 0.0
+    PET:
+      feature_drop: 0.0
+      dropout: 0.0
+      drop_probability: 0.0
+  TruthGeneration:
+    feature_drop: 0.0
+    dropout: 0.0
+    drop_probability: 0.0
+rl:
+  enabled: true
+reward_config:
+  type: omnifold
+  weight: 1.0
+  omnifold:
+    bootstrap_in_dgpo: true
+    bundle_file: null
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+ztautau_domain:
+  enabled: true
+  feature_names:
+  - theta
+  - phi
+  token_sources:
+    event_token: event_token
+    object_token: object_token
+  topology:
+    kind: back_to_back
+    target_cos_opening: -1.0
+    target_delta_phi_to_pi: 0.0
+dgpo:
+  auto_resume_from_last: true
+  auto_resume_best_source_checkpoint_dir: null
+  best_source_start_new_experiment: false
+  auto_resume_fallback_checkpoint_path: null
+  checkpoint_load_mode: weights_only
+  global_best_checkpoint_search_dirs: []
+  lr_schedule:
+    type: cosine
+    total_steps: 1500
+    min_lr_ratio: 0.1
+  require_deterministic_policy: true
+  float32_matmul_precision: medium
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  beta: 1.0
+  beta_kl: 0.0
+  adv_clip_max: null
+  grad_clip_norm: 1.0
+  gradient_conflict:
+    monitor_refit_lifecycle: false
+    enabled: false
+  num_ddim_steps: 20
+  num_train_timesteps: 8
+  policy_eval_t_min: 0.0
+  policy_eval_t_max: 0.7
+  activation_checkpointing: true
+  policy_eval_event_microbatch_size: 128
+  policy_eval_parallel_timesteps: 1
+  rollout_parallel_chains: 4
+  sequential_vp_trust_backward: false
+  steps_per_epoch: 10
+  log_every: 1
+  checkpoint_every_n_steps: 0
+  # Dense recovery for NERSC preempt; nc4shnpg used every 5 epochs.
+  checkpoint_every_n_epochs: 1
+  # Same EMA rollout schedule as nc4shnpg (also the trainer default).
+  ema_rollout_decay_max: 0.3
+  ema_rollout_decay_ramp: 0.001
+  reference_trust:
+    enabled: true
+    coefficient: 1.0
+    objective: velocity_mse
+    adaptive_boundary:
+      enabled: false
+  variance_regularization:
+    enabled: false
+    weight: 0.0
+    features: null
+  projection_constraint:
+    type: none
+  validation_K: 16
+  validation_num_ddim_steps: 20
+  # No-grad DDIM validation generation; 4x batch vs 512, same ~event budget
+  # via fewer max_batches (512×15 ≈ 2048×4).
+  validation_batch_size: 2048
+  # Denser than nc4shnpg (10) so early physics can be judged sooner.
+  validation_every_n_epochs: 5
+  validation_full_every_n_epochs: 5
+  validation_max_batches: 4
+  validation_compute_winrate: false
+  validation_log_batches: true
+  validation_rollout_parallel_chains: 8
+  train_dist_enabled: false
+  ztautau_metrics:
+    enabled: true
+    candidate_index: 0
+    bins: 60
+    log_images: true
+    image_observables:
+    - topology/cos_opening
+    - topology/delta_phi_to_pi
+  tarp:
+    enabled: true
+    profile: visible_acoplanarity
+    n_bins: 4
+    min_events: 500
+    arms:
+    - full
+    - rank_copula
+    n_null_assignments: 399
+    n_reference_trials: 8
+    seed: 20260820
+    alpha: 0.05
+    pooled_panel: true
+  adaptive_omnifold:
+    enabled: true
+    log_only: false
+    monitor_mode: weighted_and_raw
+    single_pool_train_validation: false
+    baseline_probe_on_start: true
+    fixed_audit_panel: false
+    cache_event_inputs: false
+    # No-grad K=1 OmniFold/audit pool generation. Same total events; larger
+    # per-GPU batch cuts DDIM iteration count (matched to DGPO validation).
+    pool_generation_batch_size: 2048
+    # Original 5% cadence: one weighted probe every five logical epochs.
+    staleness_every_n_epochs: 5
+    staleness_every_n_steps: null
+    trigger:
+      # Diagnostic only: also fit an unweighted truth-vs-policy judge and log
+      # staleness/raw_auc(+gap). Retrain decisions still use weighted AUC gap.
+      raw_audit_enabled: true
+      warm_start_classifier: false
+      retrain_auc_margin: 0.005
+      max_reward_age_epochs: 20
+      required_consecutive_epochs: 1
+      retrain_cooldown_epochs: 0
+      require_audit_saturation: true
+      power_alpha: 0.05
+      power_target: 0.8
+      probe_seed: 20260818
+      probe_max_events: 250000
+      rollback_to_best_on_plateau: false
+    classifier_trust:
+      enabled: false
+      probe_max_events: null
+    # Match recalibration.fit / decoder knobs so acceptance & staleness audits
+    # use the same optimizer protocol as OmniFold residual classifiers.
+    # fit_fresh_audit still forces require_saturation=false for cheap probes.
+    audit_fit:
+      anomaly_detection_steps: 0
+      batch_size: 16384
+      train_microbatch_size_per_rank: 1024
+      drop_last_batch: true
+      learning_rate: 0.0002
+      backbone_learning_rate: 1.0e-05
+      weight_decay: 0.0005
+      gradient_clip_norm: 5.0
+      sampling: independent_epoch_shuffle
+      safety_max_epochs: null
+      min_steps: 1
+      min_epochs: 1
+      validation_interval_epochs: 1.0
+      validation_patience_epochs: 10.0
+      validation_min_delta: 0.0001
+      validation_batch_size: 65536
+      progress_every_n_steps: 10
+      restore_best: true
+      require_saturation: false
+      head_dropout: 0.25
+      decoder_hidden_dim: 128
+      decoder_layers: 1
+      decoder_heads: 4
+      periodic_pair_features: false
+      topology_fourier_embedding: false
+      topology_conditioning: false
+      visible_pair_rest_frame: false
+      # Same unfrozen body tensors as recalibration / residual OmniFold.
+      train_layernorm: false
+      train_encoder: false
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+      train_backbone: false
+      asymmetric_attention: true
+    recalibration:
+      reset_optimizer_state_on_install: true
+      policy_warmup_steps: 0
+      warm_start_iterations: []
+      warm_start_from_iteration_one: false
+      # Must be auto|identity; "random" is rejected by resolve_adaptive_config.
+      crossfit_partition: auto
+      candidates_per_event: 1
+      bootstrap_on_start: true
+      bootstrap_fail_closed: true
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      refit_once_id: ''
+      pool_events: null
+      score_pool_events: 250000
+      pool_selection_seed: 42
+      min_iterations: 2
+      max_iterations: 5
+      iteration_one_only: false
+      # Fresh acceptance judge uses the same architecture (incl. trainable
+      # GroupedSequentialEmbedding). Slightly looser than nc4shnpg's 0.51 after
+      # 10% STIC bootstrap landed at BA=0.51035.
+      acceptance_audit_enabled: true
+      acceptance_max_balanced_accuracy: 0.52
+      topology_acceptance_audit_enabled: false
+      periodic_pair_features: false
+      topology_fourier_embedding: false
+      topology_conditioning: false
+      visible_pair_rest_frame: false
+      tempering: 0.75
+      adaptive_tempering:
+        enabled: false
+      ess_aware_checkpoint_selection:
+        enabled: false
+      crossfit_folds: 2
+      residual_min_auc_gain: 0.01
+      seed: 20260819
+      # No-grad reward scoring chunks; 4x vs prior 8192.
+      score_row_budget: 32768
+      adapter_bottleneck: 16
+      train_layernorm: false
+      train_encoder: false
+      # Open visible-object embedding; shares the fast fit LR with
+      # InvisibleInputProjector (fit.learning_rate, not backbone_learning_rate).
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+      train_backbone: false
+      asymmetric_attention: true
+      decoder_hidden_dim: 128
+      decoder_layers: 1
+      decoder_heads: 4
+      head_dropout: 0.25
+      log_ratio_clip: null
+      minimum_ess_fraction: 0.0
+      fit:
+        anomaly_detection_steps: 0
+        batch_size: 16384
+        train_microbatch_size_per_rank: 1024
+        drop_last_batch: true
+        learning_rate: 0.0002
+        backbone_learning_rate: 1.0e-05
+        weight_decay: 0.0005
+        gradient_clip_norm: 5.0
+        sampling: independent_epoch_shuffle
+        safety_max_epochs: null
+        # require_saturation=true needs min_steps>=1 (nc4shnpg omitted this and
+        # build_fit_config derived it from min_epochs; explicit 0 crashes).
+        min_steps: 1
+        min_epochs: 1
+        validation_interval_epochs: 1.0
+        validation_patience_epochs: 10.0
+        validation_min_delta: 0.0001
+        validation_batch_size: 65536
+        progress_every_n_steps: 10
+        restore_best: true
+        require_saturation: true

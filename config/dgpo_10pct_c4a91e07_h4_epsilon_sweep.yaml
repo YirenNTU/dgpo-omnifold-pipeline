@@ -1,0 +1,44 @@
+# Paired local-radius replay of the completed v5 reward-interface diagnostic.
+# It loads all classifiers and the fixed K=8 panel; classifier_fits=0.
+source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_reward_interface_v5
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_epsilon_sweep_v1
+expected_source_schema: c4a91e07-h4-reward-interface-v2
+expected_policy_step: 1110
+
+workers: 16
+cpus_per_worker: 2
+epsilons_rms: [1.0e-7, 3.0e-7, 1.0e-6, 3.0e-6, 1.0e-5]
+K: 8
+gradient_events: 1024
+gradient_blocks: 8
+gradient_timesteps: 4
+gradient_seed: 20261313
+beta: 1.0
+policy_eval_t_min: 0.0
+policy_eval_t_max: 0.7
+rollout_seed: 20261413
+score_batch_size: 32768
+physics_bins: 60
+response_bins: 12
+response_bootstrap_replicates: 1000
+response_bootstrap_seed: 20261613
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: c4a91e07_h4_calibrated_loo_epsilon_sweep_v1
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - SourceC4a91e07Last
+    - ReuseV5Artifacts
+    - H4Ensemble
+    - CalibratedLOO
+    - EpsilonSweep
+    - CommonNoise
+    - NoClassifierFit
+    - NoOptimizerStep
+    - NoHardTrust

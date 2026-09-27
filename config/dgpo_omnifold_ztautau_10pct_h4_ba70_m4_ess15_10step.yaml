@@ -1,0 +1,75 @@
+# Minimum-sufficient-classifier arm. Compare its first ten DGPO updates with
+# the already completed saturated H4+ESS15 run h4e15r01.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_ess15_5round.yaml
+
+experiment:
+  protocol: h4-ba70-m4-ess15-10step-v1
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4e15r01
+  single_experimental_change: minimum_sufficient_reward_ba70
+  experiment_question: >-
+    Is the H4 signal already sufficient for useful stable DGPO learning when
+    all four members stop after held-out balanced accuracy first remains above
+    0.70 for three validations, instead of training to saturation?
+  rounds: 1
+  policy_updates_per_round: 10
+  reward_lifetime_updates: 10
+  endpoint_global_step: 10
+  endpoint_selection: fixed_step_10
+
+nersc:
+  reproducibility:
+    note: >-
+      New-method arm paired to the completed h4e15r01 first reward round. The
+      policy source, data, H4 architecture,
+      two-repeat by two-fold ensemble, seeds, minimum 1000 updates per fold,
+      ESS15 tempering, policy optimizer reset, epsilon-selected policy LR and
+      ten-step endpoint are identical. Each member stops at the first state
+      after step 1000 for which oriented held-out balanced accuracy is above
+      0.70 on three consecutive validations (confidence z=0 gives the exact
+      BA=0.70 ablation requested here).
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_m4_ess15_10step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_minimum_sufficient_ablation.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_ba70_m4_ess15_10step.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_ba70_m4_ess15_10step_v1
+    version: h4_ba70_m4_ess15_10step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_m4_ess15_10step_v1/logs
+  wandb:
+    id: h4ba7010m4
+    run_name: c4a91e07_h4_ba70_m4_ess15_10step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - PairedControlH4e15r01
+      - MinimumSufficientRewardAblation
+      - BA70EarlyStop
+      - ThreeConsecutiveValidations
+      - H4NonlinearFourier
+      - FourMemberEnsemble
+      - Min1000StepsPerFold
+      - ESSTarget15pct
+      - Fixed10StepEndpoint
+      - LiveWandb
+
+options:
+  Training:
+    total_epochs: 1
+    epochs: 1
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_m4_ess15_10step_v1/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    recalibration:
+      max_reward_rounds: 1
+      fit:
+        require_saturation: false
+        minimum_sufficient_balanced_accuracy: 0.70
+        minimum_sufficient_confidence_z: 0.0
+        minimum_sufficient_required_consecutive: 3

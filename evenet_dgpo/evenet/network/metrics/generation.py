@@ -82,6 +82,7 @@ class GenerationMetrics:
             schedules: Union[None, dict] = None
     ):
         model.eval()
+        self.sampler.dtype = next(model.parameters()).dtype
 
         predict_distribution = dict()
         truth_distribution = dict()
@@ -449,9 +450,16 @@ def shared_step(
         invisible_padding: int = 0,
         update_metric: bool = True,
         event_weight: torch.Tensor = None,
-        schedules: Union[None, dict] = None
+        schedules: Union[None, dict] = None,
+        low_noise_cutoff: float = 0.0,
+        low_noise_weight: float = 1.0
 ):
     generation_loss = dict()
+
+    if not 0.0 <= low_noise_cutoff < 1.0:
+        raise ValueError(f"low_noise_cutoff must be in [0, 1), got {low_noise_cutoff}")
+    if low_noise_weight <= 0.0:
+        raise ValueError(f"low_noise_weight must be positive, got {low_noise_weight}")
 
     global_gen_loss = torch.tensor(0.0, device=device, requires_grad=True)
     recon_gen_loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -476,13 +484,46 @@ def shared_step(
             masking = None
             feature_dim = None
 
+        time = generation_result.get("time")
+        sample_weight = None
+        if (generation_target == "neutrino" and time is not None
+                and low_noise_cutoff > 0.0 and low_noise_weight != 1.0):
+            mean_weight = 1.0 + (low_noise_weight - 1.0) * low_noise_cutoff
+            sample_weight = torch.where(
+                time < low_noise_cutoff,
+                torch.full_like(time, low_noise_weight / mean_weight),
+                torch.full_like(time, 1.0 / mean_weight),
+            )
+
         generation_loss[generation_target] = gen_loss(
             predict=generation_result["vector"],
             target=generation_result["truth"],
             mask=masking,
             feature_dim=feature_dim,
-            event_weight=event_weight
+            event_weight=event_weight,
+            sample_weight=sample_weight,
         )
+
+        if time is not None:
+            with torch.no_grad():
+                low = (time < 0.1).float()
+                mid = ((time >= 0.1) & (time < 0.5)).float()
+                high = (time >= 0.5).float()
+            loss_head_dict[f"generation-{generation_target}-unweighted"] = gen_loss(
+                generation_result["vector"], generation_result["truth"], masking,
+                feature_dim, event_weight=event_weight).detach()
+            loss_head_dict[f"generation-{generation_target}-low_noise_mse"] = gen_loss(
+                generation_result["vector"], generation_result["truth"], masking,
+                feature_dim, event_weight=event_weight, sample_weight=low).detach()
+            loss_head_dict[f"generation-{generation_target}-mid_noise_mse"] = gen_loss(
+                generation_result["vector"], generation_result["truth"], masking,
+                feature_dim, event_weight=event_weight, sample_weight=mid).detach()
+            loss_head_dict[f"generation-{generation_target}-high_noise_mse"] = gen_loss(
+                generation_result["vector"], generation_result["truth"], masking,
+                feature_dim, event_weight=event_weight, sample_weight=high).detach()
+            loss_head_dict[f"generation-{generation_target}-low_noise_fraction"] = low.mean()
+            if sample_weight is not None:
+                loss_head_dict[f"generation-{generation_target}-effective_weight_mean"] = sample_weight.mean()
 
         debug_nonfinite_batch(
             {

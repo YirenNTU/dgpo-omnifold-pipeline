@@ -1,0 +1,60 @@
+extends_overlay: dgpo_h4_classifier_representation.yaml
+
+experiment:
+  protocol: no-fourier-attention-depth-v1
+  diagnostic_parent_run: h4clfpath1
+  baseline_measurement: no_fourier_depth1_clean_step1110
+  intervention: no_fourier_decoder_depth_2
+  single_question: Can a second candidate attention block learn the residual without Fourier features?
+  primary_decision_rule: >-
+    Compare depth 1 and 2 at the same update counts, source, data and seed.
+    A promising pilot requires final independent test AUC gain at least 0.02
+    with no worse test BCE. Secondary endpoint is updates to validation AUC 0.70.
+    Minimum 1000 updates and ten-epoch BCE patience, no maximum.
+    Depth changes capacity and RNG consumption; this is not a parameter-matched
+    proof that attention alone is responsible. Require seed replication.
+  stop_rule: One cold audit, no reward fit or policy update.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_no_fourier_depth2/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_no_fourier_depth.py --layers 2
+  reproducibility:
+    note: Same step-1110 policy and clean data; no engineered pair/Fourier features. Cold depth-2 classifier.
+
+logger:
+  local:
+    name: h4_no_fourier_depth2
+    version: h4_no_fourier_depth2
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_no_fourier_depth2/logs
+  wandb:
+    id: h4nfd2
+    resume: never
+    run_name: Can attention learn the residual? | no Fourier | 2 decoder layers | step-1110
+    group: No Fourier attention depth
+    tags: [ClassifierOnly, NoPolicyUpdate, NoFourier, SixteenGPU, ConstantLR]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_no_fourier_depth2/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      periodic_pair_features: false
+      topology_fourier_embedding: false
+      topology_direct_logit: false
+      topology_conditioning: false
+      visible_pair_rest_frame: false
+      decoder_layers: 2
+      representation_path_enabled: false
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_no_fourier_depth2/diagnostic_snapshots
+    recalibration:
+      periodic_pair_features: false
+      topology_fourier_embedding: false
+      topology_direct_logit: false
+      topology_conditioning: false
+      visible_pair_rest_frame: false
+      decoder_layers: 2
+

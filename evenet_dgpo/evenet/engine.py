@@ -37,6 +37,9 @@ from evenet.utilities.task_scheduler import ProgressiveTaskScheduler
 from evenet.utilities.tool import get_transition, check_param_overlap, print_params_used_by_loss, safe_load_state
 
 from evenet.utilities.logger import LocalLogger
+from evenet.utilities.fourier_integration import (
+    load_no_fourier_weights, optimizer_parameters, paired_diffusion_rng,
+)
 import logging
 
 
@@ -367,6 +370,8 @@ class EveNetEngine(L.LightningModule):
                 update_metric=update_metric,
                 event_weight=event_weight,
                 schedules=schedules,
+                low_noise_cutoff=float(self.truth_generation_cfg.get("low_noise_cutoff", 0.0)),
+                low_noise_weight=float(self.truth_generation_cfg.get("low_noise_weight", 1.0)),
             )
 
             loss_raw["generation"] = scaled_gen_loss
@@ -482,12 +487,29 @@ class EveNetEngine(L.LightningModule):
                 prefix="progressive/schedule-"
             )
 
-        outputs = self.model.shared_step(
-            batch=inputs,
-            batch_size=batch_size,
-            train_parameters=train_parameters,
-            schedules=[(key, value) for key, value in schedules.items()],
-        )
+        with paired_diffusion_rng(
+            self.config.options.Training.get("paired_diffusion_seed"),
+            training=self.training, epoch=self.current_epoch, batch_idx=batch_idx,
+            rank=self.global_rank, device=device,
+        ):
+            outputs = self.model.shared_step(
+                batch=inputs,
+                batch_size=batch_size,
+                train_parameters=train_parameters,
+                schedules=[(key, value) for key, value in schedules.items()],
+            )
+        angular = self.model.PET.angular_conditioning
+        if angular is not None and angular.log_diagnostics:
+            prefix = "train" if self.training else "val"
+            for name, value in angular.diagnostics.items():
+                self.log(f"{prefix}/fourier/{name}", value, sync_dist=True,
+                         on_step=self.training, on_epoch=not self.training, batch_size=batch_size)
+        conditioning = getattr(getattr(self.model, "TruthGeneration", None), "visible_conditioning", None)
+        if conditioning is not None and conditioning.log_diagnostics:
+            prefix = "train" if self.training else "val"
+            for name, value in conditioning.diagnostics.items():
+                self.log(f"{prefix}/visible_conditioning/{name}", value, sync_dist=True,
+                         on_step=self.training, on_epoch=not self.training, batch_size=batch_size)
 
         loss_raw, loss_detailed_dict, ass_predicts = self.calculate_loss(
             inputs, outputs,
@@ -808,6 +830,7 @@ class EveNetEngine(L.LightningModule):
                 noise_mask=inputs["x_invisible_mask"].unsqueeze(-1)  # [B, T, 1] to match noise x
             )
 
+            self.sampler.dtype = next(self.model.parameters()).dtype
             generated_distribution = self.sampler.sample(
                 data_shape=data_shape,
                 pred_fn=predict_for_neutrino,
@@ -1164,7 +1187,8 @@ class EveNetEngine(L.LightningModule):
                 decoupled_wd: bool = False,
                 warm_up: bool = True, optimizer_type: str = "lion"
         ):
-            scaled_lr = base_lr * math.sqrt(world_size) / lr_factor
+            lr_world_scale = math.sqrt(world_size) if self.config.options.Training.get("scale_lr_with_world_size", True) else 1.0
+            scaled_lr = base_lr * lr_world_scale / lr_factor
             scaled_weight_decay = base_wd / math.sqrt(world_size) * lr_factor
 
             if optimizer_type.lower() == "adamw":
@@ -1204,8 +1228,10 @@ class EveNetEngine(L.LightningModule):
 
             if not modules:
                 continue
-            valid_modules = [getattr(self.model, m) for m in modules['modules'] if m is not None]
-            params = [p for m in valid_modules for p in m.parameters()]
+            params = optimizer_parameters(
+                self.model, modules['modules'],
+                [path for part in self.model_parts.values() for path in part['modules']],
+            )
 
             if len(params) == 0:
                 self.l.warning(f"No parameters found for {name}. Skipping optimizer/scheduler configuration.")
@@ -1228,7 +1254,7 @@ class EveNetEngine(L.LightningModule):
             })
 
         # Add FAMO optimizer
-        if hasattr(self.model, "famo") and hasattr(self.model.famo, "optimizer"):
+        if self.include_famo and hasattr(self.model, "famo") and hasattr(self.model.famo, "optimizer"):
             self.l.info(f"[FAMO] --> Adding FAMO optimizer")
             optimizers.append(self.model.famo.optimizer)
 
@@ -1278,7 +1304,16 @@ class EveNetEngine(L.LightningModule):
                 self.l.warning(f"[Model] --> Loading pretrained weights from: {self.pretrain_ckpt_path}")
                 ckpt = torch.load(self.pretrain_ckpt_path, map_location=self.device)
 
-                if ema_enable and 'ema_state_dict' in ckpt and ema_replace:
+                if self.config.options.Training.get("strict_conditioning_ablation_source", False):
+                    from evenet.utilities.fourier_integration import load_conditioning_ablation_weights
+                    if ema_enable or ema_replace:
+                        raise ValueError("Conditioning ablation requires raw weights with EMA disabled")
+                    load_conditioning_ablation_weights(self.model, ckpt)
+                elif self.config.options.Training.get("strict_no_fourier_source", False):
+                    if ema_enable or ema_replace:
+                        raise ValueError("Fourier integration requires raw weights with EMA disabled")
+                    load_no_fourier_weights(self.model, ckpt)
+                elif ema_enable and 'ema_state_dict' in ckpt and ema_replace:
                     safe_load_state(self.model, ckpt['ema_state_dict'])
                 else:
                     safe_load_state(self.model, ckpt['state_dict'])
@@ -1300,6 +1335,11 @@ class EveNetEngine(L.LightningModule):
                 self.l.warning(f"[Model] --> Froze module: {module_name}")
 
         # Define Freezing
+        if self.config.options.Training.get("strict_no_fourier_source", False):
+            frozen = [name for name, p in self.model.named_parameters() if not p.requires_grad]
+            if frozen:
+                raise ValueError(f"Integration experiment requires an unfrozen backbone: {frozen}")
+            self.l.info("[Fourier integration] All model parameters are trainable; no detached backbone path")
         # self.model.freeze_module("Classification", self.classification_cfg.get("freeze", {}))
         # self.model.freeze_module("Regression", self.regression_cfg.get("freeze", {}))
         # self.model.freeze_module("Assignment", self.assignment_cfg.get("freeze", {}))
@@ -1312,7 +1352,10 @@ class EveNetEngine(L.LightningModule):
             if not group:
                 continue
 
-            module_attr = getattr(self.model, key, None)
+            try:
+                module_attr = self.model.get_submodule(key)
+            except AttributeError:
+                module_attr = None
             if not module_attr:
                 self.l.warning(f"⚠️ Warning: No module set for '{key}'. Skipping.")
                 continue

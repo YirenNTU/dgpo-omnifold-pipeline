@@ -6,6 +6,7 @@ from evenet.network.layers.utils import RandomDrop
 from evenet.network.layers.invisible_input_projector import InvisibleInputProjector
 
 from evenet.network.body.normalizer import Normalizer
+from evenet.network.body.visible_conditioning import visible_conditioning_spec
 from evenet.network.body.embedding import GlobalVectorEmbedding, PETBody
 from evenet.network.body.grouped_sequential_embedding import GroupedSequentialEmbedding
 from evenet.network.body.object_encoder import ObjectEncoder
@@ -158,6 +159,21 @@ class EveNetModel(nn.Module):
 
         # [1] Body
         pet_config = self.network_cfg.Body.PET
+        angular_cfg = pet_config.get("visible_angular_fourier", {})
+        angular_conditioning = None
+        if angular_cfg.get("enabled", False):
+            from .body.angular_conditioning import VisibleAngularFourier
+            angular_conditioning = VisibleAngularFourier(
+                self._raw_sequential_feature_names(), pet_config.hidden_dim,
+                theta_source=angular_cfg.get("theta_source", "Part_eta"),
+                phi_source=angular_cfg.get("phi_source", "Part_phi"),
+                placement=angular_cfg.get("placement", "input"),
+                projection_type=angular_cfg.get("projection_type", "linear"),
+                mlp_dim=angular_cfg.get("mlp_dim", 64),
+                log_diagnostics=angular_cfg.get("log_diagnostics", False),
+                harmonics=angular_cfg.get("harmonics"),
+                attention_heads=angular_cfg.get("attention_heads", 4),
+            )
         self.PET = PETBody(
             num_feat=self.sequential_input_dim,
             num_keep=pet_config.num_feature_keep,
@@ -176,6 +192,7 @@ class EveNetModel(nn.Module):
             mode=pet_config.mode,
             use_adapter=pet_config.get("use_adapter", False),
             adapter_bottleneck=pet_config.get("adapter_bottleneck", 16),
+            angular_conditioning=angular_conditioning,
         )
 
         # [2] Classification + Regression + Assignment Body
@@ -312,7 +329,13 @@ class EveNetModel(nn.Module):
                 drop_probability=self.network_cfg.TruthGeneration.drop_probability,
                 feature_drop=self.network_cfg.TruthGeneration.feature_drop,
                 position_encode=self.network_cfg.TruthGeneration.neutrino_position_encode,
-                max_position_length=self.network_cfg.TruthGeneration.max_position_length
+                max_position_length=self.network_cfg.TruthGeneration.max_position_length,
+                identity_init_from_layer=getattr(self.network_cfg.TruthGeneration, "identity_init_from_layer", None),
+                visible_conditioning=visible_conditioning_spec(
+                    self.network_cfg, target="diffusion", feature_names=self._raw_sequential_feature_names(),
+                    token_dim=self.sequential_input_dim, hidden_dim=self.network_cfg.TruthGeneration.hidden_dim,
+                    num_layers=self.network_cfg.TruthGeneration.num_layers, n_branches=2,
+                ),
             )
             self.neutrino_position_encode = self.network_cfg.TruthGeneration.neutrino_position_encode
 
@@ -504,6 +527,7 @@ class EveNetModel(nn.Module):
             generations["global"] = {
                 "vector": predict_target_global_vector,
                 "truth": truth_target_global_vector.detach(),
+                "time": time.detach(),
             }
 
         outputs = dict()
@@ -590,7 +614,8 @@ class EveNetModel(nn.Module):
                 mask=full_input_point_cloud_mask,
                 attn_mask=full_attn_mask,
                 time=full_time,
-                time_masking=time_masking
+                time_masking=time_masking,
+                visible_raw=x['x'] if schedule_name == "neutrino_generation" else None,
             )
 
             if schedule_name == "deterministic" or schedule_name == "generation":
@@ -677,7 +702,8 @@ class EveNetModel(nn.Module):
                 generations["point_cloud"] = {
                     "vector": pred_point_cloud_vector[..., self.generation_pc_indices] * noise_mask,
                     "truth": (truth_input_point_cloud_vector[..., self.generation_pc_indices] * noise_mask).detach(),
-                    "mask": noise_mask * full_input_point_cloud_mask
+                    "mask": noise_mask * full_input_point_cloud_mask,
+                    "time": full_time.detach(),
                 }
 
             if self.include_neutrino_generation and schedule_name == "neutrino_generation":
@@ -691,12 +717,15 @@ class EveNetModel(nn.Module):
                     label=class_label,
                     attn_mask=full_attn_mask,
                     time_masking=time_masking,
-                    position_encode=(self.neutrino_position_encode and schedule_name == "neutrino_generation")
+                    position_encode=(self.neutrino_position_encode and schedule_name == "neutrino_generation"),
+                    visible_raw=x['x'], visible_tokens=input_point_cloud, visible_mask=input_point_cloud_mask,
+                    visible_normalized=input_point_cloud_raw,
                 )
                 generations["neutrino"] = {
                     "vector": pred_point_cloud_vector[:, is_invisible_query, :],
                     "truth": truth_invisible_point_cloud_vector.detach(),
-                    "mask": invisible_point_cloud_mask.contiguous()
+                    "mask": invisible_point_cloud_mask.contiguous(),
+                    "time": full_time.detach(),
                 }
 
         return {
@@ -856,7 +885,8 @@ class EveNetModel(nn.Module):
                 mask=full_input_point_cloud_mask,
                 attn_mask=full_attn_mask,
                 time=full_time,
-                time_masking=time_masking
+                time_masking=time_masking,
+                visible_raw=cond_x['x'],
             )
 
             pred_point_cloud_vector = self.TruthGeneration(
@@ -869,7 +899,9 @@ class EveNetModel(nn.Module):
                 label=class_label,
                 attn_mask=full_attn_mask,
                 time_masking=time_masking,
-                position_encode=self.neutrino_position_encode
+                position_encode=self.neutrino_position_encode,
+                visible_raw=cond_x['x'], visible_tokens=input_point_cloud, visible_mask=input_point_cloud_mask,
+                visible_normalized=input_point_cloud_raw,
             )
 
             return pred_point_cloud_vector[:, is_invisible_query, :]

@@ -40,6 +40,33 @@ def deep_update(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+def read_overlay_yaml(
+    path: Path,
+    *,
+    _ancestors: tuple[Path, ...] = (),
+) -> dict[str, Any]:
+    """Resolve a lightweight overlay that optionally extends another overlay."""
+
+    resolved = path.expanduser().resolve()
+    if resolved in _ancestors:
+        chain = " -> ".join(str(item) for item in (*_ancestors, resolved))
+        raise ValueError(f"overlay inheritance cycle: {chain}")
+    payload = read_yaml(resolved)
+    parent = payload.pop("extends_overlay", None)
+    if parent is None:
+        return payload
+    if not isinstance(parent, str) or not parent.strip():
+        raise ValueError("extends_overlay must be a non-empty path string")
+    parent_path = Path(parent).expanduser()
+    if not parent_path.is_absolute():
+        parent_path = resolved.parent / parent_path
+    inherited = read_overlay_yaml(
+        parent_path,
+        _ancestors=(*_ancestors, resolved),
+    )
+    return deep_update(inherited, payload)
+
+
 def absolutize_default_paths(payload: Any, base_dir: Path) -> Any:
     if isinstance(payload, dict):
         output: dict[str, Any] = {}
@@ -63,14 +90,23 @@ def build_runtime_config(
 ) -> Path:
     merged = read_yaml(base_config)
     if overlay_config is not None:
-        merged = deep_update(merged, read_yaml(overlay_config))
+        merged = deep_update(merged, read_overlay_yaml(overlay_config))
     merged = absolutize_default_paths(merged, base_config.parent)
     merged.setdefault("compat", {})
     merged["compat"]["backend"] = backend
     merged["compat"]["repo_root"] = str(REPO_ROOT)
     merged.setdefault("rl", {})
     merged["rl"]["enabled"] = backend == "dgpo-evenet"
-    runtime_dir = Path(tempfile.mkdtemp(prefix="ztautau_dgpo_runtime_"))
+    # Pure EveNet passes this filename to every Ray worker. Node-local /tmp
+    # is not visible across NERSC nodes; use the shared experiment output.
+    runtime_parent = None
+    if backend == "pure-evenet":
+        checkpoint_dir = merged.get("options", {}).get("Training", {}).get("model_checkpoint_save_path")
+        if not checkpoint_dir:
+            raise ValueError("pure-evenet requires model_checkpoint_save_path for shared runtime configuration")
+        runtime_parent = Path(checkpoint_dir).expanduser().resolve().parent / "runtime_configs"
+        runtime_parent.mkdir(parents=True, exist_ok=True)
+    runtime_dir = Path(tempfile.mkdtemp(prefix="ztautau_dgpo_runtime_", dir=runtime_parent))
     runtime_path = runtime_dir / f"{backend}_runtime.yaml"
     with runtime_path.open("w") as handle:
         yaml.safe_dump(merged, handle, sort_keys=False)

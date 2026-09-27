@@ -1,0 +1,135 @@
+# Continuation of h4e20m6 from its completed step-50 checkpoint.
+#
+# The policy, EMA, references, clocks, and complete AdamW state are resumed.
+# Because the parent checkpoint contains a six-member reward, a versioned
+# one-shot refit installs a fresh 2-repeat x 2-fold (four-member) H4 reward at
+# step 50 before any further policy update.  Fresh four-member rewards are then
+# installed after every ten accepted updates for the life of the run. There is
+# no metric stop, fixed DGPO endpoint, or reward-round cap; the large epoch
+# sentinel below keeps the process alive until it is manually stopped.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble6_ess15_refit20_keepadam_50step.yaml
+
+experiment:
+  protocol: h4-fresh-ensemble4-ess15-refit10-keepadam-resume50-unbounded-v2
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4e20m6
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4e20m6
+  source_global_step: 50
+  source_reward_round_id: 3
+  continuation_policy_updates: null
+  endpoint_global_step: null
+  rounds: null
+  policy_updates_per_round: 10
+  reward_lifetime_updates: 10
+  reward_refresh_start_step: 50
+  reward_refresh_every_updates: 10
+  reward_refresh_steps: null
+  final_reward_updates: null
+  endpoint_selection: manual_stop
+  ensemble_seeds: 2
+  crossfit_folds: 2
+  initial_reward_training_reused: false
+  initial_reward_source_run: null
+  initial_reward_source_global_step: null
+  initial_raw_monitor_reused: false
+  initial_raw_monitor_rebuilt_at_step_zero: false
+  single_experimental_change: null
+  experiment_question: >-
+    Does the refit10 four-member recipe keep improving the h4e20m6 step-50
+    policy over long training when its AdamW state is preserved and reward
+    refreshes occur on a fixed schedule without a staleness decision audit?
+
+nersc:
+  reproducibility:
+    note: >-
+      Full-state continuation of h4e20m6 from its completed step-50 last.ckpt.
+      Policy weights, EMA, reference state, global/epoch clocks, LR scheduler,
+      and all policy AdamW first/second moments are preserved. A versioned,
+      fail-closed one-shot refit replaces the inherited six-member round-3
+      reward with a fresh four-member H4 reward at step 50 before any policy
+      update. A fresh four-member reward is then installed after every ten
+      accepted policy updates without a reward-round cap. The fixed schedule
+      skips both the incumbent weighted staleness classifier and the independent
+      raw judge because neither can alter the refit decision. Independent H4
+      raw-AUC studies are run offline from saved ten-step checkpoints. Classifier
+      weights and classifier AdamW never cross rounds. Soft ESS>=15%, policy LR,
+      no-hard-trust protocol, and validation cadence are preserved. The run stops
+      only when manually cancelled; ten-step checkpointing and auto-resume
+      preserve completed intervals.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble4_ess15_refit10_keepadam_resume50_no_staleness_v2/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_resume50_refit10_m4.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble4_ess15_refit10_keepadam_resume50_unbounded.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_ensemble4_ess15_refit10_keepadam_resume50_no_staleness_v2
+    version: h4_ensemble4_ess15_refit10_keepadam_resume50_no_staleness_v2
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble4_ess15_refit10_keepadam_resume50_no_staleness_v2/logs
+  wandb:
+    resume: allow
+    fresh_run: false
+    id: h4e10m4fs
+    run_name: c4a91e07_h4_ensemble4_ess15_refit10_keepadam_resume50_no_staleness_v2
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - ResumeH4e20m6Step50
+      - FormalRun
+      - NoFixedEndpoint
+      - UnlimitedRewardRounds
+      - RefitEvery10Updates
+      - FixedScheduleNoStalenessAudit
+      - FreshClassifierEveryRound
+      - ContinuousPolicyAdam
+      - H4NonlinearFourier
+      - TwoSeedsTwoFolds
+      - FourMemberRewardEnsemble
+      - AdaptiveTempering
+      - ESSTarget15pct
+      - SoftESSNoRejection
+      - NoHardTrust
+      - NoRollback
+      - LiveWandb
+
+options:
+  Training:
+    # DGPO currently uses a finite Python range. INT32_MAX is an operational
+    # no-endpoint sentinel; constant LR and manual stop make it non-scheduling.
+    total_epochs: 2147483647
+    epochs: 2147483647
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble6_ess15_refit20_keepadam_50step_v1/checkpoints/last.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble4_ess15_refit10_keepadam_resume50_no_staleness_v2/checkpoints
+
+dgpo:
+  auto_resume_from_last: true
+  auto_resume_fallback_checkpoint_path: null
+  checkpoint_load_mode: resume
+  pinned_classifier_restart: false
+  reference_trust:
+    adaptive_boundary:
+      reset_adam_first_moment_on_install: false
+      reset_adam_first_moment_on_zero_step: false
+  adaptive_omnifold:
+    trigger:
+      max_reward_age_epochs: 1
+      # Refit is deterministic at every epoch boundary, so classifier-based
+      # staleness checks cannot affect the trajectory and are omitted.
+      fixed_schedule_skip_staleness_audit: true
+    audit_fit:
+      min_steps: 1000
+    recalibration:
+      # The source stack has six members. This versioned migration permits it
+      # to load only long enough to fit and atomically install four fresh ones.
+      bootstrap_on_start: false
+      refit_once_on_resume: true
+      refit_once_fail_closed: true
+      refit_once_id: h4_m6_to_m4_refit10_keepadam_step50_no_staleness_v2
+      crossfit_repeats: 2
+      crossfit_folds: 2
+      # Parent rounds are 1..3; continuation starts with round 4 at step 50 and
+      # keeps installing one new round per ten accepted policy updates.
+      max_reward_rounds: null
+      reset_optimizer_state_on_install: false

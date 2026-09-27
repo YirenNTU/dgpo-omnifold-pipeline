@@ -1,0 +1,108 @@
+# Pure classifier-only direct-logit probe.  Start weights-only from the
+# c4a91e07 policy at step 1110, generate one fixed K=1 held-out pool, fit one
+# cold classifier, and exit before reward bootstrap or policy training.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_direction_no_ref_audit5_100step.yaml
+
+experiment:
+  protocol: h4-classifier-only-direct-logit-v2
+  single_question: >-
+    On the DGPO-finetuned c4a91e07 step-1110 policy, does a direct H4 logit
+    path learn the held-out truth-policy residual faster than the existing
+    historical late-fusion learning curve?
+  intervention: classifier_architecture_direct_h4_logit
+  classifier_design_arm: direct_logit_single_probe
+  classifier_only: true
+  rounds: 0
+  policy_updates_per_round: 0
+  reward_lifetime_updates: 0
+  reward_fit_count: 0
+  classifier_fit_count: 1
+  cold_h4_audit_policy_steps: [0]
+  gradient_direction_policy_steps: []
+  dataset_fraction: 0.10
+  distributed_world_size: 16
+  historical_control_only: true
+  historical_late_fusion_auc85_updates: 1280
+  historical_late_fusion_best_auc: 0.902
+  historical_related_run: bg5av8mr
+  primary_endpoint: audit/time_to_held_out_auc
+  classifier_auc_thresholds: [0.70, 0.85, 0.89]
+  matched_audit_optimizer_updates: 3000
+  primary_comparison_policy_step: 0
+  primary_decision_rule: >-
+    The direct path is promising if its step-0 cold audit reaches held-out AUC
+    0.85 by optimizer update 960 and reaches best held-out AUC at least 0.89
+    by update 3000. This is a historical-baseline screen, not a simultaneous
+    matched-control estimate.
+
+nersc:
+  nodes: 4
+  gpus_per_node: 4
+  reproducibility:
+    note: >-
+      Fresh weights-only start from the DGPO-finetuned c4a91e07 policy at step
+      1110. Use the same 10 percent dataset and pretrained classifier backbone.
+      Fit only the direct-logit cold-audit architecture for exactly 3000
+      classifier optimizer updates. Perform zero reward fits and zero policy
+      optimizer updates; do not launch a new late-fusion control.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_direct_logit_only_10pct/ray_results
+  execution:
+    mode: ray_train_ddp
+    workers: 16
+    gpus_per_worker: 1
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_classifier_design_ablation.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_classifier_direct_logit.yaml
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_classifier_direct_logit_only_10pct/ray_results
+
+logger:
+  local:
+    name: h4_classifier_direct_logit_only_10pct
+    version: h4_classifier_direct_logit_only_10pct_v2
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_direct_logit_only_10pct/logs
+  wandb:
+    id: h4clf02
+    run_name: Does a direct H4 head learn faster? | classifier only | step-1110 fixed policy
+    group: H4 classifier design
+    profile: standard
+    classifier_loss_curves: true
+    simplified: true
+    tags:
+      - ClassifierDesign
+      - DirectH4Logit
+      - Matched10pctDataset
+      - SourceC4a91e07Step1110
+      - HistoricalControl
+      - SixteenGPU
+      - Fixed3000StepAudit
+      - ClassifierBottleneckDiagnostics
+      - ClassifierOnly
+      - NoPolicyUpdate
+
+platform:
+  # One DDP rank per GPU: 4 Perlmutter nodes x 4 GPUs = world size 16.
+  number_of_workers: 16
+  resources_per_worker:
+    CPU: 15
+    GPU: 1
+  use_gpu: true
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_direct_logit_only_10pct/checkpoints
+
+dgpo:
+  auto_resume_from_last: false
+  gradient_conflict:
+    enabled: false
+  adaptive_omnifold:
+    baseline_probe_on_start: false
+    recalibration:
+      bootstrap_on_start: false
+    audit_fit:
+      topology_direct_logit: true
+      repeats: 1
+      # Cheap training-batch diagnostics every 10 optimizer steps; held-out
+      # validation remains every 40 steps in the inherited fixed audit.
+      progress_every_n_steps: 10

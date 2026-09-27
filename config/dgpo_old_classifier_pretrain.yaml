@@ -1,0 +1,62 @@
+extends_overlay: dgpo_h4_pair_token.yaml
+experiment:
+  protocol: old-classifier-pretrain-v1
+  source_policy_step: null
+  source_wandb_run: null
+  classifier_family: historical_old_classifier
+  single_question: What signal and ratio concentration does the old classifier learn on 10% pretrained diffusion?
+  intervention: historical_old_classifier_on_10pct_pretrained_raw_policy
+  diagnostic_parent_run: c4a91e07
+  baseline_measurement: h4pair01_step1110_different_policy_and_classifier
+  primary_endpoint: held_out_bce_and_ratio_health
+  primary_decision_rule: Describe signal and weight differences; this changes both generator and classifier and cannot isolate an architecture effect.
+  inference_scope: Classifier-only descriptive comparison; no policy update or causal architecture ranking.
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/old_classifier_pretrain/ray_results
+  execution:
+    command: shifter python3 scripts/train_old_classifier_pretrain.py
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    source_wandb_run: null
+    source_dgpo_global_step: null
+    note: Raw10pct pretrain; loaded global_step recorded at preflight; not step1110.
+logger:
+  local:
+    name: old_classifier_pretrain
+    version: old_classifier_pretrain_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/old_classifier_pretrain/logs
+  wandb:
+    id: oldpre01
+    resume: never
+    run_name: What did the old classifier learn? | 10% pretrain | held-out ratio audit
+    group: Classifier signal comparison
+    tags: [ClassifierOnly, OldClassifier, Pretrain10pct, CleanValidation, SixteenGPU]
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/old_classifier_pretrain/checkpoints
+reward_config:
+  omnifold:
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+dgpo:
+  adaptive_omnifold:
+    recalibration:
+      periodic_pair_features: false
+      topology_pair_token: false
+      topology_max_harmonic: 1
+      train_last_pet_block: false
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+    audit_fit:
+      periodic_pair_features: false
+      topology_pair_token: false
+      topology_max_harmonic: 1
+      train_last_pet_block: false
+      train_grouped_sequential_embedding: true
+      train_invisible_projector: true
+      adapter_learning_rate: null
+      decoder_learning_rate: null
+      weight_decay: 0.0005
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/old_classifier_pretrain/diagnostic_snapshots
+      ratio_audit_export_dir: /pscratch/sd/y/yiren/Ztautau/old_classifier_pretrain/ratio_audit

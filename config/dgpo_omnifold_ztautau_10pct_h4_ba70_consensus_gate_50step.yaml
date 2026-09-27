@@ -1,0 +1,69 @@
+# Matched treatment for the fixed-candidate rank audit.  The only behavioral
+# difference is apply_to_reward=true: raw-LOO advantages are confidence-weighted
+# using current members plus the immediately previous fresh reward ensemble.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_ba70_rank_audit_50step.yaml
+
+experiment:
+  protocol: h4-ba70-consensus-gate-50step-v1
+  single_experimental_change: apply_uncertainty_aware_candidate_consensus_gate
+  experiment_question: >-
+    Does member-plus-previous-round candidate-ordering consensus prevent the
+    target-JSD direction reversals seen with stable ESS and ordinary BA70 raw
+    leave-one-out rewards?
+  primary_endpoint: val_ztautau/jsd/current_to_ref_geomean/target
+  primary_direction: lower
+  success_rule: >-
+    At step 50 the geometric mean of the four paired target JSD ratios is below
+    one, its step-20-to-50 log-ratio slope is negative, and ESS remains finite.
+    Reco and topology are reported as secondary endpoints.
+
+nersc:
+  reproducibility:
+    note: >-
+      Exact matched treatment for h4ranka1. Classifiers, seeds, folds, BA70
+      stopping, ESS15 tempering, refit cadence, policy optimizer, source policy,
+      data, candidate count, learning rate, and evaluation are identical. For
+      each event, the existing current-ensemble raw-LOO advantage is multiplied
+      by a confidence gate derived from four current members and four members
+      from the immediately previous reward round. Sign agreement below 0.75 is
+      zeroed; surviving directions are softly downweighted by relative MAD.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_consensus_gate_50step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_rank_consensus.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_ba70_consensus_gate_50step.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_ba70_consensus_gate_50step_v1
+    version: h4_ba70_consensus_gate_50step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_consensus_gate_50step_v1/logs
+  wandb:
+    id: h4consg1
+    run_name: c4a91e07_h4_ba70_consensus_gate_50step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - FixedCandidateRankAudit
+      - ConsensusGatedReward
+      - BA70EarlyStop
+      - FourMemberEnsemble
+      - PreviousRoundConsensus
+      - RefitEvery10Updates
+      - ContinuousPolicyAdam
+      - ESSTarget15pct
+      - NoRawAudit
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_consensus_gate_50step_v1/checkpoints
+
+reward_config:
+  omnifold:
+    candidate_consensus:
+      apply_to_reward: true
+

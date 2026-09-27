@@ -1,0 +1,28 @@
+# Standalone classifier investigation. No policy training or reward installation.
+base_config: config/train_diffusion_nersc.yaml
+overlay_config: config/dgpo_omnifold_ztautau_10pct_visible_rest_forward_refit_fullfit.yaml
+expected_policy_step: 320
+# Set a known tensor digest here to additionally pin checkpoint content across launches.
+# Preflight always hashes and rechecks the exact source during this invocation.
+expected_policy_sha256: null
+output_dir: /pscratch/sd/y/yiren/Ztautau/residual_weight_diagnostic_step320_v1
+workers: 16
+wandb:
+  enabled: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: residual_weight_diagnostic_10pct_step320
+  log_every_n_steps: 10
+# All filtered 10% events; same event pool for all classifier fits and seeds.
+pool_events: null
+generation_batch_size: 1024
+score_batch_size: 2048
+generation_seed: 20260906
+# Split seeds stay fixed at the production YAML values, independent of training seeds.
+training_seeds: [20260906, 20260907]
+diagnostic_iterations: 3
+# Matched budget, no early stop or best restoration in intervention arms.
+control_steps: 400
+control_evaluate_every: 40
+# Diagnostic intervention only. Never installed as an OmniFold correction.
+cap_quantile: 0.995

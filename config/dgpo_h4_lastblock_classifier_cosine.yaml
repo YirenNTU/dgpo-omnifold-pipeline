@@ -1,0 +1,45 @@
+# Full DGPO run: both reward OmniFold and fresh audit use classifier scheduling.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_lastblock_no_ref_100step.yaml
+
+experiment:
+  protocol: h4-lastblock-no-reference-classifier-cosine-v1
+  intervention: omnifold_and_audit_classifier_warmup_cosine
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_classifier_cosine/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_classifier_cosine/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_h4_lastblock_classifier_cosine.yaml --
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_lastblock_classifier_cosine/ray_results
+
+logger:
+  local:
+    name: h4_lastblock_classifier_cosine
+    version: h4_lastblock_classifier_cosine_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_classifier_cosine/logs
+  wandb:
+    id: h4lbcos1
+    run_name: Schedule reward and audit learning | H4 DGPO | warmup and cosine
+    tags: [DGPO, H4, SixteenGPU, CosineLR, NoReferenceTrust]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_classifier_cosine/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      lr_scheduler: cosine
+      lr_warmup_epochs: 1.0
+      lr_cosine_epochs: 250.0
+      lr_min_ratio: 0.1
+    recalibration:
+      fit:
+        lr_scheduler: cosine
+        lr_warmup_epochs: 1.0
+        lr_cosine_epochs: 250.0
+        lr_min_ratio: 0.1

@@ -1,0 +1,78 @@
+# Combined nonlinear conditioning intervention. Start raw weights-only, not a
+# full-state resume across changed optimizer/classifier architectures.
+extends_overlay: dgpo_h4_visible_fourier_diffang.yaml
+
+network:
+  VisibleConditioning:
+    diffusion_enabled: true
+    classifier_enabled: true
+    width: 64
+    harmonics: [1, 2, 3, 4]
+    theta_source: Part_eta
+    phi_source: Part_phi
+    log_diagnostics: true
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln/checkpoints
+    EMA:
+      enable: false
+      replace_model_after_load: false
+      use_for_generation: false
+      use_ema_during_training_eval: false
+
+dgpo:
+  checkpoint_load_mode: weights_only
+  auto_resume_from_last: false
+  adaptive_omnifold:
+    recalibration:
+      bootstrap_on_start: true
+      refit_once_on_resume: false
+      fit:
+        topology_conditioning: false
+    audit_fit:
+      topology_conditioning: false
+
+logger:
+  local:
+    name: h4-visible-adaln
+    version: v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln/logs
+  wandb:
+    id: h4vadaln1
+    run_name: "Can nonlinear conditioning improve transfer? | diffusion and H4 AdaLN | raw weights"
+    group: H4 nonlinear visible conditioning
+    tags: [DGPO, VisibleOnly, NonlinearAdaLN, K4, RawWeights, VelocityMSE, SixteenGPU]
+    resume: never
+    fresh_run: true
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln/ray_results
+  reproducibility:
+    note: >-
+      Same raw diffang10lr5e4 source as the visible-Fourier baseline. Add a
+      visible-only nonlinear branch to the diffusion generation blocks and to
+      every newly fitted OmniFold/audit decoder; preserve PET additive Fourier,
+      existing GlobalEmbedding modulation and candidate H4 late fusion.
+      Velocity-MSE coefficient remains 1. New classifier conditioning uses the
+      existing head LR in a separately logged optimizer group. No EMA.
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_h4_visible_adaln.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln/ray_results
+
+experiment:
+  protocol: h4-visible-nonlinear-adaln-v1
+  intervention: visible_only_nonlinear_per_block_modulation_in_policy_and_classifier
+  single_question: Does visible-only nonlinear per-block conditioning improve reward transfer with velocity MSE anchoring?
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_visible_adaln/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+  primary_decision_rule: >-
+    Compare fixed-reward held-out gain relative to each run's initial policy,
+    velocity MSE and separately cold-audit BCE/AUC and ESS. Both architectures
+    change here, so this combined experiment alone cannot isolate which side
+    caused an improvement. Keep all research-only representation probes off.
+    Two iterations, two folds, one repeat; select lowest validation BCE with
+    25-epoch patience from step zero and no minimum-step requirement.

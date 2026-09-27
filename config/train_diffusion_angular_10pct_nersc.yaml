@@ -1,0 +1,67 @@
+# Supervised diffusion, NOT DGPO. Resolve with train_neutrino_backend.py.
+# Reuse the established fine-tuning/data/coverage setup, but remove low-noise
+# importance weighting and start from EveNet foundation weights BEFORE diffusion.
+extends_overlay: train_diffusion_low_noise_10pct_nersc.yaml
+
+platform:
+  # Per GPU; 16 workers => 32768 events per full distributed batch.
+  batch_size: 2048
+
+experiment:
+  question: Does visible-angle Fourier conditioning improve supervised conditional generation?
+  intervention: observed_theta_phi_fourier_k4
+  checkpoint_protocol: raw_weights_only_fresh_optimizer_scheduler_epoch_zero
+  source_stage: evenet_20M_a4_foundation_before_diffusion_finetuning
+  interpretation: No matched retraining control is launched; improvement alone does not isolate Fourier causally.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_seed42/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_angular_10pct_nersc.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_seed42/ray_results
+
+logger:
+  wandb:
+    id: diffang10p1
+    run_name: "Angular Fourier fine-tuning | diffusion 10% | FP32 raw pretrain"
+    group: Diffusion angular conditioning
+    tags: [Ztautau, Diffusion, FineTune, VisibleAngularFourier, Float32, RawWeights, Data10pct, GPU16]
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_seed42/logs
+    name: diffusion-angular-10pct
+    version: v1
+
+options:
+  Training:
+    precision: "32-true"
+    freeze_modules: []
+    # pretrain_model_load_path loads model weights only, unlike Lightning resume.
+    pretrain_model_load_path: /pscratch/sd/y/yiren/checkpoints.20M.a4.last.ckpt
+    model_checkpoint_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_seed42/checkpoints
+    epochs: 500
+    total_epochs: 500
+    JointCoverage:
+      enable: false
+    Components:
+      TruthGeneration:
+        low_noise_cutoff: 0.0
+        low_noise_weight: 1.0
+    EarlyStopping:
+      monitor: val/loss
+      mode: min
+      patience: 75
+      min_delta: 0.0001
+
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        enabled: true
+        theta_source: Part_eta
+        phi_source: Part_phi

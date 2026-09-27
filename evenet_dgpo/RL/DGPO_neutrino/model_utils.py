@@ -613,6 +613,43 @@ def load_evenet_model_for_dgpo(
     )
 
 
+def _match_saved_reference_token_readout(model_ref: nn.Module, saved: dict[str, Any]) -> None:
+    """Do not add policy-only parameters to a serialized, hash-paired reference.
+
+    A new zero-output branch is function preserving but changes the state hash.
+    Keep old references structurally identical instead of rewriting their digest.
+    """
+    conditioning = getattr(getattr(model_ref, "TruthGeneration", None), "visible_conditioning", None)
+    if (conditioning is not None and getattr(conditioning, "token_readout", None) is not None
+            and not any("TruthGeneration.visible_conditioning.token_readout." in key for key in saved)):
+        conditioning.token_readout = None
+        conditioning.spec.pop("token_readout", None)
+
+
+def prepare_step_zero_architecture_bootstrap(checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+    """Rebuild empty Adam groups for an architecture A/B; retain reward/anchors.
+
+    This is NOT a late-checkpoint warm restart or an optimizer-resume fallback.
+    Both arms explicitly opt in and must start before the first policy update.
+    """
+    required = {"state_dict", "dgpo_optimizer_state_dict", "dgpo_adaptive_omnifold_state",
+                "dgpo_ref_state_dict", "dgpo_round_ref_state_dict", "dgpo_round_ref_sha256",
+                "dgpo_omnifold_reward_stack", "dgpo_omnifold_reward_metadata"}
+    if checkpoint is None or required.difference(checkpoint):
+        raise ValueError("architecture bootstrap requires a complete step-zero DGPO checkpoint")
+    if (parse_dgpo_resume_from_checkpoint(checkpoint) != (0, 0)
+            or int(checkpoint.get("dgpo_epoch_step", 0)) != 0):
+        raise ValueError("architecture bootstrap requires step zero, not a trained policy checkpoint")
+    state = checkpoint["dgpo_optimizer_state_dict"]
+    if (not isinstance(state, dict) or "optimizer" not in state
+            or state["optimizer"].get("state") != {}
+            or state.get("scheduler", {}).get("last_epoch") not in (-1, 0)):
+        raise ValueError("architecture bootstrap requires empty Adam moments and an unadvanced schedule")
+    result = dict(checkpoint)
+    result.pop("dgpo_optimizer_state_dict")
+    return result
+
+
 def make_reference_model(
     current_model: EveNetModel,
     config: Config,
@@ -636,6 +673,7 @@ def make_reference_model(
         and int(checkpoint.get("dgpo_checkpoint_version", 0)) >= 1
         and "dgpo_ref_state_dict" in checkpoint
     ):
+        _match_saved_reference_token_readout(model_ref, checkpoint["dgpo_ref_state_dict"])
         safe_load_state(model_ref, checkpoint["dgpo_ref_state_dict"])
         _log.info("[DGPO/model] Loaded ref_model from dgpo_ref_state_dict (fixed anchor).")
     else:
@@ -656,6 +694,7 @@ def make_round_reference_model(
     """Frozen policy paired with the currently installed adaptive ratio reward."""
     model_ref = build_evenet_on_device(config, normalization_dict, device)
     if checkpoint is not None and "dgpo_round_ref_state_dict" in checkpoint:
+        _match_saved_reference_token_readout(model_ref, checkpoint["dgpo_round_ref_state_dict"])
         safe_load_state(model_ref, checkpoint["dgpo_round_ref_state_dict"])
         _log.info("[DGPO/model] Restored adaptive OmniFold round reference.")
     else:
@@ -744,6 +783,10 @@ def build_lightning_compatible_checkpoint(
 
     checkpoint: dict[str, Any] = {}
     checkpoint["state_dict"] = {f"model.{k}": v for k, v in orig_model.state_dict().items()}
+    endpoint_controller = getattr(orig_model, "_endpoint_kl_controller", None)
+    if endpoint_controller is not None and endpoint_controller.config.enabled:
+        from RL.DGPO_neutrino.endpoint_kl import CHECKPOINT_KEY
+        checkpoint[CHECKPOINT_KEY] = endpoint_controller.state_dict()
     n_famo = inject_default_famo_state_dict_keys(checkpoint["state_dict"])
     if n_famo > 0:
         _log.info(

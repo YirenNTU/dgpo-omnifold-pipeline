@@ -1,0 +1,20 @@
+extends_overlay: train_diffusion_fourier_integration_common.yaml
+experiment:
+  intervention: output_adapter
+  interpretation: >-
+    Optional architecture follow-up, not part of the first continuation/LR test.
+    All backbones remain trainable. Late addition bypasses PET forward mixing,
+    not backward adaptation or generation-head fusion risk. Compared with input,
+    both placement and projection change.
+logger:
+  wandb:
+    run_name: "Late Fourier adapter | diffusion continuation | PET output residual"
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        enabled: true
+        placement: output
+        projection_type: mlp
+        mlp_dim: 64
+        log_diagnostics: true

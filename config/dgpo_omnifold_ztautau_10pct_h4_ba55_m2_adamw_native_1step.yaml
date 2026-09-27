@@ -1,0 +1,118 @@
+# Native-AdamW control for the BA55 displacement-calibration experiment.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_5round.yaml
+
+experiment:
+  protocol: h4-ba55-m2-adamw-rms-one-step-v1
+  arm: native_adamw
+  paired_run_id: ba55rms1
+  single_experimental_change: parameter_update_rms_calibration
+  experiment_question: >-
+    Does calibrating the complete native AdamW proposal to the BA55 replay's
+    selected full-parameter RMS of 3e-5 improve the one-update cold-H4 endpoint?
+  epsilon_sweep_report: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_epsilon_sweep_v1/report.json
+  expected_epsilon_schema: c4a91e07-h4-calibrated-loo-epsilon-sweep-v1
+  rounds: 1
+  policy_updates_per_round: 1
+  ensemble_seeds: 1
+  crossfit_folds: 2
+  endpoint_global_step: 1
+  endpoint_selection: fixed_step_1_cold_h4
+  target_parameter_update_rms: null
+
+nersc:
+  reproducibility:
+    source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+    source_dgpo_global_step: 1110
+    note: >-
+      Paired one-update native control. Both arms start weights-only from the
+      c4a91e07 step-1110 policy, cold-fit the same one-repeat/two-fold H4
+      reward to the BA55 lower-confidence-bound threshold, use raw LOO with
+      fixed 0.75 tempering, fresh AdamW, K=8, and the same soft reference.
+      A saturated cold H4 audit with at least 1000 updates is required at the
+      fixed step-1 endpoint.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_native_1step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_ba55_rms_calibration.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_ba55_m2_adamw_native_1step.yaml
+
+logger:
+  local:
+    name: h4_ba55_m2_adamw_native_1step
+    version: h4_ba55_m2_adamw_native_1step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_native_1step_v1/logs
+  wandb:
+    id: ba55nat1
+    run_name: Native AdamW one-step control | BA55 two-fold H4 | cold H4 audit
+    group: H4 policy projection
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - BA55
+      - TwoFoldOneRepeat
+      - NativeAdamWControl
+      - OnePolicyUpdate
+      - ColdSaturatedH4Endpoint
+      - TargetPreserving
+      - NoHardTrust
+      - LiveWandb
+
+options:
+  Training:
+    total_epochs: 1
+    epochs: 1
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_native_1step_v1/checkpoints
+
+dgpo:
+  steps_per_epoch: 1
+  log_parameter_update_rms: true
+  fail_on_skipped_optimizer_step: true
+  validation_initial_enabled: false
+  parameter_update_rms_calibration:
+    enabled: false
+  adaptive_omnifold:
+    baseline_probe_on_start: true
+    staleness_every_n_epochs: 1
+    staleness_every_n_steps: null
+    trigger:
+      raw_audit_enabled: true
+      warm_start_classifier: false
+      require_audit_saturation: true
+      max_reward_age_epochs: 1
+      required_consecutive_epochs: 1
+      required_consecutive_checks: 1
+    audit_fit:
+      min_steps: 1000
+      validation_patience_epochs: 40.0
+      checkpoint_selection_metric: balanced_accuracy
+      restore_best: true
+      require_saturation: true
+    recalibration:
+      reset_optimizer_state_on_install: true
+      seed: 20260913
+      crossfit_folds: 2
+      crossfit_repeats: 1
+      min_iterations: 1
+      max_iterations: 1
+      iteration_one_only: true
+      max_reward_rounds: 1
+      tempering: 0.75
+      adaptive_tempering:
+        enabled: false
+      minimum_ess_fraction: 0.0
+      ess_aware_checkpoint_selection:
+        enabled: false
+      fit:
+        min_steps: 1
+        min_steps_per_fold: 1
+        validation_interval_epochs: 1.0
+        validation_patience_epochs: 40.0
+        checkpoint_selection_metric: balanced_accuracy
+        restore_best: true
+        require_saturation: false
+        minimum_sufficient_balanced_accuracy: 0.55
+        minimum_sufficient_confidence_z: 1.96
+        minimum_sufficient_required_consecutive: 1

@@ -1,0 +1,54 @@
+# Restrict backbone capacity after h4clfur1 showed a train/validation BCE gap.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_classifier_unfreeze_reg.yaml
+
+experiment:
+  protocol: h4-classifier-lastblock-regularized-v1
+  classifier_design_arm: fourier_lastblock_regularized
+  intervention: last_pet_block_and_adapters_with_bce_selection
+  single_question: >-
+    Can last-block tuning retain joint-structure learning while reducing
+    the generalization gap seen with full-backbone tuning?
+  primary_decision_rule: >-
+    Compare validation BCE and AUC trajectories with h4clfur1 at matched
+    updates. Restore the minimum-validation-BCE checkpoint and report its
+    disjoint test AUC; do not select checkpoints using the final test set.
+
+nersc:
+  reproducibility:
+    note: >-
+      Same pinned step-1110 policy and 10pct data protocol; train only the
+      final PET block, internal adapters and classifier/Fourier heads.
+      Dropout 0.25, AdamW weight decay 0.001, 3000 updates and 16 GPUs.
+      Select by validation BCE. No policy updates or reward fits.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_lastblock_reg_10pct/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_classifier_design_ablation.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_classifier_lastblock_reg.yaml
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_classifier_lastblock_reg_10pct/ray_results
+
+logger:
+  local:
+    name: h4_classifier_lastblock_reg_10pct
+    version: h4_classifier_lastblock_reg_10pct_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_lastblock_reg_10pct/logs
+  wandb:
+    id: h4clflb1
+    run_name: Does last-block tuning generalize? | H4 Fourier | classifier only
+    tags: [ClassifierDesign, FourierLateFusion, H4, LastPETBlock, StrongerRegularization, BCESelection, ClassifierOnly, NoPolicyUpdate, SixteenGPU, Fixed3000StepAudit, ClassifierBottleneckDiagnostics]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_lastblock_reg_10pct/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      train_backbone: false
+      train_last_pet_block: true
+      train_grouped_sequential_embedding: false
+      train_invisible_projector: false
+      train_encoder: false
+      train_layernorm: false
+      checkpoint_selection_metric: loss

@@ -1,0 +1,79 @@
+# Logging-only fixed-candidate rank audit.  This keeps the BA70 closed-loop
+# policy/reward trajectory unchanged while every fresh reward ensemble scores
+# the exact same K=8 candidate panel captured before the first policy update.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_ba70_m4_ess15_refit10_keepadam_50step_audit1.yaml
+
+experiment:
+  protocol: h4-ba70-fixed-rank-audit-50step-v1
+  single_experimental_change: fixed_candidate_rank_audit_logging_only
+  experiment_question: >-
+    Do independently fresh H4 reward ensembles preserve within-event candidate
+    ordering across ten-update refits, and does temporal ordering agreement
+    track the paired physics-JSD direction?
+  primary_endpoint: reward_rank_audit/fixed_panel/temporal/advantage_cosine
+  primary_direction: higher
+  success_rule: >-
+    The fixed panel is identical for all five reward rounds. Report member and
+    adjacent-round rank, advantage-sign, and winner agreement without changing
+    any reward, advantage, optimizer, refit, or endpoint decision.
+
+nersc:
+  reproducibility:
+    note: >-
+      Matched logging-only arm from c4a91e07 step 1110. The first DGPO rollout
+      contributes a fixed 128-event-per-rank K=8 panel that is checkpointed and
+      scored by every fresh four-member reward. Previous-round reward weights
+      are retained for one round only for scoring. The ordinary current-round
+      mean raw-LOO reward is returned unchanged. Fixed scheduled refits make
+      the expensive raw classifier audit redundant, so it is not run.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_fixed_rank_audit_50step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_rank_consensus.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_ba70_rank_audit_50step.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_ba70_fixed_rank_audit_50step_v1
+    version: h4_ba70_fixed_rank_audit_50step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_fixed_rank_audit_50step_v1/logs
+  wandb:
+    id: h4ranka1
+    run_name: c4a91e07_h4_ba70_fixed_rank_audit_50step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - FixedCandidateRankAudit
+      - LoggingOnlyControl
+      - BA70EarlyStop
+      - FourMemberEnsemble
+      - PreviousRoundAudit
+      - RefitEvery10Updates
+      - ContinuousPolicyAdam
+      - ESSTarget15pct
+      - NoRawAudit
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_fixed_rank_audit_50step_v1/checkpoints
+
+reward_config:
+  omnifold:
+    candidate_consensus:
+      enabled: true
+      apply_to_reward: false
+      temporal_history_rounds: 1
+      minimum_sign_agreement: 0.75
+      uncertainty_scale: 1.0
+      epsilon: 1.0e-8
+      fixed_panel_events_per_rank: 128
+      fixed_panel_candidates: 8
+
+dgpo:
+  adaptive_omnifold:
+    trigger:
+      fixed_schedule_log_raw_audit: false

@@ -1,0 +1,179 @@
+# Minimal frozen-reference H4 -> DGPO pilot.
+#
+# Keep only the mechanism needed to test whether the coefficient-1 reference
+# term prevents a fully untempered H4 reward from reducing the cold H4 gap.
+# Cross-fitting is retained for out-of-fold ratio estimation; extra repeated
+# cross-fit ensembles, policy-loop refits, adaptive tempering, controllers, and
+# secondary diagnostics are disabled.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_5round.yaml
+
+experiment:
+  protocol: h4-minimal-alpha1-frozen-20step-v1
+  single_question: >-
+    Can one alpha=1 two-fold H4 reward, paired with one frozen policy reference
+    and optimized by unchanged native AdamW, reduce the cold held-out H4 gap?
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+  source_policy_step: 1110
+  intervention: minimal_frozen_reference_alpha1
+  rounds: 1
+  policy_updates_per_round: 20
+  reward_lifetime_updates: 20
+  reward_fit_count: 1
+  reference_snapshot_count: 1
+  crossfit_folds: 2
+  crossfit_repeats: 1
+  applied_tempering: 1.0
+  applied_reference_trust_coefficient: 1.0
+  cold_h4_audit_policy_steps: [0, 10, 20]
+  cold_h4_audit_min_optimizer_updates: 1000
+  primary_endpoint: staleness/raw_auc_gap
+  primary_decision_rule: >-
+    The pilot supports the minimal mechanism only if the cold, identity-held-out
+    H4 audit at policy step 20 is saturated, used at least 1000 optimizer
+    updates, and has a smaller abs(AUC-0.5) gap than the equally valid step-0
+    audit. Step 10 is diagnostic; monotonic improvement is not required.
+  stop_rule: >-
+    Stop at policy step 20. Do not extend to 50 steps unless the primary rule
+    passes; an invalid or undertrained audit leaves the result unresolved.
+  wandb_required: true
+
+nersc:
+  reproducibility:
+    source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+    source_dgpo_global_step: 1110
+    note: >-
+      Fresh weights-only start from c4a91e07 policy step 1110. Fit one
+      saturated nonlinear H4 reward with two identity-stable folds and one
+      repeat, install alpha=1 and the matching frozen policy reference once,
+      then apply twenty native AdamW updates. No policy-loop classifier refit,
+      extra cross-fit repeat, optimizer reset, adaptive tempering, ESS gate,
+      rollback, hard boundary, projection, consensus, or rank transform.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_minimal_alpha1_frozen_20step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_omnifold_ztautau_10pct_h4_minimal_alpha1_frozen_20step.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_minimal_alpha1_frozen_20step_v1/ray_results
+
+logger:
+  local:
+    name: c4a91e07_h4_minimal_alpha1_frozen_20step_v1
+    version: h4_minimal_alpha1_frozen_20step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_minimal_alpha1_frozen_20step_v1/logs
+  wandb:
+    id: h4min001
+    run_name: Can alpha 1 close the H4 gap? | two-fold frozen H4 | step-1110 pilot
+    profile: standard
+    classifier_loss_curves: true
+    simplified: true
+    resume: allow
+    fresh_run: false
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - H4
+      - MinimalClosedLoop
+      - SourceC4a91e07Step1110
+      - Alpha1
+      - Beta1
+      - TwoFoldCrossfit
+      - SingleCrossfitRepeat
+      - FrozenReward
+      - FrozenReference
+      - NativeAdamW
+      - ColdSaturatedH4Audit
+      - NoPolicyLoopRefit
+      - NoAdaptiveTempering
+      - NoHardTrust
+      - NoProjection
+      - NoRollback
+
+options:
+  Training:
+    total_epochs: 2
+    epochs: 2
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_minimal_alpha1_frozen_20step_v1/checkpoints
+
+dgpo:
+  steps_per_epoch: 10
+  checkpoint_every_n_epochs: 1
+  beta: 1.0
+  advantage_estimator: leave_one_out_unscaled
+  K: 8
+  gradient_conflict:
+    enabled: false
+    monitor_refit_lifecycle: false
+  tarp:
+    enabled: false
+  ztautau_metrics:
+    enabled: false
+  variance_regularization:
+    enabled: false
+    weight: 0.0
+    features: null
+  reference_trust:
+    enabled: true
+    coefficient: 1.0
+    objective: velocity_mse
+    adaptive_boundary:
+      enabled: false
+  projection_constraint:
+    type: none
+  adaptive_omnifold:
+    staleness_every_n_epochs: 1
+    staleness_every_n_steps: null
+    trigger:
+      raw_audit_enabled: true
+      warm_start_classifier: false
+      max_reward_age_epochs: 999
+      required_consecutive_epochs: 999
+      required_consecutive_checks: 999
+      global_max_failed_rounds: 0
+      require_audit_saturation: true
+      rollback_to_best_on_plateau: false
+    audit_fit:
+      min_steps: 1000
+      min_epochs: 1
+      enforce_min_epochs: false
+      safety_max_epochs: null
+      validation_patience_epochs: 15.0
+      require_saturation: false
+      fail_if_unsaturated: true
+      disjoint_final_audit: true
+      checkpoint_selection_metric: balanced_accuracy
+      training_readiness: null
+    recalibration:
+      bootstrap_on_start: true
+      bootstrap_fail_closed: true
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+      refit_once_id: ''
+      max_reward_rounds: 1
+      scheduled_refit_fail_closed: false
+      reset_optimizer_state_on_install: false
+      reset_adam_first_moment_on_install: false
+      warm_start_iterations: []
+      warm_start_from_iteration_one: false
+      min_iterations: 1
+      max_iterations: 1
+      iteration_one_only: true
+      acceptance_audit_enabled: false
+      topology_acceptance_audit_enabled: false
+      tempering: 1.0
+      adaptive_tempering:
+        enabled: false
+      minimum_ess_fraction: 0.0
+      ess_aware_checkpoint_selection:
+        enabled: false
+      crossfit_partition: identity
+      crossfit_folds: 2
+      crossfit_repeats: 1
+      residual_closure_schedule: []
+      fit:
+        min_steps_per_fold: 1000
+        require_saturation: true
+        checkpoint_selection_metric: balanced_accuracy

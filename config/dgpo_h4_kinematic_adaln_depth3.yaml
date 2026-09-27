@@ -1,0 +1,51 @@
+extends_overlay: dgpo_h4_visible_adaln_depth3.yaml
+
+network:
+  VisibleConditioning:
+    feature_mode: kinematics
+    numerical_features: [Part_energy, Part_pt]
+    numerical_frequencies: [0.25, 0.5, 1.0, 2.0]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/checkpoints
+
+logger:
+  local:
+    name: h4-kinematic-adaln-depth3-1110
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/logs
+  wandb:
+    id: h4kfd3s1110
+    run_name: "Can deeper conditioning unlock DGPO? | angle and momentum FiLM | three blocks | raw step 1110"
+    tags: [DGPO, VisibleKinematics, NumericalFourier, NonlinearAdaLN, Depth3, RawWeights, Step1110, VelocityMSE, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/ray_results
+  reproducibility:
+    note: >-
+      Same raw step1110 three-block setup as h4vad3s1110, adding normalized visible energy/pT
+      scalars and numerical Fourier, exactly as in the one-block h4kfilm1 arm.
+      Angle harmonics and shared nonlinear encoder depth/width stay unchanged.
+      Raw c4a91e07 step1110 weights-only, never EMA; no classifier payload reuse.
+      Classifier backbone retains the original pre-DGPO 10% diffusion pretrain
+      raw checkpoint, with fresh three-block OmniFold and audit heads.
+      Earlier classifier backbone stays frozen; final PET block, PET adapters,
+      angular Fourier, invisible projector, nonlinear FiLM, decoder and H4 heads
+      remain trainable.
+      Both policy and classifier depth and the policy source change versus
+      h4kfilm1; that older arm is not a matched depth control. This is a combined
+      conditioning package, not a capacity-matched or diffusion-only causal test.
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_h4_kinematic_adaln_depth3.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/ray_results
+
+experiment:
+  protocol: h4-angle-momentum-nonlinear-film-depth3-1110
+  matched_configuration: config/dgpo_h4_visible_adaln_depth3.yaml
+  architecture_reference: config/dgpo_h4_kinematic_adaln.yaml
+  feature_comparison: config/dgpo_h4_visible_adaln_depth3.yaml
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt

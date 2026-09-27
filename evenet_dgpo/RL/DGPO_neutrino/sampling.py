@@ -12,7 +12,6 @@ from evenet.utilities.diffusion_sampler import DDIMSampler
 from RL.DGPO_neutrino.dgpo_utils import repeat_batch_for_candidates
 
 
-@torch.no_grad()
 def generate_neutrino_candidates(
     model: torch.nn.Module,
     batch: dict[str, Any],
@@ -26,6 +25,8 @@ def generate_neutrino_candidates(
     use_tqdm_ddim: bool = False,
     chain_progress_desc: str = "diffusion DDIM chains",
     expanded_batch: dict[str, Any] | None = None,
+    differentiable: bool = False,
+    checkpoint_steps: bool = False,
 ) -> Tensor:
     """Return every independent diffusion draw as ``(K, B, N, F)``.
 
@@ -81,7 +82,8 @@ def generate_neutrino_candidates(
             cond_x=batch_group,
             noise_mask=noise_mask_group,
         )
-        generated = sampler.sample(
+        with torch.set_grad_enabled(differentiable):
+            generated = sampler.sample(
             data_shape=data_shape_group,
             pred_fn=pred_partial,
             num_steps=int(num_ddim_steps),
@@ -90,7 +92,8 @@ def generate_neutrino_candidates(
             noise_mask=noise_mask_group,
             use_tqdm=use_tqdm_ddim,
             process_name=f"{chain_progress_desc} steps",
-        )
+            **({"differentiable": True, "checkpoint_steps": checkpoint_steps} if differentiable else {}),
+            )
         return generated.reshape(
             chain_count,
             batch_size,

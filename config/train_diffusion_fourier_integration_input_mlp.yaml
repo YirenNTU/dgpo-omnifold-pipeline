@@ -1,0 +1,22 @@
+extends_overlay: train_diffusion_fourier_integration_input.yaml
+experiment:
+  intervention: input_mlp_adapter
+  comparison_runs:
+    input_linear: ytchou97-university-of-washington/EveNet/98q3imcl
+    none: ytchou97-university-of-washington/EveNet/mpvmx945
+  interpretation: >-
+    Test a nonlinear Fourier adapter at the same PET input injection site.
+    Keep k=1..4, branch peak LR 2e-5, the original no-Fourier source checkpoint,
+    and all backbone weights trainable. Replace the linear projection with
+    Linear(16,64), GELU, LayerNorm(64), and zero-init Linear(64,hidden).
+    This tests the MLP adapter as a package, not nonlinearity independently
+    of normalization or parameter count. Do not resume a trained Fourier arm.
+logger:
+  wandb:
+    run_name: "Nonlinear Fourier adapter | PET input | hidden 64 | branch LR 2e-5"
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        projection_type: mlp
+        mlp_dim: 64

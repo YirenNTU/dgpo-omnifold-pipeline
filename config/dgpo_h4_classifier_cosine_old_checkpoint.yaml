@@ -1,0 +1,53 @@
+extends_overlay: dgpo_h4_classifier_cosine.yaml
+
+experiment:
+  protocol: h4-old-dgpo-classifier-cosine-v1
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+  source_policy_step: 1110
+  diagnostic_parent_run: h4clfcos1
+  baseline_measurement: h4clfcos1_step50_same_classifier_protocol
+  intervention: old_dgpo_step1110_source_only
+  single_question: How well does the same scheduled H4 classifier discriminate the original old-DGPO endpoint?
+  primary_decision_rule: >-
+    Cold-train the same H4 classifier on samples from the fixed old-DGPO
+    step-1110 policy. Compare final independent held-out AUC and fit BCE/AUC
+    trajectories with h4clfcos1 using the same seeds, data identities and
+    training protocol. Regenerate policy samples; do not reuse the step-50
+    generated pool. Minimum 1000 updates and ten-epoch BCE patience remain.
+    This changes the source distribution, not classifier design; a lower AUC
+    alone is not evidence of better classifier training.
+
+nersc:
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+    source_dgpo_global_step: 1110
+    note: >-
+      Old-DGPO finetuned checkpoint, not the later h4lbnr01 step-50 policy.
+      Same classifier-only protocol as h4clfcos1: 10pct data, 16 workers,
+      cold H4, identical peak LRs, one-epoch warmup and 250-epoch cosine
+      with 10% floor. Fresh experiment state; no policy updates.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_cosine_old_checkpoint/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_classifier_lr_stability.py --scheduler --old-checkpoint
+
+logger:
+  local:
+    name: h4_classifier_cosine_old_checkpoint
+    version: h4_classifier_cosine_old_checkpoint_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_cosine_old_checkpoint/logs
+  wandb:
+    id: h4clfold1
+    run_name: Probe the old DGPO endpoint | H4 classifier | 250-epoch cosine
+    tags: [ClassifierOnly, NoPolicyUpdate, H4, SixteenGPU, CosineLR, StabilityDiagnostics, OldDGPO]
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_cosine_old_checkpoint/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_cosine_old_checkpoint/diagnostic_snapshots

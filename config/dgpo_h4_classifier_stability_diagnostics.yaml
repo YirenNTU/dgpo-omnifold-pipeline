@@ -1,0 +1,37 @@
+extends_overlay: dgpo_h4_classifier_lr_stability.yaml
+
+experiment:
+  protocol: h4-step50-classifier-lr-stability-diagnostics-v1
+  diagnostic_parent_run: h4clflr1
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_stability_diagnostics/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_classifier_lr_stability.py --diagnostics
+
+logger:
+  local:
+    name: h4_classifier_stability_diagnostics
+    version: h4_classifier_stability_diagnostics_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_stability_diagnostics/logs
+  wandb:
+    id: h4clfd1
+    run_name: Diagnose classifier collapse | H4 adapter-decoder LR 5e-5 | step-50 replay
+    tags: [ClassifierOnly, NoPolicyUpdate, H4, LastPETBlock, Fourier, SixteenGPU, LRStability, StabilityDiagnostics]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_stability_diagnostics/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      diagnostic_enabled: true
+      diagnostic_interval_steps: 10
+      diagnostic_probe_rows: 16
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_stability_diagnostics/diagnostic_snapshots
+      diagnostic_max_snapshots: 2
+      diagnostic_gradient_threshold: 1000.0
+      diagnostic_spike_factor: 20.0
+      diagnostic_probe_bce_jump: 0.02

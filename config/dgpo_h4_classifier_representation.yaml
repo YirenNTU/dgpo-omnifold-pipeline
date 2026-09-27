@@ -1,0 +1,56 @@
+extends_overlay: dgpo_h4_classifier_stability_diagnostics.yaml
+
+experiment:
+  protocol: h4-representation-measurement-v1
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+  source_policy_step: 1110
+  diagnostic_parent_run: h4clfd1
+  baseline_measurement: h4clfd1_constant_lr_unfiltered_validation
+  intervention: old_step1110_clean_validation_and_measurement_only_representation_probes
+  single_question: Does early classifier stagnation come from gated updates or weak linear separability of its learned features?
+  primary_decision_rule: >-
+    On the fixed old-DGPO step-1110 policy, inspect first-300-update output/gate amplitudes,
+    branch activation/gradient/update scales and frozen-feature ridge readouts.
+    Readouts use a fixed context-disjoint diagnostic split of early-stop validation,
+    never the final test. They do not select checkpoints or alter training.
+    Keep constant group LRs, model, AdamW, regularization and stopping unchanged.
+    Source policy differs and clean validation excludes two known STIC events; this is not a matched
+    causal comparison against h4clfd1 and does not change the policy objective.
+
+platform:
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_representation/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_classifier_representation.py
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+    source_dgpo_global_step: 1110
+    note: Old-DGPO step-1110 policy with fresh experiment state and regenerated samples; constant group LRs, clean validation and detached measurements. No policy updates.
+
+logger:
+  local:
+    name: h4_classifier_representation
+    version: h4_classifier_representation_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_representation/logs
+  wandb:
+    id: h4clfrep1
+    run_name: Why does learning start slowly? | H4 branch probes | constant LR | clean validation
+    tags: [ClassifierOnly, NoPolicyUpdate, H4, SixteenGPU, ConstantLR, RepresentationDiagnostics, CleanValidation]
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_representation/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      lr_scheduler: constant
+      representation_diagnostic_enabled: true
+      representation_probe_rows: 128
+      representation_probe_interval_steps: 100
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_representation/diagnostic_snapshots

@@ -1,0 +1,163 @@
+# Measurement-only H4 gradient-direction pilot.
+#
+# Fit one two-fold, one-repeat, at-most-two-residual-iteration reward at step 0,
+# freeze it, disable reference trust, and ask whether its DGPO gradient keeps
+# pointing in the same direction as a freshly trained cold H4 audit.  The
+# periodic audit is read-only: it cannot refit the reward, roll back the policy,
+# or change optimizer state.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_minimal_alpha1_frozen_20step.yaml
+
+experiment:
+  protocol: h4-direction-no-reference-audit5-100step-v1
+  single_question: >-
+    With reference trust disabled, does the frozen H4 reward gradient remain
+    aligned with a fresh H4 audit gradient while cold raw AUC moves toward 0.5?
+  intervention: no_reference_trust_with_read_only_gradient_direction
+  rounds: 1
+  policy_updates_per_round: 100
+  reward_lifetime_updates: 100
+  reward_fit_count: 1
+  # DGPO still needs its one frozen v_ref for the beta=1 likelihood-ratio
+  # objective; only the additional reference-trust penalty is disabled.
+  reference_snapshot_count: 1
+  crossfit_folds: 2
+  crossfit_repeats: 1
+  residual_iterations_max: 2
+  applied_tempering: 1.0
+  applied_reference_trust_coefficient: 0.0
+  cold_h4_audit_policy_steps: [0, 50, 100]
+  gradient_direction_policy_steps: [50, 100]
+  # Override the inherited 1,000-step pilot label as well as declaring the
+  # exact fixed budget used by this experiment.
+  cold_h4_audit_min_optimizer_updates: 3000
+  cold_h4_audit_fixed_optimizer_updates: 3000
+  primary_endpoint: audit/raw_auc_gap
+  primary_decision_rule: >-
+    The idea is supported only if the step-50 and step-100 cold audits each
+    complete exactly 3000 optimizer updates, their installed-vs-fresh gradient
+    directions are reliable and positively aligned, and raw abs(AUC-0.5) at
+    step 100 is below step 0.
+  stop_rule: >-
+    Stop at policy step 100. Do not refit the reward, roll back the policy, or
+    extend the run based on an intermediate audit.
+
+nersc:
+  reproducibility:
+    note: >-
+      Fresh weights-only start from c4a91e07 policy step 1110. Fit one frozen
+      H4 reward using two identity-stable folds, one repeat, and a maximum of
+      two residual iterations. Disable all applied reference trust. Run cold,
+      read-only H4 audits every five epochs and compare their gradients with
+      the installed reward gradient on the same deterministic event panel.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_direction_no_ref_audit5_100step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_omnifold_ztautau_10pct_h4_direction_no_ref_audit5_100step.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_direction_no_ref_audit5_100step_v1/ray_results
+
+logger:
+  local:
+    name: c4a91e07_h4_direction_no_ref_audit5_100step_v1
+    version: h4_direction_no_ref_audit5_100step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_direction_no_ref_audit5_100step_v1/logs
+  wandb:
+    id: h4dir001
+    run_name: Does the DGPO direction track a fresh audit? | two-fold H4 | no reference trust
+    group: H4 policy projection
+    profile: standard
+    classifier_loss_curves: true
+    simplified: true
+    resume: allow
+    fresh_run: false
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - H4
+      - SourceC4a91e07Step1110
+      - GradientDirection
+      - TwoFoldCrossfit
+      - SingleCrossfitRepeat
+      - TwoResidualIterationsMax
+      - FrozenReward
+      - NoReferenceTrust
+      - RawAuditEvery5Epochs
+      - Fixed3000StepAudit
+      - NoStalenessController
+      - NativeAdamW
+
+options:
+  Training:
+    total_epochs: 10
+    epochs: 10
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_direction_no_ref_audit5_100step_v1/checkpoints
+
+dgpo:
+  steps_per_epoch: 10
+  checkpoint_every_n_epochs: 1
+  log_parameter_update_rms: true
+  fail_on_skipped_optimizer_step: true
+  reference_trust:
+    enabled: false
+    coefficient: 0.0
+    adaptive_boundary:
+      enabled: false
+  gradient_conflict:
+    enabled: true
+    monitor_refit_lifecycle: false
+    every_n_steps: 50
+    blocks: 8
+    events_per_block: 512
+    event_microbatch_size: 32
+    seed: 20260919
+    confidence: 0.95
+    min_split_cosine: 0.1
+    norm_floor: 1.0e-12
+  adaptive_omnifold:
+    log_only: true
+    monitor_mode: raw_only
+    baseline_probe_on_start: true
+    fixed_audit_panel: true
+    cache_event_inputs: true
+    staleness_every_n_epochs: 5
+    staleness_every_n_steps: null
+    trigger:
+      raw_audit_enabled: true
+      warm_start_classifier: false
+      require_audit_saturation: false
+      rollback_to_best_on_plateau: false
+    audit_fit:
+      steps: 3000
+      min_steps: 3000
+      min_epochs: 1
+      enforce_min_epochs: false
+      safety_max_epochs: null
+      validation_interval_steps: 40
+      validation_patience_epochs: 15.0
+      progress_every_n_steps: 40
+      require_saturation: false
+      fail_if_unsaturated: false
+      disjoint_final_audit: true
+      checkpoint_selection_metric: balanced_accuracy
+      training_readiness: null
+    recalibration:
+      bootstrap_on_start: true
+      bootstrap_fail_closed: true
+      max_reward_rounds: 1
+      min_iterations: 2
+      max_iterations: 2
+      iteration_one_only: false
+      tempering: 1.0
+      adaptive_tempering:
+        enabled: false
+      crossfit_partition: identity
+      crossfit_folds: 2
+      crossfit_repeats: 1
+      acceptance_audit_enabled: false
+      topology_acceptance_audit_enabled: false
+      reset_optimizer_state_on_install: false
+      reset_adam_first_moment_on_install: false

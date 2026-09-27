@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import tempfile
@@ -88,6 +89,8 @@ class TestWandbClocks(unittest.TestCase):
             "    global_step = 170\n"
             "    omnifold_live_log_index = 0\n"
             "    omnifold_phase_ids = _OMNIFOLD_LIVE_PHASE_IDS\n"
+            "    classifier_loss_tracker = _ClassifierFitLossTracker()\n"
+            "    classifier_plot_tracker = _ClassifierTrainingPlotTracker()\n"
         )
         harness.body[0].body.extend([callback, ast.Return(value=ast.Name(id=callback.name, ctx=ast.Load()))])
         namespace = dict(vars(dgpo_trainer))
@@ -139,6 +142,128 @@ class TestWandbClocks(unittest.TestCase):
         dgpo_trainer._wandb_log_step(wb, {"epoch": 7, "train/loss/total": .09}, step=72)
         self.assertEqual(wb.log.call_args.kwargs["step"], 100)
 
+    def test_classifier_loss_curves_keep_local_steps_and_separate_refits(self):
+        wb = mock.Mock()
+        settings = {"profile": "critical", "classifier_loss_curves": False,
+                    "classifier_loss_curves_raw": True}
+        with mock.patch.object(dgpo_trainer, '_dgpo_wandb_yaml_section', return_value=(settings, 'logger.wandb')):
+            logger = self._live_progress_logger(wb)
+            for phase, fold, step, validate in (
+                ('residual_reward', 1, 10, True),
+                ('residual_reward', 1, 20, False),
+                ('residual_reward', 2, 10, True),
+                ('raw_staleness_monitor', 0, 10, True),
+                ('raw_staleness_monitor', 0, 20, False),
+                ('raw_staleness_monitor', 0, 10, True),
+            ):
+                logger(phase, {'step': step, 'fold': fold, 'iteration': 1,
+                              'training_loss': .68, 'training_balanced_accuracy': .51,
+                              'validation_loss': .69, 'validation_balanced_accuracy': .52,
+                              'validation_auc': .53,
+                              'learning_rate': 1e-3 if step <= 10 else 2e-4,
+                              'topology_training_stage': 1 if step <= 10 else 2,
+                              'validation_evaluated': validate}, epoch_value=16)
+        wb.plot.line_series.assert_not_called()
+        rows = [call.args[0] for call in wb.log.call_args_list]
+        loss_keys = [next(k for k in row if k.startswith('classifier_fit/') and k.endswith('/training_loss')) for row in rows]
+        self.assertEqual(loss_keys[0], loss_keys[1])
+        self.assertEqual(loss_keys[3], loss_keys[4])
+        self.assertEqual(len(set(loss_keys)), 4)
+        self.assertNotEqual(loss_keys[3], loss_keys[5])
+        definitions = {c.args[0]: c.kwargs for c in wb.define_metric.call_args_list}
+        for index, (row, loss_key) in enumerate(zip(rows, loss_keys)):
+            definition = definitions[loss_key]
+            self.assertEqual(row[definition['step_metric']], [10,20,10,10,20,10][index])
+            self.assertFalse(definition['hidden'])
+            self.assertFalse(definition['step_sync'])
+            self.assertEqual(row['global_step'], 170)
+            self.assertEqual(row['epoch'], 16)
+            self.assertIn(loss_key.replace('/training_loss', '/training_balanced_accuracy'), row)
+            self.assertIn(loss_key.replace('/training_loss', '/learning_rate'), row)
+            self.assertIn(
+                loss_key.replace('/training_loss', '/topology_training_stage'),
+                row,
+            )
+            has_val = loss_key.replace('/training_loss','/validation_loss') in row
+            self.assertEqual(has_val, index not in (1,4))
+            if has_val:
+                self.assertIn(loss_key.replace('/training_loss', '/validation_balanced_accuracy'), row)
+                self.assertIn(loss_key.replace('/training_loss', '/validation_auc'), row)
+
+    def test_classifier_training_charts_use_logged_steps_from_repeat1_fold1(self):
+        import wandb
+
+        wb = mock.Mock()
+        wb.plot = wandb.plot
+        settings = {"profile": "critical", "classifier_loss_curves": True}
+        with mock.patch.object(
+            dgpo_trainer,
+            "_dgpo_wandb_yaml_section",
+            return_value=(settings, "logger.wandb"),
+        ):
+            logger = self._live_progress_logger(wb)
+            for iteration, repeat, fold, step, loss in (
+                (1, 1, 1, 10, 0.68),
+                (1, 1, 1, 20, 0.64),
+                (1, 1, 2, 999, 0.31),  # another fold: ignored
+                (2, 2, 1, 777, 0.25),  # another repeat: ignored
+                (2, 1, 2, 888, 0.22),  # reports first, but is ignored
+                (2, 1, 1, 7, 0.61),
+                (2, 1, 1, 17, 0.57),
+            ):
+                logger(
+                    "residual_reward",
+                    {
+                        "step": step,
+                        "fold": fold,
+                        "repeat": repeat,
+                        "iteration": iteration,
+                        "training_loss": loss,
+                        "validation_loss": loss + 0.01,
+                        "validation_balanced_accuracy": 0.70,
+                        "validation_auc": 0.75,
+                        "learning_rate": 1e-4,
+                        "logit_class_mean_separation": 0.25 + loss,
+                        "parameter_rms_direct_topology_head": 0.02,
+                        "gradient_rms_direct_topology_head": 0.003,
+                        "gradient_to_parameter_rms_ratio_direct_topology_head": 0.15,
+                        "validation_evaluated": True,
+                    },
+                    epoch_value=16,
+                )
+        rows = [call.args[0] for call in wb.log.call_args_list]
+        key = "Classifier training/Reward/Train loss"
+        charts = [row[key] for row in rows if key in row]
+        self.assertEqual(len(charts), 4)
+        latest = charts[-1]
+        self.assertEqual(latest.spec.string_fields["title"],
+                         "Reward classifier · Train loss · DGPO step 170")
+        self.assertEqual(
+            latest.table.data,
+            [
+                [10, "Iteration 1", 0.68],
+                [20, "Iteration 1", 0.64],
+                [7, "Iteration 2", 0.61],
+                [17, "Iteration 2", 0.57],
+            ],
+        )
+        separation_key = "Classifier training/Reward/Logit class separation"
+        separation_charts = [row[separation_key] for row in rows if separation_key in row]
+        self.assertEqual(
+            separation_charts[-1].table.data,
+            [
+                [10, "Iteration 1", 0.93],
+                [20, "Iteration 1", 0.89],
+                [7, "Iteration 2", 0.86],
+                [17, "Iteration 2", 0.82],
+            ],
+        )
+        self.assertIn(
+            "omnifold_live/residual_reward/gradient_rms_direct_topology_head",
+            rows[-1],
+        )
+        self.assertFalse(any(k.startswith("classifier_fit/") for row in rows for k in row))
+
     def test_global_confirmation_real_progress_callbacks_and_axes(self):
         wb = mock.Mock()
         logger = self._live_progress_logger(wb)
@@ -175,6 +300,30 @@ class TestWandbClocks(unittest.TestCase):
         self._live_progress_logger(wb, is_rank0=False)("global_best_candidate", {}, epoch_value=16)
         wb.log.assert_not_called()
 
+    def test_live_progress_labels_actual_optimizer_learning_rates(self):
+        logger = self._live_progress_logger(None)
+        with mock.patch.object(dgpo_trainer._log, "info") as log:
+            logger("raw_staleness_audit", {
+                "step": 70, "learning_rate": 2e-4,
+                "optimizer_group_lr_0": 2e-4,
+                "optimizer_group_lr_head": 2e-4,
+                "optimizer_group_lr_backbone": 1e-5,
+                "optimizer_group_lr_decoder": 5e-5,
+                "optimizer_group_lr_adapter": 5e-5,
+            }, epoch_value=-1)
+        args = log.call_args.args
+        message = args[0] % args[1:]
+        self.assertIn("base_lr=0.0002", message)
+        self.assertIn("actual_lrs=[head=0.0002, backbone=1e-05, decoder=5e-05, adapter=5e-05]", message)
+        self.assertNotIn("actual_lrs=[0=", message)
+
+    def test_all_classifier_diagnostic_charts_survive_critical_profile(self):
+        for role in ("Reward", "Fresh audit"):
+            for _metric, label, _validation in dgpo_trainer._ClassifierTrainingPlotTracker._METRICS:
+                key = f"Classifier training/{role}/{label}"
+                self.assertIn(key, dgpo_trainer._WANDB_CLASSIFIER_TRAINING_CHARTS)
+                self.assertTrue(dgpo_trainer._wandb_critical_keep(key))
+
     def test_critical_axes_hide_metadata_and_do_not_forward_fill_stale_epochs(self):
         wb = mock.Mock()
         dgpo_trainer._wandb_define_axes(wb, critical=True)
@@ -186,6 +335,66 @@ class TestWandbClocks(unittest.TestCase):
         self.assertFalse(definitions["staleness/raw_auc"]["step_sync"])
         self.assertTrue(definitions["omnifold_live/*"]["hidden"])
         self.assertEqual(definitions["omnifold_live/*"]["step_metric"], "omnifold_live/log_index")
+        self.assertNotIn("omnifold_live/residual_reward/training_loss", definitions)
+        for key in dgpo_trainer._WANDB_CLASSIFIER_TRAINING_CHARTS:
+            self.assertFalse(definitions[key]["hidden"])
+
+    def test_compact_classifier_logging_uses_fixed_phase_metrics_only(self):
+        wb = mock.Mock()
+        settings = {"profile": "critical", "classifier_loss_curves": False}
+        with mock.patch.object(
+            dgpo_trainer,
+            "_dgpo_wandb_yaml_section",
+            return_value=(settings, "logger.wandb"),
+        ):
+            logger = self._live_progress_logger(wb)
+            logger(
+                "residual_reward",
+                {
+                    "step": 10,
+                    "parameter_update_rms_adapter": 0.00005,
+                    "update_to_parameter_rms_ratio_decoder": 0.001,
+                    "optimizer_group_lr_0": 0.0002,
+                    "stability/probe/bce_delta": 0.01,
+                    "stability/representation_probe/fourier/holdout_auc": 0.7,
+                    "stability/layer/representation/fourier/activation_rms/rankmean": 0.2,
+                    "stability/layer/bank.decoder.norm/pre_norm_variance_min/rankmin": 0.02,
+                    "iteration": 1,
+                    "fold": 1,
+                    "training_loss": 0.68,
+                    "training_balanced_accuracy": 0.61,
+                    "validation_loss": 0.69,
+                    "validation_balanced_accuracy": 0.60,
+                    "validation_auc": 0.66,
+                    "threshold_reached": 1.0,
+                    "validation_oriented_balanced_accuracy": 0.70,
+                    "validation_balanced_accuracy_lcb": 0.70,
+                    "validation_balanced_accuracy_lcb_standard_error": 0.001,
+                    "validation_balanced_accuracy_lcb_streak": 3.0,
+                    "validation_evaluated": True,
+                },
+                epoch_value=0,
+            )
+        row = wb.log.call_args.args[0]
+        self.assertFalse(any(key.startswith("classifier_fit/") for key in row))
+        for metric in ("parameter_update_rms_adapter", "update_to_parameter_rms_ratio_decoder", "optimizer_group_lr_0",
+                       "stability/probe/bce_delta", "stability/layer/bank.decoder.norm/pre_norm_variance_min/rankmin",
+                       "stability/representation_probe/fourier/holdout_auc",
+                       "stability/layer/representation/fourier/activation_rms/rankmean"):
+            self.assertTrue(any(key.endswith("/" + metric) for key in row), metric)
+        for metric in (
+            "training_loss",
+            "training_balanced_accuracy",
+            "validation_loss",
+            "validation_balanced_accuracy",
+            "validation_auc",
+            "threshold_reached",
+            "validation_oriented_balanced_accuracy",
+            "validation_balanced_accuracy_lcb",
+            "validation_balanced_accuracy_lcb_standard_error",
+            "validation_balanced_accuracy_lcb_streak",
+        ):
+            self.assertIn(f"omnifold_live/residual_reward/{metric}", row)
 
     def test_critical_profile_filters_dormant_ablation_and_duplicate_plots(self):
         payload = {
@@ -200,6 +409,7 @@ class TestWandbClocks(unittest.TestCase):
             "val_ztautau/residual/ref/topology/cos_opening/mean": .2,
             "omnifold_live/meta/fit_step": 300,
             "staleness/raw_classifier_warm_started": 0,
+            "staleness/raw_no_improvement_patience": 24,
             "staleness/raw_audit_training_ready": 1,
             "staleness/raw_audit_training_min_steps": 600,
             "staleness/raw_audit_training_steps": 660,
@@ -210,6 +420,7 @@ class TestWandbClocks(unittest.TestCase):
         self.assertIn("omnifold_live/meta/fit_step", clean)
         self.assertIn("reference_trust/velocity_mse", clean)
         self.assertIn("reference_trust/velocity_mse_ratio", clean)
+        self.assertEqual(clean["staleness/raw_no_improvement_patience"], 24)
         self.assertNotIn("reference_trust/extragradient/enabled", clean)
 
     def test_mid_epoch_zero_resume_does_not_relabel_policy_as_baseline(self):
@@ -329,7 +540,182 @@ class TestMidEpochResume(unittest.TestCase):
                     )
 
 
+class TestPinnedRestartSelection(unittest.TestCase):
+    def test_first_start_applies_pinned_resume_without_last_ckpt(self):
+        self.assertTrue(
+            dgpo_trainer._should_apply_pinned_classifier_restart(
+                pinned=True, load_mode="resume", auto_resume_checkpoint=None,
+                best_source_dir=None,
+            )
+        )
+
+    def test_existing_last_ckpt_skips_pinned_reset(self):
+        self.assertFalse(
+            dgpo_trainer._should_apply_pinned_classifier_restart(
+                pinned=True, load_mode="resume",
+                auto_resume_checkpoint="/tmp/this/last.ckpt",
+                best_source_dir=None,
+            )
+        )
+
+    def test_weights_only_first_start_cannot_pin(self):
+        with self.assertRaises(ValueError):
+            dgpo_trainer._should_apply_pinned_classifier_restart(
+                pinned=True, load_mode="weights_only", auto_resume_checkpoint=None,
+                best_source_dir=None,
+            )
+
+
 class TestBestPointNewExperiment(unittest.TestCase):
+    def test_pinned_restart_keeps_classifiers_but_not_historical_scores(self):
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import AdaptiveOmniFoldState
+        a = {'single_pool_train_validation': True, 'single_pool_split_seed': 42,
+             'recalibration': {'seed': 7, 'crossfit_folds': 2}}
+        cache = {'outer_partition': {'schema': 'condition-hash-80-20-v1', 'seed': 42},
+                 'protocol': {'scheme': 'condition_sha256_v1', 'seed': 7, 'folds': 2},
+                 'models': [{'iteration': 1, 'fold': i, 'state': {'w': torch.ones(1)}} for i in (1, 2)]}
+        increments = [
+            {'state': {'w': torch.ones(1)}, 'base_digest': 'base',
+             'packing_spec': {'shape': [1]}}
+            for _ in range(2)
+        ]
+        previous = AdaptiveOmniFoldState(reward_round_id=3, baseline_auc_gap=.1, trigger_threshold=.02,
+                                        raw_monitor_state={'protocol': {'seed': 42}, 'state': {'w': torch.ones(1)}})
+        p = {'dgpo_adaptive_omnifold_state': previous.to_dict(),
+             'dgpo_omnifold_reward_stack': {'reward': {
+                 'warm_start_state': cache, 'increments': increments,
+                 'increment_iterations': [1, 1],
+                 'increment_coefficients': [.5, .5],
+             }},
+             'dgpo_ref_state_dict': {}, 'dgpo_round_ref_state_dict': {},
+             'dgpo_round_ref_sha256': 'test', 'dgpo_omnifold_reward_metadata': {},
+             'state_dict': {'w': torch.ones(1)}, 'dgpo_optimizer_state_dict': {'old': 1}}
+        result = dgpo_trainer._prepare_pinned_classifier_restart(p, {'adaptive_omnifold': a})
+        self.assertIs(result['dgpo_omnifold_reward_stack'], p['dgpo_omnifold_reward_stack'])
+        self.assertEqual(result['global_step'], 0)
+        self.assertNotIn('dgpo_optimizer_state_dict', result)
+        state = result['dgpo_adaptive_omnifold_state']
+        self.assertTrue(state['raw_monitor_state']['inherit_monitor_as_is'])
+        self.assertNotIn('recertify_inherited_weights', state['raw_monitor_state'])
+        self.assertFalse(state['raw_monitor_baseline_pending'])
+        self.assertEqual(state['probe_history'], [])
+        self.assertNotIn('inherit_monitor_as_is', p['dgpo_adaptive_omnifold_state']['raw_monitor_state'])
+        # The inherited reference keeps its installed stack but restarts the
+        # global-best trust schedule at age zero instead of failing the resume.
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import clamp_fixed_trust_radius_after_resume
+        restarted = AdaptiveOmniFoldState.from_dict(state)
+        cfg = SimpleNamespace(trust_boundary_enabled=True, trust_radius_mode="best_decay",
+                              trust_delta_max=0.1, trust_delta_floor=0.02, trust_best_decay_factor=0.9)
+        clamp_fixed_trust_radius_after_resume(restarted, cfg=cfg, initialize_round_decay=True)
+        self.assertEqual(restarted.trust_best_decay_count, 0)
+        self.assertEqual(restarted.trust_best_decay_round_id, 3)
+        self.assertEqual(restarted.trust_current_delta, 0.1)
+        self.assertEqual(restarted.last_decision, 'new_experiment_from_best')
+        self.assertIsNone(restarted.policy_warmup_protocol)
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
+            start_inherited_round_policy_warmup, policy_round_warmup_metrics,
+        )
+        warmup_cfg = SimpleNamespace(policy_warmup_steps=10, policy_warmup_start_factor=.1)
+        with self.assertRaises(ValueError):
+            policy_round_warmup_metrics(restarted, cfg=warmup_cfg)
+        metrics = start_inherited_round_policy_warmup(restarted, cfg=warmup_cfg, restart=True)
+        self.assertAlmostEqual(metrics['train/round_warmup/lr_scale'], .1)
+        self.assertEqual(restarted.policy_warmup_round_id, 3)
+        resume = AdaptiveOmniFoldState.from_dict(restarted.to_dict())
+        resume.raw_monitor_baseline_pending = False
+        resume.last_decision = 'raw_improved'
+        resume.policy_warmup_protocol = None
+        resume.policy_warmup_round_id = -1
+        resume.policy_warmup_completed_updates = 0
+        resume.raw_patience_warmup_updates_seen = 0
+        self.assertEqual(start_inherited_round_policy_warmup(resume, cfg=warmup_cfg, global_step=30), {})
+        metrics = start_inherited_round_policy_warmup(resume, cfg=warmup_cfg, global_step=0)
+        self.assertAlmostEqual(metrics['train/round_warmup/lr_scale'], .1)
+
+        repeated = copy.deepcopy(p)
+        repeated_cfg = copy.deepcopy(a)
+        repeated_cfg['recalibration']['crossfit_repeats'] = 5
+        repeated_cache = repeated['dgpo_omnifold_reward_stack']['reward']['warm_start_state']
+        repeated_cache['protocol']['repeats'] = 5
+        repeated_cache['protocol']['repeat_seed_stride'] = 104729
+        repeated_cache['models'] = []
+        repeated_reward = repeated['dgpo_omnifold_reward_stack']['reward']
+        repeated_reward['increments'] = [copy.deepcopy(increments[0]) for _ in range(10)]
+        repeated_reward['increment_iterations'] = [1] * 10
+        repeated_reward['increment_coefficients'] = [.1] * 10
+        repeated_result = dgpo_trainer._prepare_pinned_classifier_restart(
+            repeated, {'adaptive_omnifold': repeated_cfg}
+        )
+        self.assertEqual(
+            len(
+                repeated_result['dgpo_omnifold_reward_stack']['reward']
+                ['increments']
+            ),
+            10,
+        )
+
+        p['dgpo_omnifold_reward_stack']['reward']['increments'].pop()
+        with self.assertRaisesRegex(ValueError, 'every serialized'):
+            dgpo_trainer._prepare_pinned_classifier_restart(p, {'adaptive_omnifold': a})
+
+    def test_pinned_restart_rebuilds_only_missing_non_warm_raw_monitor(self):
+        from RL.DGPO_neutrino.omnifold_ztautau.adaptive import AdaptiveOmniFoldState
+
+        adaptive = {
+            'single_pool_train_validation': False,
+            'single_pool_split_seed': 42,
+            'trigger': {'warm_start_classifier': False},
+            'recalibration': {'seed': 7, 'crossfit_folds': 2, 'crossfit_repeats': 3},
+        }
+        increments = [
+            {'state': {'w': torch.ones(1)}, 'base_digest': 'base',
+             'packing_spec': {'shape': [1]}}
+            for _ in range(6)
+        ]
+        cache = {
+            'outer_partition': None,
+            'protocol': {
+                'scheme': 'condition_sha256_v1', 'seed': 7, 'folds': 2,
+                'repeats': 3,
+            },
+            'models': [],
+        }
+        previous = AdaptiveOmniFoldState(
+            reward_round_id=1, baseline_auc_gap=.1, trigger_threshold=.02,
+            raw_monitor_state={},
+        )
+        checkpoint = {
+            'dgpo_adaptive_omnifold_state': previous.to_dict(),
+            'dgpo_omnifold_reward_stack': {'reward': {
+                'warm_start_state': cache,
+                'increments': increments,
+                'increment_iterations': [1] * 6,
+                'increment_coefficients': [1.0 / 6.0] * 6,
+            }},
+            'dgpo_ref_state_dict': {}, 'dgpo_round_ref_state_dict': {},
+            'dgpo_round_ref_sha256': 'paired',
+            'dgpo_omnifold_reward_metadata': {},
+            'state_dict': {'w': torch.ones(1)},
+        }
+
+        result = dgpo_trainer._prepare_pinned_classifier_restart(
+            checkpoint, {'adaptive_omnifold': adaptive}
+        )
+        state = result['dgpo_adaptive_omnifold_state']
+        self.assertEqual(state['raw_monitor_state'], {})
+        self.assertTrue(state['raw_monitor_baseline_pending'])
+        self.assertIs(
+            result['dgpo_omnifold_reward_stack'],
+            checkpoint['dgpo_omnifold_reward_stack'],
+        )
+
+        requires_monitor = copy.deepcopy(adaptive)
+        requires_monitor['trigger']['warm_start_classifier'] = True
+        with self.assertRaisesRegex(ValueError, 'warm_start_classifier=true'):
+            dgpo_trainer._prepare_pinned_classifier_restart(
+                checkpoint, {'adaptive_omnifold': requires_monitor}
+            )
+
     def test_reset_clock_optimizer_and_trust_without_changing_reward_pair(self):
         from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
             AdaptiveOmniFoldState, clamp_fixed_trust_radius_after_resume,
@@ -710,8 +1096,472 @@ class TestDgpoCosineResume(unittest.TestCase):
         self._advance(list(model.parameters()), wrapper, 10)
         self.assertEqual([g["lr"] for g in wrapper.param_groups], [.001, .01])
 
+    def test_legacy_cosine_checkpoint_defaults_to_decaying_all_groups(self):
+        params, original = self._make()
+        self._advance(params, original, 30)
+        saved = copy.deepcopy(original.state_dict())
+        del saved["lr_schedule"]["decay_groups"]
+        _, resumed = self._make()
+        resumed.load_state_dict(saved)
+        self.assertEqual(resumed.cosine_state["decay_groups"], [True, True])
+        self.assertEqual([g["lr"] for g in original.param_groups],
+                         [g["lr"] for g in resumed.param_groups])
+
+
+class TestExplicitResumeLearningRateChange(unittest.TestCase):
+    def _make(self, *, higher_lr=False, all_groups=False):
+        names = ["body", "generation", "projector", "angular_conditioning", "visible_conditioning"]
+        params = [torch.nn.Parameter(torch.tensor([1.], dtype=torch.float64)) for _ in names]
+        rates = [5e-5 if higher_lr else 1e-6] * 3 + [1e-4] * 2
+        optimizer = torch.optim.AdamW([
+            {"params": [p], "lr": lr, "group_name": name}
+            for p, lr, name in zip(params, rates, names, strict=True)
+        ], weight_decay=.001)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lambda _: 1.] * len(names))
+        wrapper = dgpo_trainer._DgpoOptimizerWithSchedule(
+            optimizer, scheduler, warmup_steps=1, warmup_groups=[False] * len(names),
+            cosine_config={"total_steps": 15000, "min_lr_ratio": .1,
+                           "groups": names if all_groups else names[-2:]},
+        )
+        return params, wrapper
+
+    def test_override_keeps_moments_and_clock_but_uses_new_base_rates_and_decay_scope(self):
+        params, original = self._make()
+        advance = TestDgpoCosineResume()._advance
+        advance(params, original, 326)
+        saved = copy.deepcopy(original.state_dict())
+        restored_params, restored = self._make(higher_lr=True, all_groups=True)
+        restored.load_state_dict(saved, use_config_lr_schedule=True)
+        self.assertEqual(restored.scheduler.last_epoch, 326)
+        self.assertEqual(restored.scheduler._step_count, original.scheduler._step_count)
+        self.assertEqual(restored.cosine_state["start_step"], 1)
+        self.assertEqual(restored.cosine_state["decay_groups"], [True] * 5)
+        self.assertEqual(restored.scheduler.base_lrs, [5e-5] * 3 + [1e-4] * 2)
+        for index, (p, q, pg) in enumerate(zip(params, restored_params, restored.param_groups, strict=True)):
+            for key in ("step", "exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(restored.state[q][key], original.state[p][key], rtol=0, atol=0)
+            base = 5e-5 if index < 3 else 1e-4
+            self.assertEqual(pg["initial_lr"], base)
+            self.assertAlmostEqual(pg["lr"], base * restored._cosine_factor(326, index))
+            if index < 3:
+                self.assertGreater(pg["lr"], original.param_groups[index]["lr"] * 49)
+            else:
+                self.assertEqual(pg["lr"], original.param_groups[index]["lr"])
+        self.assertEqual(restored.scheduler.get_last_lr(), [pg["lr"] for pg in restored.param_groups])
+        self.assertEqual(saved["scheduler"]["base_lrs"], [1e-6] * 3 + [1e-4] * 2)
+
+    def test_repeated_resume_and_transaction_restore_do_not_restart_or_lose_override(self):
+        advance = TestDgpoCosineResume()._advance
+        params, original = self._make()
+        advance(params, original, 30)
+        params, active = self._make(higher_lr=True, all_groups=True)
+        active.load_state_dict(copy.deepcopy(original.state_dict()), use_config_lr_schedule=True)
+        advance(params, active, 20)
+        saved = copy.deepcopy(active.state_dict())
+        # Both subsequent startup resumes and exact transaction restores work.
+        for override in (False, True):
+            _, restored = self._make(higher_lr=True, all_groups=True)
+            restored.load_state_dict(copy.deepcopy(saved), use_config_lr_schedule=override)
+            self.assertEqual(restored.cosine_state, saved["lr_schedule"])
+            self.assertEqual(restored.scheduler.state_dict(), saved["scheduler"])
+            self.assertEqual([pg["lr"] for pg in restored.param_groups],
+                             [pg["lr"] for pg in active.param_groups])
+        # A rollback on the SAME object restores the old clock/rates exactly.
+        advance(params, active, 10)
+        active.load_state_dict(saved)
+        self.assertEqual(active.scheduler.state_dict(), saved["scheduler"])
+        # End at the original absolute horizon, not 15000 steps after resume.
+        active.scheduler.last_epoch = 14999
+        active._apply_cosine_lr()
+        advance(params, active, 2)
+        for pg in active.param_groups:
+            expected = 1e-5 if "conditioning" in pg["group_name"] else 5e-6
+            self.assertAlmostEqual(pg["lr"], expected)
+
+    def test_default_resume_stays_strict_and_restores_saved_rates(self):
+        _, original = self._make()
+        saved = copy.deepcopy(original.state_dict())
+        _, changed_scope = self._make(higher_lr=True, all_groups=True)
+        with self.assertRaisesRegex(ValueError, "decay_groups"):
+            changed_scope.load_state_dict(saved)
+        _, same_scope = self._make(higher_lr=True)
+        same_scope.load_state_dict(saved)
+        self.assertEqual(same_scope.scheduler.base_lrs, [1e-6] * 3 + [1e-4] * 2)
+
+    def test_override_requires_saved_clock_and_same_group_identity(self):
+        _, original = self._make()
+        for invalid in ("missing_clock", "different_groups", "bare_optimizer"):
+            saved = copy.deepcopy(original.state_dict())
+            if invalid == "missing_clock":
+                del saved["scheduler"]["last_epoch"]
+            elif invalid == "different_groups":
+                saved["optimizer"]["param_groups"][0]["group_name"] = "wrong_group"
+            else:
+                saved = saved["optimizer"]
+            _, resumed = self._make(higher_lr=True, all_groups=True)
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "resume_use_config"):
+                resumed.load_state_dict(saved, use_config_lr_schedule=True)
+
+
+class TestPolicyEpochCosine(unittest.TestCase):
+    def test_epoch_horizon_resolves_to_policy_updates_without_mutating_config(self):
+        config = {"type": "cosine", "total_epochs": 1500, "total_steps": None, "min_lr_ratio": .1}
+        for steps in (10, 13):
+            with self.subTest(steps=steps):
+                resolved = dgpo_trainer._resolve_dgpo_lr_schedule(config, steps_per_epoch=steps)
+                self.assertEqual(resolved["total_steps"], 1500 * steps)
+                self.assertEqual(resolved["total_epochs"], 1500)
+        self.assertIsNone(config["total_steps"])
+
+    def test_step_based_and_constant_schedules_remain_unchanged(self):
+        for cfg in ({"type": "constant", "total_steps": 1500},
+                    {"type": "cosine", "total_steps": 1500, "min_lr_ratio": .1}):
+            self.assertEqual(dgpo_trainer._resolve_dgpo_lr_schedule(cfg, steps_per_epoch=10), cfg)
+
+    def test_ambiguous_invalid_horizons_do_not_silently_shorten_schedule(self):
+        for cfg in ({"type": "cosine", "total_epochs": 1500, "total_steps": 1500},
+                    {"type": "constant", "total_epochs": 1500},
+                    *({"type": "cosine", "total_epochs": v} for v in (0, -1, True, 1.5))):
+            with self.subTest(cfg=cfg), self.assertRaises(ValueError):
+                dgpo_trainer._resolve_dgpo_lr_schedule(cfg, steps_per_epoch=10)
+
+    def test_resume_override_is_explicit_boolean_and_cosine_only(self):
+        for cfg in ({"type": "cosine", "resume_use_config": "false"},
+                    {"type": "constant", "resume_use_config": True}):
+            with self.subTest(cfg=cfg), self.assertRaisesRegex(ValueError, "resume_use_config"):
+                dgpo_trainer._resolve_dgpo_lr_schedule(cfg, steps_per_epoch=10)
+
+
+class TestPolicyConditioningLearningRates(unittest.TestCase):
+    def _make(self, rates=None, *, cosine=False, configure_model=None, schedule=None):
+        class Config(dict):
+            __getattr__ = dict.__getitem__
+
+        model = torch.nn.Module()
+        model.PET = torch.nn.Module()
+        model.PET.pretrained = torch.nn.Linear(2, 2)
+        model.PET.angular_conditioning = torch.nn.Linear(2, 2)
+        model.TruthGeneration = torch.nn.Module()
+        model.TruthGeneration.pretrained = torch.nn.Linear(2, 2)
+        model.TruthGeneration.visible_conditioning = torch.nn.Sequential(
+            torch.nn.Linear(2, 3), torch.nn.SiLU(), torch.nn.Linear(3, 2))
+        model.unassigned = torch.nn.Parameter(torch.ones(1))
+        model.double()
+        if configure_model is not None:
+            configure_model(model)
+        options = Config(learning_rate=1e-6, weight_decay=.001, Components={
+            "PET": {"optimizer_group": "body", "learning_rate": 1e-7,
+                    "weight_decay": .002, "warm_up": False},
+            "TruthGeneration": {"optimizer_group": "generation", "learning_rate": 1e-6,
+                                "weight_decay": .003, "warm_up": False},
+        })
+        with mock.patch.object(dgpo_trainer, "global_config", SimpleNamespace(
+                options=SimpleNamespace(Training=options))), \
+                mock.patch.object(dgpo_trainer, "_unwrap_core_evenet", return_value=model):
+            optimizer = dgpo_trainer.build_optimizer(
+                model, steps_per_epoch=10, warmup_steps=2, is_rank0=False,
+                conditioning_learning_rates=rates,
+                lr_schedule=schedule if schedule is not None else (
+                    {"type": "cosine", "total_steps": 20, "min_lr_ratio": .1} if cosine else None),
+            )
+        return model, optimizer
+
+    def test_branch_groups_have_exclusive_ownership_and_real_adamw_updates(self):
+        model, optimizer = self._make({"angular_conditioning": 1e-5, "visible_conditioning": 1e-5})
+        groups = {g["group_name"]: g for g in optimizer.param_groups}
+        expected = {"body": ("PET.pretrained", 1e-7, .002),
+                    "generation": ("TruthGeneration.pretrained", 1e-6, .003),
+                    "angular_conditioning": ("PET.angular_conditioning", 1e-5, .002),
+                    "visible_conditioning": ("TruthGeneration.visible_conditioning", 1e-5, .003)}
+        for name, (path, lr, wd) in expected.items():
+            self.assertEqual(groups[name]["lr"], lr)
+            self.assertEqual(groups[name]["weight_decay"], wd)
+            self.assertEqual({id(p) for p in groups[name]["params"]},
+                             {id(p) for p in model.get_submodule(path).parameters()})
+        assigned = [id(p) for g in optimizer.param_groups for p in g["params"]]
+        self.assertEqual(len(assigned), len(set(assigned)))
+        self.assertEqual(set(assigned), {id(p) for p in model.parameters() if p.requires_grad})
+        before = {id(p): p.detach().clone() for p in model.parameters()}
+        sum(p.sum() for p in model.parameters()).backward()
+        optimizer.step()
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                old = before[id(p)]
+                expected_update = group["lr"] * (1 / (1 + group["eps"]) + group["weight_decay"] * old)
+                torch.testing.assert_close(old - p.detach(), expected_update, rtol=1e-7, atol=1e-14)
+
+    def test_no_override_and_single_override_preserve_parent_behavior(self):
+        model, optimizer = self._make()
+        groups = {g["group_name"]: g for g in optimizer.param_groups}
+        self.assertEqual(set(groups), {"body", "generation", "__fallback__"})
+        self.assertEqual({id(p) for p in groups["body"]["params"]},
+                         {id(p) for p in model.PET.parameters()})
+        self.assertEqual({id(p) for p in groups["generation"]["params"]},
+                         {id(p) for p in model.TruthGeneration.parameters()})
+        model, optimizer = self._make({"visible_conditioning": 1e-5})
+        groups = {g["group_name"]: g for g in optimizer.param_groups}
+        self.assertNotIn("angular_conditioning", groups)
+        self.assertEqual({id(p) for p in groups["body"]["params"]},
+                         {id(p) for p in model.PET.parameters()})
+
+    def test_scheduler_and_matching_checkpoint_resume_keep_branch_rates(self):
+        rates = {"angular_conditioning": 1e-5, "visible_conditioning": 1e-5}
+        model, optimizer = self._make(rates, cosine=True)
+        for _ in range(9):
+            optimizer.zero_grad()
+            sum(p.square().sum() for p in model.parameters()).backward()
+            optimizer.step()
+            optimizer.scheduler_step()
+        restored, resumed = self._make(dict(reversed(list(rates.items()))), cosine=True)
+        restored.load_state_dict(model.state_dict())
+        resumed.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+        self.assertEqual(resumed.scheduler.state_dict(), optimizer.scheduler.state_dict())
+        self.assertEqual([g["group_name"] for g in resumed.param_groups],
+                         [g["group_name"] for g in optimizer.param_groups])
+        for _ in range(11):
+            for m, opt in ((model, optimizer), (restored, resumed)):
+                opt.zero_grad()
+                sum(p.square().sum() for p in m.parameters()).backward()
+                opt.step()
+                opt.scheduler_step()
+        for p, q in zip(model.parameters(), restored.parameters(), strict=True):
+            torch.testing.assert_close(p, q, rtol=0, atol=0)
+        groups = {g["group_name"]: g for g in resumed.param_groups}
+        self.assertAlmostEqual(groups["angular_conditioning"]["lr"], 1e-6)
+        self.assertAlmostEqual(groups["visible_conditioning"]["lr"], 1e-6)
+        self.assertAlmostEqual(groups["body"]["lr"], 1e-8)
+
+    def test_branch_only_cosine_1500_epochs_preserves_pretrained_rates(self):
+        rates = {"angular_conditioning": 1e-4, "visible_conditioning": 1e-4}
+        schedule = {"type": "cosine", "total_epochs": 1500, "total_steps": None,
+                    "min_lr_ratio": .1, "groups": list(rates)}
+        _, optimizer = self._make(rates, schedule=schedule)
+        self.assertEqual(optimizer.cosine_state["total_steps"], 15000)
+        for index, (group, base) in enumerate(zip(optimizer.param_groups, optimizer.scheduler.base_lrs, strict=True)):
+            expected = base * .1 if group["group_name"] in rates else base
+            self.assertAlmostEqual(base * optimizer._cosine_factor(15000, index), expected)
+        # Resume mid-decay and reward refit must not restart the cosine clock.
+        model, optimizer = self._make(rates, schedule={**schedule, "total_epochs": 2})
+        advance = TestDgpoCosineResume()._advance
+        advance(list(model.parameters()), optimizer, 9)
+        saved = copy.deepcopy(optimizer.state_dict())
+        restored, resumed = self._make(rates, schedule={**schedule, "total_epochs": 2})
+        restored.load_state_dict(model.state_dict())
+        resumed.load_state_dict(saved)
+        dgpo_trainer._reset_optimizer_after_reward_install(
+            resumed, cfg=SimpleNamespace(reset_optimizer_state_on_install=True,
+                                         trust_reset_adam_first_moment=False), accepted=True)
+        self.assertEqual(resumed.cosine_state, saved["lr_schedule"])
+        advance(list(restored.parameters()), resumed, 11)
+        groups = {g["group_name"]: g for g in resumed.param_groups}
+        for name in rates:
+            self.assertAlmostEqual(groups[name]["lr"], 1e-5)
+        self.assertEqual(groups["body"]["lr"], 1e-7)
+        self.assertEqual(groups["generation"]["lr"], 1e-6)
+
+    def test_invalid_decay_groups_and_changed_resume_scope_rejected(self):
+        rates = {"angular_conditioning": 1e-4, "visible_conditioning": 1e-4}
+        schedule = {"type": "cosine", "total_epochs": 1500, "min_lr_ratio": .1}
+        for groups in ([], "visible_conditioning", ["typo"],
+                       ["visible_conditioning", "visible_conditioning"], [1]):
+            with self.subTest(groups=groups), self.assertRaisesRegex(ValueError, "cosine groups"):
+                self._make(rates, schedule={**schedule, "groups": groups})
+        _, all_groups = self._make(rates, schedule=schedule)
+        _, branches_only = self._make(rates, schedule={**schedule, "groups": list(rates)})
+        with self.assertRaisesRegex(ValueError, "decay_groups"):
+            branches_only.load_state_dict(all_groups.state_dict())
+
+    def test_invalid_or_inactive_branch_override_is_rejected(self):
+        for rates in ({"typo": 1e-5}, [], {"visible_conditioning": True},
+                      {"visible_conditioning": 0}, {"visible_conditioning": -1},
+                      {"visible_conditioning": float("nan")},
+                      {"visible_conditioning": float("inf")}):
+            with self.subTest(rates=rates), self.assertRaisesRegex(ValueError, "conditioning_learning_rates"):
+                self._make(rates)
+        with self.assertRaisesRegex(ValueError, "requires enabled"):
+            self._make({"visible_conditioning": 1e-5}, configure_model=lambda m:
+                       setattr(m.TruthGeneration, "visible_conditioning", None))
+        with self.assertRaisesRegex(ValueError, "requires trainable"):
+            self._make({"visible_conditioning": 1e-5}, configure_model=lambda m:
+                       m.TruthGeneration.visible_conditioning.requires_grad_(False))
+
+    def test_named_rates_survive_compact_wandb_and_use_policy_clock(self):
+        wandb = mock.Mock()
+        dgpo_trainer._wandb_define_axes(wandb, critical=True)
+        wandb.define_metric.assert_any_call("train/lr/scheduled/*", step_metric="global_step",
+                                          step_sync=False, hidden=False)
+        for name in ("angular_conditioning", "visible_conditioning", "body", "generation"):
+            key = f"train/lr/scheduled/{name}"
+            self.assertTrue(dgpo_trainer._wandb_critical_keep(key))
+            self.assertTrue(dgpo_trainer._wandb_simplified_keep(key, 1e-5))
+
 
 class TestPairedAdaptivePool(unittest.TestCase):
+    def test_matched_periodic_audit_routes_to_diagnostic_with_training_pool(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(dgpo_trainer.dgpo_train_loop))
+        callback = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                        and node.name == '_selection_blind_fixed_schedule_audit')
+        cfg = SimpleNamespace(
+            audit_fit={'training_population': 'omnifold_fold', 'training_fold': 1},
+            crossfit_folds=2, seed=20260920, probe_seed=20260921,
+            periodic_pair_features_enabled=True, visible_pair_rest_frame_enabled=False,
+        )
+        train_pool = SimpleNamespace(n_events=208355)
+        evaluation_pool = SimpleNamespace(n_events=118992)
+        shard, loader, policy, builder = object(), object(), object(), object()
+        materialize = mock.Mock(return_value=train_pool)
+        fit = mock.Mock(return_value={'raw_auc': .6, 'raw_auc_gap': .1,
+                                     'raw_audit_saturated': 1., 'raw_audit_training_ready': 0.,
+                                     'raw_audit_uses_omnifold_fold': 1., 'raw_audit_training_fold': 1.})
+        namespace = dict(vars(dgpo_trainer))
+        namespace.update(
+            adaptive_cfg=cfg, omnifold_train_shard=shard, omnifold_train_loader_cfg=loader,
+            model=policy, sampler=None, device=torch.device('cpu'), world_size=16, rank=0,
+            num_ddim_val=20, probe_panel_seed=42, is_rank0=False, score_pool=evaluation_pool,
+            omnifold_source=SimpleNamespace(model_builder=builder), epoch=4, global_step=50,
+            adaptive_state=SimpleNamespace(probe_history=[{
+                'fixed_schedule_diagnostic_only': 1., 'global_step': 0., 'raw_auc_gap': .01,
+            }], reward_round_id=0),
+            _materialize_adaptive_omnifold_pool=materialize, fit_raw_policy_audit=fit,
+        )
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[callback], type_ignores=[])),
+                     '<matched-audit-production-callback>', 'exec'), namespace)
+        with mock.patch.object(dgpo_trainer, "_materialize_adaptive_omnifold_pool", materialize):
+            result = namespace[callback.name]()
+        self.assertEqual(materialize.call_args.args, (shard, loader))
+        self.assertIs(materialize.call_args.kwargs['model'], policy)
+        self.assertEqual(materialize.call_args.kwargs['training_crossfit_fold'], (2, 1, 20260920))
+        self.assertIsNone(materialize.call_args.kwargs['quota_events'])
+        self.assertEqual(materialize.call_args.kwargs['world_size'], 16)
+        self.assertIs(fit.call_args.kwargs['training_pool'], train_pool)
+        self.assertIs(fit.call_args.kwargs['pool'], evaluation_pool)
+        self.assertIsNone(fit.call_args.kwargs['warm_start_cache'])
+        self.assertEqual(result['staleness/trigger_recalibration'], 0.)
+        self.assertEqual(result['audit/trajectory_points'], 1.)
+        self.assertEqual(result['audit/raw_auc_gap_change_from_step0'], 0.)
+
+        # Exercise the actual branch predicate: intermediate five-epoch audits
+        # must not fall through to the legacy small-pool raw plateau monitor.
+        route = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                     and ast.unparse(node.test).startswith('diagnostic_raw_only or'))
+        expression = compile(ast.Expression(route.test), '<matched-audit-route>', 'eval')
+        self.assertTrue(eval(expression, {'diagnostic_raw_only': False, 'adaptive_cfg': cfg,
+                                          'direct_fixed_schedule_refit': False}))
+        self.assertFalse(eval(expression, {'diagnostic_raw_only': False, 'adaptive_cfg': cfg,
+                                           'direct_fixed_schedule_refit': True}))
+        cfg.audit_fit.clear()
+        self.assertFalse(eval(expression, {'diagnostic_raw_only': False, 'adaptive_cfg': cfg,
+                                           'direct_fixed_schedule_refit': False}))
+
+    def test_raw_audit_generates_only_exact_reward_training_fold_and_refreshes(self):
+        from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import (
+            _identity_crossfit_splits, _crossfit_repeat_seed, pack_event_inputs,
+        )
+        n = 400
+        ids = torch.arange(n, dtype=torch.float32)
+        batch = {
+            'x': ids[:, None, None].expand(n, 2, 3).clone(),
+            'x_mask': torch.ones(n, 2, 1),
+            'conditions': ids[:, None, None].expand(n, 1, 2).clone(),
+            'conditions_mask': torch.ones(n, 1),
+            'x_invisible': ids[:, None, None].expand(n, 2, 2).clone(),
+            'x_invisible_mask': torch.ones(n, 2),
+        }
+        packed, _ = pack_event_inputs(batch)
+        seed = _crossfit_repeat_seed(20260920, 1)
+        fit_idx, _ = _identity_crossfit_splits(packed, folds=2, seed=seed)[0]
+        source = _OrderChangingShard(batch)
+        fixed = dgpo_trainer._FixedEventInputShard(source)
+        policy = _Policy(0.)
+        observed = []
+
+        def generate(model, data, _sampler, **kwargs):
+            observed.append(set(data['x'][:, 0, 0].tolist()))
+            return torch.randn(1, len(data['x']), 2, 2) + model.offset
+
+        def collect(shard):
+            return dgpo_trainer._materialize_adaptive_omnifold_pool(
+                shard, {'batch_size': n}, model=policy, sampler=None,
+                device=torch.device('cpu'), world_size=1, rank=0,
+                quota_events=None, num_ddim_steps=20, seed=42,
+                training_crossfit_fold=(2, 1, seed),
+            )
+
+        with mock.patch.object(dgpo_trainer, 'generate_neutrino_candidates', side_effect=generate):
+            first = collect(fixed)
+            policy.offset = 5.
+            second = collect(fixed)
+        expected = set(ids[fit_idx].tolist())
+        self.assertEqual(observed, [expected, expected])
+        self.assertEqual(set(first.truth[:, 0].tolist()), expected)
+        self.assertEqual(source.calls, 1)
+        torch.testing.assert_close(first.packed_event, second.packed_event, atol=0, rtol=0)
+        torch.testing.assert_close(second.candidates - first.candidates, torch.full_like(first.candidates, 5.))
+
+        # A rank whose local input contains only the excluded fold must still
+        # participate in all-gather with correctly shaped empty tensors.
+        other = torch.tensor([i for i in range(n) if i not in expected])
+        empty_shard = _ChunkedShard({key: value[other] for key, value in batch.items()}, n)
+        def gather(local, **kwargs):
+            self.assertEqual(local['truth'].shape, (0, 4))
+            self.assertEqual(local['candidates'].shape, (0, 1, 4))
+            return {'packed_event': first.packed_event, 'truth': first.truth,
+                    'candidates': first.candidates, 'packing_spec': first.packing_spec.to_dict()}
+        with mock.patch('RL.DGPO_neutrino.omnifold_ztautau.adaptive.gather_pool_across_ranks', side_effect=gather), \
+                mock.patch.object(dgpo_trainer, 'generate_neutrino_candidates') as gen:
+            collect(empty_shard)
+            gen.assert_not_called()
+
+    def test_fixed_inputs_reuse_identities_but_regenerate_current_policy(self):
+        n = 40
+        identities = torch.arange(n, dtype=torch.float32)
+        batch = {
+            'x': identities[:, None, None].expand(n, 2, 3).clone(),
+            'x_mask': torch.ones(n, 2, 1),
+            'conditions': identities[:, None, None].expand(n, 1, 2).clone(),
+            'conditions_mask': torch.ones(n, 1),
+            'x_invisible': torch.randn(n, 2, 2),
+            'x_invisible_mask': torch.ones(n, 2),
+        }
+        source = _OrderChangingShard(batch)
+        fixed = dgpo_trainer._FixedEventInputShard(source)
+        policy = _Policy(0.)
+        def generate(model, data, _sampler, **kwargs):
+            self.assertFalse(torch.is_grad_enabled())
+            return torch.randn(1, len(data['x']), 2, 2) + model.offset
+        def collect():
+            return dgpo_trainer._materialize_adaptive_omnifold_pool(
+                fixed, {'batch_size': n}, model=policy, sampler=None,
+                device=torch.device('cpu'), world_size=1, rank=0,
+                quota_events=32, num_ddim_steps=20, seed=42,
+            )
+        with mock.patch.object(dgpo_trainer, 'generate_neutrino_candidates', side_effect=generate) as gen:
+            first = collect()
+            # Neither original tensors nor returned batch mutations can alter
+            # the fixed panel. The latest policy, however, must still be used.
+            batch['x'].fill_(-123.)
+            returned = next(fixed.iter_torch_batches(batch_size=n))
+            returned['x'].fill_(999.)
+            policy.offset = 5.
+            second = collect()
+        self.assertEqual(source.calls, 1)
+        self.assertEqual(gen.call_count, 2)
+        torch.testing.assert_close(first.packed_event, second.packed_event, atol=0, rtol=0)
+        torch.testing.assert_close(first.truth, second.truth, atol=0, rtol=0)
+        torch.testing.assert_close(second.candidates - first.candidates, torch.full_like(first.candidates, 5.))
+        with self.assertRaisesRegex(ValueError, 'unchanged generation loader'):
+            list(fixed.iter_torch_batches(batch_size=20))
+
+    def test_fixed_input_cache_retains_tail_for_validation(self):
+        batch = {'x': torch.arange(35).reshape(35,1,1), 'truth': torch.arange(35)}
+        fixed = dgpo_trainer._FixedEventInputShard(_ChunkedShard(batch, 16))
+        for _ in range(2):
+            chunks = list(fixed.iter_torch_batches(batch_size=16))
+            self.assertEqual([len(chunk['x']) for chunk in chunks], [16,16,3])
+            self.assertEqual(torch.cat([chunk['truth'] for chunk in chunks]).tolist(), list(range(35)))
+
     def test_current_and_reference_share_one_iterator_and_ddim_noise(self):
         n_events = 32
         identity = torch.arange(n_events, dtype=torch.float32)

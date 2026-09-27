@@ -1,0 +1,90 @@
+# Pure supervised architecture screen, separate from the DGPO reward-transfer test.
+extends_overlay: train_diffusion_fourier_integration_common.yaml
+
+# All three supervised arms inherit the same 16-GPU geometry.
+platform:
+  number_of_workers: 16
+  resources_per_worker:
+    GPU: 1
+  use_gpu: true
+
+rl:
+  enabled: false
+
+network:
+  TruthGeneration:
+    num_layers: 3
+    identity_init_from_layer: 1
+  VisibleConditioning:
+    diffusion_enabled: true
+    classifier_enabled: false
+    width: 64
+    harmonics: [1, 2, 3, 4]
+    theta_source: Part_eta
+    phi_source: Part_phi
+    feature_mode: kinematics
+    numerical_features: [Part_energy, Part_pt]
+    numerical_frequencies: [0.25, 0.5, 1.0, 2.0]
+    log_diagnostics: true
+    diffusion_token_readout:
+      enabled: false
+      block: last
+      width: 64
+      heads: 4
+
+options:
+  Training:
+    # Same policy point as the DGPO A/B; supervised weights-only, never resume.
+    pretrain_model_load_path: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+    model_checkpoint_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_token_film_global/checkpoints
+    strict_no_fourier_source: false
+    strict_conditioning_ablation_source: true
+    Components:
+      TruthGeneration.visible_conditioning:
+        optimizer_group: visible_conditioning
+        optimizer_type: adamW
+        learning_rate: 0.0001
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        warm_up: true
+
+logger:
+  local:
+    name: diffusion-token-film-global
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_token_film_global/logs
+  wandb:
+    id: difftokglobal1
+    run_name: "Which conditioning predicts velocity better? | global FiLM | matched 50 epochs"
+    group: Diffusion conditioning architecture
+    tags: [DiffusionOnly, NoRL, GlobalFiLM, RawWeights, Data10pct, GPU16, PairedNoise]
+
+nersc:
+  nodes: 4
+  gpus_per_node: 4
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_token_film_global/ray_results
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_token_film_global.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_token_film_global/ray_results
+
+experiment:
+  question: Does token-specific conditioning improve supervised velocity prediction as well as reward transfer?
+  source_wandb_run: null
+  source_stage: completed_raw_step1110_step0_classifier_bootstrap_policy_weights_only
+  checkpoint_protocol: identical_raw_policy_weights_fresh_optimizer_scheduler
+  intervention: existing_three_block_global_film
+  primary_endpoint: mean_val_loss_last_5_epochs_at_fixed_50_epoch_budget
+  interpretation: >-
+    Three matched arms retain the same PET angular Fourier, three generation
+    blocks, data order, noise draws, FP32, 16 GPUs and 2048 events/GPU. Compare
+    PET-only (no generation FiLM), global FiLM, and global plus last-block token
+    FiLM. The saved step-0 global modulation outputs must be zero before removing
+    them from PET-only. Body LR2e-5, head/projector/visible-FiLM LR1e-4, PET Fourier
+    LR2e-5; five-epoch warmup and cosine over50 epochs. No early termination
+    within the fixed screen. No classifier, reward, velocity-reference penalty,
+    low-noise reweighting or joint-coverage callback. Lower velocity MSE alone
+    does not establish improved joint physics or easier DGPO reward transfer.

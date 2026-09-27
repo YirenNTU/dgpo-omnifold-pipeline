@@ -8,10 +8,16 @@ def loss(
         target: Tensor,
         mask: Optional[Tensor] = None,
         feature_dim: Optional[int] = None,
-        event_weight: Optional[Tensor] = None
+        event_weight: Optional[Tensor] = None,
+        sample_weight: Optional[Tensor] = None
 ):
+    weight = None
     if event_weight is not None:
         weight = event_weight.view(-1, *([1] * (predict.ndim - 1))).float()
+    if sample_weight is not None:
+        sample_weight = sample_weight.view(-1, *([1] * (predict.ndim - 1))).float()
+        weight = sample_weight if weight is None else weight * sample_weight
+    if weight is not None:
         if mask is not None:
             den = torch.sum(mask.float() * weight) * feature_dim
             if den == 0:

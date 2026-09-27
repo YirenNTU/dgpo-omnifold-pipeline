@@ -1,0 +1,5 @@
+# Paths relative to the repository root; use with rsync --exclude-from.
+/experiments/dgpo_toy/
+/artifacts/dgpo_toy/
+/artifacts/c4a91e07_review/
+/artifacts/classifier_signal_comparison/

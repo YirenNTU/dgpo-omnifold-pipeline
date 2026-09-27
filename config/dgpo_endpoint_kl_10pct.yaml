@@ -1,0 +1,118 @@
+# Online endpoint KL, using the raw step-1110 lineage and frozen H4 reward.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_lastblock_no_ref_100step.yaml
+
+dgpo:
+  validation_every_n_epochs: 10
+  validation_full_every_n_epochs: 10
+  gradient_conflict:
+    every_n_steps: 100  # 10 policy updates/epoch; align with fresh audit.
+  adaptive_omnifold:
+    staleness_every_n_epochs: 10
+    staleness_every_n_steps: null
+    # Latest trained H4 baseline: h4ratio1 (standardized-long + BCE delta 1e-3).
+    # Architecture stays last-PET-block + adapters + H4 late fusion.
+    audit_fit: &latest_classifier_fit
+      fourier_output_standardization: true
+      learning_rate: 0.0002
+      backbone_learning_rate: 0.00001
+      adapter_learning_rate: 0.00005
+      decoder_learning_rate: 0.00005
+      decoder_learning_rate_scope: all
+      lr_scheduler: constant
+      weight_decay: 0.001
+      gradient_clip_norm: 5.0
+      steps: 3000
+      min_steps: 300
+      validation_interval_steps: null
+      validation_interval_epochs: 1.0
+      validation_patience_epochs: 10.0
+      validation_min_delta: 0.001
+      checkpoint_selection_metric: loss
+      restore_best: true
+      require_saturation: false
+      log_parameter_updates: true
+      diagnostic_enabled: true
+      diagnostic_interval_steps: 10
+      diagnostic_probe_rows: 16
+      diagnostic_max_snapshots: 2
+      diagnostic_gradient_threshold: 1000.0
+      diagnostic_spike_factor: 20.0
+      diagnostic_probe_bce_jump: 0.02
+      representation_diagnostic_enabled: true
+      representation_probe_rows: 128
+      representation_probe_interval_steps: 100
+      representation_path_enabled: true
+    recalibration:
+      fit:
+        <<: *latest_classifier_fit
+        min_steps_per_fold: 300
+        # Absolute cap: legacy cross-fit scaling would halve steps to 1500.
+        max_steps_per_fold: 3000
+  endpoint_kl:
+    enabled: true
+    coefficient: 1.0
+    bootstrap_steps: 200
+    fit_steps: 20
+    fit_events_per_rank: 128
+    validation_events_per_rank: 32
+    actor_events_per_rank: 16
+    microbatch_size: 8
+    validation_interval: 10
+    learning_rate: 0.00002
+    backbone_learning_rate: 0.000002
+    weight_decay: 0.001
+    grad_clip_norm: 5.0
+    seed: 20260921
+  reference_trust:
+    enabled: false
+    coefficient: 0.0
+    adaptive_boundary:
+      enabled: false
+  gradient_transfer_trace:
+    enabled: false
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_endpoint_kl/checkpoints
+    EMA:
+      use_for_generation: false
+      replace_model_after_load: false
+      use_ema_during_training_eval: false
+
+platform:
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+
+logger:
+  local:
+    name: h4_endpoint_kl
+    version: h4_endpoint_kl_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_endpoint_kl/logs
+  wandb:
+    id: h4epkl1
+    run_name: 'Does endpoint KL improve reward transfer? | frozen H4 | raw step 1110'
+    group: H4 endpoint KL
+    tags: [DGPO, H4, EndpointKL, RawWeights, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_endpoint_kl/ray_results
+  execution:
+    command: shifter python3 scripts/train_dgpo_endpoint_kl.py --endpoint-kl on
+
+experiment:
+  protocol: h4-endpoint-kl-v1
+  intervention: online_conditional_endpoint_reverse_kl
+  single_question: Does an online endpoint KL penalty improve transfer of a fixed H4 reward?
+  primary_endpoint: frozen_classifier/ensemble/auc_gap
+  classifier_setup_reference: h4ratio1
+  cold_h4_audit_min_optimizer_updates: 300
+  cold_h4_audit_policy_steps: [100]
+  primary_decision_rule: >-
+    Compare frozen-classifier measurements at policy steps 0 and 100;
+    keep the fresh cold audit at 100 separate. Audit and policy validation
+    run every ten DGPO epochs (ten policy updates per epoch). Both OmniFold folds and
+    audits use the standardized h4ratio1 classifier setup, constant grouped
+    learning rates, minimum 300 and maximum 3000 updates per fit, ten-epoch
+    BCE patience and min_delta 0.001. Restore the strict best validation BCE.
+    Reaching the cap is budget exhaustion, not evidence of saturation or closure.
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_endpoint_kl/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt

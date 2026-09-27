@@ -1,0 +1,109 @@
+# Fresh DGPO from the previous high-LR diffusion run, NOT diffang10oldopt1.
+extends_overlay: dgpo_h4_angular_conditioning_1110.yaml
+
+options:
+  Training:
+    pretrain_model_load_path: null
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_lr5e4/checkpoints/last.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_visible_fourier_diffang/checkpoints
+    EMA:
+      enable: false
+      replace_model_at_end: false
+
+dgpo:
+  checkpoint_load_mode: weights_only
+  auto_resume_from_last: false
+  # Fixed-schedule refits skip the audits required by this extra monitor.
+  gradient_conflict:
+    enabled: false
+  adaptive_omnifold:
+    log_only: false
+    monitor_mode: raw_plateau_refit
+    # Remove research-only classifier probes, retain ordinary validation/early stop.
+    audit_fit:
+      steps: null
+      min_steps: 0
+      enforce_min_epochs: false
+      validation_patience_epochs: 25
+      restore_best: true
+      checkpoint_selection_metric: loss
+      diagnostic_enabled: false
+      representation_diagnostic_enabled: false
+      representation_path_enabled: false
+      representation_export_dir: null
+      log_parameter_updates: false
+    trigger:
+      max_reward_age_epochs: 20
+      fixed_schedule_skip_staleness_audit: true
+      fixed_schedule_log_raw_audit: true
+    recalibration:
+      bootstrap_on_start: true
+      refit_once_on_resume: false
+      min_iterations: 2
+      max_iterations: 2
+      iteration_one_only: false
+      fixed_iteration_budget: true
+      ess_aware_checkpoint_selection: false
+      max_reward_rounds: null
+      scheduled_refit_fail_closed: true
+      fit:
+        steps: null
+        max_steps_per_fold: null
+        min_steps: 0
+        min_steps_per_fold: 0
+        warm_start_min_epochs_per_fold: null
+        enforce_min_epochs: false
+        validation_patience_epochs: 25
+        restore_best: true
+        checkpoint_selection_metric: loss
+        diagnostic_enabled: false
+        representation_diagnostic_enabled: false
+        representation_path_enabled: false
+        representation_export_dir: null
+        log_parameter_updates: false
+
+logger:
+  local:
+    name: h4-visible-fourier-diffang
+    version: v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_visible_fourier_diffang/logs
+  wandb:
+    id: h4visang1
+    # Scalar curves for every fold; no cumulative plot/table reconstruction.
+    classifier_loss_curves: false
+    classifier_loss_curves_raw: true
+    resume: never
+    fresh_run: true
+    run_name: "Trained angular diffusion to DGPO | visible-token plus H4 Fourier | velocity MSE"
+    group: H4 angular conditioning
+    tags: [DGPO, VisibleAngularFourier, ThetaPhiH4, K4, RawWeights, VelocityMSE, SixteenGPU]
+
+experiment:
+  protocol: h4-visible-fourier-trained-diffusion-v1
+  source_run: diffang10lr5e4
+  intervention: trained_visible_token_fourier_backbone_plus_existing_tau_pair_fourier
+  single_question: Can DGPO improve the trained angular diffusion using visible-token and tau-pair Fourier signals?
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_visible_fourier_diffang/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_visible_fourier_diffang/ray_results
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_lr5e4/checkpoints/last.ckpt
+    note: >-
+      Raw last checkpoint from diffang10lr5e4; fresh policy optimizer and fresh
+      two-iteration, two-fold one-repeat classifier bootstrap and refits every
+      20 policy epochs. Keep the learned PET angular
+      projection for all valid visible tokens, k=1..4 theta/phi, in policy and
+      classifier backbones. Retain existing H4 tau-pair late-fusion Fourier.
+      Classifier trains last PET block plus adapters/head as before; the
+      pretrained visible angular projection remains frozen during classifier fit.
+      Cold audits use the same representation and fit settings. Velocity-MSE
+      reference coefficient 1, endpoint KL off, cold audit every five epochs,
+      physics validation every ten epochs, no total policy-step limit.
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_h4_visible_fourier_diffang.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_visible_fourier_diffang/ray_results

@@ -1,0 +1,29 @@
+# Paired fixed-policy screen. Generates one pool, then fits 2-fold and 5-fold OOF.
+# Five-fold uses five held-out trainings; it is not five full-data fits.
+# No policy updates, reward installation, or intervention-control refits.
+base_config: config/train_diffusion_nersc.yaml
+overlay_config: config/dgpo_omnifold_ztautau_10pct_visible_rest_forward_refit_fullfit.yaml
+expected_policy_step: 320
+expected_policy_sha256: null
+output_dir: /pscratch/sd/y/yiren/Ztautau/oof_ensemble_diagnostic_step320_r1f2_r1f5_v1
+workers: 16
+wandb:
+  enabled: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: oof_ensemble_diagnostic_10pct_step320_r1f2_r1f5
+  log_every_n_steps: 10
+pool_events: null
+generation_batch_size: 1024
+score_batch_size: 2048
+generation_seed: 20260906
+training_seeds: [20260906, 20260907]
+crossfit_repeat_arms: [1]
+crossfit_fold_arms: [2, 5]
+diagnostic_iterations: 3
+run_controls: false
+physics_bins: 40
+# Retained for the shared diagnostic schema; unused when run_controls=false.
+control_steps: 400
+control_evaluate_every: 40
+cap_quantile: 0.995

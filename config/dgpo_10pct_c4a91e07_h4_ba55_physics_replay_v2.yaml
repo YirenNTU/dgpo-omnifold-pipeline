@@ -1,0 +1,80 @@
+# Corrected physics-first rerun. Launch through diagnose_ba55_physics_replay.py
+# so a stale actionability-only implementation fails before allocating GPUs.
+source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_weak_classifier_trajectory_v1
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_physics_replay_v2
+expected_source_schema: c4a91e07-h4-weak-classifier-trajectory-v1
+expected_policy_step: 1110
+
+reward_stage: ba_lcb_55
+selected_members:
+  - {seed: 20260913, fold: 1}
+  - {seed: 20260913, fold: 2}
+
+workers: 16
+cpus_per_worker: 2
+probe_events: 2048
+K: 8
+gradient_events: 1024
+gradient_blocks: 8
+gradient_timesteps: 4
+gradient_seed: 20261313
+beta: 1.0
+policy_eval_t_min: 0.0
+policy_eval_t_max: 0.7
+raw_tempering: 0.75
+score_batch_size: 32768
+
+step_rms_values: [0.00003]
+rollout_seeds:
+  - 20261701
+  - 20261702
+  - 20261703
+  - 20261704
+  - 20261705
+  - 20261706
+  - 20261707
+  - 20261708
+minimum_plus_beats_zero_fraction: 0.75
+minimum_plus_beats_minus_fraction: 0.75
+bootstrap_seed: 20261801
+bootstrap_replicates: 10000
+
+physics_endpoint:
+  enabled: true
+  target_components:
+    - tau_a_delta_theta
+    - tau_a_delta_phi
+    - tau_b_delta_theta
+    - tau_b_delta_phi
+  physics_bins: 60
+  response_bins: 12
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h4b55phys2
+  resume: never
+  name: Does BA55 H4 improve target physics? | RMS 3e-5 | corrected replay
+  group: Physics-first H4 actionability
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - SourceC4a91e07Last
+    - SourceAqbszk1r
+    - SourceH4b55lr1Evidence
+    - H4
+    - BA55
+    - TwoFoldOneRepeat
+    - TwoMemberOOF
+    - ArtifactReplay
+    - CorrectedPhysicsEndpoint
+    - PhysicsFirstEndpoint
+    - TargetJSDMean
+    - NormalizedRMS3e5
+    - EightSeedCRN
+    - NoClassifierFit
+    - NoPolicyUpdate
+    - NoHardTrust

@@ -5,3 +5,21 @@ __pycache__/
 wandb/
 ray_results/
 *.ckpt
+
+# Generated experiment outputs stay local.
+/artifacts/
+checkpoints/
+*.pt
+*.pth
+*.pth.tar
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npz
+*.npy
+*.parquet
+*.root
+*.log

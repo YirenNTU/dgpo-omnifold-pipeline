@@ -1,0 +1,27 @@
+extends_overlay: train_diffusion_token_film_global.yaml
+network:
+  VisibleConditioning:
+    diffusion_token_readout:
+      enabled: true
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_token_film_last/checkpoints
+logger:
+  local:
+    name: diffusion-token-film-last
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_token_film_last/logs
+  wandb:
+    id: difftoklast1
+    run_name: "Which conditioning predicts velocity better? | last-block token FiLM | matched 50 epochs"
+    tags: [DiffusionOnly, NoRL, TokenFiLM, RawWeights, Data10pct, GPU16, PairedNoise]
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_token_film_last/ray_results
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_token_film_last.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_token_film_last/ray_results
+experiment:
+  intervention: global_film_plus_last_block_token_readout

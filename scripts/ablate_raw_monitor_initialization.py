@@ -353,7 +353,12 @@ def compact_summary(results, cfg):
     }
 
 
-def ablation_worker(cfg):
+def ablation_worker(cfg, *, run_arm_fn=None, summary_fn=None, arm_names=None):
+    # Optional standalone diagnostic extension; default 200-step A/B/C behavior
+    # is unchanged. No hooks are used by production DGPO.
+    run_arm_fn = run_arm if run_arm_fn is None else run_arm_fn
+    summary_fn = compact_summary if summary_fn is None else summary_fn
+    arm_names = ARMS if arm_names is None else arm_names
     import ray.train
     import ray.train.torch
     from RL.DGPO_neutrino.model_utils import load_training_config, load_normalization_dict
@@ -418,11 +423,11 @@ def ablation_worker(cfg):
               f"train={len(train)} validation={len(val)}; no policy generation/updates", flush=True)
     del model
     results = {}
-    for arm in ARMS:
+    for arm in arm_names:
         with seeded(cfg["seed"], device):
             model = builder.make_classifier(spec, reset=True)
         replay.strict_monitor_load(model, arm_initial_state(arm, cold, old))
-        results[arm] = run_arm(model, arm, data, cfg, rank=rank)
+        results[arm] = run_arm_fn(model, arm, data, cfg, rank=rank)
         del model
         gc.collect()
         if device.type == "cuda":
@@ -432,15 +437,15 @@ def ablation_worker(cfg):
     if rank == 0:
         verify_sources(cfg)
         report = {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
-                  "policy_updates": 0, "policy_generations": 0, "classifier_fits": 3,
+                  "policy_updates": 0, "policy_generations": 0, "classifier_fits": len(arm_names),
                   "protected_sources_unchanged": True, "training_events": len(train), "validation_events": len(val),
                   "positive_control": control, "arms": results,
-                  "limitations": [f"Single seed and a fixed {cfg['steps']}-update quick screen are not proof of convergence.",
+                  "limitations": cfg.get("limitations", [f"Single seed and a fixed {cfg['steps']}-update quick screen are not proof of convergence.",
                                   "Validation identities were used historically for model selection, not an untouched test.",
                                   "B resets decoder, slot-position encoder and readout; failure does not isolate which of those matters.",
-                                  "Module gradients are measured after distributed averaging and clipping; updates also include AdamW decay."]}
+                                  "Module gradients are measured after distributed averaging and clipping; updates also include AdamW decay."])}
         replay._exclusive_json(Path(cfg["output_dir"]) / "report.json", report)
-        replay._exclusive_json(Path(cfg["output_dir"]) / "summary.json", compact_summary(results, cfg))
+        replay._exclusive_json(Path(cfg["output_dir"]) / "summary.json", summary_fn(results, cfg))
         print(f"[monitor-ablation] report: {cfg['output_dir']}/report.json", flush=True)
         print(f"[monitor-ablation] compact results: {cfg['output_dir']}/summary.json", flush=True)
     ray.train.report({f"{arm}/final_auc": result["final"]["auc"] for arm, result in results.items()})

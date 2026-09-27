@@ -1,0 +1,14 @@
+extends_overlay: train_diffusion_fourier_integration_common.yaml
+experiment:
+  intervention: input_linear
+logger:
+  wandb:
+    run_name: "Fourier baseline rate | pretrained diffusion | branch LR 2e-5"
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        enabled: true
+        placement: input
+        projection_type: linear
+        log_diagnostics: true

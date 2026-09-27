@@ -1,0 +1,65 @@
+# Continue learned Fourier/raw weights, restart the historical optimization recipe.
+# Do not pass --resume_checkpoint: that restores the previous optimizer/schedule.
+extends_overlay: train_diffusion_angular_10pct_lr5e4.yaml
+
+experiment:
+  question: Does the historical diffusion optimization recipe improve the trained Fourier model?
+  intervention: historical_effective_lr8e4_warmup1_cosine1000_patience25
+  source_stage: angular_diffusion_lr5e4_last_checkpoint
+  parent_wandb_run: diffang10lr5e4
+  comparison_wandb_run: bvp5rn76
+  interpretation: Sequential fine-tuning; retains Fourier, raw/no-EMA and cleaned validation. Not a matched architecture ablation.
+
+logger:
+  wandb:
+    id: diffang10oldopt1
+    run_name: "Historical optimizer setup | Fourier diffusion 10% | 8e-4 cosine | last high-LR weights"
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_legacy_setup/logs
+    name: diffusion-angular-legacy-setup
+
+options:
+  Training:
+    pretrain_model_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_lr5e4/checkpoints/last.ckpt
+    model_checkpoint_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_legacy_setup/checkpoints
+    epochs: 1000
+    total_epochs: 1000
+    learning_rate_warm_up_factor: 1.0
+    # Historical nominal 2e-4 * sqrt(16) = effective 8e-4.
+    # Explicit effective rates avoid the historical shared-body LR ambiguity.
+    scale_lr_with_world_size: false
+    learning_rate_factor: 1.0
+    learning_rate: 0.0008
+    learning_rate_body: 0.0008
+    learning_rate_median: 0.0008
+    diffusion_every_n_epochs: 20
+    diffusion_every_n_steps: 1
+    eval_metrics_every_n_epochs: 1
+    EarlyStopping:
+      patience: 25
+      min_delta: 0.0
+    Components:
+      PET:
+        learning_rate: 0.0008
+      GlobalEmbedding:
+        learning_rate: 0.0008
+      ObjectEncoder:
+        learning_rate: 0.0008
+      GroupedSequentialEmbedding:
+        learning_rate: 0.0008
+      InvisibleInputProjector:
+        learning_rate: 0.0008
+      TruthGeneration:
+        learning_rate: 0.0008
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_legacy_setup/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py
+      --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_angular_10pct_legacy_setup.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_angular_10pct_legacy_setup/ray_results

@@ -1,0 +1,77 @@
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_lastblock_no_ref_100step.yaml
+
+experiment:
+  protocol: h4-step50-classifier-lr-stability-v1
+  classifier_only: true
+  classifier_design_arm: adapter_decoder_lr_stability
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4lbnr01
+  source_policy_step: 50
+  rounds: 0
+  policy_updates_per_round: 0
+  reward_fit_count: 0
+  reward_lifetime_updates: 0
+  classifier_fit_count: 1
+  retain_installed_classifier: false
+  retained_classifier_checkpoint: null
+  cold_h4_audit_policy_steps: [0]
+  gradient_direction_policy_steps: []
+  primary_endpoint: staleness/raw_auc
+  baseline_measurement: h4lbnr01_step50_cold_audit
+  intervention: adapter_and_decoder_lr_5e-5
+  single_question: Does reducing only adapter and decoder LR prevent classifier instability on the fixed step-50 policy?
+  primary_decision_rule: >-
+    Compare the complete fit trajectory with h4lbnr01's step-50 audit.
+    Inspect validation BCE/AUC, gradient spikes, logit separation, clipping,
+    and per-module AdamW update RMS. AUC near chance after loss of learned
+    separation is a failed classifier, not distribution closure.
+    Preserve minimum 1000 updates and ten-epoch BCE patience with no maximum.
+  stop_rule: Stop after one cold audit; no reward fit or policy update.
+
+nersc:
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_no_ref_100step/checkpoints/dgpo-epoch=4-next_ep=5-step=50.ckpt
+    source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4lbnr01
+    source_dgpo_global_step: 50
+    note: >-
+      Regenerate the fixed K=1 validation pool with the original probe seed,
+      loader geometry and 16 ranks; use the same identity split and cold seed.
+      Exact sample equality requires the same Shifter/runtime and data shards.
+      Only adapters and the complete classifier decoder change LR to 5e-5.
+      Fourier/output head stays 2e-4; last PET block stays 1e-5.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_lr_stability/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_classifier_lr_stability.py
+
+logger:
+  local:
+    name: h4_classifier_lr_stability
+    version: h4_classifier_lr_stability_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_lr_stability/logs
+  wandb:
+    id: h4clflr1
+    run_name: Stabilize classifier updates | H4 adapter-decoder LR 5e-5 | step-50 replay
+    group: H4 classifier stability
+    classifier_loss_curves: true
+    classifier_loss_curves_raw: true
+    tags: [ClassifierOnly, NoPolicyUpdate, H4, LastPETBlock, Fourier, SixteenGPU, LRStability]
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_no_ref_100step/checkpoints/dgpo-epoch=4-next_ep=5-step=50.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_lr_stability/checkpoints
+
+dgpo:
+  ztautau_metrics:
+    enabled: false
+  gradient_conflict:
+    enabled: false
+  adaptive_omnifold:
+    baseline_probe_on_start: false
+    audit_fit:
+      adapter_learning_rate: 0.00005
+      decoder_learning_rate: 0.00005
+      decoder_learning_rate_scope: all
+      log_parameter_updates: true
+    recalibration:
+      bootstrap_on_start: false

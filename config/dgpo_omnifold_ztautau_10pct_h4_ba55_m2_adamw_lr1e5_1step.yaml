@@ -1,0 +1,61 @@
+# Matched native-AdamW learning-rate arm. The only training change from
+# ba55nat1 is a tenfold policy LR, from 1e-6 to 1e-5.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_ba55_m2_adamw_native_1step.yaml
+
+experiment:
+  protocol: h4-ba55-m2-adamw-lr-one-step-v1
+  arm: native_adamw_lr1e5
+  paired_run_id: ba55nat1
+  single_experimental_change: native_adamw_learning_rate
+  experiment_question: >-
+    Does increasing the complete native AdamW learning rate from 1e-6 to
+    1e-5 produce a larger policy displacement and improve the one-update
+    cold-H4 endpoint under the same BA55 reward?
+  native_adamw_lr_override: 1.0e-5
+  target_parameter_update_rms: null
+
+nersc:
+  reproducibility:
+    note: >-
+      Learning-rate arm paired to ba55nat1. The only training-affecting change
+      is a tenfold native AdamW policy LR. Source policy, BA55 reward fit,
+      candidates, raw LOO objective, tempering, K, soft reference, optimizer
+      initialization, and cold saturated H4 endpoint are unchanged.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_lr1e5_1step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_ba55_rms_calibration.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_ba55_m2_adamw_lr1e5_1step.yaml
+
+logger:
+  local:
+    name: h4_ba55_m2_adamw_lr1e5_1step
+    version: h4_ba55_m2_adamw_lr1e5_1step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_lr1e5_1step_v1/logs
+  wandb:
+    id: ba55lr10
+    run_name: AdamW LR 1e-5 one-step | BA55 two-fold H4 | cold H4 audit
+    group: H4 policy projection
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - BA55
+      - TwoFoldOneRepeat
+      - NativeAdamW
+      - PolicyLr1e5
+      - OnePolicyUpdate
+      - ColdSaturatedH4Endpoint
+      - TargetPreserving
+      - NoHardTrust
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_adamw_lr1e5_1step_v1/checkpoints
+
+dgpo:
+  parameter_update_rms_calibration:
+    enabled: false

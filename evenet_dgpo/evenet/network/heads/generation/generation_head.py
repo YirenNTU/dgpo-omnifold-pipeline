@@ -11,6 +11,7 @@ from evenet.network.layers.linear_block import ResNetDense
 from evenet.network.layers.utils import StochasticDepth
 from evenet.network.layers.transformer import GeneratorTransformerBlockModule
 from evenet.network.layers.activation import create_residual_connection
+from evenet.network.body.visible_conditioning import VisibleConditioning
 
 
 class EventGenerationHead(nn.Module):
@@ -29,7 +30,9 @@ class EventGenerationHead(nn.Module):
             drop_probability: float,
             feature_drop: float,
             position_encode: bool = False,
-            max_position_length: int = 20
+            max_position_length: int = 20,
+            visible_conditioning: Optional[dict] = None,
+            identity_init_from_layer: Optional[int] = None,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -79,6 +82,14 @@ class EventGenerationHead(nn.Module):
             for _ in range(num_layers)
         ])
         self.generator = nn.Linear(projection_dim, output_dim)
+        self.visible_conditioning = VisibleConditioning(**visible_conditioning) if visible_conditioning else None
+        if identity_init_from_layer is not None:
+            if (isinstance(identity_init_from_layer, bool)
+                    or not isinstance(identity_init_from_layer, int)
+                    or not 0 <= identity_init_from_layer < num_layers):
+                raise ValueError("identity_init_from_layer must be a zero-based block index below num_layers")
+            for block in self.gen_transformer_blocks[identity_init_from_layer:]:
+                block.initialize_as_identity()
 
     def forward(self,
                 x,
@@ -90,7 +101,11 @@ class EventGenerationHead(nn.Module):
                 label,
                 attn_mask=None,
                 time_masking=None,
-                position_encode=False):
+                position_encode=False,
+                visible_raw=None,
+                visible_tokens=None,
+                visible_mask=None,
+                visible_normalized=None):
         """
         x: [B, T, D] <- Noised Input
         global_cond: [B, 1, D] <- Global Condition
@@ -126,16 +141,45 @@ class EventGenerationHead(nn.Module):
             # TODO: Check if this works
 
         if label is not None:
-            label = F.one_hot(label, num_classes=self.num_classes).float()  # [B, 1, C]
+            label = F.one_hot(label, num_classes=self.num_classes).to(
+                dtype=self.label_dense.weight.dtype)  # [B, 1, C]
             label_emb = self.label_dense(label)  # [B, 1, D]
             cond_token = cond_token + label_emb
 
         else:
             print("ERROR: In Generation Head, Label is None, skipping label embedding")
 
-        for transformer_block in self.gen_transformer_blocks:
+        modulations = None
+        token_memory = None
+        if self.visible_conditioning is not None:
+            if any(value is None for value in (visible_raw, visible_tokens, visible_mask, time_masking)):
+                raise ValueError("TruthGeneration visible conditioning requires observed context and invisible mask")
+            extra = (dict(normalized_raw=visible_normalized)
+                     if self.visible_conditioning.feature_mode == "kinematics" else {})
+            if self.visible_conditioning.token_readout is not None:
+                modulations, token_memory, token_mask = self.visible_conditioning(
+                    visible_raw, visible_tokens, visible_mask, return_tokens=True, **extra)
+            else:
+                modulations = self.visible_conditioning(visible_raw, visible_tokens, visible_mask, **extra)
+        for index, transformer_block in enumerate(self.gen_transformer_blocks):
             concatenated = cond_token + x
-            out_x, cond_token = transformer_block(concatenated, cond_token, x_mask, attn_mask=attn_mask)
+            modulation = modulations[index] if modulations is not None else None
+            if token_memory is not None and index == len(self.gen_transformer_blocks) - 1:
+                # Visible-first layout is the existing EveNet generation contract.
+                # Queries contain noisy state, time and slot information, never clean truth.
+                n_visible = token_memory.shape[1]
+                residual = self.visible_conditioning.token_readout(
+                    concatenated[:, n_visible:], token_memory,
+                    (time_masking.bool() & x_mask.bool())[:, n_visible:], token_mask)
+                modulation = tuple(global_part[:, None, :] + F.pad(local, (0, 0, n_visible, 0))
+                                   for global_part, local in zip(modulation, residual))
+                if self.visible_conditioning.log_diagnostics:
+                    self.visible_conditioning.diagnostics.update(self.visible_conditioning.token_readout.diagnostics)
+            out_x, cond_token = transformer_block(
+                concatenated, cond_token, x_mask, attn_mask=attn_mask,
+                modulation=modulation,
+                modulation_mask=(time_masking.bool() & x_mask.bool()) if modulations is not None else None,
+            )
         x = cond_token + x
         x = F.layer_norm(x, [x.size(-1)])
         x = self.generator(x)
@@ -253,7 +297,8 @@ class GlobalCondGenerationHead(nn.Module):
         cond_token = self.cond_token_embedding(global_token)  # [B, 1, 2D]
 
         if label is not None:
-            label = F.one_hot(label, num_classes=self.num_classes).float()  # [B, 1, C]
+            label = F.one_hot(label, num_classes=self.num_classes).to(
+                dtype=self.label_embedding[0].weight.dtype)  # [B, 1, C]
             cond_label = self.label_embedding(label)  # [B, 1, 2D]
             cond_token = cond_token + cond_label
 

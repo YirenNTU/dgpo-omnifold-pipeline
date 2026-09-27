@@ -1,0 +1,13 @@
+# Resume this DGPO run, never fall back to supervised diffusion weights.
+extends_overlay: dgpo_h4_visible_fourier_diffang.yaml
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/h4_visible_fourier_diffang/checkpoints/last.ckpt
+
+dgpo:
+  checkpoint_load_mode: resume
+  auto_resume_from_last: true
+  # Same path intentionally: missing last.ckpt must fail rather than start fresh.
+  auto_resume_fallback_checkpoint_path: /pscratch/sd/y/yiren/Ztautau/h4_visible_fourier_diffang/checkpoints/last.ckpt
+  auto_resume_best_source_checkpoint_dir: null

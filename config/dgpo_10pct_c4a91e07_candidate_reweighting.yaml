@@ -1,0 +1,59 @@
+# Fixed-candidate counterfactual. Reuses the completed v5 K=8 panel and fits
+# nothing. The c4a91e07 policy and candidates never change in this run.
+source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_reward_interface_v5
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_candidate_reweighting_v1
+expected_source_schema: c4a91e07-h4-reward-interface-v2
+expected_policy_step: 1110
+
+workers: 16
+cpus_per_worker: 2
+K: 8
+score_batch_size: 32768
+
+# For raw H4 logits alpha=0.75 is the predeclared production-matched endpoint.
+# For the already-tempered installed legacy stack, scale=1.0 is its matched
+# endpoint. The other values test consistency as each score is strengthened.
+tilt_exponents: [0.25, 0.5, 0.75, 1.0]
+physics_bins: 60
+response_bins: 12
+response_bootstrap_replicates: 1000
+response_bootstrap_seed: 20261713
+
+# Fail-closed primary scientific comparison. Controls below may not change
+# which arm determines the reported finding.
+primary:
+  source: h4_ensemble
+  exponent: 0.75
+  require_independent_judge_improvement: true
+  require_target_jsd_mean_improvement: true
+  minimum_target_components_improved: 3
+
+# Load the non-Fourier reward stack already installed in c4a91e07/last.ckpt and
+# score it on the exact same event/candidate panel. No legacy classifier is fit.
+legacy_control:
+  enabled: true
+  base_config: config/train_diffusion_nersc.yaml
+  overlay_config: config/dgpo_omnifold_ztautau_10pct_old_method_hard_ablation.yaml
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h4cfw001
+  resume: allow
+  name: c4a91e07_h4_vs_legacy_fixed_candidate_counterfactual_v1
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - FixedPolicy
+    - FixedCandidates
+    - CounterfactualReweighting
+    - H4Ensemble
+    - LegacyHistoricalControl
+    - ProductionAlpha075
+    - IndependentJudge
+    - NoClassifierFit
+    - NoPolicyUpdate
+    - NoHardTrust

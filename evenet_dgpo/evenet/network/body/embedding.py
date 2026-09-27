@@ -265,7 +265,8 @@ class PETBody(nn.Module):
             self, num_feat, num_keep, feature_drop, projection_dim, local, K, num_local,
             num_layers, num_heads, drop_probability, talking_head, layer_scale,
             layer_scale_init, dropout, mode, use_adapter: bool = False,
-            adapter_bottleneck: int = 16
+            adapter_bottleneck: int = 16,
+            angular_conditioning=None,
     ):
         super().__init__()
         self.num_keep = num_keep
@@ -282,6 +283,7 @@ class PETBody(nn.Module):
         # DGPO may enable block-wise non-reentrant checkpointing at runtime.
         # It remains off for ordinary EveNet training and inference.
         self.gradient_checkpointing = False
+        self.angular_conditioning = angular_conditioning
 
         self.random_drop = RandomDrop(feature_drop if 'all' in self.mode else 0.0, num_keep)
         self.feature_embedding = nn.Sequential(
@@ -320,7 +322,8 @@ class PETBody(nn.Module):
                 time: Tensor,
                 attn_mask: Optional[Tensor]=None,
                 time_masking: Optional[Tensor]=None,
-                adapters: Optional[nn.ModuleList]=None) -> Tensor:
+                adapters: Optional[nn.ModuleList]=None,
+                visible_raw: Optional[Tensor]=None) -> Tensor:
         """
 
         :param input_features: input features (batch_size, num_objects, num_features)
@@ -332,6 +335,11 @@ class PETBody(nn.Module):
         """
         encoded = self.random_drop(input_features)
         encoded = self.feature_embedding(encoded)
+        if (self.angular_conditioning is not None and visible_raw is not None
+                and self.angular_conditioning.placement == "input"):
+            n_visible = visible_raw.shape[1]
+            # Invisible slots never receive their clean angles as conditioning.
+            encoded = self.angular_conditioning.inject(encoded, visible_raw, mask[:, :n_visible])
 
         time = time.unsqueeze(1).unsqueeze(1).repeat(1, encoded.shape[1], 1)
         if time_masking is not None:
@@ -394,7 +402,12 @@ class PETBody(nn.Module):
                 encoded = encoded * mask.float()
 
 
-        return torch.add(encoded, skip_connection)
+        encoded = torch.add(encoded, skip_connection)
+        if (self.angular_conditioning is not None and visible_raw is not None
+                and self.angular_conditioning.placement == "output"):
+            encoded = self.angular_conditioning.inject(
+                encoded, visible_raw, mask[:, :visible_raw.shape[1]], target_mask=mask, time=time)
+        return encoded
 
 
 class PositionEmbedding(nn.Module):

@@ -1,0 +1,118 @@
+# Closed-loop test of the minimum-sufficient H4 reward hypothesis.
+#
+# Reward classifiers stop at BA=0.70 after the established 1000-step signal
+# floor. Independent saturated judges measure the policy at steps
+# 0,10,20,30,40,50 and never control training.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_ba70_m4_ess15_10step.yaml
+
+experiment:
+  protocol: h4-ba70-m4-ess15-refit10-keepadam-50step-audit1-v1
+  historical_controls:
+    - ytchou97-university-of-washington/nu2flow-RL/aqbszk1r
+    - ytchou97-university-of-washington/nu2flow-RL/h4e15r01
+    - ytchou97-university-of-washington/nu2flow-RL/h4e10m4fs
+  single_experimental_change: closed_loop_minimum_sufficient_reward
+  experiment_question: >-
+    When every fresh four-member H4 reward is limited to the stable BA=0.70
+    regime, does DGPO reduce a fully trained independent H4 judge's
+    abs(AUC-0.5) over five fixed ten-update rounds without collapsing ESS?
+  rounds: 5
+  policy_updates_per_round: 10
+  reward_lifetime_updates: 10
+  reward_refresh_steps: [0, 10, 20, 30, 40]
+  audit_steps: [0, 10, 20, 30, 40, 50]
+  endpoint_global_step: 50
+  endpoint_selection: fixed_step_50
+  reward_members: 4
+  audit_repeats: 1
+  primary_endpoint: staleness/raw_auc_gap
+  primary_direction: lower
+  success_rule: >-
+    The fresh audit must saturate at every boundary; the raw AUC
+    gap at step 50 must be below step 0 and its six-point least-squares slope
+    must be negative. Nonmonotonic intermediate rounds are allowed.
+
+nersc:
+  reproducibility:
+    note: >-
+      Exact c4a91e07 last.ckpt at source step 1110, loaded weights-only. Five
+      fresh reward rounds use two condition-hash seeds by two identity folds.
+      Every member trains for at least 1000 optimizer steps and then stops when
+      oriented held-out balanced accuracy exceeds 0.70 for three consecutive
+      validations. Raw leave-one-out DGPO reward, adaptive ESS15 tempering,
+      fixed ten-update reward lifetime, no hard trust/projection/rollback, and
+      continuous policy AdamW across refits. One fully trained fresh H4 judge
+      uses the same fixed seed/split and event panel at
+      steps 0,10,20,30,40,50. Its results are logging-only and cannot alter
+      refits, policy updates, or endpoint selection.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_m4_ess15_refit10_keepadam_50step_audit1_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_ba70_closed_loop.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_ba70_m4_ess15_refit10_keepadam_50step_audit1.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_ba70_m4_ess15_refit10_keepadam_50step_audit1_v1
+    version: h4_ba70_m4_ess15_refit10_keepadam_50step_audit1_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_m4_ess15_refit10_keepadam_50step_audit1_v1/logs
+  wandb:
+    id: h4b70c50
+    run_name: c4a91e07_h4_ba70_m4_ess15_refit10_keepadam_50step_audit1_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - ClosedLoopBA70
+      - FiveRewardRounds
+      - RefitEvery10Updates
+      - FreshClassifierEveryRound
+      - FourMemberRewardEnsemble
+      - ContinuousPolicyAdam
+      - RawLOOReward
+      - ESSTarget15pct
+      - OneFreshSaturatedAudit
+      - FixedAuditPanel
+      - SelectionBlindAudit
+      - NoHardTrust
+      - NoProjection
+      - NoRollback
+      - LiveWandb
+
+options:
+  Training:
+    total_epochs: 5
+    epochs: 5
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba70_m4_ess15_refit10_keepadam_50step_audit1_v1/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    trigger:
+      # Refit timing is fixed. The independent judge is retained only as the
+      # primary outcome and cannot trigger, delay, or cancel a reward refresh.
+      fixed_schedule_skip_staleness_audit: true
+      fixed_schedule_log_raw_audit: true
+      warm_start_classifier: false
+      require_audit_saturation: true
+      max_reward_age_epochs: 1
+      rollback_to_best_on_plateau: false
+    audit_fit:
+      min_steps: 1000
+      validation_patience_epochs: 15.0
+      checkpoint_selection_metric: balanced_accuracy
+      disjoint_final_audit: true
+      repeats: 1
+      repeat_seed_stride: 104729
+      fail_if_unsaturated: true
+    recalibration:
+      max_reward_rounds: 5
+      reset_optimizer_state_on_install: false
+      reset_adam_first_moment_on_install: false
+      fit:
+        min_steps_per_fold: 1000
+        require_saturation: false
+        minimum_sufficient_balanced_accuracy: 0.70
+        minimum_sufficient_confidence_z: 0.0
+        minimum_sufficient_required_consecutive: 3

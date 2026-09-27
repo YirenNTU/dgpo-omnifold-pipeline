@@ -1,0 +1,135 @@
+# Exact classifier-to-DGPO gradient-transfer trace from c4a91e07 step 1110.
+#
+# The applied policy objective, H4 reward, ESS tempering, AdamW, rollout, and
+# soft reference coefficient remain identical to the existing four-member
+# fixed-reward production setup.  The only addition is read-only logging of
+# component gradients and native optimizer displacement at five updates.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_ess15_single_reward_50step.yaml
+
+experiment:
+  protocol: h4-gradient-transfer-trace-20step-v1
+  single_experimental_change: read_only_exact_gradient_transfer_instrumentation
+  single_question: >-
+    Does the coefficient-1 soft velocity-MSE reference cancel a still-useful
+    installed H4 direction on the exact c4a91e07 step-1110 lineage, and does
+    any fixed coefficient remain safe as component scales drift?
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+  source_policy_step: 1110
+  control_wandb_run: null
+  configuration_parent: >-
+    config/dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_ess15_single_reward_50step.yaml
+  historical_reference_runs:
+    - ytchou97-university-of-washington/nu2flow-RL/122b9d84
+    - ytchou97-university-of-washington/nu2flow-RL/1fe91ab2
+  rounds: 1
+  policy_updates_per_round: 20
+  reward_lifetime_updates: 20
+  endpoint_selection: fixed_step_20
+  endpoint_global_step: 20
+  applied_objective_changed: false
+  applied_reference_trust_coefficient: 1.0
+  gradient_trace_update_end_steps: [1, 2, 5, 10, 20]
+  cold_h4_audit_policy_steps: [0, 10, 20]
+  cold_h4_audit_min_optimizer_updates: 1000
+  primary_endpoint: staleness/raw_auc_gap
+  primary_decision_rule: >-
+    Confirm deterministic reference cancellation if the installed H4 gradient
+    remains aligned with the fresh H4 judge while total_on_h4 projection
+    crosses zero. Attribute the loss to optimizer geometry if total remains
+    aligned but native AdamW displacement does not. Attribute it to critic
+    staleness if installed H4 loses alignment with the fresh H4 judge.
+
+nersc:
+  reproducibility:
+    note: >-
+      Twenty-update fixed-H4 diagnostic from c4a91e07 step 1110. The ordinary
+      coefficient-1 H4-plus-velocity-MSE objective and native AdamW update are
+      applied unchanged. Exact component gradients are captured on the real
+      training graph at updates 1,2,5,10,20. Fresh saturated H4 audits run at
+      policy steps 0,10,20 and never change the reward or policy.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_20step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_gradient_transfer_trace.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_gradient_transfer_trace_20step.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_gradient_transfer_trace_20step_v1
+    version: h4_gradient_transfer_trace_20step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_20step_v1/logs
+  wandb:
+    id: h4xfer01
+    run_name: c4a91e07_h4_gradient_transfer_trace_20step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Step1110
+      - H4NonlinearFourier
+      - FourMemberEnsemble
+      - FixedH4Reward
+      - ExactProductionGradientTrace
+      - NativeAdamWDisplacement
+      - ReferenceCoefficientOne
+      - CounterfactualLambdaReadOnly
+      - ColdSaturatedH4Audit
+      - NoObjectiveChange
+      - NoHardTrust
+      - NoProjection
+      - LiveWandb
+
+options:
+  Training:
+    total_epochs: 2
+    epochs: 2
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_gradient_transfer_trace_20step_v1/checkpoints
+
+dgpo:
+  steps_per_epoch: 10
+  checkpoint_every_n_epochs: 1
+  log_parameter_update_rms: true
+  fail_on_skipped_optimizer_step: true
+  gradient_transfer_trace:
+    enabled: true
+    update_end_steps: [1, 2, 5, 10, 20]
+    counterfactual_trust_coefficients: [0.0, 0.1, 0.2, 0.5, 1.0]
+    norm_floor: 1.0e-12
+  gradient_conflict:
+    enabled: true
+    monitor_refit_lifecycle: false
+    every_n_steps: 10
+    blocks: 8
+    events_per_block: 512
+    event_microbatch_size: 32
+    seed: 20260915
+    confidence: 0.95
+    min_split_cosine: 0.1
+    norm_floor: 1.0e-12
+  adaptive_omnifold:
+    # Preserve the existing separate reward train/validation pools. The cold
+    # monitor still uses an identity-stable internal split for its read-only
+    # gradient probe.
+    single_pool_train_validation: false
+    staleness_every_n_epochs: 1
+    staleness_every_n_steps: null
+    trigger:
+      warm_start_classifier: false
+      require_audit_saturation: true
+      rollback_to_best_on_plateau: false
+      max_reward_age_epochs: 1
+      required_consecutive_checks: 999
+      global_max_failed_rounds: 0
+    audit_fit:
+      min_steps: 1000
+      min_epochs: 1
+      enforce_min_epochs: false
+      safety_max_epochs: null
+      validation_patience_epochs: 15.0
+      require_saturation: false
+      fail_if_unsaturated: true
+      training_readiness: null
+    recalibration:
+      max_reward_rounds: 1
+      reset_optimizer_state_on_install: true

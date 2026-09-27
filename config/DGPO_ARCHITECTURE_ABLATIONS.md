@@ -1,5 +1,12 @@
 # 10% OmniFold architecture ablations
 
+An additional [visible-pair rest-frame arm](DGPO_VISIBLE_REST_ABLATION.md) adds
+visible-only Lorentz conditioning and a two-layer decoder. It now starts from
+the final step-320 DGPO policy of W&B run `f6b4ec46`, with fresh clocks/classifiers.
+It uses its own YAML/output directory; the three configurations below remain unchanged.
+Unlike those three arms, the rest-frame arm uses the same Fourier + rest-frame
+architecture and inputs for OmniFold and staleness, with separate trained weights.
+
 These are independent full-DGPO experiments, not continuations of the existing
 resume run. The latest Fourier arm starts from the live `state_dict` of the
 10% diffusion pretrain checkpoint at epoch 214. The control and larger/deeper

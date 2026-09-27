@@ -1,0 +1,44 @@
+extends_overlay: dgpo_h4_scale_standardized.yaml
+
+experiment:
+  protocol: h4-output-scale-long-v1
+  intervention: extend_successful_fixed_standardization_to_bce_convergence
+  inference_scope: Classifier convergence only; not a DGPO update or a step-300 full-state resume.
+  diagnostic_parent_run: h4scls1-retry1
+  primary_decision_rule: >-
+    Same seed and architecture as the successful standardized screen. Measure
+    best early-stop validation BCE and the complete train/validation trajectory;
+    report final independent test BCE at the restored best checkpoint separately.
+    Require improvement beyond the step-300 anchor without persistent widening
+    of the train/validation gap. Track activation RMS, gradients and ratio tails.
+    Reaching 3000 updates is budget exhaustion, not proof of saturation.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized_long/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_output_scaling.py --arm standardized-long
+
+logger:
+  local:
+    name: h4_scale_standardized_long
+    version: h4_scale_standardized_long_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized_long/logs
+  wandb:
+    id: h4scllong1
+    resume: never
+    run_name: Does Fourier scaling stay healthy? | H4 classifier | BCE convergence
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized_long/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      steps: 3000
+      min_steps: 1000
+      validation_patience_epochs: 10
+      require_saturation: false
+      representation_export_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized_long/panels
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_scale_standardized_long/diagnostic_snapshots

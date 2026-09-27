@@ -23,8 +23,10 @@ from torch import Tensor
 
 from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import (
     EventPackingSpec,
+    event_identity_inputs,
     FrozenResidualRatioReward,
     _score_population,
+    _crossfit_repeat_seed,
     _identity_crossfit_splits,
     fit_independent_evenet_audit,
     fit_residual_ratio_stack,
@@ -37,6 +39,7 @@ from RL.DGPO_neutrino.omnifold_ztautau.ratio_fit import (
     global_mean_one_from_log_weights,
 )
 from RL.DGPO_neutrino.omnifold_ztautau.stage import build_fit_config
+from RL.DGPO_neutrino.omnifold_ztautau.rest_frame import REST_FRAME_KEY
 
 
 _log = logging.getLogger(__name__)
@@ -65,10 +68,120 @@ def _optional_str(value: Any) -> str | None:
     return None if not normalized or normalized.lower() == "null" else normalized
 
 
+def _optional_positive_float(value: Any, *, name: str) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
+        raise ValueError(f"{name} must be finite and positive")
+    return float(value)
+
+
 def _float_tuple(value: Any, *, name: str) -> tuple[float, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
         raise TypeError(f"{name} must be a list or tuple of numbers")
     return tuple(float(item) for item in value)
+
+
+def _raw_patience_schedule(value: Any) -> tuple[tuple[int, int], ...]:
+    """Validate an optional monotone (start_step, required_checks) schedule."""
+    if value is None:
+        return ()
+    name = "trigger.patience_schedule"
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a list of start_step/required_consecutive_checks entries")
+    stages = []
+    for entry in value:
+        start = _cfg_get(entry, "start_step", None)
+        checks = _cfg_get(entry, "required_consecutive_checks", None)
+        if type(start) is not int or start < 0 or type(checks) is not int or checks < 1:
+            raise ValueError(f"{name} requires nonnegative integer start_step and positive integer checks")
+        if (not stages and start != 0) or (stages and start <= stages[-1][0]):
+            raise ValueError(f"{name} must start at step 0 with strictly increasing start steps")
+        if stages and checks < stages[-1][1]:
+            raise ValueError(f"{name} patience must be nondecreasing")
+        stages.append((start, checks))
+    return tuple(stages)
+
+
+def _residual_closure_schedule(value: Any) -> tuple[tuple[int, float], ...]:
+    """Optional step-based tightening of the residual (not raw) AUC gate."""
+    if value is None:
+        return ()
+    name = "recalibration.residual_closure_schedule"
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a list")
+    stages = []
+    for entry in value:
+        start = _cfg_get(entry, "start_step", None)
+        auc = _cfg_get(entry, "max_auc", None)
+        if (type(start) is not int or start < 0 or isinstance(auc, bool)
+                or not isinstance(auc, (int, float)) or not math.isfinite(auc)
+                or not .5 < auc < 1.):
+            raise ValueError(f"{name} requires nonnegative integer start_step and 0.5 < max_auc < 1")
+        if (not stages and start != 0) or (stages and start <= stages[-1][0]):
+            raise ValueError(f"{name} must start at 0 with strictly increasing steps")
+        if stages and auc > stages[-1][1]:
+            raise ValueError(f"{name} max_auc must be nonincreasing")
+        stages.append((start, float(auc)))
+    return tuple(stages)
+
+
+def _classifier_architecture_overrides(
+    value: Any,
+) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("recalibration.reward_classifier must be a mapping")
+    overrides = dict(value)
+    dropout_keys = {"head_dropout", "topology_dropout"}
+    scale_keys = {"topology_context_residual_scale"}
+    dimension_keys = {"decoder_hidden_dim", "decoder_layers", "decoder_heads", "relation_token_count"}
+    flag_keys = {
+        "periodic_pair_features",
+        "topology_fourier_embedding",
+        "topology_direct_logit",
+        "topology_conditioning",
+        "topology_pair_token",
+        "visible_pair_rest_frame",
+    }
+    unknown = set(overrides) - dropout_keys - scale_keys - dimension_keys - flag_keys
+    if unknown:
+        raise ValueError(
+            "recalibration.reward_classifier has unsupported keys: "
+            f"{sorted(unknown)}"
+        )
+    if any(
+        isinstance(overrides[key], bool)
+        or not isinstance(overrides[key], (int, float))
+        or not math.isfinite(float(overrides[key]))
+        or not 0.0 <= float(overrides[key]) < 1.0
+        for key in dropout_keys & overrides.keys()
+    ):
+        raise ValueError("reward classifier dropout must be finite and in [0, 1)")
+    if any(
+        type(overrides[key]) is not int or int(overrides[key]) < 1
+        for key in dimension_keys & overrides.keys()
+    ):
+        raise ValueError("reward classifier dimensions must be positive integers")
+    if any(type(overrides[key]) is not bool for key in flag_keys & overrides.keys()):
+        raise ValueError("reward classifier feature flags must be boolean")
+    if any(
+        isinstance(overrides[key], bool)
+        or not isinstance(overrides[key], (int, float))
+        or not math.isfinite(float(overrides[key]))
+        or not 0.0 <= float(overrides[key]) <= 1.0
+        for key in scale_keys & overrides.keys()
+    ):
+        raise ValueError(
+            "reward classifier residual scales must be finite and in [0, 1]"
+        )
+    return overrides
 
 
 @dataclass(frozen=True)
@@ -90,6 +203,8 @@ class AdaptiveOmniFoldConfig:
     raw_improvement_min_delta: float
     raw_rollback_to_best_on_plateau: bool
     max_reward_age_epochs: int | None
+    fixed_schedule_skip_staleness_audit: bool
+    fixed_schedule_log_raw_audit: bool
     required_consecutive_epochs: int
     retrain_cooldown_epochs: int
     classifier_trust_enabled: bool
@@ -115,6 +230,8 @@ class AdaptiveOmniFoldConfig:
     trust_auc_stop_gap: float
     trust_reset_adam_first_moment: bool
     trust_reset_adam_first_moment_on_zero_step: bool
+    trust_transactional_rejection: bool
+    trust_stop_after_rejection: bool
     trust_enforcement: str
     trust_backtrack_factor: float
     trust_max_backtracks: int
@@ -166,20 +283,36 @@ class AdaptiveOmniFoldConfig:
     acceptance_audit_enabled: bool
     acceptance_max_balanced_accuracy: float
     periodic_pair_features_enabled: bool
+    visible_pair_rest_frame_enabled: bool
     topology_fourier_embedding_enabled: bool
     topology_max_harmonic: int
     topology_include_theta_pair: bool
+    topology_theta_fourier: bool
     topology_acceptance_audit_enabled: bool
     topology_acceptance_max_auc_gap: float
     topology_acceptance_repeats: int
     tempering: float
+    adaptive_tempering_enabled: bool
+    target_ess_fraction: float
+    minimum_tempering: float
+    tempering_grid_steps: int
+    inherit_previous_tempering: bool
+    ess_aware_checkpoint_selection: bool
+    ess_aware_max_checkpoints: int
+    ess_aware_first_residual_only: bool
+    log_ratio_clip: float | None
+    minimum_ess_fraction: float
     crossfit_folds: int
+    crossfit_repeats: int
     residual_min_auc_gain: float
     seed: int
     score_row_budget: int
     audit_fit: dict[str, Any]
+    reward_classifier: dict[str, Any]
     fit: dict[str, Any]
+    residual_closure_schedule: tuple[tuple[int, float], ...] = ()
     warm_start_iterations: tuple[int, ...] = ()
+    warm_start_from_iteration_one: bool = False
     crossfit_partition: str = "auto"
     trust_round_decay_factor: float = 0.9
     trust_best_decay_factor: float = 0.9
@@ -187,6 +320,7 @@ class AdaptiveOmniFoldConfig:
     staleness_every_n_steps: int | None = None
     single_pool_train_validation: bool = False
     single_pool_split_seed: int = 42
+    cache_event_inputs: bool = False
     reset_optimizer_state_on_install: bool = False
     policy_warmup_steps: int = 0
     policy_warmup_start_factor: float = 0.1
@@ -196,9 +330,16 @@ class AdaptiveOmniFoldConfig:
     raw_global_confirmation_fit: dict[str, Any] = field(default_factory=dict)
     raw_global_confirmation_warm_start: bool = False
     raw_pause_patience_during_warmup: bool = False
+    raw_patience_schedule: tuple[tuple[int, int], ...] = ()
+    iteration_one_only: bool = False
+    fixed_iteration_budget: bool = False
+    max_reward_rounds: int | None = None
+    scheduled_refit_fail_closed: bool = False
 
 
-def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
+def resolve_adaptive_config(
+    dgpo_config: Any, *, classifier_only: bool = False,
+) -> AdaptiveOmniFoldConfig:
     block = _cfg_get(dgpo_config, "adaptive_omnifold", None)
     trigger = _cfg_get(block, "trigger", None)
     classifier_trust = _cfg_get(block, "classifier_trust", None)
@@ -208,6 +349,46 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         None,
     )
     recal = _cfg_get(block, "recalibration", None)
+    adaptive_tempering = _cfg_get(recal, "adaptive_tempering", None)
+    ess_aware_checkpoint_selection = _cfg_get(
+        recal, "ess_aware_checkpoint_selection", None
+    )
+    if isinstance(ess_aware_checkpoint_selection, Mapping):
+        ess_aware_enabled = bool(
+            _cfg_get(ess_aware_checkpoint_selection, "enabled", False)
+        )
+        ess_aware_max_checkpoints = int(
+            _cfg_get(ess_aware_checkpoint_selection, "max_checkpoints", 16)
+        )
+        ess_aware_first_residual_only = bool(
+            _cfg_get(
+                ess_aware_checkpoint_selection, "first_residual_only", False
+            )
+        )
+    else:
+        ess_aware_enabled = bool(ess_aware_checkpoint_selection or False)
+        ess_aware_max_checkpoints = 16
+        ess_aware_first_residual_only = False
+    if type(_cfg_get(recal, "iteration_one_only", False)) is not bool:
+        raise ValueError("iteration_one_only must be a boolean")
+    if type(_cfg_get(adaptive_tempering, "enabled", False)) is not bool:
+        raise ValueError("adaptive_tempering.enabled must be a boolean")
+    if type(_cfg_get(adaptive_tempering, "inherit_previous", False)) is not bool:
+        raise ValueError(
+            "adaptive_tempering.inherit_previous must be a boolean"
+        )
+    if type(ess_aware_enabled) is not bool:
+        raise ValueError(
+            "ess_aware_checkpoint_selection.enabled must be a boolean"
+        )
+    if type(ess_aware_first_residual_only) is not bool:
+        raise ValueError(
+            "ess_aware_checkpoint_selection.first_residual_only must be a boolean"
+        )
+    if type(_cfg_get(block, "cache_event_inputs", False)) is not bool:
+        raise ValueError("cache_event_inputs must be a boolean")
+    if type(_cfg_get(recal, "visible_pair_rest_frame", False)) is not bool:
+        raise ValueError("visible_pair_rest_frame must be a boolean")
     reference_trust = _cfg_get(dgpo_config, "reference_trust", None)
     trust_boundary = _cfg_get(reference_trust, "adaptive_boundary", None)
     trust_radius_calibration = _cfg_get(
@@ -268,6 +449,7 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         staleness_every_n_steps=_optional_int(_cfg_get(block, "staleness_every_n_steps", None)),
         single_pool_train_validation=bool(_cfg_get(block, "single_pool_train_validation", False)),
         single_pool_split_seed=int(_cfg_get(block, "single_pool_split_seed", 42)),
+        cache_event_inputs=_cfg_get(block, "cache_event_inputs", False),
         fixed_audit_panel=bool(
             _cfg_get(block, "fixed_audit_panel", False)
         ),
@@ -293,8 +475,15 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         raw_global_confirmation_fit=dict(_cfg_get(trigger, "global_confirmation_fit", {}) or {}),
         raw_global_confirmation_warm_start=bool(_cfg_get(trigger, "global_confirmation_warm_start", False)),
         raw_pause_patience_during_warmup=bool(_cfg_get(trigger, "pause_patience_during_warmup", False)),
+        raw_patience_schedule=_raw_patience_schedule(_cfg_get(trigger, "patience_schedule", None)),
         max_reward_age_epochs=_optional_int(
             _cfg_get(trigger, "max_reward_age_epochs", None)
+        ),
+        fixed_schedule_skip_staleness_audit=bool(
+            _cfg_get(trigger, "fixed_schedule_skip_staleness_audit", False)
+        ),
+        fixed_schedule_log_raw_audit=bool(
+            _cfg_get(trigger, "fixed_schedule_log_raw_audit", False)
         ),
         required_consecutive_epochs=max(
             1, int(_cfg_get(trigger, "required_consecutive_checks",
@@ -411,6 +600,12 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
                 "reset_adam_first_moment_on_zero_step",
                 False,
             )
+        ),
+        trust_transactional_rejection=bool(
+            _cfg_get(trust_boundary, "transactional_rejection", False)
+        ),
+        trust_stop_after_rejection=bool(
+            _cfg_get(trust_boundary, "stop_after_rejection", False)
         ),
         trust_enforcement=str(
             _cfg_get(trust_boundary, "enforcement", "post_step_backtracking")
@@ -630,6 +825,14 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         candidates_per_event=int(_cfg_get(recal, "candidates_per_event", 1)),
         min_iterations=int(_cfg_get(recal, "min_iterations", 2)),
         max_iterations=int(_cfg_get(recal, "max_iterations", 12)),
+        max_reward_rounds=_optional_int(
+            _cfg_get(recal, "max_reward_rounds", None)
+        ),
+        scheduled_refit_fail_closed=bool(
+            _cfg_get(recal, "scheduled_refit_fail_closed", False)
+        ),
+        iteration_one_only=_cfg_get(recal, "iteration_one_only", False),
+        fixed_iteration_budget=_cfg_get(recal, "fixed_iteration_budget", False),
         acceptance_audit_enabled=bool(
             _cfg_get(recal, "acceptance_audit_enabled", True)
         ),
@@ -639,6 +842,9 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         periodic_pair_features_enabled=bool(
             _cfg_get(recal, "periodic_pair_features", False)
         ),
+        visible_pair_rest_frame_enabled=bool(
+            _cfg_get(recal, "visible_pair_rest_frame", False)
+        ),
         topology_fourier_embedding_enabled=bool(
             _cfg_get(recal, "topology_fourier_embedding", False)
         ),
@@ -647,6 +853,9 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         ),
         topology_include_theta_pair=bool(
             _cfg_get(recal, "topology_include_theta_pair", False)
+        ),
+        topology_theta_fourier=bool(
+            _cfg_get(recal, "topology_theta_fourier", False)
         ),
         topology_acceptance_audit_enabled=bool(
             _cfg_get(recal, "topology_acceptance_audit_enabled", False)
@@ -659,19 +868,52 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
             int(_cfg_get(recal, "topology_acceptance_repeats", 1)),
         ),
         tempering=float(_cfg_get(recal, "tempering", 1.0)),
+        adaptive_tempering_enabled=bool(
+            _cfg_get(adaptive_tempering, "enabled", False)
+        ),
+        target_ess_fraction=float(
+            _cfg_get(adaptive_tempering, "target_ess_fraction", 0.2)
+        ),
+        minimum_tempering=float(
+            _cfg_get(adaptive_tempering, "minimum", 0.1)
+        ),
+        tempering_grid_steps=int(
+            _cfg_get(adaptive_tempering, "grid_steps", 14)
+        ),
+        inherit_previous_tempering=bool(
+            _cfg_get(adaptive_tempering, "inherit_previous", False)
+        ),
+        ess_aware_checkpoint_selection=ess_aware_enabled,
+        ess_aware_max_checkpoints=ess_aware_max_checkpoints,
+        ess_aware_first_residual_only=ess_aware_first_residual_only,
+        log_ratio_clip=_optional_positive_float(
+            _cfg_get(recal, "log_ratio_clip", None),
+            name="recalibration.log_ratio_clip",
+        ),
+        minimum_ess_fraction=float(
+            _cfg_get(recal, "minimum_ess_fraction", 0.0)
+        ),
         crossfit_folds=int(_cfg_get(recal, "crossfit_folds", 2)),
+        crossfit_repeats=int(_cfg_get(recal, "crossfit_repeats", 1)),
         residual_min_auc_gain=float(
             _cfg_get(recal, "residual_min_auc_gain", 1.0e-3)
+        ),
+        residual_closure_schedule=_residual_closure_schedule(
+            _cfg_get(recal, "residual_closure_schedule", None)
         ),
         seed=int(_cfg_get(recal, "seed", 20260819)),
         score_row_budget=max(1, int(_cfg_get(recal, "score_row_budget", 512))),
         audit_fit=dict(
             _cfg_get(block, "audit_fit", _cfg_get(recal, "fit", {})) or {}
         ),
+        reward_classifier=_classifier_architecture_overrides(
+            _cfg_get(recal, "reward_classifier", None)
+        ),
         fit=dict(_cfg_get(recal, "fit", {}) or {}),
         warm_start_iterations=tuple(
             _cfg_get(recal, "warm_start_iterations", ()) or ()
         ),
+        warm_start_from_iteration_one=_cfg_get(recal, "warm_start_from_iteration_one", False),
         crossfit_partition=str(_cfg_get(recal, "crossfit_partition", "auto")),
         reset_optimizer_state_on_install=bool(
             _cfg_get(recal, "reset_optimizer_state_on_install", False)
@@ -688,8 +930,98 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
     if (isinstance(config.policy_warmup_steps, bool)
             or not isinstance(config.policy_warmup_steps, int) or config.policy_warmup_steps < 0):
         raise ValueError("policy_warmup_steps must be a nonnegative integer")
+    minimum_sufficient_target = config.fit.get(
+        "minimum_sufficient_balanced_accuracy"
+    )
+    if minimum_sufficient_target is not None:
+        if (
+            isinstance(minimum_sufficient_target, bool)
+            or not isinstance(minimum_sufficient_target, (int, float))
+            or not math.isfinite(float(minimum_sufficient_target))
+            or not 0.5 < float(minimum_sufficient_target) < 1.0
+        ):
+            raise ValueError(
+                "fit.minimum_sufficient_balanced_accuracy must lie in (0.5, 1)"
+            )
+        if bool(config.fit.get("require_saturation", True)):
+            raise ValueError(
+                "fit.minimum_sufficient_balanced_accuracy requires "
+                "fit.require_saturation=false"
+            )
+        confidence_z = config.fit.get(
+            "minimum_sufficient_confidence_z", 0.0
+        )
+        if (
+            isinstance(confidence_z, bool)
+            or not isinstance(confidence_z, (int, float))
+            or not math.isfinite(float(confidence_z))
+            or float(confidence_z) < 0.0
+        ):
+            raise ValueError(
+                "fit.minimum_sufficient_confidence_z must be finite and nonnegative"
+            )
+        required_consecutive = config.fit.get(
+            "minimum_sufficient_required_consecutive", 1
+        )
+        if type(required_consecutive) is not int or required_consecutive < 1:
+            raise ValueError(
+                "fit.minimum_sufficient_required_consecutive must be a positive integer"
+            )
     if not 0.0 < config.policy_warmup_start_factor <= 1.0:
         raise ValueError("policy_warmup_start_factor must be finite and in (0, 1]")
+    if (
+        config.log_ratio_clip is not None
+        and (
+            not math.isfinite(config.log_ratio_clip)
+            or config.log_ratio_clip <= 0.0
+        )
+    ):
+        raise ValueError("recalibration.log_ratio_clip must be finite and positive")
+    if config.adaptive_tempering_enabled:
+        if (
+            not math.isfinite(config.minimum_tempering)
+            or not 0.0 < config.minimum_tempering <= config.tempering
+        ):
+            raise ValueError(
+                "adaptive_tempering.minimum must lie in (0, tempering]"
+            )
+        if (
+            not math.isfinite(config.target_ess_fraction)
+            or not config.minimum_ess_fraction
+            <= config.target_ess_fraction
+            <= 1.0
+        ):
+            raise ValueError(
+                "adaptive_tempering.target_ess_fraction must lie in "
+                "[minimum_ess_fraction, 1]"
+            )
+        if config.tempering_grid_steps < 2:
+            raise ValueError(
+                "adaptive_tempering.grid_steps must be at least two"
+            )
+    elif config.inherit_previous_tempering:
+        raise ValueError(
+            "adaptive_tempering.inherit_previous requires adaptive_tempering.enabled"
+        )
+    if config.ess_aware_max_checkpoints < 1:
+        raise ValueError(
+            "ess_aware_checkpoint_selection.max_checkpoints must be positive"
+        )
+    if (
+        config.ess_aware_first_residual_only
+        and not config.ess_aware_checkpoint_selection
+    ):
+        raise ValueError(
+            "ess_aware_checkpoint_selection.first_residual_only requires "
+            "ess_aware_checkpoint_selection.enabled"
+        )
+    if (
+        not math.isfinite(config.minimum_ess_fraction)
+        or not 0.0 <= config.minimum_ess_fraction <= 1.0
+    ):
+        raise ValueError(
+            "recalibration.minimum_ess_fraction must lie in [0, 1]"
+        )
     if config.policy_warmup_steps and config.trust_extragradient_enabled:
         raise ValueError("policy round warmup is not supported with extragradient")
     if config.candidates_per_event != 1:
@@ -733,21 +1065,33 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
             "log_only=false"
         )
     if config.raw_monitor_warm_start and not (
-        config.monitor_mode == "raw_plateau_refit" and config.fixed_audit_panel
-        and config.raw_audit_enabled and config.require_audit_saturation
+        config.fixed_audit_panel
+        and config.raw_audit_enabled
+        and config.require_audit_saturation
     ):
-        raise ValueError("warm-start raw monitor requires raw_plateau_refit, fixed_audit_panel, raw_audit_enabled and saturation")
+        raise ValueError(
+            "warm-start raw monitor requires a fixed audit panel, "
+            "raw_audit_enabled, and saturation"
+        )
     monitor_readiness = validate_monitor_training_readiness(config.audit_fit.get("training_readiness"))
     if monitor_readiness is not None and not (
-        config.monitor_mode == "raw_plateau_refit" and config.single_pool_train_validation
-        and config.raw_monitor_warm_start and config.require_audit_saturation
+        config.raw_monitor_warm_start
+        and config.fixed_audit_panel
+        and config.require_audit_saturation
     ):
-        raise ValueError("monitor training_readiness requires warm-start raw_plateau_refit with identity-stable single-pool splits and saturation")
+        raise ValueError(
+            "monitor training_readiness requires a fixed-panel, warm-start "
+            "raw monitor with saturation"
+        )
     if config.staleness_every_n_steps is not None:
         if config.staleness_every_n_steps < 1:
             raise ValueError("staleness_every_n_steps must be positive or null")
         if config.monitor_mode != "raw_plateau_refit" or config.trust_extragradient_enabled:
             raise ValueError("step-based staleness requires raw_plateau_refit without extragradient")
+    if config.raw_patience_schedule and (
+        config.monitor_mode != "raw_plateau_refit" or config.staleness_every_n_steps is None
+    ):
+        raise ValueError("trigger.patience_schedule requires step-based raw_plateau_refit monitoring")
     if config.single_pool_train_validation:
         if config.monitor_mode != "raw_plateau_refit" or config.acceptance_audit_enabled or config.topology_acceptance_audit_enabled:
             raise ValueError("single-pool mode requires raw_plateau_refit without acceptance/topology audits")
@@ -779,11 +1123,13 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
     if config.raw_best_scope not in {"round", "global"}:
         raise ValueError("trigger.best_scope must be round or global")
     if config.raw_best_scope == "global" and (
-        not config.raw_rollback_to_best_on_plateau
+        config.monitor_mode != "raw_plateau_refit"
+        or not config.raw_audit_enabled or not config.fixed_audit_panel
+        or not config.require_audit_saturation
         or config.classifier_trust_enabled or config.max_reward_age_epochs is not None
-        or config.staleness_every_n_steps is None or config.raw_global_max_failed_rounds < 1
+        or config.staleness_every_n_steps is None or config.raw_global_max_failed_rounds < 0
     ):
-        raise ValueError("global raw best requires step-based rollback, positive failed-round limit, and no competing age/classifier triggers")
+        raise ValueError("global raw best requires saturated fixed-panel step monitoring, nonnegative failed-round limit (0 disables stop), and no competing age/classifier triggers")
     if config.raw_global_confirm_candidates and config.raw_best_scope != "global":
         raise ValueError("global candidate confirmation requires best_scope=global")
     allowed_confirmation_overrides = {"min_steps", "min_epochs", "enforce_min_epochs"}
@@ -840,21 +1186,147 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         and config.pool_generation_batch_size < 1
     ):
         raise ValueError("pool_generation_batch_size must be positive")
+    if type(config.fixed_iteration_budget) is not bool:
+        raise ValueError("fixed_iteration_budget must be a boolean")
+    if config.fixed_iteration_budget:
+        if config.iteration_one_only or config.min_iterations != config.max_iterations:
+            raise ValueError("fixed_iteration_budget requires equal min/max iterations and iteration_one_only=false")
+        if config.acceptance_audit_enabled or config.residual_closure_schedule:
+            raise ValueError("fixed_iteration_budget does not use closure acceptance audits/schedules")
+    if config.iteration_one_only:
+        if config.monitor_mode != "raw_plateau_refit" and not (
+            config.monitor_mode == "raw_only" and config.log_only
+        ):
+            raise ValueError("iteration_one_only requires raw_plateau_refit or log-only raw_only monitoring")
+        if config.min_iterations != 1 or config.max_iterations != 1:
+            raise ValueError("iteration_one_only requires min_iterations=max_iterations=1")
+        if config.acceptance_audit_enabled or config.topology_acceptance_audit_enabled:
+            raise ValueError("iteration_one_only does not use additional closure/acceptance classifiers")
+        if config.residual_closure_schedule:
+            raise ValueError("iteration_one_only must not claim a residual_closure_schedule")
     if config.min_iterations < 1 or config.max_iterations < config.min_iterations:
         raise ValueError("adaptive OmniFold iterations require 1 <= min <= max")
+    if config.max_reward_rounds is not None and config.max_reward_rounds < 1:
+        raise ValueError("recalibration.max_reward_rounds must be positive or null")
+    if config.scheduled_refit_fail_closed and config.max_reward_age_epochs is None:
+        raise ValueError(
+            "scheduled_refit_fail_closed requires trigger.max_reward_age_epochs"
+        )
+    if config.fixed_schedule_skip_staleness_audit and (
+        config.monitor_mode != "raw_plateau_refit"
+        or config.log_only
+        or config.max_reward_age_epochs is None
+        or config.staleness_every_n_steps is not None
+        or config.classifier_trust_enabled
+        or config.raw_rollback_to_best_on_plateau
+        or config.trust_boundary_enabled
+        or config.trust_trajectory_search_enabled
+        or config.trust_signed_direction_probe_enabled
+        or config.trust_signed_direction_recovery_enabled
+        or config.trust_extragradient_enabled
+    ):
+        raise ValueError(
+            "trigger.fixed_schedule_skip_staleness_audit requires an epoch-based "
+            "raw_plateau_refit schedule with max_reward_age_epochs, log_only=false, "
+            "and no classifier/trust/rollback controller"
+        )
+    if config.fixed_schedule_log_raw_audit and (
+        not config.fixed_schedule_skip_staleness_audit
+        or not config.raw_audit_enabled
+        or not config.fixed_audit_panel
+        or config.raw_monitor_warm_start
+    ):
+        raise ValueError(
+            "trigger.fixed_schedule_log_raw_audit requires the fixed schedule, "
+            "raw_audit_enabled=true, fixed_audit_panel=true, and a fresh "
+            "classifier at every boundary"
+        )
+    audit_repeats = config.audit_fit.get("repeats", 1)
+    audit_population = config.audit_fit.get("training_population", "probe_split")
+    if audit_population not in ("probe_split", "omnifold_fold"):
+        raise ValueError("audit_fit.training_population must be probe_split or omnifold_fold")
+    if audit_population == "omnifold_fold":
+        if ((not config.fixed_schedule_log_raw_audit and not classifier_only)
+                or config.raw_monitor_warm_start or not config.fixed_audit_panel
+                or config.single_pool_train_validation
+                or config.crossfit_partition != "identity" or config.pool_events is not None
+                or not config.cache_event_inputs
+                or not config.audit_fit.get("disjoint_final_audit", False)
+                or config.audit_fit.get("training_readiness") is not None):
+            raise ValueError(
+                "omnifold_fold audit requires cold fixed-schedule or classifier-only diagnostics, cached full "
+                "identity-crossfit training data, separate validation and disjoint final audit"
+            )
+        audit_fold = config.audit_fit.get("training_fold", 1)
+        if type(audit_fold) is not int or not 1 <= audit_fold <= config.crossfit_folds:
+            raise ValueError("audit_fit.training_fold must identify an OmniFold fold (one-based)")
+    audit_repeat_seed_stride = config.audit_fit.get(
+        "repeat_seed_stride", 104_729
+    )
+    if type(audit_repeats) is not int or audit_repeats < 1:
+        raise ValueError("audit_fit.repeats must be a positive integer")
+    if (
+        type(audit_repeat_seed_stride) is not int
+        or audit_repeat_seed_stride < 1
+    ):
+        raise ValueError(
+            "audit_fit.repeat_seed_stride must be a positive integer"
+        )
+    if audit_repeats > 1 and config.raw_monitor_warm_start:
+        raise ValueError(
+            "repeated raw audits require fresh classifier initialization"
+        )
     if config.crossfit_folds < 2:
         raise ValueError("adaptive OmniFold crossfit_folds must be at least two")
+    if config.crossfit_repeats < 1:
+        raise ValueError(
+            "adaptive OmniFold crossfit_repeats must be at least one"
+        )
     if config.crossfit_partition not in ("auto", "identity"):
         raise ValueError("crossfit_partition must be 'auto' or 'identity'")
     fold_minimum = config.fit.get("min_steps_per_fold", 0)
     if type(fold_minimum) is not int or fold_minimum < 0:
         raise ValueError("min_steps_per_fold must be a nonnegative integer")
+    warm_epochs = config.fit.get("warm_start_min_epochs_per_fold")
+    if warm_epochs is not None and (
+        isinstance(warm_epochs, bool) or not isinstance(warm_epochs, (int, float))
+        or not math.isfinite(warm_epochs) or warm_epochs <= 0
+    ):
+        raise ValueError("warm_start_min_epochs_per_fold must be a finite positive number")
+    if warm_epochs is not None and config.fit.get("sampling", "independent_epoch_shuffle") != "independent_epoch_shuffle":
+        raise ValueError("warm_start_min_epochs_per_fold requires independent_epoch_shuffle")
     if any(
         isinstance(value, bool) or not isinstance(value, int)
         or not 1 <= value <= config.max_iterations
         for value in config.warm_start_iterations
     ) or len(set(config.warm_start_iterations)) != len(config.warm_start_iterations):
         raise ValueError("warm_start_iterations must contain unique iteration ids in [1, max_iterations]")
+    if type(config.warm_start_from_iteration_one) is not bool:
+        raise ValueError("warm_start_from_iteration_one must be a boolean")
+    if config.warm_start_from_iteration_one and config.warm_start_iterations != (1,):
+        raise ValueError("warm_start_from_iteration_one requires warm_start_iterations: [1]")
+    later_lr = config.fit.get("later_iteration_learning_rate")
+    later_mode = config.fit.get("later_iteration_train_mode", "full")
+    if later_mode not in ("full", "last_decoder_and_output", "output_then_last_decoder"):
+        raise ValueError("unsupported later_iteration_train_mode")
+    if later_mode != "full" and not config.warm_start_from_iteration_one:
+        raise ValueError("later_iteration_train_mode requires warm_start_from_iteration_one")
+    if later_lr is not None:
+        if (isinstance(later_lr, bool) or not isinstance(later_lr, (int, float))
+            or not math.isfinite(later_lr) or later_lr <= 0):
+            raise ValueError("later_iteration_learning_rate must be finite and positive")
+        if not config.warm_start_from_iteration_one:
+            raise ValueError("later_iteration_learning_rate requires warm_start_from_iteration_one")
+    decoder_lr = config.fit.get("later_iteration_decoder_learning_rate")
+    if later_mode == "output_then_last_decoder":
+        output_lr = later_lr or config.fit.get("learning_rate", 2e-3)
+        if (isinstance(decoder_lr, bool) or not isinstance(decoder_lr, (int, float))
+                or not math.isfinite(decoder_lr) or not 0 < decoder_lr <= output_lr):
+            raise ValueError("staged fitting requires positive decoder LR <= output LR")
+        if not config.fit.get("restore_best", True):
+            raise ValueError("staged fitting requires restore_best")
+    elif decoder_lr is not None:
+        raise ValueError("later_iteration_decoder_learning_rate requires output_then_last_decoder")
     if not 0.0 <= config.residual_min_auc_gain < 0.5:
         raise ValueError("residual_min_auc_gain must lie in [0, 0.5)")
     if not 0.5 < config.acceptance_max_balanced_accuracy < 1.0:
@@ -991,6 +1463,21 @@ def resolve_adaptive_config(dgpo_config: Any) -> AdaptiveOmniFoldConfig:
         if config.trust_enforcement != "post_step_backtracking":
             raise ValueError(
                 "adaptive trust enforcement must be 'post_step_backtracking'"
+            )
+        if (
+            config.trust_stop_after_rejection
+            and not config.trust_transactional_rejection
+        ):
+            raise ValueError(
+                "stop_after_rejection requires transactional_rejection=true"
+            )
+        if (
+            config.trust_transactional_rejection
+            and config.trust_reset_adam_first_moment_on_zero_step
+        ):
+            raise ValueError(
+                "transactional rejection restores the complete AdamW state; "
+                "disable reset_adam_first_moment_on_zero_step"
             )
         if not 0.0 < config.trust_backtrack_factor < 1.0:
             raise ValueError("adaptive trust backtrack_factor must lie in (0, 1)")
@@ -1238,6 +1725,30 @@ def resolve_trigger_threshold(
     return threshold
 
 
+def baseline_probe_auc_gap(
+    probe: Mapping[str, Any],
+    *,
+    cfg: AdaptiveOmniFoldConfig,
+) -> float:
+    """Select the baseline measured by the active staleness controller."""
+
+    key = (
+        "raw_auc_gap"
+        if cfg.monitor_mode == "raw_plateau_refit"
+        else "weighted_auc_gap"
+    )
+    if key not in probe:
+        raise KeyError(
+            f"adaptive baseline probe is missing controller metric {key!r}"
+        )
+    value = float(probe[key])
+    if not math.isfinite(value) or not 0.0 <= value <= 0.5:
+        raise ValueError(
+            f"adaptive baseline probe {key} must be finite and in [0, 0.5]"
+        )
+    return value
+
+
 @dataclass
 class AdaptiveOmniFoldState:
     reward_round_id: int = 0
@@ -1268,6 +1779,10 @@ class AdaptiveOmniFoldState:
     resume_refit_once_id: str = ""
     installed_at_epoch: int = -1
     last_recalibration_epoch: int | None = None
+    # Unlike last_recalibration_epoch, this advances for rejected fits too.
+    # It prevents an over-age incumbent from launching the same expensive
+    # candidate again at every audit while preserving the incumbent's true age.
+    last_recalibration_attempt_epoch: int | None = None
     last_decision: str = "uninitialized"
     trust_initial_effective_raw_auc_gap: float = float("nan")
     trust_current_raw_auc: float = float("nan")
@@ -1289,12 +1804,20 @@ class AdaptiveOmniFoldState:
     trust_best_observation_step: int = -1
     policy_warmup_round_id: int = -1
     policy_warmup_completed_updates: int = 0
+    gradient_post_install_probe_round_id: int = -1
+    gradient_warmup_probe_round_id: int = -1
+    gradient_lifecycle_monitor_state: dict[str, Any] = field(default_factory=dict)
+    gradient_lifecycle_monitor_step: int = -1
+    gradient_lifecycle_raw_auc: float = float("nan")
     raw_patience_warmup_updates_seen: int = 0
     policy_warmup_protocol: dict[str, Any] | None = None
     # Fixed denominator for eta_r / eta_0 = sqrt(delta_r / delta_0).
     # Newer reward rounds must not silently rebase the DGPO LR schedule.
     trust_policy_lr_reference_delta: float = float("nan")
     trust_boundary_count: int = 0
+    trust_accepted_updates: int = 0
+    trust_rejection_stop_requested: bool = False
+    trust_first_rejected_global_step: int = -1
     trust_statistically_closed: bool = False
     # Optional empirical cap learned from actual policy drift at a statistically
     # stale fresh audit. It is carried into later reward rounds; the current
@@ -1487,7 +2010,11 @@ class AdaptiveOmniFoldState:
         # Checkpoints written before best-point rollback support already carry
         # the fixed-panel raw audit history. Recover the best epoch so the
         # trainer can resolve its unpruned epoch snapshot after a v16 restart.
-        if math.isfinite(state.raw_best_auc_gap) and state.raw_best_epoch < 0:
+        # A certified global bootstrap best legitimately has epoch=-1,
+        # step=0, next_epoch=0. Never reinterpret it as missing legacy metadata
+        # and overwrite only epoch/step with a later round's closest AUC.
+        if (not state.raw_global_initialized
+                and math.isfinite(state.raw_best_auc_gap) and state.raw_best_epoch < 0):
             best_row: Mapping[str, Any] | None = None
             best_distance = float("inf")
             for item in state.probe_history:
@@ -2022,6 +2549,39 @@ def migrate_unstarted_policy_warmup_after_resume(
     return True
 
 
+def start_inherited_round_policy_warmup(
+    state: AdaptiveOmniFoldState, *, cfg: AdaptiveOmniFoldConfig,
+    global_step: int | None = None, restart: bool = False,
+) -> dict[str, float]:
+    """Start warmup after inheriting an installed round without a new install.
+
+    Best-point and pinned-classifier restarts keep ``reward_round_id`` but
+    rebuild adaptive state without warmup clocks. The post-baseline
+    last.ckpt may already have overwritten ``last_decision``, so a step-0
+    checkpoint whose warmup never started is also eligible. Regular resume
+    of a mid-round checkpoint that never started warmup still fail-closes.
+    """
+    if cfg.policy_warmup_steps == 0 or state.policy_warmup_protocol is not None:
+        return {}
+    if state.reward_round_id < 0:
+        return {}
+    unstarted = (
+        state.policy_warmup_round_id == -1
+        and type(state.policy_warmup_completed_updates) is int
+        and state.policy_warmup_completed_updates == 0
+        and state.raw_patience_warmup_updates_seen == 0
+    )
+    if not unstarted:
+        return {}
+    if not (
+        restart
+        or state.last_decision == "new_experiment_from_best"
+        or global_step == 0
+    ):
+        return {}
+    return start_policy_round_warmup(state, cfg=cfg)
+
+
 def start_policy_round_warmup(
     state: AdaptiveOmniFoldState, *, cfg: AdaptiveOmniFoldConfig,
 ) -> dict[str, float]:
@@ -2461,8 +3021,9 @@ def clamp_fixed_trust_radius_after_resume(
     empirical cap remains active. Round-decay resumes preserve the stored age;
     legacy installed references opt in at age zero, while cold bootstrap leaves
     initialization to its first successful install. Global-best resumes retain
-    their feasibility-protected radius and global record without another decay.
-    This is idempotent.
+    their feasibility-protected radius and global record without another decay;
+    a best-point / pinned restart (installed reference, reset schedule) opts in
+    at age zero with the full initial radius. This is idempotent.
     """
 
     if not cfg.trust_boundary_enabled:
@@ -2471,7 +3032,24 @@ def clamp_fixed_trust_radius_after_resume(
         if state.trust_best_decay_protocol is None:
             if not initialize_round_decay:
                 return {}
-            raise ValueError("best_decay requires a fresh reference install; use weights_only to branch")
+            # A best-point / pinned-classifier restart keeps the installed
+            # reference but resets its trust schedule (no live radius, no
+            # global record).  Opt that inherited reference in at age zero,
+            # exactly as round_decay does.  A checkpoint that still carries a
+            # live radius without a best-decay schedule is a mid-run protocol
+            # switch; expanding it silently is not allowed.
+            if not state.calibrated or math.isfinite(state.trust_current_delta):
+                raise ValueError("best_decay requires a fresh reference install; use weights_only to branch")
+            delta, target, protocol = _preview_best_decay_radius(
+                state, cfg=cfg, round_id=int(state.reward_round_id),
+            )
+            state.trust_current_delta = delta
+            state.trust_best_decay_round_id = int(state.reward_round_id)
+            state.trust_best_decay_protocol = protocol
+            return {"reference_trust/delta": delta,
+                    "reference_trust/best_decay/count": float(state.trust_best_decay_count),
+                    "reference_trust/best_decay/target": target,
+                    "reference_trust/best_decay/inherited_reference_age_zero": 1.0}
         if state.trust_best_decay_round_id != state.reward_round_id:
             raise ValueError("checkpointed best-decay reference id does not match reward")
         delta, target, _ = _preview_best_decay_radius(state, cfg=cfg, round_id=state.reward_round_id)
@@ -3011,6 +3589,10 @@ def adaptive_audit_protocol_signature(cfg: AdaptiveOmniFoldConfig) -> str:
         "single_pool_train_validation": cfg.single_pool_train_validation,
         "single_pool_split_seed": cfg.single_pool_split_seed,
     }
+    if cfg.cache_event_inputs:
+        payload["fixed_input_cache"] = "cpu-shard-v1"
+    if cfg.audit_fit.get("training_population") == "omnifold_fold":
+        payload["training_crossfit"] = {"seed": cfg.seed, "folds": cfg.crossfit_folds, "repeat": 1}
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -3096,6 +3678,19 @@ def reward_refit_due_to_age(
     return reward_age >= limit, reward_age
 
 
+def reward_round_budget_exhausted(
+    state: "AdaptiveOmniFoldState", *, max_reward_rounds: int | None
+) -> bool:
+    """Return whether bootstrap/refits already installed the allowed rounds."""
+
+    if max_reward_rounds is None:
+        return False
+    limit = int(max_reward_rounds)
+    if limit < 1:
+        raise ValueError("max_reward_rounds must be positive or null")
+    return int(state.reward_round_id) >= limit
+
+
 def scheduled_raw_refit_due(
     state: AdaptiveOmniFoldState,
     *,
@@ -3112,9 +3707,14 @@ def scheduled_raw_refit_due(
     due, age = reward_refit_due_to_age(
         state, epoch=epoch, max_reward_age_epochs=cfg.max_reward_age_epochs,
     )
+    cooldown_anchor = (
+        state.last_recalibration_attempt_epoch
+        if state.last_recalibration_attempt_epoch is not None
+        else state.last_recalibration_epoch
+    )
     cooldown = bool(
-        state.last_recalibration_epoch is not None
-        and int(epoch) - int(state.last_recalibration_epoch) < cfg.retrain_cooldown_epochs
+        cooldown_anchor is not None
+        and int(epoch) - int(cooldown_anchor) < cfg.retrain_cooldown_epochs
     )
     trigger = bool(due and epoch >= 0 and not baseline_only and not cfg.log_only and not cooldown)
     return trigger, {
@@ -3122,6 +3722,11 @@ def scheduled_raw_refit_due(
         "staleness/max_reward_age_epochs": float(cfg.max_reward_age_epochs or 0),
         "staleness/age_refit_due": float(due),
         "staleness/age_trigger_recalibration": float(trigger),
+        "staleness/age_refit_cooldown_active": float(cooldown),
+        "staleness/last_refit_attempt_epoch": float(
+            -1 if state.last_recalibration_attempt_epoch is None
+            else state.last_recalibration_attempt_epoch
+        ),
     }
 
 
@@ -3189,10 +3794,15 @@ def update_controller(
     exceeded = bool(
         decision_eligible and final_gap_exceeded
     )
+    cooldown_anchor = (
+        state.last_recalibration_attempt_epoch
+        if state.last_recalibration_attempt_epoch is not None
+        else state.last_recalibration_epoch
+    )
     epochs_since_recalibration = (
         None
-        if state.last_recalibration_epoch is None
-        else max(0, int(epoch) - int(state.last_recalibration_epoch))
+        if cooldown_anchor is None
+        else max(0, int(epoch) - int(cooldown_anchor))
     )
     cooldown_active = bool(
         cfg.retrain_cooldown_epochs > 0
@@ -3318,6 +3928,24 @@ def global_raw_candidate_due(state: AdaptiveOmniFoldState, probe: Mapping[str, f
                 and gap < state.raw_best_auc_gap - cfg.raw_improvement_min_delta)
 
 
+def raw_staleness_patience(cfg: AdaptiveOmniFoldConfig, *, global_step: int) -> int:
+    """Patience follows the persisted training clock, not the rollback point/round.
+
+    No extra scheduler state or classifier cache invalidation is necessary.
+    Without a schedule, preserve the legacy fixed-patience behavior exactly.
+    """
+    if not cfg.raw_patience_schedule:
+        return int(cfg.required_consecutive_epochs)
+    if type(global_step) is not int or global_step < 0:
+        raise ValueError("scheduled raw patience requires a nonnegative integer global_step")
+    patience = cfg.raw_patience_schedule[0][1]
+    for start, checks in cfg.raw_patience_schedule:
+        if global_step < start:
+            break
+        patience = checks
+    return patience
+
+
 def update_raw_plateau_controller(
     state: AdaptiveOmniFoldState,
     probe: Mapping[str, float],
@@ -3340,6 +3968,7 @@ def update_raw_plateau_controller(
         raise ValueError(
             "raw plateau controller requires monitor_mode=raw_plateau_refit"
         )
+    patience = raw_staleness_patience(cfg, global_step=global_step)
     if cfg.raw_best_scope == "global" and not state.raw_global_initialized:
         initialize_global_raw_best(state)
     gap = float(probe.get("raw_auc_gap", float("nan")))
@@ -3402,14 +4031,17 @@ def update_raw_plateau_controller(
         and (finite or cfg.staleness_every_n_steps is None)
         and not improved
         and not warmup_interval
-        and state.raw_no_improvement_streak >= cfg.required_consecutive_epochs
+        and state.raw_no_improvement_streak >= patience
     )
     if fired:
         decision = "raw_plateau_recalibrate"
         if cfg.raw_best_scope == "global" and state.raw_global_refit_pending:
             state.raw_global_failed_rounds += 1
             state.raw_global_refit_pending = False
-            state.raw_global_stop_requested = state.raw_global_failed_rounds >= cfg.raw_global_max_failed_rounds
+            state.raw_global_stop_requested = (
+                cfg.raw_global_max_failed_rounds > 0
+                and state.raw_global_failed_rounds >= cfg.raw_global_max_failed_rounds
+            )
             if state.raw_global_stop_requested:
                 fired = False
                 decision = "raw_global_stagnation_stop"
@@ -3423,6 +4055,7 @@ def update_raw_plateau_controller(
         "reward_round_id": float(state.reward_round_id),
         "decision_recalibrate": float(fired),
         **{key: float(value) for key, value in probe.items()},
+        "raw_no_improvement_patience": float(patience),
     }
     if not training_ready:
         # History readers used during resume also require saturation. Do not let
@@ -3466,7 +4099,7 @@ def update_raw_plateau_controller(
             state.raw_no_improvement_streak
         ),
         "staleness/raw_no_improvement_patience": float(
-            cfg.required_consecutive_epochs
+            patience
         ),
         "staleness/every_n_steps": float(cfg.staleness_every_n_steps or 0),
         "staleness/raw_decision_eligible": float(eligible),
@@ -3585,6 +4218,8 @@ class AdaptiveOmniFoldPool:
     truth: Tensor
     candidates: Tensor
     packing_spec: EventPackingSpec
+    # Optional policy-only sidecar. Never part of classifier inputs or identity hashing.
+    policy_noise_mask: Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.packed_event.ndim != 2:
@@ -3598,10 +4233,20 @@ class AdaptiveOmniFoldPool:
             raise ValueError("adaptive pool event axes do not match")
         if int(self.candidates.shape[1]) != 1:
             raise ValueError("adaptive OmniFold pools must contain exactly K=1")
+        if self.policy_noise_mask is not None and tuple(self.policy_noise_mask.shape) != (n_events, 2):
+            raise ValueError("policy noise mask must be (N,2)")
 
     @property
     def n_events(self) -> int:
         return int(self.packed_event.shape[0])
+
+    @property
+    def identity_inputs(self) -> Tensor:
+        return event_identity_inputs(self.packed_event, self.packing_spec)
+
+    @property
+    def identity_override(self) -> Tensor | None:
+        return self.identity_inputs if REST_FRAME_KEY in self.packing_spec.shapes else None
 
     def to(self, device: torch.device) -> "AdaptiveOmniFoldPool":
         return AdaptiveOmniFoldPool(
@@ -3609,6 +4254,7 @@ class AdaptiveOmniFoldPool:
             truth=self.truth.to(device=device, dtype=torch.float32),
             candidates=self.candidates.to(device=device, dtype=torch.float32),
             packing_spec=self.packing_spec,
+            policy_noise_mask=None if self.policy_noise_mask is None else self.policy_noise_mask.to(device),
         )
 
     def prefix(self, max_events: int | None) -> "AdaptiveOmniFoldPool":
@@ -3622,6 +4268,7 @@ class AdaptiveOmniFoldPool:
             truth=self.truth[:count],
             candidates=self.candidates[:count],
             packing_spec=self.packing_spec,
+            policy_noise_mask=None if self.policy_noise_mask is None else self.policy_noise_mask[:count],
         )
 
     def select(self, indices: Tensor) -> "AdaptiveOmniFoldPool":
@@ -3630,6 +4277,7 @@ class AdaptiveOmniFoldPool:
             truth=self.truth.index_select(0, indices.to(self.truth.device)),
             candidates=self.candidates.index_select(0, indices.to(self.candidates.device)),
             packing_spec=self.packing_spec,
+            policy_noise_mask=None if self.policy_noise_mask is None else self.policy_noise_mask.index_select(0, indices.to(self.policy_noise_mask.device)),
         )
 
     def repack(self, target_spec: EventPackingSpec) -> "AdaptiveOmniFoldPool":
@@ -3646,6 +4294,7 @@ class AdaptiveOmniFoldPool:
             truth=self.truth,
             candidates=self.candidates,
             packing_spec=target_spec,
+            policy_noise_mask=self.policy_noise_mask,
         )
 
 
@@ -3653,7 +4302,7 @@ def split_single_classifier_pool(
     pool: AdaptiveOmniFoldPool, *, seed: int,
 ) -> tuple[AdaptiveOmniFoldPool, AdaptiveOmniFoldPool]:
     """Use every budgeted identity once across stable 80/20 classifier splits."""
-    fit_idx, val_idx = _identity_crossfit_splits(pool.packed_event, folds=5, seed=seed)[0]
+    fit_idx, val_idx = _identity_crossfit_splits(pool.identity_inputs, folds=5, seed=seed)[0]
     return pool.select(fit_idx), pool.select(val_idx)
 
 
@@ -3732,6 +4381,79 @@ def score_reward_on_pool(
     return score
 
 
+@torch.no_grad()
+def evaluate_frozen_checkpoint_auc(
+    stack: FrozenResidualRatioReward,
+    pool: AdaptiveOmniFoldPool,
+    *,
+    checkpoint_index: int | None = 0,
+    row_budget: int,
+) -> float:
+    """Evaluate one unchanged reward member on truth versus current generation."""
+
+    from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import (
+        _weighted_binary_score_metrics,
+    )
+
+    index = None if checkpoint_index is None else int(checkpoint_index)
+    if index is not None and (index < 0 or index >= stack.num_checkpoints):
+        raise IndexError("frozen reward checkpoint index is out of range")
+    try:
+        device = next(stack.parameters()).device
+    except StopIteration:
+        device = pool.packed_event.device
+    compatible = pool.repack(stack.packing_spec)
+    aligned = compatible if compatible.packed_event.device == device else compatible.to(device)
+    def score(candidate: Tensor) -> Tensor:
+        if index is None:
+            return _score_population(stack, aligned.packed_event, candidate, int(row_budget))
+        return stack.checkpoint_logits(
+            index, aligned.packed_event, candidate, batch_size=int(row_budget)
+        )
+
+    truth_score = score(aligned.truth.unsqueeze(1))
+    generated_score = score(aligned.candidates)
+    if generated_score.shape[1] != 1:
+        raise ValueError("fixed classifier AUC requires a K=1 evaluation pool")
+    _loss, _balanced_accuracy, auc = _weighted_binary_score_metrics(
+        truth_score,
+        generated_score,
+        torch.ones_like(generated_score),
+    )
+    return float(auc)
+
+
+def bootstrap_baseline_pool(
+    cfg: AdaptiveOmniFoldConfig, pool: AdaptiveOmniFoldPool,
+) -> AdaptiveOmniFoldPool | None:
+    """The bootstrap must honor the explicit request to skip baseline fits."""
+    if not cfg.baseline_probe_on_start or cfg.monitor_mode == "raw_plateau_refit":
+        return None
+    return pool.prefix(cfg.probe_max_events)
+
+
+def step_zero_raw_audit_enabled(cfg: AdaptiveOmniFoldConfig) -> bool:
+    return bool(cfg.baseline_probe_on_start and (
+        cfg.fixed_schedule_log_raw_audit or cfg.monitor_mode == "raw_only"
+    ))
+
+
+def frozen_classifier_metrics(
+    stack: FrozenResidualRatioReward, pool: AdaptiveOmniFoldPool, *, row_budget: int,
+) -> dict[str, float]:
+    """Read-only, oriented AUC on one common external K=1 event panel."""
+    metrics = {"frozen_classifier/events": float(pool.n_events)}
+    for label, index in [("ensemble", None)] + [
+        (f"fold{i + 1:02d}", i) for i in range(stack.num_checkpoints)
+    ]:
+        auc = evaluate_frozen_checkpoint_auc(
+            stack, pool, checkpoint_index=index, row_budget=row_budget,
+        )
+        metrics[f"frozen_classifier/{label}/auc"] = auc
+        metrics[f"frozen_classifier/{label}/auc_gap"] = abs(auc - 0.5)
+    return metrics
+
+
 def _weight_diagnostics(log_weight: Tensor) -> dict[str, float]:
     weights = global_mean_one_from_log_weights(log_weight).reshape(-1)
     n_rows = max(int(weights.numel()), 1)
@@ -3745,6 +4467,28 @@ def _weight_diagnostics(log_weight: Tensor) -> dict[str, float]:
         "reward_std": float(log_weight.std(unbiased=False).detach().cpu()),
         "probe_events": float(log_weight.shape[0]),
         "probe_rows": float(log_weight.numel()),
+    }
+
+
+def _iteration_one_weight_metrics(log_weight: Tensor) -> dict[str, float]:
+    """Read-only statistics of the actual tempered, optionally clipped weights.
+
+    Inputs are replicated full OOF/validation vectors, not per-rank shards.
+    Float64 softmax avoids overflowing unnormalised exp(log_weight).
+    """
+    flat = log_weight.detach().reshape(-1).double()
+    if not flat.numel() or not bool(torch.isfinite(flat).all()):
+        raise FloatingPointError("iteration-one monitor received empty/nonfinite log weights")
+    shares = torch.softmax(flat, dim=0)
+    n = flat.numel()
+    ess = 1.0 / shares.square().sum()
+    return {
+        "ess": float(ess.cpu()),
+        "ess_fraction": float((ess / n).cpu()),
+        "max_mean_one_weight": float((shares.max() * n).cpu()),
+        "top_1pct_mass": float(shares.topk(max(1, math.ceil(n * .01))).values.sum().cpu()),
+        "log_weight_std": float(flat.std(unbiased=False).cpu()),
+        "rows": float(n),
     }
 
 
@@ -3842,6 +4586,7 @@ def fit_fresh_audit(
     warm_start_cache: dict[str, Any] | None = None,
     progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
     training_readiness: Mapping[str, Any] | None = None,
+    explicit_split_indices: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> dict[str, float]:
     if pool.n_events < 30:
         raise ValueError("fresh adaptive OmniFold audit needs at least 30 events")
@@ -3861,14 +4606,28 @@ def fit_fresh_audit(
     )
     if cfg.single_pool_train_validation:
         fit_index, validation_index = _identity_crossfit_splits(
-            pool.packed_event, folds=5, seed=cfg.single_pool_split_seed,
+            pool.identity_inputs, folds=5, seed=cfg.single_pool_split_seed,
         )[0]
         n_fit, n_valid = len(fit_index), len(validation_index)
+    if explicit_split_indices is not None:
+        n_fit, n_valid = (len(index) for index in explicit_split_indices[:2])
     fit_config = build_fit_config(
         resolved_fit_block,
         n_train=n_fit,
         n_validation=n_valid,
         max_batch_population=n_fit if cfg.single_pool_train_validation else None,
+    )
+    _log.info(
+        "[DGPO/omnifold] audit fit budget: n_fit=%s n_valid=%s batch=%s "
+        "min_steps=%s patience_evaluations=%s interval_steps=%s "
+        "require_saturation=%s",
+        n_fit,
+        n_valid,
+        fit_config.batch_size,
+        fit_config.min_steps,
+        fit_config.validation_patience_evaluations,
+        fit_config.validation_interval_steps,
+        fit_config.require_saturation,
     )
     factory = peft_bank_factory(
         model_builder,
@@ -3877,12 +4636,41 @@ def fit_fresh_audit(
         reset=True,
         classifier_overrides={
             key: resolved_fit_block[key]
-            for key in ("head_dropout", "topology_dropout", "decoder_hidden_dim",
-                        "decoder_layers", "decoder_heads", "periodic_pair_features",
-                        "topology_fourier_embedding", "topology_conditioning")
+            for key in (
+                "head_dropout",
+                "topology_dropout",
+                "decoder_hidden_dim",
+                "decoder_layers",
+                "decoder_heads",
+                "periodic_pair_features",
+                "topology_fourier_embedding",
+                "topology_direct_logit",
+                "topology_context_residual_scale",
+                "topology_conditioning",
+                "topology_pair_token",
+                "relation_token_count",
+                "visible_pair_rest_frame",
+                "topology_max_harmonic",
+                "topology_include_theta_pair",
+                "topology_theta_fourier",
+                "topology_hidden_dim",
+                "topology_embedding_dim",
+                "topology_fusion_hidden_dim",
+                "train_layernorm",
+                "train_encoder",
+                "train_grouped_sequential_embedding",
+                "train_invisible_projector",
+                "train_angular_conditioning",
+                "train_backbone",
+                "train_last_pet_block",
+                "asymmetric_attention",
+            )
             if resolved_fit_block.get(key) is not None
         },
     )
+    classifier_kind = resolved_fit_block.get("classifier_kind", "evenet")
+    if classifier_kind != "evenet":
+        raise ValueError(f"unknown audit classifier_kind: {classifier_kind}")
     weighted_bank_name = "audit"
     try:
         weighted_result = fit_independent_evenet_audit(
@@ -3907,8 +4695,19 @@ def fit_fresh_audit(
             ),
             progress_callback=progress_callback,
             warm_start_cache=warm_start_cache,
-            identity_split_seed=(cfg.single_pool_split_seed if cfg.single_pool_train_validation else None),
+            identity_split_seed=(
+                cfg.single_pool_split_seed
+                if cfg.single_pool_train_validation
+                else (
+                    int(seed)
+                    if warm_start_cache is not None
+                    or training_readiness is not None
+                    else None
+                )
+            ),
+            **({"identity_condition": aligned.identity_override} if aligned.identity_override is not None else {}),
             **({"training_readiness": training_readiness} if training_readiness is not None else {}),
+            **({"explicit_split_indices": explicit_split_indices} if explicit_split_indices is not None else {}),
         )
     finally:
         discard = getattr(model_builder, "discard_bank", None)
@@ -3938,6 +4737,7 @@ def fit_fresh_audit(
             unsafe_lcb_reached
         ),
         "audit_fresh_pretrained_initialization": float(not getattr(weighted_result, "warm_started", False)),
+        "audit_fresh_initialization": float(not getattr(weighted_result, "warm_started", False)),
         "audit_reused_previous_classifier": float(getattr(weighted_result, "warm_started", False)),
         "audit_training_ready": float(getattr(weighted_result, "training_ready", False)),
         "audit_training_min_steps": float(getattr(weighted_result, "training_min_steps", 0)),
@@ -3980,7 +4780,11 @@ def fit_fresh_audit(
             )
         ),
         "audit_fit_events": float(weighted_result.fit_events),
+        "audit_early_stop_events": float(getattr(weighted_result, "early_stop_events", n_valid)),
         "audit_test_events": float(weighted_result.audit_events),
+        "audit_steps_per_epoch": float(getattr(weighted_result, "training_steps_per_epoch", 0)),
+        "audit_validation_interval_steps": float(fit_config.validation_interval_steps),
+        "audit_patience_evaluations": float(fit_config.validation_patience_evaluations),
         "audit_probe_events": float(pool.n_events),
         "audit_reused_validation_for_final": float(
             reuse_validation_for_final
@@ -4147,6 +4951,27 @@ def fit_repeated_topology_audit(
     return aggregate
 
 
+def _external_raw_audit_population(
+    training_pool: AdaptiveOmniFoldPool, evaluation_pool: AdaptiveOmniFoldPool, *, seed: int,
+) -> tuple[AdaptiveOmniFoldPool, tuple[Tensor, Tensor, Tensor]]:
+    """Keep the entire selected training fold; split external evaluation 50/50.
+
+    Hash only visible identities, so Ray reorderings and newly generated samples
+    cannot move an event between early-stop and final-test populations.
+    """
+    if training_pool.packing_spec != evaluation_pool.packing_spec:
+        raise ValueError("raw audit training and evaluation packing must match")
+    early, final = _identity_crossfit_splits(evaluation_pool.identity_inputs, folds=2, seed=seed)[0]
+    n_fit = training_pool.n_events
+    combined = AdaptiveOmniFoldPool(
+        packed_event=torch.cat((training_pool.packed_event, evaluation_pool.packed_event)),
+        truth=torch.cat((training_pool.truth, evaluation_pool.truth)),
+        candidates=torch.cat((training_pool.candidates, evaluation_pool.candidates)),
+        packing_spec=training_pool.packing_spec,
+    )
+    return combined, (torch.arange(n_fit, device=early.device), early + n_fit, final + n_fit)
+
+
 def fit_raw_policy_audit(
     *,
     pool: AdaptiveOmniFoldPool,
@@ -4161,94 +4986,186 @@ def fit_raw_policy_audit(
     warm_start_cache: dict[str, Any] | None = None,
     progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
     use_training_readiness: bool = True,
+    repeats: int | None = None,
+    training_pool: AdaptiveOmniFoldPool | None = None,
 ) -> dict[str, float]:
-    """Fit the standard unweighted truth-vs-policy judge on one fixed pool."""
+    """Fit fresh unweighted truth-vs-policy judges on one fixed event pool.
 
-    raw_audit = fit_fresh_audit(
-        pool=pool,
-        log_weight=torch.zeros(
-            tuple(pool.candidates.shape[:2]),
-            device=pool.candidates.device,
-            dtype=torch.float32,
-        ),
-        model_builder=model_builder,
-        cfg=cfg,
-        device=device,
-        seed=int(seed) + 7919,
-        reuse_validation_for_final=True,
-        # Raw AUC measures policy-vs-truth discrepancy; in raw_plateau_refit
-        # mode it controls refits. Train to validation-loss saturation.
-        early_stop_auc_gap=None,
-        early_stop_balanced_accuracy_lcb=(
-            early_stop_balanced_accuracy_lcb
-        ),
-        early_stop_balanced_accuracy_confidence_z=(
-            early_stop_balanced_accuracy_confidence_z
-        ),
-        early_stop_balanced_accuracy_required_consecutive=(
-            early_stop_balanced_accuracy_required_consecutive
-        ),
-        fit_overrides=fit_overrides,
-        warm_start_cache=warm_start_cache,
-        progress_callback=progress_callback,
-        **({"training_readiness": cfg.audit_fit["training_readiness"]}
-           if use_training_readiness and cfg.audit_fit.get("training_readiness") is not None else {}),
+    ``audit_fit.repeats`` is opt-in. Each repeat gets an independent model
+    initialization and identity split, while every policy boundary reuses the
+    same repeat seeds. This makes the mean gap a paired trajectory statistic
+    and exposes between-judge uncertainty without feeding it back into DGPO.
+    """
+
+    repeat_count = int(
+        cfg.audit_fit.get("repeats", 1) if repeats is None else repeats
     )
-    return {
-        "raw_auc": float(raw_audit["judge_auc_weighted"]),
-        "raw_classifier_warm_started": float(raw_audit.get("audit_reused_previous_classifier", 0.0)),
-        "raw_audit_training_ready": float(raw_audit.get("audit_training_ready", 0.0)),
-        "raw_audit_training_min_steps": float(raw_audit.get("audit_training_min_steps", 0.0)),
-        "raw_audit_training_steps": float(raw_audit.get("audit_training_steps", 0.0)),
-        "raw_audit_training_epochs": float(raw_audit.get("audit_training_epochs", float("nan"))),
-        "raw_auc_gap": float(raw_audit["weighted_auc_gap"]),
-        "raw_balanced_accuracy": float(raw_audit["audit_balanced_accuracy"]),
-        "raw_audit_saturated": float(raw_audit["audit_saturated"]),
-        "raw_audit_unsafe_balanced_accuracy_lcb_reached": float(
-            raw_audit.get(
-                "audit_unsafe_balanced_accuracy_lcb_reached",
-                0.0,
+    repeat_seed_stride = int(cfg.audit_fit.get("repeat_seed_stride", 104_729))
+    if repeat_count < 1:
+        raise ValueError("raw audit repeats must be positive")
+    if repeat_count > 1 and warm_start_cache is not None:
+        raise ValueError("repeated raw audits cannot share a warm-start cache")
+    matched_fold = cfg.audit_fit.get("training_population", "probe_split") == "omnifold_fold"
+    if matched_fold != (training_pool is not None):
+        raise ValueError("omnifold_fold raw audit requires its freshly generated training fold")
+    if matched_fold and warm_start_cache is not None:
+        raise ValueError("omnifold_fold raw audits are cold, not warm-started")
+
+    def _as_raw_metrics(raw_audit: Mapping[str, float]) -> dict[str, float]:
+        return {
+            "raw_auc": float(raw_audit["judge_auc_weighted"]),
+            "raw_classifier_warm_started": float(raw_audit.get("audit_reused_previous_classifier", 0.0)),
+            "raw_audit_training_ready": float(raw_audit.get("audit_training_ready", 0.0)),
+            "raw_audit_training_min_steps": float(raw_audit.get("audit_training_min_steps", 0.0)),
+            "raw_audit_training_steps": float(raw_audit.get("audit_training_steps", 0.0)),
+            "raw_audit_training_epochs": float(raw_audit.get("audit_training_epochs", float("nan"))),
+            "raw_auc_gap": float(raw_audit["weighted_auc_gap"]),
+            "raw_balanced_accuracy": float(raw_audit["audit_balanced_accuracy"]),
+            "raw_audit_saturated": float(raw_audit["audit_saturated"]),
+            "raw_audit_unsafe_balanced_accuracy_lcb_reached": float(
+                raw_audit.get("audit_unsafe_balanced_accuracy_lcb_reached", 0.0)
+            ),
+            "raw_audit_validation_loss": float(raw_audit["audit_validation_loss"]),
+            "raw_audit_validation_auc": float(raw_audit["audit_validation_auc"]),
+            "raw_audit_validation_oriented_balanced_accuracy": float(
+                raw_audit.get("audit_validation_oriented_balanced_accuracy", float("nan"))
+            ),
+            "raw_audit_validation_balanced_accuracy_lcb": float(
+                raw_audit.get("audit_validation_balanced_accuracy_lcb", float("nan"))
+            ),
+            "raw_audit_validation_balanced_accuracy_lcb_standard_error": float(
+                raw_audit.get("audit_validation_balanced_accuracy_lcb_standard_error", float("nan"))
+            ),
+            "raw_audit_validation_balanced_accuracy_lcb_streak": float(
+                raw_audit.get("audit_validation_balanced_accuracy_lcb_streak", 0.0)
+            ),
+            "raw_audit_fit_events": float(raw_audit["audit_fit_events"]),
+            "raw_audit_early_stop_events": float(raw_audit.get("audit_early_stop_events", float("nan"))),
+            "raw_audit_test_events": float(raw_audit["audit_test_events"]),
+            "raw_audit_probe_events": float(raw_audit["audit_probe_events"]),
+            "raw_audit_steps_per_epoch": float(raw_audit.get("audit_steps_per_epoch", float("nan"))),
+            "raw_audit_validation_interval_steps": float(raw_audit.get("audit_validation_interval_steps", float("nan"))),
+            "raw_audit_patience_evaluations": float(raw_audit.get("audit_patience_evaluations", float("nan"))),
+            "raw_audit_uses_omnifold_fold": float(matched_fold),
+            "raw_audit_training_fold": float(cfg.audit_fit.get("training_fold", 1)) if matched_fold else 0.0,
+            "raw_auc_null_se_approx": float(
+                raw_audit.get("audit_auc_null_se_approx", float("nan"))
+            ),
+            "raw_auc_gap_z_approx": float(
+                raw_audit.get("audit_weighted_auc_gap_z_approx", float("nan"))
+            ),
+            "raw_auc_gap_pvalue_approx": float(
+                raw_audit.get("audit_weighted_auc_gap_pvalue_approx", float("nan"))
+            ),
+        }
+
+    results: list[dict[str, float]] = []
+    for repeat_index in range(repeat_count):
+        repeat_number = repeat_index + 1
+        audit_seed = int(seed) + 7919 + repeat_index * repeat_seed_stride
+        fit_pool, explicit_splits = pool, None
+        if training_pool is not None:
+            fit_pool, explicit_splits = _external_raw_audit_population(training_pool, pool, seed=audit_seed)
+        zero_log_weight = torch.zeros(
+            tuple(fit_pool.candidates.shape[:2]), device=fit_pool.candidates.device, dtype=torch.float32,
+        )
+        raw_audit = fit_fresh_audit(
+            pool=fit_pool,
+            log_weight=zero_log_weight,
+            model_builder=model_builder,
+            cfg=cfg,
+            device=device,
+            seed=audit_seed,
+            reuse_validation_for_final=not bool(
+                cfg.audit_fit.get("disjoint_final_audit", False)
+            ),
+            # Raw AUC measures policy-vs-truth discrepancy. Train to the
+            # validation-loss plateau; threshold stopping is reserved for the
+            # deliberately capacity-limited reward classifiers.
+            early_stop_auc_gap=None,
+            early_stop_balanced_accuracy_lcb=early_stop_balanced_accuracy_lcb,
+            early_stop_balanced_accuracy_confidence_z=(
+                early_stop_balanced_accuracy_confidence_z
+            ),
+            early_stop_balanced_accuracy_required_consecutive=(
+                early_stop_balanced_accuracy_required_consecutive
+            ),
+            fit_overrides=fit_overrides,
+            warm_start_cache=warm_start_cache,
+            **({"explicit_split_indices": explicit_splits} if explicit_splits is not None else {}),
+            progress_callback=(
+                None
+                if progress_callback is None
+                else lambda row, repeat_number=repeat_number: progress_callback(
+                    {"repeat": float(repeat_number), **row}
+                )
+            ),
+            **(
+                {"training_readiness": cfg.audit_fit["training_readiness"]}
+                if use_training_readiness
+                and cfg.audit_fit.get("training_readiness") is not None
+                else {}
+            ),
+        )
+        if training_pool is not None:
+            raw_audit = {**raw_audit, "audit_probe_events": float(pool.n_events)}
+        results.append(_as_raw_metrics(raw_audit))
+
+    if repeat_count == 1:
+        aggregate = {
+            **results[0],
+            "raw_audit_repeats": 1.0,
+            "raw_auc_gap_stdev": 0.0,
+            "raw_auc_gap_se": 0.0,
+        }
+    else:
+        aggregate = {
+            key: sum(item[key] for item in results) / float(repeat_count)
+            for key in results[0]
+        }
+        aggregate["raw_classifier_warm_started"] = float(
+            any(item["raw_classifier_warm_started"] >= 0.5 for item in results)
+        )
+        aggregate["raw_audit_training_ready"] = float(
+            all(item["raw_audit_training_ready"] >= 0.5 for item in results)
+        )
+        aggregate["raw_audit_saturated"] = float(
+            all(item["raw_audit_saturated"] >= 0.5 for item in results)
+        )
+        aggregate["raw_audit_unsafe_balanced_accuracy_lcb_reached"] = float(
+            any(
+                item["raw_audit_unsafe_balanced_accuracy_lcb_reached"] >= 0.5
+                for item in results
             )
-        ),
-        "raw_audit_validation_loss": float(raw_audit["audit_validation_loss"]),
-        "raw_audit_validation_auc": float(raw_audit["audit_validation_auc"]),
-        "raw_audit_validation_oriented_balanced_accuracy": float(
-            raw_audit.get(
-                "audit_validation_oriented_balanced_accuracy",
-                float("nan"),
-            )
-        ),
-        "raw_audit_validation_balanced_accuracy_lcb": float(
-            raw_audit.get(
-                "audit_validation_balanced_accuracy_lcb",
-                float("nan"),
-            )
-        ),
-        "raw_audit_validation_balanced_accuracy_lcb_standard_error": float(
-            raw_audit.get(
-                "audit_validation_balanced_accuracy_lcb_standard_error",
-                float("nan"),
-            )
-        ),
-        "raw_audit_validation_balanced_accuracy_lcb_streak": float(
-            raw_audit.get(
-                "audit_validation_balanced_accuracy_lcb_streak",
-                0.0,
-            )
-        ),
-        "raw_audit_fit_events": float(raw_audit["audit_fit_events"]),
-        "raw_audit_test_events": float(raw_audit["audit_test_events"]),
-        "raw_audit_probe_events": float(raw_audit["audit_probe_events"]),
-        "raw_auc_null_se_approx": float(
-            raw_audit.get("audit_auc_null_se_approx", float("nan"))
-        ),
-        "raw_auc_gap_z_approx": float(
-            raw_audit.get("audit_weighted_auc_gap_z_approx", float("nan"))
-        ),
-        "raw_auc_gap_pvalue_approx": float(
-            raw_audit.get("audit_weighted_auc_gap_pvalue_approx", float("nan"))
-        ),
-    }
+        )
+        gaps = [item["raw_auc_gap"] for item in results]
+        gap_mean = aggregate["raw_auc_gap"]
+        gap_stdev = math.sqrt(
+            sum((gap - gap_mean) ** 2 for gap in gaps)
+            / float(repeat_count - 1)
+        )
+        aggregate.update(
+            {
+                "raw_audit_repeats": float(repeat_count),
+                "raw_auc_gap_stdev": float(gap_stdev),
+                "raw_auc_gap_se": float(
+                    gap_stdev / math.sqrt(float(repeat_count))
+                ),
+            }
+        )
+        for index, item in enumerate(results, start=1):
+            for key, value in item.items():
+                aggregate[f"raw_audit_repeat_{index:02d}/{key.removeprefix('raw_')}"] = value
+
+    if (
+        bool(cfg.audit_fit.get("fail_if_unsaturated", False))
+        and aggregate["raw_audit_saturated"] < 0.5
+    ):
+        raise RuntimeError(
+            "one or more repeated raw policy audits did not reach validation "
+            "saturation"
+        )
+    return aggregate
 
 
 def fit_reference_trust_audit(
@@ -4281,6 +5198,7 @@ def fit_reference_trust_audit(
         ),
         fit_overrides=cfg.classifier_trust_audit_fit,
         use_training_readiness=False,
+        repeats=1,
         progress_callback=progress_callback,
     )
     return {
@@ -4319,6 +5237,7 @@ def probe_installed_reward(
     device: torch.device,
     seed: int | None = None,
     early_stop_auc_gap: float | None = None,
+    raw_warm_start_cache: dict[str, Any] | None = None,
     progress_callback: OmniFoldProgressCallback | None = None,
 ) -> dict[str, float]:
     log_weight = score_reward_on_pool(
@@ -4352,6 +5271,7 @@ def probe_installed_reward(
             cfg=cfg,
             device=device,
             seed=cfg.probe_seed if seed is None else int(seed),
+            warm_start_cache=raw_warm_start_cache,
             progress_callback=(
                 None
                 if progress_callback is None
@@ -4378,6 +5298,22 @@ def _broadcast_int(value: int, *, world_size: int, device: torch.device) -> int:
     return int(payload.item())
 
 
+def residual_closure_auc_limit(
+    cfg: AdaptiveOmniFoldConfig, *, global_step: int | None = None,
+) -> float:
+    """Resolve once per refit from the persisted policy clock, not fit updates."""
+    if not cfg.residual_closure_schedule:
+        return .5 + float(cfg.residual_min_auc_gain)
+    if type(global_step) is not int or global_step < 0:
+        raise ValueError("residual closure schedule requires a nonnegative DGPO global_step")
+    limit = cfg.residual_closure_schedule[0][1]
+    for start, auc in cfg.residual_closure_schedule:
+        if global_step < start:
+            break
+        limit = auc
+    return float(limit)
+
+
 def run_adaptive_refit(
     *,
     state: AdaptiveOmniFoldState,
@@ -4393,8 +5329,36 @@ def run_adaptive_refit(
     world_size: int,
     enforce_round_acceptance: bool = True,
     progress_callback: OmniFoldProgressCallback | None = None,
+    global_step: int | None = None,
 ) -> dict[str, Any]:
     """Fit, independently audit, and atomically install reward/reference pair."""
+    state.last_recalibration_attempt_epoch = int(epoch)
+    closure_limit = residual_closure_auc_limit(cfg, global_step=global_step)
+    closure_metrics = {
+        "omnifold/residual_closure_auc_limit": closure_limit,
+        "omnifold/residual_closure_schedule_enabled": float(bool(cfg.residual_closure_schedule)),
+        "omnifold/refit_global_step": float(global_step if global_step is not None else -1),
+    }
+    if cfg.iteration_one_only:
+        closure_metrics = {
+            "omnifold/iteration_one_only": 1.0,
+            "omnifold/closure_evaluated": 0.0,
+            "omnifold/refit_global_step": float(global_step if global_step is not None else -1),
+            "omnifold/iteration1_monitor/min_signal_auc": closure_limit,
+        }
+    if cfg.fixed_iteration_budget:
+        closure_metrics = {
+            "omnifold/fixed_iteration_budget": float(cfg.max_iterations),
+            "omnifold/closure_evaluated": 0.0,
+            "omnifold/refit_global_step": float(global_step if global_step is not None else -1),
+        }
+        _log.info("[DGPO/omnifold] fixed budget: %s iterations; install useful increments without requiring closure", cfg.max_iterations)
+    elif cfg.iteration_one_only:
+        _log.info("[DGPO/omnifold] refit global_step=%s iteration-one-only: signal AUC>%.6g; closure NOT evaluated",
+                  global_step, closure_limit)
+    else:
+        _log.info("[DGPO/omnifold] refit global_step=%s residual closure AUC<=%.6g (fixed for this refit)",
+                  global_step, closure_limit)
     if cfg.single_pool_train_validation:
         # Both sides come from this policy's one generated, budgeted pool.
         # Warm-started reward classifiers never fit the fixed validation 20%.
@@ -4416,9 +5380,15 @@ def run_adaptive_refit(
     smallest_fold = None
     if cfg.single_pool_train_validation:
         if cfg.warm_start_iterations or cfg.crossfit_partition == "identity":
-            smallest_fold = min(len(fit_index) for fit_index, _ in _identity_crossfit_splits(
-                fit_pool.packed_event, folds=cfg.crossfit_folds, seed=cfg.seed,
-            ))
+            smallest_fold = min(
+                len(fit_index)
+                for repeat in range(1, cfg.crossfit_repeats + 1)
+                for fit_index, _ in _identity_crossfit_splits(
+                    fit_pool.identity_inputs,
+                    folds=cfg.crossfit_folds,
+                    seed=_crossfit_repeat_seed(cfg.seed, repeat),
+                )
+            )
         else:
             smallest_fold = fit_pool.n_events - math.ceil(fit_pool.n_events / cfg.crossfit_folds)
     fit_config = build_fit_config(
@@ -4433,6 +5403,7 @@ def run_adaptive_refit(
         fit_pool.packing_spec,
         reward_bank_name,
         reset=True,
+        classifier_overrides=cfg.reward_classifier,
     )
     previous_warm_state = None
     outer_partition = (
@@ -4454,11 +5425,15 @@ def run_adaptive_refit(
             gen_condition=fit_pool.packed_event,
             gen_sample=fit_pool.candidates,
             iterations=cfg.max_iterations,
+            **({"iteration_one_only": True} if cfg.iteration_one_only else {}),
+            **({"fixed_iteration_budget": True} if cfg.fixed_iteration_budget else {}),
             min_iterations=cfg.min_iterations,
             fit_config=fit_config,
             tempering=cfg.tempering,
             crossfit_folds=cfg.crossfit_folds,
-            residual_min_auc_gain=cfg.residual_min_auc_gain,
+            crossfit_repeats=cfg.crossfit_repeats,
+            residual_min_auc_gain=(closure_limit - .5 if cfg.residual_closure_schedule
+                                   else cfg.residual_min_auc_gain),
             seed=(
                 cfg.seed
                 if cfg.trust_trajectory_search_enabled
@@ -4471,13 +5446,56 @@ def run_adaptive_refit(
             device=device,
             warm_start_iterations=cfg.warm_start_iterations,
             warm_start_state=previous_warm_state,
+            **({"warm_start_from_iteration_one": True} if cfg.warm_start_from_iteration_one else {}),
+            **({"later_iteration_learning_rate": cfg.fit["later_iteration_learning_rate"]}
+               if cfg.fit.get("later_iteration_learning_rate") is not None else {}),
+            **({"later_iteration_train_mode": cfg.fit["later_iteration_train_mode"]}
+               if "later_iteration_train_mode" in cfg.fit else {}),
+            **({"later_iteration_decoder_learning_rate": cfg.fit["later_iteration_decoder_learning_rate"]}
+               if "later_iteration_decoder_learning_rate" in cfg.fit else {}),
             crossfit_seed=cfg.seed,
             crossfit_partition=cfg.crossfit_partition,
             min_steps_per_fold=cfg.fit.get("min_steps_per_fold", 0),
+            **({"max_steps_per_fold": cfg.fit["max_steps_per_fold"]}
+               if cfg.fit.get("max_steps_per_fold") is not None else {}),
+            # Opt-in exact fold-epoch controls; legacy overlays keep their
+            # original scaled update budgets. Explicit step/evaluation controls
+            # still take precedence over epoch-based validation settings.
+            **({
+                "warm_start_min_epochs_per_fold": cfg.fit["warm_start_min_epochs_per_fold"],
+                "validation_interval_epochs": (
+                    cfg.fit.get("validation_interval_epochs", 0.2)
+                    if cfg.fit.get("validation_interval_steps") is None else None
+                ),
+                "validation_patience_epochs": (
+                    cfg.fit.get("validation_patience_epochs", 5.0)
+                    if "validation_patience_evaluations" not in cfg.fit else None
+                ),
+            } if cfg.fit.get("warm_start_min_epochs_per_fold") is not None else {}),
+            **({"identity_condition": fit_pool.identity_override} if fit_pool.identity_override is not None else {}),
             progress_callback=(
                 None
                 if progress_callback is None
                 else lambda row: progress_callback("residual_reward", row)
+            ),
+            log_ratio_clip=cfg.log_ratio_clip,
+            minimum_ess_fraction=cfg.minimum_ess_fraction,
+            adaptive_tempering=cfg.adaptive_tempering_enabled,
+            target_ess_fraction=cfg.target_ess_fraction,
+            minimum_tempering=cfg.minimum_tempering,
+            tempering_grid_steps=cfg.tempering_grid_steps,
+            inherit_previous_tempering=cfg.inherit_previous_tempering,
+            ess_aware_checkpoint_selection=cfg.ess_aware_checkpoint_selection,
+            ess_aware_max_checkpoints=cfg.ess_aware_max_checkpoints,
+            ess_aware_first_residual_only=cfg.ess_aware_first_residual_only,
+            minimum_sufficient_balanced_accuracy=cfg.fit.get(
+                "minimum_sufficient_balanced_accuracy"
+            ),
+            minimum_sufficient_confidence_z=cfg.fit.get(
+                "minimum_sufficient_confidence_z", 0.0
+            ),
+            minimum_sufficient_required_consecutive=cfg.fit.get(
+                "minimum_sufficient_required_consecutive", 1
             ),
         )
         if outer_partition is not None and getattr(result, "warm_start_state", None) is not None:
@@ -4488,8 +5506,11 @@ def run_adaptive_refit(
             marker in message
             for marker in (
                 "did not saturate",
+                "did not reach minimum-sufficient balanced accuracy",
                 "did not enter closure band",
                 "failed the null/AUC gate",
+                "first residual classifier failed the AUC gate",
+                "first residual classifier failed the ESS gate",
                 "stopped before min_iterations",
                 "did not produce a held-out no-op",
                 "unsaturated",
@@ -4500,6 +5521,7 @@ def run_adaptive_refit(
         state.probe_exceedance_streak = 0
         state.last_decision = "recalibration_failed"
         return {
+            **closure_metrics,
             "omnifold/accepted": 0.0,
             "omnifold/accept_reason": message,
             "omnifold/reward_round_id": float(state.reward_round_id),
@@ -4511,6 +5533,7 @@ def run_adaptive_refit(
     new_stack = FrozenResidualRatioReward.from_fit_result(
         result,
         tempering=cfg.tempering,
+        log_ratio_clip=cfg.log_ratio_clip,
     ).to(device).eval()
     new_stack.assert_frozen()
     acceptance_seed = cfg.probe_seed + 1000 + int(state.recalibration_count)
@@ -4519,12 +5542,48 @@ def run_adaptive_refit(
     all_saturated = bool(result.diagnostics) and all(
         bool(getattr(item, "saturated", False)) for item in result.diagnostics
     )
+    minimum_sufficient_target = cfg.fit.get(
+        "minimum_sufficient_balanced_accuracy"
+    )
+    minimum_sufficient_enabled = minimum_sufficient_target is not None
+    all_minimum_sufficient = bool(result.diagnostics) and all(
+        bool(getattr(item, "minimum_sufficient", False))
+        for item in result.diagnostics
+    )
+    all_fits_ready = (
+        all_minimum_sufficient if minimum_sufficient_enabled else all_saturated
+    )
     accuracy_limit = float(cfg.acceptance_max_balanced_accuracy)
     closure_auc = float(
         getattr(result.diagnostics[-1], "validation_auc", float("nan"))
     )
     raw_auc = float(
         getattr(result.diagnostics[0], "validation_auc", float("nan"))
+    )
+    train_log_weight = getattr(result, "train_log_weight", None)
+    validation_log_weight = getattr(result, "validation_log_weight", None)
+    if train_log_weight is None or validation_log_weight is None:
+        if cfg.minimum_ess_fraction > 0.0:
+            raise RuntimeError(
+                "ESS installation guard requires train and validation log weights"
+            )
+        # Compatibility for synthetic/legacy fit-result adapters when the
+        # guard is disabled. Production ResidualRatioResult always has both.
+        train_weight_diagnostics: dict[str, float] = {}
+        validation_weight_diagnostics: dict[str, float] = {}
+        observed_ess_fraction = 1.0
+    else:
+        train_weight_diagnostics = _weight_diagnostics(train_log_weight)
+        validation_weight_diagnostics = _weight_diagnostics(
+            validation_log_weight
+        )
+        observed_ess_fraction = min(
+            float(train_weight_diagnostics["ess_fraction"]),
+            float(validation_weight_diagnostics["ess_fraction"]),
+        )
+    ess_guard_passed = bool(
+        math.isfinite(observed_ess_fraction)
+        and observed_ess_fraction >= float(cfg.minimum_ess_fraction)
     )
     raw_auc_se = auc_null_standard_error(
         score_pool.n_events,
@@ -4535,7 +5594,7 @@ def run_adaptive_refit(
         cfg=cfg,
         raw_auc=raw_auc,
         raw_auc_se=raw_auc_se,
-        enforce=bool(enforce_round_acceptance and all_saturated),
+        enforce=bool(enforce_round_acceptance and all_fits_ready),
     )
     round_action = _broadcast_int(
         int(round_acceptance["action"]),
@@ -4551,13 +5610,17 @@ def run_adaptive_refit(
     round_acceptance["action"] = round_action
     round_acceptance["decision"] = round_decision
     round_allowed = round_action in (1, 2)
-    closure_limit = 0.5 + float(cfg.residual_min_auc_gain)
     candidate_probe.update(
         {
             "residual_closure_auc": closure_auc,
             "residual_closure_auc_gap": abs(closure_auc - 0.5),
         }
     )
+    if cfg.iteration_one_only:
+        # The only fitted classifier measured RAW separation. Do not publish
+        # its AUC as post-weighting closure.
+        candidate_probe.clear()
+        candidate_probe["iteration1_raw_auc"] = raw_auc
     if cfg.acceptance_audit_enabled:
         candidate_log_weight = score_reward_on_pool(
             new_stack,
@@ -4605,19 +5668,30 @@ def run_adaptive_refit(
             )
         del candidate_log_weight
         accepted_local = bool(
-            all_saturated
+            all_fits_ready
             and candidate_probe.get("audit_saturated", 0.0) >= 0.5
             and math.isfinite(audit_accuracy)
             and audit_accuracy < accuracy_limit
             and topology_accepted
+            and ess_guard_passed
             and round_allowed
         )
     else:
         audit_accuracy = float("nan")
         accepted_local = bool(
-            all_saturated
+            all_fits_ready
             and math.isfinite(closure_auc)
-            and closure_auc <= closure_limit
+            and (
+                (result.iterations == 1 and len(result.diagnostics) == 1
+                 and bool(getattr(result.diagnostics[0], "accepted", False))
+                 and closure_auc > closure_limit)
+                if cfg.iteration_one_only else
+                (result.iterations == cfg.max_iterations
+                 and len(result.diagnostics) == cfg.max_iterations
+                 and all(bool(d.accepted) for d in result.diagnostics))
+                if cfg.fixed_iteration_budget else closure_auc <= closure_limit
+            )
+            and ess_guard_passed
             and round_allowed
         )
     accepted = _broadcast_bool(
@@ -4675,7 +5749,7 @@ def run_adaptive_refit(
     baseline_gap = float(
         baseline_probe.get(
             "audit_observed_auc_gap",
-            candidate_probe["residual_closure_auc_gap"],
+            abs(raw_auc - .5) if cfg.iteration_one_only else candidate_probe["residual_closure_auc_gap"],
         )
     )
     round_delta_before = float(state.trust_current_delta)
@@ -4738,10 +5812,28 @@ def run_adaptive_refit(
                 for item in result.diagnostics
             )
         ),
+        "omnifold/crossfit_folds": float(cfg.crossfit_folds),
+        "omnifold/crossfit_repeats": float(cfg.crossfit_repeats),
         "omnifold/all_fits_saturated": float(all_saturated),
+        "omnifold/all_fits_ready": float(all_fits_ready),
+        "omnifold/minimum_sufficient/enabled": float(
+            minimum_sufficient_enabled
+        ),
+        "omnifold/minimum_sufficient/target_balanced_accuracy": (
+            float("nan")
+            if minimum_sufficient_target is None
+            else float(minimum_sufficient_target)
+        ),
+        "omnifold/minimum_sufficient/confidence_z": float(
+            cfg.fit.get("minimum_sufficient_confidence_z", 0.0)
+        ),
+        "omnifold/minimum_sufficient/required_consecutive": float(
+            cfg.fit.get("minimum_sufficient_required_consecutive", 1)
+        ),
         "omnifold/acceptance_audit_enabled": float(
             cfg.acceptance_audit_enabled
         ),
+        **closure_metrics,
         "omnifold/acceptance_max_balanced_accuracy": accuracy_limit,
         "omnifold/topology_acceptance_audit_enabled": float(
             cfg.topology_acceptance_audit_enabled
@@ -4752,6 +5844,51 @@ def run_adaptive_refit(
         "omnifold/topology_acceptance_repeats": float(
             cfg.topology_acceptance_repeats
         ),
+        "omnifold/weight_guard/minimum_ess_fraction": float(
+            cfg.minimum_ess_fraction
+        ),
+        "omnifold/weight_guard/observed_ess_fraction": float(
+            observed_ess_fraction
+        ),
+        "omnifold/weight_guard/passed": float(ess_guard_passed),
+        "omnifold/weight_guard/log_ratio_clip": (
+            float("nan")
+            if cfg.log_ratio_clip is None
+            else float(cfg.log_ratio_clip)
+        ),
+        "omnifold/adaptive_tempering/enabled": float(
+            cfg.adaptive_tempering_enabled
+        ),
+        "omnifold/adaptive_tempering/maximum": float(cfg.tempering),
+        "omnifold/adaptive_tempering/minimum": float(
+            cfg.minimum_tempering
+        ),
+        "omnifold/adaptive_tempering/target_ess_fraction": float(
+            cfg.target_ess_fraction
+        ),
+        "omnifold/adaptive_tempering/grid_steps": float(
+            cfg.tempering_grid_steps
+        ),
+        "omnifold/adaptive_tempering/inherit_previous": float(
+            cfg.inherit_previous_tempering
+        ),
+        "omnifold/ess_aware_checkpoint_selection/enabled": float(
+            cfg.ess_aware_checkpoint_selection
+        ),
+        "omnifold/ess_aware_checkpoint_selection/max_checkpoints": float(
+            cfg.ess_aware_max_checkpoints
+        ),
+        "omnifold/ess_aware_checkpoint_selection/first_residual_only": float(
+            cfg.ess_aware_first_residual_only
+        ),
+        **{
+            f"omnifold/weight_guard/train_{key}": float(value)
+            for key, value in train_weight_diagnostics.items()
+        },
+        **{
+            f"omnifold/weight_guard/validation_{key}": float(value)
+            for key, value in validation_weight_diagnostics.items()
+        },
         "omnifold/initial_bootstrap": float(initial_bootstrap),
         "reference_trust/round_acceptance/enabled": float(
             round_acceptance["enabled"]
@@ -4839,11 +5976,44 @@ def run_adaptive_refit(
         diagnostics[f"{prefix}/saturated"] = float(
             bool(getattr(fit_diag, "saturated", False))
         )
+        diagnostics[f"{prefix}/minimum_sufficient"] = float(
+            bool(getattr(fit_diag, "minimum_sufficient", False))
+        )
+        fold_steps = [
+            int(getattr(item, "steps_completed"))
+            for item in getattr(fit_diag, "fold_diagnostics", ())
+            if getattr(item, "steps_completed", None) is not None
+        ]
+        threshold_reached_folds = sum(
+            bool(getattr(item, "threshold_reached", False))
+            for item in getattr(fit_diag, "fold_diagnostics", ())
+        )
+        diagnostics[f"{prefix}/threshold_reached_folds"] = float(
+            threshold_reached_folds
+        )
+        if fold_steps:
+            diagnostics[f"{prefix}/fit_steps_min"] = float(min(fold_steps))
+            diagnostics[f"{prefix}/fit_steps_mean"] = float(
+                sum(fold_steps) / len(fold_steps)
+            )
+            diagnostics[f"{prefix}/fit_steps_max"] = float(max(fold_steps))
         diagnostics[f"{prefix}/stored_in_reward"] = float(
             index <= int(result.iterations)
         )
         diagnostics[f"{prefix}/warm_started_folds"] = float(
             len(getattr(fit_diag, "warm_started_folds", ()))
+        )
+        diagnostics[f"{prefix}/applied_tempering"] = float(
+            getattr(fit_diag, "applied_tempering", cfg.tempering)
+        )
+        diagnostics[f"{prefix}/train_ess_fraction"] = float(
+            getattr(fit_diag, "train_ess_fraction", float("nan"))
+        )
+        diagnostics[f"{prefix}/validation_ess_fraction"] = float(
+            getattr(fit_diag, "validation_ess_fraction", float("nan"))
+        )
+        diagnostics[f"{prefix}/ess_target_reached"] = float(
+            bool(getattr(fit_diag, "ess_target_reached", False))
         )
         for source_name, metric_name in (
             ("validation_loss", "validation_loss"),
@@ -4857,6 +6027,40 @@ def run_adaptive_refit(
             value = getattr(fit_diag, source_name, None)
             if value is not None and math.isfinite(float(value)):
                 diagnostics[f"{prefix}/{metric_name}"] = float(value)
+        for fold_number, fold_diag in enumerate(
+            getattr(fit_diag, "fold_diagnostics", ()), start=1
+        ):
+            for source_name, metric_name in (
+                ("validation_auc", "validation_auc"),
+                ("validation_loss", "validation_loss"),
+                ("validation_balanced_accuracy", "validation_balanced_accuracy"),
+            ):
+                value = getattr(fold_diag, source_name, None)
+                if value is not None and math.isfinite(float(value)):
+                    diagnostics[
+                        f"{prefix}/fold{fold_number:02d}/{metric_name}"
+                    ] = float(value)
+    if cfg.fixed_iteration_budget:
+        # The last residual was measured BEFORE the final increment, not after it.
+        for key in list(diagnostics):
+            if "residual_closure_auc" in key:
+                diagnostics.pop(key)
+        diagnostics["omnifold/last_residual_auc_before_update"] = closure_auc
+    if cfg.iteration_one_only:
+        monitor_prefix = "omnifold/iteration1_monitor"
+        for name, logw in (("train_oof", result.train_log_weight),
+                           ("validation_ensemble", result.validation_log_weight)):
+            if logw is not None:
+                diagnostics.update({f"{monitor_prefix}/{name}/{key}": value
+                                    for key, value in _iteration_one_weight_metrics(logw).items()})
+        first = result.diagnostics[0]
+        diagnostics.update({
+            f"{monitor_prefix}/raw_auc": raw_auc,
+            f"{monitor_prefix}/validation_bce": float(first.validation_loss),
+            f"{monitor_prefix}/train_bce": float(first.final_loss),
+            f"{monitor_prefix}/warm_started_folds": float(len(first.warm_started_folds)),
+            f"{monitor_prefix}/tempering": float(cfg.tempering),
+        })
     if not accepted:
         state.recalibrations_rejected += 1
         state.probe_exceedance_streak = 0
@@ -4895,6 +6099,12 @@ def run_adaptive_refit(
                     )
                 )
             )
+        elif not ess_guard_passed:
+            accept_reason = (
+                "candidate density-ratio weights failed ESS guard: "
+                f"ESS/N={observed_ess_fraction:.5g}, "
+                f"required>={cfg.minimum_ess_fraction:.5g}"
+            )
         elif cfg.acceptance_audit_enabled:
             accept_reason = (
                 "candidate did not reach saturated acceptance/baseline closure: "
@@ -4904,6 +6114,16 @@ def run_adaptive_refit(
                 f"baseline_saturated={bool(baseline_probe.get('audit_saturated', 0.0))}, "
                 f"topology_gap={candidate_probe.get('topology_audit_auc_gap', float('nan')):.5g}, "
                 f"topology_saturated={bool(candidate_probe.get('topology_audit_saturated', 0.0))}"
+            )
+        elif cfg.fixed_iteration_budget:
+            accept_reason = "fixed-budget candidate failed fit/signal gate; closure not required"
+        elif cfg.iteration_one_only:
+            accept_reason = (
+                "iteration-one candidate failed minimum-sufficient/signal gate; "
+                "closure not evaluated"
+                if minimum_sufficient_enabled
+                else "iteration-one candidate failed saturation/signal gate; "
+                "closure not evaluated"
             )
         else:
             accept_reason = (
@@ -4977,6 +6197,13 @@ def run_adaptive_refit(
     diagnostics.update(
         {
             "omnifold/accept_reason": (
+                "fixed iteration budget completed; useful cross-fit increments installed; closure not evaluated"
+                if cfg.fixed_iteration_budget else
+                "iteration-one-only ablation: minimum-sufficient cross-fit "
+                "signal installed; closure not evaluated"
+                if cfg.iteration_one_only and minimum_sufficient_enabled else
+                "iteration-one-only ablation: saturated cross-fit signal installed; closure not evaluated"
+                if cfg.iteration_one_only else
                 "candidate reached saturated cross-fit residual closure; "
                 "fresh acceptance audit disabled"
                 if not cfg.acceptance_audit_enabled
@@ -5014,6 +6241,7 @@ __all__ = [
     "evaluate_signed_direction_probe",
     "evaluate_signed_direction_recovery",
     "record_extragradient_rejection",
+    "reward_round_budget_exhausted",
     "build_reference_trust_pool",
     "fit_reference_trust_audit",
     "fit_raw_policy_audit",
@@ -5026,6 +6254,7 @@ __all__ = [
     "reward_refit_due_to_age",
     "run_adaptive_refit",
     "install_adaptive_trust_round",
+    "start_inherited_round_policy_warmup",
     "start_policy_round_warmup",
     "policy_round_warmup_metrics",
     "advance_policy_round_warmup",

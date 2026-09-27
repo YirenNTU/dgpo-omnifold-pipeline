@@ -1,0 +1,47 @@
+extends_overlay: dgpo_h4_pair_token.yaml
+experiment:
+  protocol: h4-relation-tokens-v1
+  single_question: Can learned whole-event relations yield useful discrimination without engineered topology features?
+  intervention: four_relation_latents_two_cross_self_rounds_mean_pool_no_pair_fourier
+  diagnostic_parent_run: h4pair01
+  baseline_measurement: h4pair01
+  primary_endpoint: held_out_test_bce_at_best_validation_bce
+  primary_decision_rule: Report best-validation checkpoint test BCE/AUC, calibration, ratio concentration and training stability; lower AUC alone is not success.
+  inference_scope: Single-seed architecture pilot; no causal Fourier-only attribution, high-order-structure guarantee or DGPO claim.
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_relation_tokens/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_relation_tokens.py
+logger:
+  local:
+    name: h4_relation_tokens
+    version: h4_relation_tokens_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_relation_tokens/logs
+  wandb:
+    id: h4rel01
+    resume: never
+    run_name: Learn whole-event relations | EveNet 4 tokens 2 rounds | step-1110 samples
+    group: H4 structural classification
+    tags: [ClassifierOnly, NoPolicyUpdate, RelationTokens, NoFourier, CleanValidation, SixteenGPU]
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_relation_tokens/checkpoints
+dgpo:
+  adaptive_omnifold:
+    recalibration:
+      periodic_pair_features: false
+      topology_pair_token: false
+      topology_fourier_embedding: false
+      topology_max_harmonic: 1
+      relation_token_count: 4
+      decoder_layers: 2
+    audit_fit:
+      periodic_pair_features: false
+      topology_pair_token: false
+      topology_fourier_embedding: false
+      topology_max_harmonic: 1
+      relation_token_count: 4
+      decoder_layers: 2
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_relation_tokens/diagnostic_snapshots
+      ratio_audit_export_dir: /pscratch/sd/y/yiren/Ztautau/h4_relation_tokens/ratio_audit

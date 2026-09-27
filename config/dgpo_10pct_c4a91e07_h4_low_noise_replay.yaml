@@ -1,0 +1,55 @@
+reward_source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_reward_interface_v5
+time_source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_low_noise_time_alignment_v1
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_low_noise_replay_v1
+
+expected_reward_schema: c4a91e07-h4-reward-interface-v2
+expected_time_schema: c4a91e07-h4-time-stratum-alignment-v1
+expected_direction_schema: c4a91e07-h4-time-stratum-directions-v1
+expected_source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+expected_time_wandb_id: h4time01
+expected_policy_step: 1110
+
+workers: 16
+cpus_per_worker: 2
+K: 8
+score_batch_size: 32768
+rollout_seeds:
+  - 2026091531
+  - 2026091532
+  - 2026091533
+  - 2026091534
+  - 2026091535
+  - 2026091536
+  - 2026091537
+  - 2026091538
+
+bootstrap_replicates: 20000
+bootstrap_seed: 2026091539
+confidence_level: 0.90
+minimum_low_over_full_gain: 1.25
+minimum_consistency_fraction: 0.75
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h4trep01
+  resume: never
+  name: c4a91e07_h4_low_noise_replay_v1
+  group: c4a91e07_h4_projection_diagnostics
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - H4Ensemble
+    - SourceH4time01
+    - SavedDirections
+    - LowNoise
+    - MultiSeedReplay
+    - CommonNoiseSignedProbe
+    - TargetPreserving
+    - NoClassifierFit
+    - NoGradientComputation
+    - NoOptimizerStep
+    - LiveWandb

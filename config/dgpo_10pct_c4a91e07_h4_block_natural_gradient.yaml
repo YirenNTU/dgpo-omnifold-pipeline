@@ -1,0 +1,68 @@
+# Target-preserving policy-geometry diagnostic selected by h4grad01.
+reward_source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_reward_interface_v5
+gradient_source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_production_gradient_reproducibility_v1
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_block_natural_gradient_v1
+
+expected_reward_schema: c4a91e07-h4-reward-interface-v2
+expected_gradient_schema: c4a91e07-h4-production-gradient-reproducibility-v1
+expected_direction_schema: c4a91e07-h4-production-gradient-directions-v1
+expected_source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+expected_gradient_wandb_id: h4grad01
+expected_policy_step: 1110
+
+workers: 16
+cpus_per_worker: 2
+K: 8
+
+# Disjoint from all h4grad01 gradient and probe events.
+curvature_events: 2048
+curvature_selection_seed: 2026091511
+curvature_candidate_seed: 2026091512
+curvature_timesteps: 8
+curvature_path_seed: 2026091513
+basis_probe_rms: 1.0e-6
+
+# Automatic ridge uses no judge result.
+maximum_metric_condition: 100.0
+ridge_floor_fraction: 1.0e-6
+zero_block_norm: 1.0e-12
+
+# Vanilla defines the functional trust radius. Natural RMS is solved to match it.
+vanilla_parameter_rms: 1.0e-6
+distance_match_tolerance: 0.05
+distance_match_iterations: 3
+minimum_parameter_rms: 1.0e-8
+maximum_parameter_rms: 3.0e-5
+minimum_decisive_efficiency_gain: 2.0
+
+judge_events: 2048
+judge_selection_seed: 2026091514
+judge_rollout_seed: 2026091515
+score_batch_size: 32768
+
+save_direction_vectors: true
+upload_direction_vectors: false
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h4natg01
+  resume: never
+  name: c4a91e07_h4_block_natural_gradient_v1
+  group: c4a91e07_h4_projection_diagnostics
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - H4Ensemble
+    - SourceH4grad01
+    - BlockNaturalGradient
+    - EmpiricalGaussNewton
+    - MatchedVPPathDistance
+    - TargetPreserving
+    - CommonNoiseSignedProbe
+    - NoClassifierFit
+    - NoOptimizerStep
+    - LiveWandb

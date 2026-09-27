@@ -55,6 +55,10 @@ Training:
     TruthGeneration:
       include: true
       diffusion_steps: 2
+      # Optional normalized low-noise emphasis for supervised v-prediction
+      # training. Zero/one preserve the historical uniform-timestep loss.
+      low_noise_cutoff: 0.0
+      low_noise_weight: 1.0
 
   EarlyStopping:
     patience: 100

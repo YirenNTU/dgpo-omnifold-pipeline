@@ -1,0 +1,76 @@
+# Paired ESS-tempering follow-up to W&B run h4fr5r01.
+# The launcher proves that adaptive_tempering is the only training-affecting
+# difference from dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_5round.yaml.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_5round.yaml
+
+experiment:
+  protocol: h4-fresh-ensemble-ess15-5round-v1
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4fr5r01
+  single_experimental_change: soft_ess15_adaptive_tempering
+
+nersc:
+  reproducibility:
+    note: >-
+      Paired follow-up to h4fr5r01 from the same c4a91e07 step-1110 weights.
+      Classifier architecture, two-repeat by two-fold fresh ensembles, seeds,
+      policy LR, ten accepted updates per round, five-round fixed endpoint,
+      optimizer resets, and absence of hard trust/rollback are unchanged. The
+      only training change is a deterministic soft search for the largest
+      reward tempering in [0.10, 0.4821227506] whose cumulative train-OOF and
+      validation-ensemble ESS fractions both reach 15%. Missing the target at
+      the minimum scale does not reject a reward or change the endpoint.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_fresh_ensemble_ess15_5round_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_fresh_ensemble_pilot.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_ess15_5round.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_fresh_ensemble_ess15_5round_v1
+    version: h4_fresh_ensemble_ess15_5round_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_fresh_ensemble_ess15_5round_v1/logs
+  wandb:
+    id: h4e15r01
+    run_name: c4a91e07_h4_fresh_ensemble_ess15_5round_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - PairedControlH4fr5r01
+      - Fixed50StepEndpoint
+      - FiveRewardRounds
+      - TenUpdatesPerRound
+      - H4NonlinearFourier
+      - TwoSeedsTwoFolds
+      - FreshClassifierEveryRound
+      - FreshClassifierOptimizer
+      - FreshPolicyOptimizerEveryRound
+      - V5TemperatureMaximum
+      - EpsilonSelectedPolicyLR
+      - AdaptiveTempering
+      - ESSTarget15pct
+      - SoftESSNoRejection
+      - NoHardTrust
+      - NoRollback
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_fresh_ensemble_ess15_5round_v1/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    recalibration:
+      adaptive_tempering:
+        enabled: true
+        target_ess_fraction: 0.15
+        minimum: 0.10
+        grid_steps: 14
+        inherit_previous: false
+      # Keep both mechanisms disabled so adaptive scaling is the sole change.
+      minimum_ess_fraction: 0.0
+      ess_aware_checkpoint_selection:
+        enabled: false

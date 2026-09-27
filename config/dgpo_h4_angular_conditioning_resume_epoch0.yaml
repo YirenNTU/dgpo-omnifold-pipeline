@@ -1,0 +1,38 @@
+# Requires this experiment's completed classifier-bootstrap checkpoint.
+# epoch=-1 means no policy epoch has completed; next_ep=0 starts policy epoch 0.
+extends_overlay: dgpo_h4_angular_conditioning_1110.yaml
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/h4_angular_conditioning_1110/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+
+dgpo:
+  checkpoint_load_mode: resume
+  # Explicit epoch-zero anchor, never silently select a later last.ckpt.
+  auto_resume_from_last: false
+  adaptive_omnifold:
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: false
+
+logger:
+  wandb:
+    resume: allow
+    fresh_run: false
+
+nersc:
+  reproducibility:
+    note: >-
+      Resume the angular-conditioning experiment's completed bootstrap at
+      next_ep=0, global_step=0. Restore installed theta-phi H4 classifiers and
+      matching reference; no bootstrap or startup refit. Velocity-MSE penalty
+      coefficient 1, endpoint KL off. Do not substitute an old phi-only checkpoint.
+  execution:
+    command: >-
+      shifter python3 scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_h4_angular_conditioning_resume_epoch0.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_angular_conditioning_1110/ray_results
+
+experiment:
+  startup_mode: resume_completed_epoch_zero_bootstrap

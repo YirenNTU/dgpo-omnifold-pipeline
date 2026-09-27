@@ -1,0 +1,62 @@
+# Fixed-policy classifier experiment: original H4 Fourier late fusion.
+# The old direct-logit config remains reproducible under its own run ID.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_classifier_direct_logit.yaml
+
+experiment:
+  protocol: h4-classifier-only-fourier-v1
+  classifier_design_arm: fourier_late_fusion
+  intervention: remove_direct_logit_shortcut
+  single_question: >-
+    Does the original conditional H4 Fourier late-fusion classifier recover
+    useful discrimination without the added direct-logit shortcut?
+  comparison_run: h4clf02
+  endpoint_selection: fixed_classifier_budget
+  stop_rule: Stop after one 3000-update cold classifier fit with zero policy updates.
+  primary_decision_rule: >-
+    Report validation AUC and BCE at 200, 400, 800, 960, 1280 and 3000 updates,
+    first validation crossing of AUC 0.70 and 0.85, final disjoint test AUC,
+    and clipping frequency. Compare with h4clf02 only at equal fit budgets;
+    a single-seed difference is descriptive, not a replicated causal result.
+
+nersc:
+  reproducibility:
+    note: >-
+      Fixed DGPO-finetuned step-1110 policy; same 10pct training lineage and
+      held-out validation pool as h4clf02. Original H4 Fourier late fusion,
+      one cold fit, 3000 classifier updates, zero reward fits or policy updates.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_fourier_only_10pct/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_classifier_design_ablation.py
+      --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_classifier_fourier_only_10pct/ray_results
+
+logger:
+  local:
+    name: h4_classifier_fourier_only_10pct
+    version: h4_classifier_fourier_only_10pct_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_fourier_only_10pct/logs
+  wandb:
+    id: h4clff01
+    run_name: Does Fourier late fusion learn reliably? | classifier only | fixed policy
+    tags: [ClassifierDesign, FourierLateFusion, H4, ClassifierOnly, NoPolicyUpdate, SixteenGPU, Fixed3000StepAudit, ClassifierBottleneckDiagnostics]
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_fourier_only_10pct/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      periodic_pair_features: true
+      topology_fourier_embedding: true
+      topology_max_harmonic: 4
+      topology_direct_logit: false
+      topology_conditioning: false
+      topology_include_theta_pair: false
+      visible_pair_rest_frame: false
+      topology_warmup_steps: 0
+      topology_body_unfreeze_step: 0
+      topology_warmup_learning_rate: null
+      topology_context_residual_scale: 1.0

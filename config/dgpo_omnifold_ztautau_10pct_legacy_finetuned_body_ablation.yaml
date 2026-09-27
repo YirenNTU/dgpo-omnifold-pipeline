@@ -1,0 +1,77 @@
+# Single-variable classifier-backbone ablation derived from c4a91e07.
+#
+# Science protocol and classifier architecture inherit the c4a91e07 legacy
+# control: no Fourier/rest features, 128x1 decoder, head dropout 0.25, frozen
+# EveNet Body, and trainable internal PET adapters + GroupedSequentialEmbedding
+# + InvisibleInputProjector. The model starts from the 10% diffusion fine-tune
+# rather than a later DGPO policy. The classifier discards all task heads,
+# including TruthGeneration; its own trainable position encoder starts fresh.
+extends_overlay: dgpo_omnifold_ztautau_10pct_old_method_hard_ablation.yaml
+
+nersc:
+  reproducibility:
+    classifier_backbone_protocol: diffusion_finetune_10pct_body_only
+    note: >-
+      Legacy c4a91e07-structure body ablation. Start policy weights and the
+      OmniFold classifier Body from the 10% diffusion fine-tune last.ckpt.
+      Start DGPO, optimizer, reward, and adaptive state fresh through
+      weights_only startup.
+      Discard classifier task heads including TruthGeneration. Keep the legacy
+      no-Fourier/no-rest architecture and freeze the Body except for the
+      originally trainable GroupedSequentialEmbedding, InvisibleInputProjector,
+      and internal PET adapters. Bootstrap a fresh residual stack.
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    source_dgpo_global_step: 0
+    source_wandb_run: Ztautau-Diffusion-Pretrain-10pct-seed42
+    diagnostic_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_legacy_finetuned_10pct_body_seed42/ray_results
+  execution:
+    command: shifter python3 scripts/train_dgpo_old_method_10pct.py --config
+      config/dgpo_omnifold_ztautau_10pct_legacy_finetuned_body_ablation.yaml
+
+logger:
+  wandb:
+    classifier_loss_curves: false
+    id: ft10body
+    run_name: dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_legacy_finetuned_10pct_body_seed42
+    tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - ScalingLawAllData10pct
+    - LegacyC4a91e07Classifier
+    - FineTuned10pctDiffusionBodyInit
+    - BodyOnlyCheckpoint
+    - NoTruthGenerationInClassifier
+    - FrozenBody
+    - TrainablePETAdapters
+    - TrainableGroupedSequentialEmbedding
+    - TrainableInvisibleProjector
+    - HeadDropout025
+    - NoFourierNoRest
+    - FreshOmniFoldBootstrap
+    - WeightedGapRetrain
+    - RawAucDiagnosticMonitor
+    - CompactWandbCoreMetrics
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_legacy_finetuned_10pct_body_seed42/logs
+    name: dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_legacy_finetuned_10pct_body_seed42
+    version: old_method_hard_10pct_legacy_finetuned_body
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_legacy_finetuned_10pct_body_seed42/checkpoints
+
+reward_config:
+  omnifold:
+    backbone_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+
+dgpo:
+  checkpoint_load_mode: weights_only
+  adaptive_omnifold:
+    recalibration:
+      body_only_checkpoint: true
+      bootstrap_on_start: true
+      refit_once_on_resume: false

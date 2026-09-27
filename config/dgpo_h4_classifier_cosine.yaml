@@ -1,0 +1,55 @@
+extends_overlay: dgpo_h4_classifier_stability_diagnostics.yaml
+
+experiment:
+  protocol: h4-step50-classifier-cosine-v1
+  diagnostic_parent_run: h4clfd1
+  classifier_design_arm: warmup_cosine_scheduler
+  baseline_measurement: h4clfd1_constant_lr_classifier
+  intervention: classifier_linear_warmup_cosine_decay
+  single_question: Does warmup and cosine decay improve classifier convergence on the fixed step-50 policy?
+  primary_decision_rule: >-
+    Compare validation BCE/AUC and final held-out audit with constant-LR h4clfd1.
+    Keep the fixed step-50 policy, data, peak group LRs and diagnostics unchanged.
+    Minimum 1000 updates and ten-epoch BCE patience remain; the 250-epoch
+    cosine horizon is not a training cap. Curve smoothness alone is not success.
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_cosine/ray_results
+  execution:
+    command: shifter python3 scripts/train_h4_classifier_lr_stability.py --scheduler
+  reproducibility:
+    note: >-
+      Same fixed step-50 policy, 10pct data and 16 workers as h4clfd1.
+      Only classifier LR scheduling changes. No world-size LR scaling.
+      Cosine horizon is not a training cap; keep 1000-update minimum and
+      ten-epoch validation BCE patience. Warmup starts at zero as in EveNet.
+
+logger:
+  local:
+    name: h4_classifier_cosine
+    version: h4_classifier_cosine_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_cosine/logs
+  wandb:
+    id: h4clfcos1
+    run_name: Does cosine decay improve convergence? | H4 classifier | step-50 replay
+    tags: [ClassifierOnly, NoPolicyUpdate, H4, SixteenGPU, CosineLR, StabilityDiagnostics]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_classifier_cosine/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    audit_fit:
+      lr_scheduler: cosine
+      lr_warmup_epochs: 1.0
+      lr_cosine_epochs: 250.0
+      lr_min_ratio: 0.1
+      diagnostic_snapshot_dir: /pscratch/sd/y/yiren/Ztautau/h4_classifier_cosine/diagnostic_snapshots
+    recalibration:
+      fit:
+        lr_scheduler: cosine
+        lr_warmup_epochs: 1.0
+        lr_cosine_epochs: 250.0
+        lr_min_ratio: 0.1

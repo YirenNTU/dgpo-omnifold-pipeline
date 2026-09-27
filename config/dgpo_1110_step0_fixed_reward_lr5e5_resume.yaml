@@ -1,0 +1,56 @@
+# Continue the high-LR run itself; NEVER replay its upstream step-0 checkpoint.
+extends_overlay: dgpo_1110_step0_fixed_reward_lr5e5.yaml
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110_step0_lr5e5/checkpoints/last.ckpt
+
+dgpo:
+  checkpoint_load_mode: resume
+  auto_resume_from_last: true
+  lr_schedule:
+    # This run already has the requested high LRs and all-group cosine decay.
+    # Restore saved effective LRs, AdamW moments and scheduler clock exactly.
+    resume_use_config: false
+
+logger:
+  wandb:
+    # Fresh logging only: training still restores the entire saved state.
+    id: null
+    resume: never
+    fresh_run: true
+    run_name: "Can longer training absorb fixed reward? | H4 FiLM | 5e-5 cosine | continuation"
+
+nersc:
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110_step0_lr5e5/checkpoints/last.ckpt
+    note: >-
+      Full continuation of h4s0lr5e5, not a repeat of its step-0 replay.
+      Restore raw policy, AdamW moments, saved effective LRs, cosine clock,
+      policy counters, installed OmniFold classifiers and matching references.
+      Keep body/generation/projector base LRs at 5e-5 and both conditioning
+      branches at 1e-4, with the original cosine endpoint at absolute policy
+      epoch 1500 (15000 updates), not 1500 additional epochs or a warm restart.
+      No bootstrap, refit or audit; unchanged validation every 10 epochs.
+      Velocity-MSE coefficient 1, raw/no EMA, 16 GPUs. Reuse the same checkpoint
+      output directory but create a new W&B run with an automatically generated
+      ID. Actual start epoch/step come from the latest saved checkpoint.
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_1110_step0_fixed_reward_lr5e5_resume.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110_step0_lr5e5/ray_results
+
+experiment:
+  protocol: h4-1110-step0-fixed-reward-policy-lr5e5-full-resume
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4s0lr5e5
+  source_run: h4s0lr5e5
+  source_policy_step: null  # Read saved counters; W&B's latest point may be newer.
+  startup_mode: continue_latest_high_lr_checkpoint
+  intervention: unchanged_high_lr_fixed_reward_continuation
+  stop_rule: Continue to the original absolute policy epoch 1500 or job walltime.
+  primary_decision_rule: >-
+    Continue the same fixed-reward and unchanged policy-validation trajectories.
+    No LR reset, new classifier, reward refit or reference recentering.
+    Without fresh audits, this run does not measure fresh-classifier closure.

@@ -1,0 +1,18 @@
+extends_overlay: train_diffusion_fourier_integration_input.yaml
+experiment:
+  intervention: input_linear_branch_lr_3x
+  comparison_runs:
+    input: ytchou97-university-of-washington/EveNet/98q3imcl
+    none: ytchou97-university-of-washington/EveNet/mpvmx945
+  hypothesis: >-
+    Test whether a 3x Fourier branch learning rate improves validation velocity
+    loss relative to the matched input and no-Fourier controls. Residual/base
+    RMS is a diagnostic of branch scale, not evidence of improved conditioning.
+logger:
+  wandb:
+    run_name: "Faster Fourier learning | pretrained diffusion | branch LR 6e-5"
+options:
+  Training:
+    Components:
+      PET.angular_conditioning:
+        learning_rate: 0.00006

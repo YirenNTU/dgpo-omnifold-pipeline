@@ -1,0 +1,89 @@
+# Matched diffusion-only A/B; do not compare against an older live run as control.
+extends_overlay: dgpo_1110_step0_fixed_reward_lr5e5.yaml
+
+# Explicit for both DGPO arms and their standalone fresh-audit configurations.
+platform:
+  number_of_workers: 16
+  resources_per_worker:
+    GPU: 1
+  use_gpu: true
+
+network:
+  VisibleConditioning:
+    diffusion_token_readout:
+      enabled: false
+      block: last
+      width: 64
+      heads: 4
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_token_film_control/checkpoints
+
+dgpo:
+  # A new experiment, NOT full optimizer resume across a changed architecture.
+  # Only empty step-0 Adam state may be rebuilt; reward/references stay exact.
+  step_zero_architecture_bootstrap: true
+  auto_resume_from_last: false
+  validation_initial_enabled: true
+  lr_schedule:
+    resume_use_config: false
+
+logger:
+  local:
+    name: h4-token-film-control
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_token_film_control/logs
+  wandb:
+    id: h4tokctrl1
+    resume: never
+    fresh_run: false
+    run_name: "Can token routing improve reward uptake? | global FiLM control | fixed V-MSE 1"
+    group: H4 token conditioning
+    tags: [DGPO, DiffusionOnly, GlobalFiLM, FixedReward, VelocityMSE1, RawWeights, StepZeroReplay, SixteenGPU]
+
+nersc:
+  nodes: 4
+  gpus_per_node: 4
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_token_film_control/ray_results
+  reproducibility:
+    note: >-
+      Both arms inherit the exact completed step-0 raw-1110 bootstrap, including
+      fitted H4 classifiers and original/round references. Empty Adam groups
+      are rebuilt identically at epoch/step 0; no trained moments are discarded.
+      Policy LR 5e-5, conditioning LR 1e-4, cosine1500 epochs to 10%, 10 updates
+      per epoch; first screen stops at 1000 updates without shortening cosine.
+      Velocity-MSE coefficient 1. Fixed reward, no in-training audits
+      or refits. Validation every10 epochs, K16/DDIM20/max4 batches. Raw/no EMA,
+      16 GPUs. Judge all-sample reward, not legacy best-of-K mean. Fresh audits
+      use the matched OmniFold training fold and external early-stop/test split,
+      never installed into the training reward.
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_token_film_control.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_token_film_control/ray_results
+      --max-steps 1000
+
+experiment:
+  protocol: h4-token-conditioning-ablation-v1
+  arm: global_film_control
+  classifier_only: false
+  classifier_fit_count: 0
+  reward_fit_count: 0
+  policy_update_budget: 1000
+  stop_rule: Stop at 1000 policy updates, save endpoint, then review matched fresh H4 audits before extending.
+  endpoint_selection: absolute_policy_step1000
+  matched_configuration: config/dgpo_token_film_last.yaml
+  intervention: none_matched_global_film_control
+  primary_endpoint: val/reward/all_sample_mean
+  single_question: Does a last-block token-specific readout improve fixed-reward uptake at unchanged velocity-MSE coefficient 1?
+  primary_decision_rule: >-
+    Compare all-sample held-out reward gains from the shared step-0 baseline at
+    matched policy steps; also report elapsed time and velocity-MSE drift.
+    Best-of-K is secondary. Evaluate predeclared equal-step endpoints with a
+    separate fresh H4 classifier (held-out BCE/AUC); never feed it back into RL.
+    This compares an added-capacity/routing package, not pooling in isolation.
+    Increased fixed reward alone does not establish distribution closure or
+    prove that velocity-MSE is or is not limiting.

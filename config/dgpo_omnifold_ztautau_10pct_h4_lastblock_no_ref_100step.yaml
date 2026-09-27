@@ -1,0 +1,162 @@
+# Actual policy training, not the classifier-only terminal branch.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_direction_no_ref_audit5_100step.yaml
+
+experiment:
+  protocol: h4-lastblock-no-reference-100step-v1
+  classifier_only: false
+  dataset_fraction: 0.10
+  distributed_world_size: 16
+  residual_iterations_max: 1
+  cold_h4_audit_policy_steps: [50, 100]
+  cold_h4_audit_min_optimizer_updates: 1000
+  cold_h4_audit_fixed_optimizer_updates: null
+  baseline_measurement: frozen_classifier_external_panel_step0
+  retain_installed_classifier: true
+  retained_classifier_checkpoint: >-
+    /pscratch/sd/y/yiren/Ztautau/h4_lastblock_no_ref_100step/checkpoints/
+    dgpo-epoch=-1-next_ep=0-step=0.ckpt
+  retained_classifier_payload_key: dgpo_omnifold_reward_stack
+  intervention: frozen_lastblock_fourier_reward_without_reference_trust
+  primary_endpoint: frozen_classifier/ensemble/auc_gap
+  single_question: >-
+    Do native DGPO updates reduce the original frozen classifier AUC toward
+    0.5 without the additive reference-trust penalty?
+  primary_decision_rule: >-
+    Compare unchanged frozen fold and ensemble classifiers at policy steps
+    0, 50 and 100 on the fixed external validation event/noise panel.
+    Step zero only scores the installed classifiers; it trains no cold audit.
+    Cold audits at 50 and 100 are secondary diagnostics.
+    All fits use at least 1000 updates, no maximum step budget, and ten
+    classifier epochs of validation-BCE patience. Select minimum-validation-BCE
+    checkpoints. Frozen-classifier and fresh-audit measurements are distinct;
+    do not splice them into one AUC trajectory.
+    A near-chance underfit classifier is not evidence of closure; inspect
+    its full learning curve. This is an exploratory no-trust trajectory,
+    not a matched causal estimate of removing trust.
+  stop_rule: Stop at 100 policy updates; no reward refit, rollback or extension.
+
+nersc:
+  nodes: 4
+  gpus_per_node: 4
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    note: >-
+      Same 10pct policy and classifier-pretrain lineage. Fresh weights-only
+      policy start at step 1110. One reward bootstrap: two folds, one repeat,
+      one iteration (no residual stacking). Last PET block plus adapters and Fourier
+      heads train; input projectors and earlier pretrained blocks freeze.
+      Native policy AdamW unchanged; no additive trust or hard boundary.
+      No step-0 cold audit; score frozen ensemble/folds at 0/50/100.
+      Secondary cold audits at 50/100.
+      All fits: minimum 1000 updates, no maximum, ten-epoch BCE patience; 16 GPUs.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_no_ref_100step/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_lastblock_no_ref.py
+
+logger:
+  local:
+    name: h4_lastblock_no_ref_100step
+    version: h4_lastblock_no_ref_100step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_no_ref_100step/logs
+  wandb:
+    id: h4lbnr01
+    run_name: Does DGPO improve without reference trust? | last-block H4 | 100 policy steps
+    group: H4 policy projection
+    tags: [DGPO, H4, LastPETBlock, FourierLateFusion, TwoFoldCrossfit, SingleCrossfitRepeat, OneIteration, FrozenReward, NoReferenceTrust, NativeAdamW, SixteenGPU, Min1000Steps, Patience10Epochs, NoBaselineAudit]
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_lastblock_no_ref_100step/checkpoints
+
+dgpo:
+  # Joint tau-pair observables from candidate zero, never reward-selected.
+  ztautau_metrics:
+    enabled: true
+    candidate_index: 0
+    bins: 60
+    log_images: true
+    image_observables:
+      - topology/cos_opening
+      - topology/delta_phi_to_pi
+      - topology/back_to_back_loss
+      - topology/calibration_deltaR_sum
+  checkpoint_every_n_epochs: 1
+  log_every: 1
+  log_parameter_update_rms: true
+  gradient_conflict:
+    enabled: true
+    monitor_refit_lifecycle: false
+    every_n_steps: 50
+    blocks: 8
+    events_per_block: 512
+    event_microbatch_size: 32
+  checkpoint_load_mode: weights_only
+  auto_resume_from_last: false
+  adaptive_omnifold:
+    baseline_probe_on_start: false
+    audit_fit:
+      steps: null
+      min_steps: 1000
+      safety_max_epochs: null
+      validation_interval_steps: null
+      validation_interval_epochs: 1.0
+      validation_patience_epochs: 10.0
+      train_backbone: false
+      train_last_pet_block: true
+      train_encoder: false
+      train_layernorm: false
+      train_grouped_sequential_embedding: false
+      train_invisible_projector: false
+      head_dropout: 0.25
+      topology_dropout: 0.25
+      weight_decay: 0.001
+      checkpoint_selection_metric: loss
+      restore_best: true
+      periodic_pair_features: true
+      topology_fourier_embedding: true
+      topology_max_harmonic: 4
+      topology_direct_logit: false
+      topology_conditioning: false
+      topology_include_theta_pair: false
+      visible_pair_rest_frame: false
+      topology_context_residual_scale: 1.0
+      topology_warmup_steps: 0
+      topology_body_unfreeze_step: 0
+      progress_every_n_steps: 10
+    recalibration:
+      min_iterations: 1
+      max_iterations: 1
+      # Install the accepted first increment without requiring residual closure.
+      iteration_one_only: true
+      train_backbone: false
+      train_last_pet_block: true
+      train_encoder: false
+      train_layernorm: false
+      train_grouped_sequential_embedding: false
+      train_invisible_projector: false
+      head_dropout: 0.25
+      topology_dropout: 0.25
+      periodic_pair_features: true
+      topology_fourier_embedding: true
+      topology_max_harmonic: 4
+      topology_direct_logit: false
+      topology_conditioning: false
+      topology_include_theta_pair: false
+      visible_pair_rest_frame: false
+      topology_context_residual_scale: 1.0
+      fit:
+        steps: null
+        min_steps: 1000
+        min_steps_per_fold: 1000
+        safety_max_epochs: null
+        warm_start_min_epochs_per_fold: 1.0
+        validation_interval_epochs: 1.0
+        validation_patience_epochs: 10.0
+        weight_decay: 0.001
+        checkpoint_selection_metric: loss
+        require_saturation: false
+        validation_interval_steps: null
+        restore_best: true

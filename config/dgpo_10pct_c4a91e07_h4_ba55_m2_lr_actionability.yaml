@@ -1,0 +1,69 @@
+# Fast artifact replay of the completed aqbszk1r BA55 trajectory diagnostic.
+# It reuses saved candidate logits and the saturated independent H4 judge:
+# classifier_fits=0, policy_updates=0.
+source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_weak_classifier_trajectory_v1
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ba55_m2_lr_actionability_replay_v1
+expected_source_schema: c4a91e07-h4-weak-classifier-trajectory-v1
+expected_policy_step: 1110
+
+reward_stage: ba_lcb_55
+selected_members:
+  - {seed: 20260913, fold: 1}
+  - {seed: 20260913, fold: 2}
+
+workers: 16
+cpus_per_worker: 2
+probe_events: 1024
+K: 8
+gradient_events: 1024
+gradient_blocks: 8
+gradient_timesteps: 4
+gradient_seed: 20261313
+beta: 1.0
+policy_eval_t_min: 0.0
+policy_eval_t_max: 0.7
+raw_tempering: 0.75
+score_batch_size: 32768
+
+# Parameter-space radius, not an AdamW LR. The winning radius will be mapped
+# to a native optimizer step only in the next short closed-loop pilot.
+step_rms_values: [0.000001, 0.000003, 0.00001, 0.00003, 0.0001]
+rollout_seeds:
+  - 20261701
+  - 20261702
+  - 20261703
+  - 20261704
+  - 20261705
+  - 20261706
+  - 20261707
+  - 20261708
+minimum_plus_beats_zero_fraction: 0.75
+minimum_plus_beats_minus_fraction: 1.0
+bootstrap_seed: 20261801
+bootstrap_replicates: 10000
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h4b55lr1
+  resume: allow
+  name: Can a larger policy step escape the plateau? | BA55 two-fold H4 | checkpoint replay
+  group: H4 policy projection
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - SourceC4a91e07Last
+    - SourceAqbszk1r
+    - H4
+    - BA55
+    - TwoFoldOneRepeat
+    - TwoMemberOOF
+    - ArtifactReplay
+    - LearningRateRadiusSweep
+    - EightSeedCRN
+    - NoClassifierFit
+    - NoPolicyUpdate
+    - NoHardTrust

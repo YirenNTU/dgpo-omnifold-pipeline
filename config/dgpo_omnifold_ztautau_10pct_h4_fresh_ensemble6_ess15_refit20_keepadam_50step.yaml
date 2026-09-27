@@ -1,0 +1,96 @@
+# Six-member non-disruptive reward refresh pilot paired to h4e50m6.
+#
+# The exact round-1 reward/reference snapshot is inherited from h4e50m6 at
+# policy step 0, avoiding a redundant six-member fit. The reward-age scheduler
+# installs fresh rounds at steps 20 and 40. Later classifiers and their
+# optimizers start fresh, while policy Adam remains continuous across installs.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble6_ess15_single_reward_50step.yaml
+
+experiment:
+  protocol: h4-fresh-ensemble6-ess15-refit20-keepadam-50step-v1
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4e50m6
+  single_experimental_change: nondisruptive_fresh_reward_every_20_updates
+  rounds: 3
+  policy_updates_per_round: 20
+  reward_lifetime_updates: 20
+  reward_refresh_steps:
+    - 0
+    - 20
+    - 40
+  final_reward_updates: 10
+  initial_reward_training_reused: true
+  initial_reward_source_run: ytchou97-university-of-washington/nu2flow-RL/h4e50m6
+  initial_reward_source_global_step: 0
+  initial_raw_monitor_reused: false
+  initial_raw_monitor_rebuilt_at_step_zero: true
+
+nersc:
+  reproducibility:
+    note: >-
+      Paired follow-up to h4e50m6. First start pinned-inherits its exact
+      dgpo-epoch=-1-next_ep=0-step=0 checkpoint: the policy is still the source
+      c4a91e07 step-1110 model and the matching six-member round-1 reward,
+      reference, and calibration are already installed. Because that snapshot
+      was produced with warm_start_classifier=false, it intentionally has no
+      serialized raw-monitor weights; one fresh diagnostic raw-AUC baseline is
+      fitted at step 0 before policy updates. This does not retrain or replace
+      the inherited reward. It never loads the h4e50m6 step-50 last.ckpt. Fresh
+      six-member rewards are trained and installed at steps 20 and 40.
+      Classifier weights and classifier optimizer state never cross those
+      rounds; policy Adam moments and counters remain continuous across installs.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble6_ess15_refit20_keepadam_50step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_fresh_ensemble_pilot.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble6_ess15_refit20_keepadam_50step.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_ensemble6_ess15_refit20_keepadam_50step_v1
+    version: h4_ensemble6_ess15_refit20_keepadam_50step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble6_ess15_refit20_keepadam_50step_v1/logs
+  wandb:
+    id: h4e20m6
+    run_name: c4a91e07_h4_ensemble6_ess15_refit20_keepadam_50step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - PairedControlH4e50m6
+      - Fixed50StepEndpoint
+      - ThreeRewardRounds
+      - RefitEvery20Updates
+      - FreshClassifierEveryRound
+      - ContinuousPolicyAdam
+      - H4NonlinearFourier
+      - ThreeSeedsTwoFolds
+      - SixMemberRewardEnsemble
+      - AdaptiveTempering
+      - ESSTarget15pct
+      - SoftESSNoRejection
+      - NoHardTrust
+      - NoRollback
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble6_ess15_single_reward_50step_v1/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ensemble6_ess15_refit20_keepadam_50step_v1/checkpoints
+
+dgpo:
+  checkpoint_load_mode: resume
+  pinned_classifier_restart: true
+  adaptive_omnifold:
+    trigger:
+      # Bootstrap is installed at epoch -1. Ages 2 and 4 correspond to the
+      # normal epoch-end audits at global steps 20 and 40.
+      max_reward_age_epochs: 2
+    recalibration:
+      # Round 1 is loaded from the h4e50m6 step-0 snapshot.
+      bootstrap_on_start: false
+      # Bootstrap plus scheduled installs at steps 20 and 40.
+      max_reward_rounds: 3
+      # Preserve policy Adam moments/counters when a fresh reward is installed.
+      reset_optimizer_state_on_install: false

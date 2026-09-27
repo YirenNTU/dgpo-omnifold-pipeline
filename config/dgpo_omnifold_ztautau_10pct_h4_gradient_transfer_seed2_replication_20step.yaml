@@ -1,0 +1,86 @@
+# Independent-seed replication of the exact h4xfer01 phase from policy step 0
+# through step 20.  The source, H4 architecture, objective, optimizer, audit
+# budget, and phase boundary stay fixed; only the declared stochastic seed
+# bundle changes.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_gradient_transfer_trace_20step.yaml
+
+experiment:
+  protocol: h4-gradient-transfer-seed2-replication-20step-v1
+  single_experimental_change: independent_seed_bundle_replication
+  single_question: >-
+    Does the fixed-H4/native-AdamW 50-step classifier-closure result reproduce
+    under an independent reward, fit-population, audit, gradient-panel, and
+    TARP seed bundle?
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4xfer01
+  matched_continuation_control: >-
+    ytchou97-university-of-washington/nu2flow-RL/h4xfer02
+  seed_replication_of: h4xfer01_plus_h4xfer02
+  replication_seed_bundle_id: seed2
+  endpoint_selection: fixed_step_20
+  phase_role: full_state_boundary_for_predeclared_step50_replication
+  primary_endpoint: deferred_to_seed2_step50_late_window_mean
+  primary_decision_rule: >-
+    Phase 1 only establishes the matched step-20 full-state boundary. The
+    predeclared replication endpoint is evaluated after phase 2 as
+    mean(gap30,gap40,gap50)-gap0 within this new seed run; passing requires a
+    negative value.
+
+nersc:
+  reproducibility:
+    note: >-
+      Phase 1 of the independent-seed replication. It starts weights-only from
+      the same c4a91e07 step-1110 checkpoint and preserves the four-member H4
+      architecture, fixed reward, K=8 calibrated-LOO objective, coefficient-1
+      velocity-MSE reference, native AdamW, and cold >=1000-update audit
+      protocol. Only the five declared stochastic seeds differ. The phase-20
+      checkpoint is then resumed without state changes by phase 2.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_20step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_seed_replication.py
+
+logger:
+  local:
+    name: c4a91e07_h4_seed2_replication_20step_v1
+    version: h4_seed2_replication_20step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_20step_v1/logs
+  wandb:
+    id: h4rep01
+    run_name: c4a91e07_h4_seed2_replication_50step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - IndependentSeedReplication
+      - SeedBundle2
+      - SourceC4a91e07Step1110
+      - MatchedH4xfer01H4xfer02
+      - FourMemberEnsemble
+      - FixedH4RewardThroughStep50
+      - ExactProductionGradientTrace
+      - NativeAdamW
+      - ReferenceCoefficientOne
+      - ColdSaturatedH4Audit
+      - TwoPhaseFullStateBoundaryAt20
+      - NoRefit
+      - NoObjectiveChange
+      - NoHardTrust
+      - NoProjection
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_seed2_replication_20step_v1/checkpoints
+
+dgpo:
+  gradient_conflict:
+    seed: 20261015
+  tarp:
+    seed: 20261022
+  adaptive_omnifold:
+    trigger:
+      probe_seed: 20261021
+    recalibration:
+      pool_selection_seed: 314159
+      seed: 20261020

@@ -1,0 +1,70 @@
+# Replay the completed classifier bootstrap, BEFORE any new policy updates.
+# Inherit the high-LR/fixed-reward protocol, not its latest-checkpoint selection.
+extends_overlay: dgpo_227e4975_fixed_reward_resume.yaml
+
+options:
+  Training:
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110_step0_lr5e5/checkpoints
+
+dgpo:
+  checkpoint_load_mode: resume
+  # Pin the completed bootstrap; never substitute a later last.ckpt.
+  auto_resume_from_last: false
+  validation_every_n_epochs: 10
+  validation_full_every_n_epochs: 10
+  # No audit at epoch 0, 50, or any other epoch; no classifier bootstrap/refit.
+  # The parent retains the adaptive container only to restore/save the matching
+  # reward/reference state. Its monitor cadence lies beyond the 1500-epoch run.
+
+logger:
+  local:
+    name: h4-step0-fixed-reward-lr5e5
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110_step0_lr5e5/logs
+  wandb:
+    id: h4s0lr5e5
+    resume: never
+    fresh_run: false
+    run_name: "Can larger policy steps absorb fixed reward? | H4 FiLM | 5e-5 cosine | step-0 replay"
+    group: H4 policy projection
+    tags: [DGPO, H4, VisibleKinematics, NonlinearAdaLN, Depth3, RawWeights, Step1110, StepZeroReplay, FixedReward, NoRefit, NoAudit, HigherPolicyLR, Cosine1500, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110_step0_lr5e5/ray_results
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+    note: >-
+      Inherit the completed step-0 classifier bootstrap of the three-block
+      angle/momentum FiLM experiment initialized from raw c4a91e07 step1110.
+      This is NOT a raw-1110 weights-only restart or a late 227e4975 checkpoint.
+      Restore installed classifiers, original/round references and step-0
+      optimizer/scheduler state; explicitly apply configured LR bases/scope.
+      Start policy epoch/step at the saved 0/0. Body/generation/projector use
+      5e-5 and new conditioning branches use 1e-4, all decaying to 10% over
+      1500 policy epochs (15000 updates). No bootstrap, refit, initial audit,
+      periodic audit or pending-baseline fit. Keep original validation settings
+      including the step-0 physics baseline and every-10-epoch validation.
+      Velocity-MSE coefficient 1, raw/no EMA, 16 GPUs; source files untouched.
+      Use a new W&B run and output directory because this replays step 0.
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_1110_step0_fixed_reward_lr5e5.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110_step0_lr5e5/ray_results
+
+experiment:
+  protocol: h4-1110-step0-fixed-reward-policy-lr5e5
+  source_policy_step: 0
+  upstream_raw_policy_step: 1110
+  startup_mode: inherit_completed_step_zero_bootstrap
+  intervention: replay_step0_fixed_reward_no_audit_policy_lr5e5_cosine1500
+  single_question: Can higher policy LR absorb the original fixed H4 reward from the pre-update step-0 snapshot?
+  stop_rule: Train from policy step 0 to epoch 1500 or job walltime.
+  endpoint_selection: absolute_policy_epoch1500
+  primary_decision_rule: >-
+    Compare fixed-reward and unchanged validation trajectories within the
+    inherited initial reward round. No fresh classifier is trained, so this
+    run does not measure fresh-classifier AUC closure. It is not a continuation
+    of the later reward round or an unchanged-LR longer-training control.

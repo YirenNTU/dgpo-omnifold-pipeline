@@ -103,6 +103,29 @@ def test_tarp_reports_insufficient_candidate_pool() -> None:
     assert metrics["val_tarp/skipped_insufficient_k"] == 1.0
 
 
+def test_topology_detects_changed_pairing_with_identical_leg_marginals():
+    batch = _batch(100)
+    truth = torch.zeros(100, 2, 2)
+    phi = torch.linspace(-0.4, 0.4, 100)
+    truth[:, 0, 1] = phi
+    truth[:, 1, 1] = phi
+    batch["x_invisible"] = truth
+    current = truth.clone()
+    current[:, 1, 1] = phi.flip(0)
+    arrays = collect_ztautau_validation_arrays(
+        current.unsqueeze(0), truth.unsqueeze(0), batch, torch.ones(100),
+    )
+    metrics = build_ztautau_validation_metrics(
+        arrays, val_k=1, tarp_config={"enabled": False},
+        metrics_config={"enabled": True, "bins": 60}, include_images=False,
+    )
+    for leg in ("a", "b"):
+        assert metrics[f"val_ztautau/jsd/current/target/tau_{leg}_delta_phi"] == 0
+    assert metrics["val_ztautau/jsd/current/topology/delta_phi_to_pi"] > 0.2
+    assert metrics["val_ztautau/jsd/ref/topology/delta_phi_to_pi"] == 0
+    assert not any(key.startswith("val_tarp/") for key in metrics)
+
+
 def test_nonzero_candidate_index_is_rejected() -> None:
     with np.testing.assert_raises_regex(ValueError, "candidate_index must be 0"):
         build_ztautau_validation_metrics(

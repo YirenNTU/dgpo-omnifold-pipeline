@@ -1,0 +1,73 @@
+# Long reward-lifetime ablation paired to W&B run h4e15r01.
+#
+# The initial H4 2x2 ensemble, ESS15 tempering, policy learning rate, validation
+# cadence, and fixed 50-update endpoint are unchanged.  The sole
+# training-affecting change is that the bootstrap reward remains installed for
+# all 50 policy updates.  Ten-step raw audits continue as selection-blind
+# diagnostics, while max_reward_rounds=1 prevents intermediate reward or Adam
+# resets.
+extends_overlay: dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_ess15_5round.yaml
+
+experiment:
+  protocol: h4-fresh-ensemble-ess15-single-reward-50step-v1
+  control_wandb_run: ytchou97-university-of-washington/nu2flow-RL/h4e15r01
+  single_experimental_change: one_reward_for_all_50_policy_updates
+  rounds: 1
+  policy_updates_per_round: 50
+  reward_lifetime_updates: 50
+
+nersc:
+  reproducibility:
+    note: >-
+      Paired reward-lifetime ablation to h4e15r01 from the same c4a91e07
+      step-1110 weights. The initial fresh H4 two-repeat by two-fold ensemble,
+      ESS15 adaptive tempering, policy LR, fifty-update endpoint, validation
+      cadence, and absence of hard trust/rollback are unchanged. The bootstrap
+      reward and its policy Adam state remain installed for all fifty updates;
+      ten-step raw audits are diagnostic only and cannot install another reward.
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ess15_single_reward_50step_v1/ray_results
+  execution:
+    command: >-
+      shifter python3 scripts/train_dgpo_h4_fresh_ensemble_pilot.py
+      --config config/dgpo_omnifold_ztautau_10pct_h4_fresh_ensemble_ess15_single_reward_50step.yaml
+
+logger:
+  local:
+    name: c4a91e07_h4_ess15_single_reward_50step_v1
+    version: h4_ess15_single_reward_50step_v1
+    save_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ess15_single_reward_50step_v1/logs
+  wandb:
+    id: h4e50r01
+    run_name: c4a91e07_h4_ess15_single_reward_50step_v1
+    tags:
+      - NERSC
+      - Ztautau
+      - DGPO
+      - SourceC4a91e07Last
+      - PairedControlH4e15r01
+      - Fixed50StepEndpoint
+      - SingleRewardRound
+      - FiftyUpdatesPerReward
+      - NoIntermediateRewardReset
+      - NoIntermediateAdamReset
+      - H4NonlinearFourier
+      - TwoSeedsTwoFolds
+      - FreshInitialClassifier
+      - AdaptiveTempering
+      - ESSTarget15pct
+      - SoftESSNoRejection
+      - NoHardTrust
+      - NoRollback
+      - LiveWandb
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_ess15_single_reward_50step_v1/checkpoints
+
+dgpo:
+  adaptive_omnifold:
+    recalibration:
+      # Bootstrap counts as round one. Monitoring continues every ten updates,
+      # but the round budget prevents all intermediate reward installations.
+      max_reward_rounds: 1

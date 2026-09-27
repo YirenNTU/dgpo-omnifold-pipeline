@@ -1,0 +1,66 @@
+# Four independent estimates of the exact production DGPO gradient.
+# No classifier fit, optimizer step, reward transformation, or cold H4 audit.
+source_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_reward_interface_v5
+output_dir: /pscratch/sd/y/yiren/Ztautau/c4a91e07_h4_production_gradient_reproducibility_v1
+expected_source_schema: c4a91e07-h4-reward-interface-v2
+expected_source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/c4a91e07
+expected_policy_step: 1110
+
+workers: 16
+cpus_per_worker: 2
+realizations: 4
+
+# Exact production estimator inherited from the v5 runtime.
+events_per_worker: 512
+event_microbatch_size: 128
+K: 8
+gradient_timesteps: 8
+beta: 1.0
+policy_eval_t_min: 0.0
+policy_eval_t_max: 0.7
+
+# Four disjoint 8,192-event gradient batches are drawn from final_audit.
+event_selection_seed: 2026091501
+candidate_seed: 2026091502
+gradient_seed: 2026091503
+
+# These events are disjoint from every gradient batch.  All directions use the
+# same events and rollout noise, with matched 1e-6 parameter RMS.
+probe_events: 2048
+probe_selection_seed: 2026091504
+probe_rollout_seed: 2026091505
+probe_epsilon_rms: 1.0e-6
+score_batch_size: 32768
+
+# Logging-only estimate of diffusion-time conflict.  It never contributes to
+# the production gradient or an update.
+time_diagnostic_events_per_worker: 8
+
+# Float16 directions permit exact replay locally without making the live W&B
+# artifact several hundred MB.  The JSON report and manifest are uploaded.
+save_direction_vectors: true
+upload_direction_vectors: false
+
+wandb:
+  enabled: true
+  required: true
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: h4grad01
+  resume: never
+  name: c4a91e07_h4_production_gradient_reproducibility_v1
+  group: c4a91e07_h4_projection_diagnostics
+  tags:
+    - NERSC
+    - Ztautau
+    - DGPO
+    - SourceC4a91e07Step1110
+    - H4Ensemble
+    - CalibratedLOO
+    - FourProductionGradients
+    - ExactObjective
+    - TargetPreserving
+    - CommonNoiseSignedProbe
+    - NoClassifierFit
+    - NoOptimizerStep
+    - LiveWandb

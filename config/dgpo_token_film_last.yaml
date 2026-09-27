@@ -1,0 +1,35 @@
+extends_overlay: dgpo_token_film_control.yaml
+
+network:
+  VisibleConditioning:
+    diffusion_token_readout:
+      enabled: true
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/h4_token_film_last/checkpoints
+
+logger:
+  local:
+    name: h4-token-film-last
+    save_dir: /pscratch/sd/y/yiren/Ztautau/h4_token_film_last/logs
+  wandb:
+    id: h4tokfilm1
+    run_name: "Can token routing improve reward uptake? | last-block token FiLM | fixed V-MSE 1"
+    tags: [DGPO, DiffusionOnly, TokenFiLM, LastBlock, FixedReward, VelocityMSE1, RawWeights, StepZeroReplay, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/h4_token_film_last/ray_results
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_token_film_last.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/h4_token_film_last/ray_results
+      --max-steps 1000
+
+experiment:
+  arm: last_block_token_film
+  matched_configuration: config/dgpo_token_film_control.yaml
+  intervention: additive_query_dependent_visible_token_film_in_last_generation_block_only
