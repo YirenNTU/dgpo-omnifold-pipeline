@@ -1,0 +1,12 @@
+# Pure arithmetic on the already completed16-GPU panel; no Ray/inference/training.
+source_config: config/conditional_tau_weight_factor_swap.yaml
+caps: [30, 20, 10, 5]
+bootstrap: 2000
+bootstrap_seed: 100165
+cpu_threads: 16
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cap_ess_ablation
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Does a lower cap help? | context256 | ESS-matched controls | saved K64
+  group: Conditional tau ratio - cap and ESS

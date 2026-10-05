@@ -1,0 +1,66 @@
+# Classifier KL: current/anchor raw logit minus frozen truth/anchor raw logit.
+# Same feature map; coefficient1; velocity penalty disabled; fresh KL head every update.
+audit_relative_steps:
+- 0
+- 50
+- 200
+- 500
+bootstrap_replicates: 300
+bootstrap_seed: 20261004
+checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/checkpoints/dgpo-epoch=191-next_ep=192-step=1920.ckpt
+condition_edges:
+- -1.0
+- -0.5
+- 0.5
+- 1.0
+condition_groups: 3
+diagnostic_evaluation_events: 32768
+direction_rms_fractions:
+- 1.0
+full_trajectory:
+  event_microbatch: 64
+  parity_atol: 5.0e-05
+  parity_rtol: 5.0e-05
+  reward_layout: k1_event_microbatch_v2
+  reference_coefficient: 1.0
+  reward_refit:
+    anchor_step: 1920
+    ratio_bound: null
+    reference_recenter: true
+  classifier_kl:
+    anchor_step: 1920
+    coefficient: 1.0
+    refit_every_updates: 1
+gradient_events_per_rank: 512
+gradient_repeats: 2
+native_training_directory: /pscratch/sd/y/yiren/Ztautau/tau_full_trajectory_1920/native_training_full_rows_v2
+noise_edges:
+- 0.0
+- 0.23333333333333334
+- 0.4666666666666667
+- 0.7
+protocol: tau_full_trajectory
+reconstruction_tolerance: 0.0001
+relative_steps:
+- 0
+- 1
+- 5
+- 10
+- 20
+- 35
+- 50
+- 100
+- 150
+- 200
+- 300
+- 400
+- 500
+series_root: /pscratch/sd/y/yiren/Ztautau/tau_classifier_kl_1920_mb64
+source_runtime: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/runtime.yaml
+source_step: 1920
+trajectory_updates:
+- 50
+- 200
+- 500
+wandb_group: Tau full trajectory
+workers: 16

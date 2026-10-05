@@ -1,0 +1,29 @@
+# Reuse completed BCE 443eg16h. Only two NEW head fits; no sampling or DGPO.
+baseline_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_relative_input_1110
+baseline_run: 443eg16h
+baseline_config: config/conditional_tau_relative_input_10pct.yaml
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_ratio_objectives_1110
+workers: 16
+batch_size: 1024
+early_stopping:
+  monitor: val_bce
+  patience: 25
+  min_delta: 0.0001
+  min_steps: 1000
+# All other training/preprocessing settings are inherited and checked against
+# the completed BCE manifest: 250 epochs, cosine 2e-4 -> 1e-5, seed 42,
+# fresh MLP, frozen raw step1110 features, same K=1 samples and event split.
+# User-requested exception: early stopping above replaces BCE's fixed budget.
+# BCE is NOT rerun. Both new arms share this same stopping rule.
+# Common selection: minimum internal validation BCE. Cij never selects a fit.
+nnukl_c: 0.01
+# c=0.01 is an exploratory working choice, NOT a certified bound or a cap.
+# Population preservation would require true sup(p/q) < 100, unverified here.
+# Log correction activation; if inactive, nnUKL equals MLC (not a negative test).
+bootstrap: 500
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  group: Conditional tau ratio objectives - frozen raw 1110
+  mlc_name: Does direct ratio fitting help? | frozen tau head | MLC | raw 1110
+  nnukl_name: Does risk correction help? | frozen tau head | nnUKL | raw 1110

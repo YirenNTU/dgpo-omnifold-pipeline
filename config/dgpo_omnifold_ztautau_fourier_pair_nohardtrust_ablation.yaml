@@ -48,7 +48,7 @@ nersc:
 platform:
   # Use exactly the same fixed seed-42 5% identities as diffusion pretraining.
   data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_5pct_seed42/train
-  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42/val
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
   number_of_workers: 16
   resources_per_worker:
     CPU: 20

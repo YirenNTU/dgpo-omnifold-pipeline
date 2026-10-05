@@ -1,0 +1,24 @@
+# Fixed-cap Monte Carlo replication, NOT independent-event generalization.
+source: /pscratch/sd/y/yiren/Ztautau/conditional_tau_sampling_convergence/sampling-3c003b208f
+source_run: pt4n8f9t
+selection_run: 12nni684
+classifier_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_conditioning_1110/film-267e4db8e8
+classifier_run: pzq0nl1i
+events: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+expected_events: 119002
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cap_confirmation
+workers: 16
+batch_size: 1024
+feature_batch_size: 256
+prefixes: [64]
+cap: 30
+# Old panel: seed930481 + 1000003*j + rank, j=0..63.
+# New panel: use the next64 candidate stream indices, j=64..127.
+seed: 64930673
+bootstrap: 500
+bootstrap_seed: 930481
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Does capped Cij improvement repeat? | frozen FiLM | cap30 K64 | fresh draws
+  group: Conditional tau ratio sampling convergence

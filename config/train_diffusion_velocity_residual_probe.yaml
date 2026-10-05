@@ -1,0 +1,73 @@
+# One-question probe: can observed conditioning alone improve the frozen source?
+extends_overlay: train_diffusion_token_film_global.yaml
+
+network:
+  VisibleConditioning:
+    diffusion_token_readout:
+      enabled: true
+      mode: velocity
+      block: output
+      width: 64
+      heads: 4
+
+options:
+  Training:
+    epochs: 20
+    total_epochs: 20
+    learning_rate_warm_up_factor: 2.0
+    train_only_modules: [TruthGeneration.visible_conditioning.token_readout]
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_velocity_residual_probe/checkpoints
+    EarlyStopping:
+      patience: 21
+      min_delta: 0.0
+    Components:
+      TruthGeneration.visible_conditioning:
+        optimizer_group: visible_conditioning
+        optimizer_type: adamW
+        learning_rate: 0.0005
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        warm_up: true
+
+logger:
+  local:
+    name: diffusion-velocity-residual-probe
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_velocity_residual_probe/logs
+  wandb:
+    id: diffvelres1
+    run_name: "Can conditioning predict missing velocity? | frozen backbone | output residual"
+    tags: [DiffusionOnly, ConditioningProbe, FrozenBackbone, VelocityResidual, CrossAttention, RawWeights, Data10pct, GPU16, PairedNoise]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_velocity_residual_probe/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_velocity_residual_probe.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_velocity_residual_probe/ray_results
+
+experiment:
+  question: Can a conditioning-only output head predict velocity residuals missed by the frozen source model?
+  intervention: frozen_source_plus_zero_initialized_output_velocity_residual
+  matched_configuration: config/train_diffusion_token_film_global.yaml
+  source_wandb_run: ytchou97-university-of-washington/EveNet/difftokglobal1
+  source_policy_checkpoint: /pscratch/sd/y/yiren/Ztautau/h4_kinematic_adaln_depth3_1110/checkpoints/dgpo-epoch=-1-next_ep=0-step=0.ckpt
+  primary_endpoint: minimum_val_loss_and_epoch19_val_loss_relative_to_epoch0_on_fixed_noise
+  stop_rule: exactly20_epochs_or_failure
+  interpretation: >-
+    Load the same raw step-zero weights as the completed residual-all and matched
+    global-FiLM screens. Freeze every saved parameter and keep the frozen model in
+    eval mode even during training. Train only a new width64 four-head visible-token
+    readout at5e-4 with two-epoch warmup and cosine over20 epochs. It queries the
+    final invisible hidden representation using observed-only Fourier/kinematic
+    memory and adds a four-coordinate correction after the original velocity
+    projector. The final projection is zero initialized, so epoch-zero predictions
+    exactly equal the source function. No truth is an input, no EMA, classifier,
+    reward, reference penalty, low-noise weighting or joint-coverage callback.
+    A held-out fixed-noise val-loss reduction shows extra conditional predictive
+    information is accessible to this branch; it does not establish sample-level
+    physics improvement or DGPO reward transfer. Failure is evidence against this
+    branch/capacity/20-epoch optimizer, not all possible conditioning.

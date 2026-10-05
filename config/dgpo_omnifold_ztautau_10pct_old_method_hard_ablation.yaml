@@ -48,7 +48,7 @@ platform:
   # Keep a true held-out score pool (old 5% used diffusion_val_20pct) so
   # residual closure + acceptance audit are not scored on the fit identities.
   data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
-  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42/val
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
   batch_size: 512
   number_of_workers: 16
   use_gpu: true

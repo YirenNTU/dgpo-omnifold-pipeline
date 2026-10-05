@@ -32,14 +32,14 @@ def optimizer_parameters(model, module_paths, all_module_paths):
             for p in model.get_submodule(child).parameters()
         }
         for p in model.get_submodule(path).parameters():
-            if id(p) not in excluded and id(p) not in seen:
+            if p.requires_grad and id(p) not in excluded and id(p) not in seen:
                 params.append(p)
                 seen.add(id(p))
     return params
 
 
 def load_conditioning_ablation_weights(model, checkpoint):
-    """Exact shared raw load for PET-only/global-FiLM/token-FiLM continuation.
+    """Exact shared raw load for PET-only/global-FiLM/token-readout continuation.
 
     Dropping global FiLM is allowed only when all saved modulation outputs are
     identically zero. Adding the new token readout is also a zero-output change.
@@ -49,13 +49,13 @@ def load_conditioning_ablation_weights(model, checkpoint):
     target = model.state_dict()
     prefix = "TruthGeneration.visible_conditioning."
     new_prefix = prefix + "token_readout."
+    if any(k.startswith(new_prefix) for k in source):
+        raise ValueError("common supervised source must precede token-readout training")
     removing_global = any(k.startswith(prefix) for k in source) and not any(k.startswith(prefix) for k in target)
     if removing_global:
         gates = [v for k, v in source.items() if k.startswith(prefix + "modulations.")]
         if not gates or any(torch.count_nonzero(v).item() for v in gates):
             raise ValueError("PET-only arm can remove global FiLM only from a zero-output step-0 source")
-        if any(k.startswith(new_prefix) for k in source):
-            raise ValueError("common supervised source must precede token-readout training")
     unused_roots = {"famo", "Classification", "Regression", "Assignment", "Segmentation", "GlobalGeneration", "ReconGeneration"}
     missing = [k for k in target if k not in source and not k.startswith(new_prefix)]
     mismatch = [k for k in target if k in source and target[k].shape != source[k].shape]

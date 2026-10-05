@@ -12,7 +12,8 @@ from torch import nn
 
 
 def visible_conditioning_spec(network_cfg, *, target, feature_names, token_dim,
-                              hidden_dim, num_layers, n_branches):
+                              hidden_dim, num_layers, n_branches, output_dim=None,
+                              attention_heads=None):
     cfg = dict(getattr(network_cfg, "VisibleConditioning", {}) or {})
     if not cfg.get(f"{target}_enabled", False):
         return None
@@ -32,7 +33,35 @@ def visible_conditioning_spec(network_cfg, *, target, feature_names, token_dim,
     # Never change classifier PEFT specs or payloads when enabling policy readout.
     token_cfg = dict(cfg.get("diffusion_token_readout", {}) or {})
     if target == "diffusion" and token_cfg.get("enabled", False):
+        if token_cfg.get("mode", "film") == "velocity":
+            if output_dim is None:
+                raise ValueError("velocity token readout requires the diffusion output dimension")
+            token_cfg["output_dim"] = int(output_dim)
         spec["token_readout"] = token_cfg
+    probe_cfg = dict(cfg.get("diffusion_reward_probe", {}) or {})
+    if target == "diffusion" and probe_cfg.get("enabled", False):
+        if output_dim != 2:
+            raise ValueError("reward conditioning probe is only for delta-theta/phi generation")
+        spec["reward_probe"] = probe_cfg
+    relation_cfg = dict(cfg.get("diffusion_relation_adapter", {}) or {})
+    if target == "diffusion" and relation_cfg.get("enabled", False):
+        spec["relation_adapter"] = relation_cfg
+    if target == "diffusion":
+        fourier_enabled = cfg.get("diffusion_fourier_enabled", True)
+        if type(fourier_enabled) is not bool:
+            raise ValueError("diffusion_fourier_enabled must be boolean")
+        if not fourier_enabled:
+            spec["fourier_enabled"] = False
+        scale_enabled = cfg.get("diffusion_film_scale_enabled", True)
+        if type(scale_enabled) is not bool:
+            raise ValueError("diffusion_film_scale_enabled must be boolean")
+        if not scale_enabled:
+            spec["film_scale_enabled"] = False
+        pair_cfg = dict(cfg.get("diffusion_pair_attention", {}) or {})
+        if pair_cfg.get("enabled", False):
+            if attention_heads is None:
+                raise ValueError("pair attention requires the generation head count")
+            spec["pair_attention"] = dict(pair_cfg, heads=int(attention_heads))
     return spec
 
 
@@ -41,8 +70,13 @@ class VisibleConditioning(nn.Module):
                  n_branches, width=64, harmonics=(1, 2, 3, 4),
                  theta_source="Part_eta", phi_source="Part_phi",
                  log_diagnostics=True, feature_mode="angles", numerical_features=(),
-                 numerical_frequencies=(.25, .5, 1., 2.), token_readout=None):
+                 numerical_frequencies=(.25, .5, 1., 2.), token_readout=None, reward_probe=None,
+                 relation_adapter=None, film_scale_enabled=True, pair_attention=None,
+                 fourier_enabled=True):
         super().__init__()
+        if type(fourier_enabled) is not bool:
+            raise ValueError("fourier_enabled must be boolean")
+        self.fourier_enabled = fourier_enabled
         if min(token_dim, hidden_dim, num_layers, n_branches) < 1 or width < 2:
             raise ValueError("visible conditioning dimensions must be positive (width >= 2)")
         if not harmonics or any(int(k) != k or k < 1 for k in harmonics) or len(set(harmonics)) != len(harmonics):
@@ -56,6 +90,13 @@ class VisibleConditioning(nn.Module):
                          num_layers=int(num_layers), n_branches=int(n_branches), width=int(width),
                          harmonics=list(harmonics), theta_source=theta_source, phi_source=phi_source,
                          log_diagnostics=bool(log_diagnostics))
+        if type(film_scale_enabled) is not bool:
+            raise ValueError("film_scale_enabled must be boolean")
+        if not fourier_enabled:
+            self.spec["fourier_enabled"] = False
+        self.film_scale_enabled = film_scale_enabled
+        if not film_scale_enabled:
+            self.spec["film_scale_enabled"] = False
         self.theta_index, self.phi_index = names.index(theta_source), names.index(phi_source)
         self.feature_mode = feature_mode
         extra_token_dim = 0
@@ -92,9 +133,9 @@ class VisibleConditioning(nn.Module):
         self.token_readout = None
         if token_readout and token_readout.get("enabled", False):
             from .token_conditioning import TokenSpecificConditioning
-            if n_branches != 2 or token_readout.get("block", "last") != "last":
-                raise ValueError("token readout supports only the last diffusion block")
-            unknown = set(token_readout) - {"enabled", "block", "width", "heads"}
+            if n_branches != 2:
+                raise ValueError("token readout is supported only for diffusion")
+            unknown = set(token_readout) - {"enabled", "block", "width", "heads", "mode", "output_dim"}
             if unknown:
                 raise ValueError(f"unknown token readout options: {sorted(unknown)}")
             self.spec["token_readout"] = dict(token_readout)
@@ -102,9 +143,56 @@ class VisibleConditioning(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.token_readout = TokenSpecificConditioning(
                     hidden_dim, width, width=int(token_readout.get("width", 64)),
-                    heads=int(token_readout.get("heads", 4)))
+                    heads=int(token_readout.get("heads", 4)),
+                    mode=token_readout.get("mode", "film"),
+                    block=token_readout.get("block", "last"),
+                    output_dim=token_readout.get("output_dim"))
+        self.reward_probe = None
+        if reward_probe and reward_probe.get("enabled", False):
+            from .reward_conditioning import RewardConditioningProbe
+            if n_branches != 2 or self.token_readout is not None:
+                raise ValueError("reward probe requires global-FiLM diffusion without token readout")
+            if set(reward_probe) - {"enabled", "basis", "width", "seed"}:
+                raise ValueError("unknown reward conditioning probe option")
+            self.spec["reward_probe"] = dict(reward_probe)
+            self.reward_probe = RewardConditioningProbe(token_dim, basis=reward_probe["basis"],
+                width=int(reward_probe.get("width", 128)), seed=int(reward_probe.get("seed", 20260930)))
 
-    def forward(self, raw, tokens, mask, *, normalized_raw=None, return_tokens=False):
+        self.relation_adapter = None
+        if relation_adapter and relation_adapter.get("enabled", False):
+            from .relation_conditioning import RelationConditioning
+            if n_branches != 2 or self.token_readout is not None or self.reward_probe is not None:
+                raise ValueError("Relation adapter requires global-FiLM diffusion only")
+            if set(relation_adapter) - {"enabled", "mode", "width", "seed"}:
+                raise ValueError("Unknown relation adapter options")
+            if "Part_energy" not in names or "Part_pt" not in names:
+                raise ValueError("Relation adapter needs observed energy and pt")
+            self.relation_indices = [names.index("Part_energy"), names.index("Part_pt")]
+            self.spec["relation_adapter"] = dict(relation_adapter)
+            self.relation_adapter = RelationConditioning(width, 2*n_branches*hidden_dim, num_layers,
+                mode=relation_adapter.get("mode", "relations"), width=int(relation_adapter.get("width",64)),
+                seed=int(relation_adapter.get("seed",20260930)))
+
+        self.pair_attention = None
+        if pair_attention and pair_attention.get("enabled", False):
+            from .pair_attention import VisiblePairAttentionBias
+            if n_branches != 2 or self.token_readout is not None or self.reward_probe is not None:
+                raise ValueError("pair attention requires global-FiLM diffusion without token/reward readout")
+            if set(pair_attention) - {"enabled", "heads", "width", "seed"}:
+                raise ValueError("Unknown pair attention options")
+            if "Part_energy" not in names or "Part_pt" not in names:
+                raise ValueError("pair attention needs observed energy and pt")
+            self.pair_indices = [names.index("Part_energy"), names.index("Part_pt")]
+            self.spec["pair_attention"] = dict(pair_attention)
+            self.pair_attention = VisiblePairAttentionBias(
+                heads=int(pair_attention["heads"]), layers=num_layers,
+                width=int(pair_attention.get("width", 32)),
+                seed=int(pair_attention.get("seed", 20260930)))
+
+    def forward(self, raw, tokens, mask, *, normalized_raw=None, return_tokens=False,
+                return_attention_bias=False):
+        if return_attention_bias and (self.pair_attention is None or return_tokens):
+            raise ValueError("attention bias requires an enabled pair branch and no token readout")
         if raw.ndim != 3 or tokens.ndim != 3 or raw.shape[:2] != tokens.shape[:2]:
             raise ValueError("visible conditioning requires matching [batch, visible slots, features]")
         if raw.shape[-1] != len(self.spec["feature_names"]) or tokens.shape[-1] != self.spec["token_dim"]:
@@ -122,12 +210,17 @@ class VisibleConditioning(nn.Module):
         k = self.harmonics.to(raw)
         angles = torch.cat((theta[..., None] * k, phi[..., None] * k), dim=-1)
         fourier = torch.cat((angles.sin(), angles.cos()), dim=-1).to(tokens)
+        if not self.fourier_enabled:
+            fourier = torch.zeros_like(fourier)
         token_parts = [self.token_norm(tokens), fourier]
         if self.feature_mode == "kinematics":
             if normalized_raw is None or normalized_raw.shape != raw.shape:
                 raise ValueError("kinematic conditioning requires pre-projection normalized observed inputs")
             numeric = torch.where(valid[..., None], normalized_raw, 0.)[..., self.numerical_indices].to(tokens)
-            token_parts.extend((numeric, self._numerical_fourier(numeric)))
+            numeric_fourier = self._numerical_fourier(numeric)
+            if not self.fourier_enabled:
+                numeric_fourier = torch.zeros_like(numeric_fourier)
+            token_parts.extend((numeric, numeric_fourier))
         encoded = self.encoder(torch.cat(token_parts, dim=-1))
         count = valid.sum(dim=1, keepdim=True)
         # Finite sentinel permits empty visible events without softmax NaNs.
@@ -138,6 +231,12 @@ class VisibleConditioning(nn.Module):
         context = self.event_encoder(torch.cat((pooled, count.to(pooled).log1p()), dim=-1))
         present = (count > 0).to(context)
         outputs = [head(context) * present for head in self.modulations]
+        if self.relation_adapter is not None:
+            from .relation_conditioning import pair_summary
+            relations, pair_present = pair_summary(theta, phi, raw[...,self.relation_indices[0]],
+                                                   raw[...,self.relation_indices[1]], valid)
+            additions = self.relation_adapter(context, relations, pair_present)
+            outputs = [base + addition for base, addition in zip(outputs, additions)]
         if self.log_diagnostics:
             with torch.no_grad():
                 packed = torch.stack(outputs).detach().float().reshape(
@@ -145,13 +244,37 @@ class VisibleConditioning(nn.Module):
                 self.diagnostics = {"context_rms": (context.detach().float() * present).square().mean().sqrt(),
                                     "scale_rms": packed[..., 0, :].square().mean().sqrt(),
                                     "shift_rms": packed[..., 1, :].square().mean().sqrt()}
+                if self.relation_adapter is not None:
+                    delta = torch.stack(additions).detach().float().reshape(
+                        len(outputs), raw.shape[0], self.spec["n_branches"], 2, self.spec["hidden_dim"])
+                    self.diagnostics["relation_scale_rms"] = delta[...,0,:].square().mean().sqrt()
+                    self.diagnostics["relation_shift_rms"] = delta[...,1,:].square().mean().sqrt()
                 if self.feature_mode == "kinematics":
                     self.diagnostics["numerical_input_rms"] = numeric.detach().float().square().sum().div(
                         (valid.sum() * max(1, len(self.numerical_indices))).clamp_min(1)).sqrt()
         modulations = [output.chunk(2 * self.spec["n_branches"], dim=-1) for output in outputs]
+        modulations = [self.apply_scale_policy(parts) for parts in modulations]
+        if self.log_diagnostics:
+            self.diagnostics["effective_scale_rms"] = (
+                self.diagnostics["scale_rms"] if self.film_scale_enabled
+                else self.diagnostics["scale_rms"].new_zeros(()))
+        if return_attention_bias:
+            biases = self.pair_attention(theta, phi, raw[..., self.pair_indices[0]],
+                                         raw[..., self.pair_indices[1]], valid)
+            if self.log_diagnostics:
+                self.diagnostics.update(self.pair_attention.diagnostics)
+            return modulations, biases
         if return_tokens:
             return modulations, torch.where(valid[..., None], encoded, 0.), valid
         return modulations
+
+    def apply_scale_policy(self, modulation):
+        """Disable only FiLM gamma; keep beta, LayerNorm and residual LayerScale."""
+        if self.film_scale_enabled:
+            return modulation
+        # Keep checkpoint tensor shapes intact; gamma rows are inactive in this arm.
+        return tuple(torch.zeros_like(value) if i % 2 == 0 else value
+                     for i, value in enumerate(modulation))
 
     def _numerical_fourier(self, values):
         phase = (values[..., None] * self.numerical_frequencies.to(values)).flatten(-2)

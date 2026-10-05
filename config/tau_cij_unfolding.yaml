@@ -1,0 +1,17 @@
+sample_source: /pscratch/sd/y/yiren/Ztautau/tau_cij_sampling_bias/probe-c77f6b3e8c
+output: /pscratch/sd/y/yiren/Ztautau/tau_cij_unfolding
+seed: 421002
+response_fraction: 0.5
+bins: 10
+min_response_entries: 20
+svd_k: 5
+repeats: 100
+response_bootstraps: 30
+targets: [-0.5, -0.3, -0.1, 0.0, 0.1, 0.3, 0.5]
+# Optional absolute .so path; null uses ROOT's library search path.
+roounfold_library: null
+wandb:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: "Does unfolding preserve the gain? | pretrain vs DGPO | fixed response | Cij scan"
+  group: Tau Cij unfolding

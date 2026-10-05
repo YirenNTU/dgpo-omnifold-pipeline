@@ -63,6 +63,60 @@ def test_legacy_config_keeps_probe_split():
     assert cfg.audit_fit.get("training_population", "probe_split") == "probe_split"
 
 
+def test_global_film_resume_refit_full_fold_audit():
+    config, cfg = resolved("dgpo_global_film_diffusion_last.yaml")
+    assert cfg.monitor_mode == "raw_plateau_refit" and not cfg.log_only
+    assert cfg.raw_audit_enabled and not cfg.raw_monitor_warm_start
+    assert cfg.staleness_every_n_epochs == 5
+    assert not adaptive.step_zero_raw_audit_enabled(cfg)
+    assert not cfg.bootstrap_on_start
+    assert cfg.refit_once_on_resume and cfg.refit_once_id
+    assert cfg.refit_once_fail_closed and cfg.scheduled_refit_fail_closed
+    assert cfg.fixed_schedule_skip_staleness_audit and cfg.fixed_schedule_log_raw_audit
+    assert config["dgpo"]["checkpoint_load_mode"] == "resume"
+    assert not config["dgpo"]["lr_schedule"]["resume_use_config"]
+    assert config["logger"]["wandb"]["fresh_run"]
+    training = config["options"]["Training"]
+    assert training["model_checkpoint_load_path"] == training["model_checkpoint_save_path"] + "/last.ckpt"
+    assert cfg.max_reward_age_epochs == 10
+    assert cfg.min_iterations == cfg.max_iterations == 1
+    assert cfg.crossfit_folds == 2 and cfg.crossfit_repeats == 1
+    assert cfg.fit["min_steps_per_fold"] == cfg.audit_fit["min_steps"] == 850
+    assert cfg.audit_fit["training_population"] == "omnifold_fold"
+    assert cfg.audit_fit["training_fold"] == 1
+    assert cfg.audit_fit["disjoint_final_audit"]
+    assert config["platform"]["number_of_workers"] == 16
+    for fraction in (0.499, 0.501):
+        fit = evenet_ratio._scaled_crossfit_config(
+            build_fit_config(cfg.fit, n_train=416701, n_validation=118992),
+            fraction, min_steps_per_fold=850)
+        assert fit.min_steps == 850
+
+
+@pytest.mark.parametrize("change", [
+    {"log_only": False},
+    {"trigger": {"raw_audit_enabled": False}},
+    {"trigger": {"warm_start_classifier": True}},
+])
+def test_matched_log_only_audit_rejects_unsafe_modes(change):
+    from train_neutrino_backend import deep_update
+    config, _ = resolved("dgpo_global_film_diffusion_last.yaml")
+    config["dgpo"]["adaptive_omnifold"] = deep_update(
+        config["dgpo"]["adaptive_omnifold"], {
+            "log_only": True, "monitor_mode": "raw_only",
+            "trigger": {"max_reward_age_epochs": None,
+                        "fixed_schedule_skip_staleness_audit": False,
+                        "fixed_schedule_log_raw_audit": False},
+            "recalibration": {"refit_once_on_resume": False,
+                              "refit_once_fail_closed": False,
+                              "scheduled_refit_fail_closed": False}})
+    adaptive.resolve_adaptive_config(config["dgpo"])
+    config["dgpo"]["adaptive_omnifold"] = deep_update(
+        config["dgpo"]["adaptive_omnifold"], change)
+    with pytest.raises(ValueError):
+        adaptive.resolve_adaptive_config(config["dgpo"])
+
+
 @pytest.mark.parametrize("key,value", [("training_fold", 0), ("training_fold", 3),
                                        ("training_population", "typo"), ("disjoint_final_audit", False)])
 def test_invalid_matched_audit_config_fails_before_training(key, value):

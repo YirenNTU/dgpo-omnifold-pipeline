@@ -1,0 +1,21 @@
+# Only training-negative reuse changes vs pzq0nl1i. No policy update or new feature.
+upstream_config: config/conditional_tau_conditioning_10pct.yaml
+baseline_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_conditioning_1110/film-267e4db8e8
+baseline_run: pzq0nl1i
+panel_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cap_confirmation/confirm-fedfec09a0
+panel_run: fzekzrmr
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_fresh_negatives_1110
+workers: 16
+batch_size: 1024
+feature_batch_size: 256
+fresh_seed: 1930930
+bootstrap: 500
+# Training inherited exactly: 250 epochs; cosine 2e-4 -> 1e-5;
+# patience25 / min_delta1e-4 / minimum1000 optimizer steps; lowest-val-BCE selection.
+# Fit354488, internal-val62213, external-test119002. Frozen validation/test K1.
+# Every fit event gets K1/epoch; old DistributedSampler padding is retained.
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Do fresh negatives improve ratios? | FiLM BCE | K1 per epoch | raw 1110
+  group: Conditional tau ratio - fresh negatives

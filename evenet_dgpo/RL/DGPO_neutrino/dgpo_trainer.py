@@ -38,6 +38,10 @@ from evenet.utilities.fourier_integration import optimizer_parameters as module_
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+if str(_REPO_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT.parent))
+if str(_REPO_ROOT.parent / "scripts") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT.parent / "scripts"))
 
 import ray
 import ray.train
@@ -254,6 +258,15 @@ _DGPO_POLICY_BATCH_TENSOR_KEYS = frozenset(
         "classification",
         "x_invisible",
         "x_invisible_mask",
+        # The optional noisy-angle residual consumes these observed directions
+        # in BOTH rollout and gradient-bearing (T*K*B) policy evaluation. Keep
+        # the explicit visible-only allowlist; do not retain truth auxiliaries.
+        "lead_a_visible_px",
+        "lead_a_visible_py",
+        "lead_a_visible_pz",
+        "lead_b_visible_px",
+        "lead_b_visible_py",
+        "lead_b_visible_pz",
     }
 )
 
@@ -1954,6 +1967,12 @@ def build_reward_aggregator(
     weight = float(getattr(rc, "weight", 1.0))
     feature_names = _reward_feature_names()
     agg = RewardAggregator()
+    if reward_type == "conditional_tau":
+        from RL.DGPO_neutrino.conditional_tau_reward import load_reward
+        block = _dgpo_cfg_get(rc, "conditional_tau", {})
+        agg.add(load_reward(_dgpo_cfg_get(block, "bundle_file", None), device,
+                           int(_dgpo_cfg_get(block, "feature_batch_size", 256))), weight)
+        return agg
     if reward_type in {"omnifold", "omnifold_guided", "ztautau_omnifold"}:
         from RL.DGPO_neutrino.omnifold_ztautau.dgpo_reward import (
             build_uninstalled_ztautau_omnifold_reward,
@@ -4602,6 +4621,10 @@ def train_step(
     parameter_update_rms_target: float | None = None,
     parameter_update_rms_min_scale: float = 0.0,
     parameter_update_rms_max_scale: float = float("inf"),
+    mechanism_capture: Any | None = None,
+    mechanism_read_only: bool = False,
+    mechanism_candidates: Tensor | None = None,
+    trajectory_controller: Any | None = None,
 ) -> dict[str, Any]:
     """Rollout once, accumulate gradients, then apply one controlled AdamW update.
 
@@ -4613,6 +4636,11 @@ def train_step(
     # Frozen method constant: all K candidates share the diffusion timestep t and
     # noise eps during policy evaluation (only the DDIM chain index varies).
     shared_noise = True
+    if getattr(reward_agg, "conditional_tau_source", None) is not None:
+        from RL.DGPO_neutrino.conditional_tau_reward import canonical_policy_batch
+        # Canonicalize BEFORE rollout AND gradient/reference forwards, not just
+        # the reward call. Historical tau-ratio negatives were generated at0.
+        batch = canonical_policy_batch(batch)
     endpoint_controller = getattr(_unwrap_core_evenet(model), "_endpoint_kl_controller", None)
     endpoint_active = endpoint_controller is not None and endpoint_controller.config.enabled
     if endpoint_active and extragradient_optimizer_base_params is not None:
@@ -4719,7 +4747,7 @@ def train_step(
     gradient_transfer_cfg = resolve_gradient_transfer_trace_config(
         _dgpo_cfg_get(global_config.dgpo, "gradient_transfer_trace", None)
     )
-    gradient_transfer_active = gradient_transfer_trace_due(
+    gradient_transfer_active = mechanism_capture is not None or gradient_transfer_trace_due(
         gradient_transfer_cfg,
         update_end_step=int(global_step) + 1,
     )
@@ -4766,6 +4794,29 @@ def train_step(
             torch.zeros_like(parameter, dtype=torch.float32)
             for parameter in gradient_transfer_parameters
         ]
+    pathwise_active = trajectory_controller is not None and trajectory_controller.active
+    classifier_trust = getattr(trajectory_controller, 'hard_trust', None)
+    classifier_trust_metrics = {}
+    if trajectory_controller is not None:
+        if getattr(trajectory_controller, 'hard_trust_cfg', None) is not None:
+            if classifier_trust is None or rms_calibration_active or trust_policy_lr_scale != 1.0:
+                raise ValueError('Classifier trust requires its initialized isolated post-AdamW gate')
+        if (endpoint_active or projection_active or gradient_transfer_active or sequential_vp_trust_backward
+                or reference_trust_max_ratio is not None or extragradient_optimizer_base_params is not None
+                or ema_rollout is not None or ema_save is not None or mechanism_candidates is not None
+                or variance_reg_active or float(_dgpo_cfg_get(global_config.dgpo, "beta_kl", 0.0)) != 0
+                or reference_trust_coefficient != trajectory_controller.native_reference_coefficient
+                or trust_objective != "velocity_mse"):
+            raise ValueError("Full trajectory requires the isolated declared reference protocol and coefficient")
+        source = reward_agg.conditional_tau_source
+        if source is None or len(reward_agg.sources) != 1 or reward_agg.sources[0][1] != 1.0:
+            raise ValueError("Full trajectory requires only the unscaled inherited tau reward")
+        if trajectory_controller.classifier_kl_cfg is not None:
+            critic = trajectory_controller.classifier_kl
+            if critic is None or critic.fit_step != int(global_step):
+                raise ValueError("Classifier KL must be freshly fitted at the current policy step")
+        mechanism_candidates = trajectory_controller.rollout(core, batch, sampler,
+            K=K, num_ddim_steps=num_ddim_steps, device=device)
     B = int(batch["x"].shape[0])
     if policy_eval_event_microbatch_size is None:
         policy_event_microbatch_size = B
@@ -4802,7 +4853,7 @@ def train_step(
     # Keep the rollout on the live policy unless YAML explicitly asks for EMA.
     buf = _maybe_install_ema_for_generation(ema_rollout, model, core)
     try:
-        candidates_phys = generate_neutrino_candidates(
+        candidates_phys = mechanism_candidates.to(device=device, dtype=dtype) if mechanism_candidates is not None else generate_neutrino_candidates(
             core,
             policy_batch,
             sampler,
@@ -4833,7 +4884,10 @@ def train_step(
 
     reward_batch = dict(batch)
     reward_batch["_dgpo_reward_context"] = "policy_update"
-    rewards, reward_breakdown = reward_agg.compute(candidates_phys, reward_batch)
+    if trajectory_controller is not None:
+        rewards, reward_breakdown = trajectory_controller.score_rollout(reward_agg, candidates_phys, reward_batch)
+    else:
+        rewards, reward_breakdown = reward_agg.compute(candidates_phys, reward_batch)
     rewards, reward_breakdown, rew_nonfinite_diag = _dgpo_sanitize_rollout_rewards(
         rewards,
         reward_breakdown,
@@ -5380,6 +5434,12 @@ def train_step(
                 beta_dgpo,
                 K,
             )
+            if pathwise_active:
+                # Preserve the reference graph and all native weighting, but
+                # remove the DGPO main gradient. Full-DDIM reward is added once
+                # after the eight reference timestep draws have accumulated.
+                dlast["trajectory/native_surrogate_monitor"] = loss_vel.detach()
+                loss_vel = loss_vel * 0.0
             # ``L_cur`` is this exact per-row velocity MSE, already carrying the
             # required gradient graph. Reuse it instead of recomputing the tensor.
             kl_loss = L_cur.mean()
@@ -5540,6 +5600,24 @@ def train_step(
                 dtype=torch.float64,
             )
             dlast.update(variance_diag)
+            if mechanism_capture is not None:
+                # Split the EXACT native full-call loss. In particular, keep
+                # its detached sigmoid gate rather than recomputing per cell.
+                from RL.DGPO_neutrino.tau_mechanism_gradients import (
+                    native_reward_event_terms, velocity_reference_event_terms,
+                    observed_visible_opening_labels, normalized_time_labels,
+                )
+                gate = torch.sigmoid((float(beta_dgpo) / int(K)) *
+                    (eval_advantages * (L_cur.detach() - L_ref.detach())).sum(0)).detach()
+                mechanism_capture.capture_call(
+                    reward_terms_b=native_reward_event_terms(L_cur, eval_advantages, gate),
+                    reference_terms_b=velocity_reference_event_terms(model_v, ref_v, noise_mask_rep,
+                        K=int(K), B=local_B, weight_correction=trust_weight_correction),
+                    condition_labels=observed_visible_opening_labels(eval_batch, edges=mechanism_capture.condition_edges),
+                    noise_labels=normalized_time_labels(t_rep.reshape(int(K), local_B)[0],
+                        edges=mechanism_capture.noise_edges),
+                    weight=event_weight / float(acc_steps),
+                )
             outcomes.append(
                 (loss_backward, dlast, loss_vel, reference_trace_loss)
             )
@@ -5758,7 +5836,7 @@ def train_step(
                 ctx = (
                     model.no_sync()
                     if isinstance(model, DDP)
-                    and (endpoint_active or gradient_transfer_active or not is_last_backward)
+                    and (endpoint_active or gradient_transfer_active or not is_last_backward or pathwise_active)
                     else nullcontext()
                 )
                 with ctx:
@@ -5861,6 +5939,14 @@ def train_step(
                         total_chunk_loss.backward()
             completed_substeps += chunk_size
         del parallel_input_cache
+    trajectory_metrics = {}
+    if trajectory_controller is not None and skipped_substeps:
+        raise FloatingPointError("Full-trajectory comparison cannot skip reference/reward substeps")
+    if trajectory_controller is not None:
+        trajectory_ctx = model.no_sync() if isinstance(model, DDP) else nullcontext()
+        with trajectory_ctx:
+            trajectory_metrics = trajectory_controller.backward(core, batch, sampler,
+                reward_agg.conditional_tau_source, candidates_phys, rewards, device=device)
     endpoint_metrics = {}
     if endpoint_active:
         # All policy backwards stay local until BOTH losses have accumulated.
@@ -5874,11 +5960,14 @@ def train_step(
                 reduce_gradients=lambda critic: _all_reduce_accumulated_gradients(critic, world_size=world_size),
             )
     manually_reduced_gradient_tensors = 0
-    if sequential_vp_trust_backward or gradient_transfer_active or endpoint_active:
+    if sequential_vp_trust_backward or gradient_transfer_active or endpoint_active or pathwise_active:
         manually_reduced_gradient_tensors = _all_reduce_accumulated_gradients(
             core,
             world_size=world_size,
         )
+    if pathwise_active and trajectory_controller.balance is not None:
+        trajectory_metrics = trajectory_controller.finalize_gradients(
+            core, world_size=world_size, device=device)
     gradient_transfer_vectors: dict[str, Tensor] | None = None
     if gradient_transfer_active:
         assert gradient_transfer_h4_accum is not None
@@ -5911,6 +6000,30 @@ def train_step(
             "actual_unclipped": flatten_param_grads(core).detach().float(),
         }
     diag_last = _weighted_mean_diag_dict(diags, diag_weights)
+    if pathwise_active:
+        diag_last["loss_total"] = diag_last["loss_total"] + trajectory_metrics["trajectory/reward_loss"]
+        if trajectory_controller.classifier_kl_cfg is not None:
+            diag_last["loss_total"] = diag_last["loss_total"] + trajectory_metrics["trajectory/classifier_kl/loss"]
+        if trajectory_controller.balance is not None:
+            effective_coefficient = trajectory_metrics["trajectory/reference_coefficient"]
+            diag_last["loss_total"] = diag_last["loss_total"] + (
+                effective_coefficient-reference_trust_coefficient)*diag_last["reference_trust/loss"]
+            diag_last["reference_trust/coefficient"] = torch.tensor(
+                effective_coefficient, device=device, dtype=torch.float64)
+            diag_last["reference_trust/weighted_loss"] = effective_coefficient*diag_last["reference_trust/loss"]
+    if mechanism_read_only:
+        if mechanism_capture is None or gradient_transfer_vectors is None:
+            raise ValueError("Read-only mechanism capture requires native gradient vectors")
+        mechanism_capture.reduce_(world_size=world_size, collective_device=device)
+        # Return before clipping, AdamW, scheduling, projection or EMA changes.
+        result = {"mechanism_vectors": {key: value.detach().cpu()
+                    for key, value in gradient_transfer_vectors.items()},
+                  "mechanism_capture": mechanism_capture,
+                  "mechanism_candidates": candidates_phys.detach().cpu(),
+                  "mechanism_gradient_present": [p.grad is not None for p in gradient_transfer_parameters],
+                  "train/optimizer_step_ran": 0.0}
+        optimizer.zero_grad(set_to_none=True)
+        return result
     if endpoint_active:
         # Add the endpoint component once, not once per denoising timestep.
         diag_last["loss_total"] = diag_last["loss_total"] + endpoint_metrics["endpoint_kl/weighted_loss"]
@@ -6116,14 +6229,18 @@ def train_step(
                     original_lr * trust_policy_lr_scale * trust_initial_scale
                 )
         try:
-            optimizer.step()
-            trust_optimizer_state_advanced = True
+            if classifier_trust is not None:
+                optimizer_ran, classifier_trust_metrics = classifier_trust.propose(model, optimizer, int(global_step))
+                trust_boundary_hit = not optimizer_ran
+            else:
+                optimizer.step()
+                optimizer_ran = True
+            trust_optimizer_state_advanced = optimizer_ran
         finally:
             for group, original_lr in zip(
                 optimizer.param_groups, original_group_lrs, strict=True
             ):
                 group["lr"] = original_lr
-        optimizer_ran = True
         if rms_calibration_active:
             assert theta_old_snap is not None
             theta_candidate = snapshot_params(model)
@@ -6464,6 +6581,16 @@ def train_step(
     out["train/grad/global_norm_pre_clip"] = float(grad_norm_pre_clip_max)
     out["train/grad/clip_active"] = 1.0 if grad_clip_active_any else 0.0
     out["train/optimizer_step_ran"] = float(optimizer_ran)
+    out.update(classifier_trust_metrics)
+    if pathwise_active and trajectory_controller.balance is not None:
+        if not optimizer_ran:
+            raise FloatingPointError("Dynamic balance cannot commit without an optimizer update")
+        trajectory_controller.commit_balance()
+    out.update(trajectory_metrics)
+    if pathwise_active:
+        out["train/loss/pathwise_reward"] = trajectory_metrics["trajectory/reward_loss"]
+        out["trajectory/native_surrogate_monitor"] = out["train/loss/dgpo"]
+        out["train/loss/dgpo"] = 0.0
     angular = getattr(getattr(unwrap_for_state_dict(model), "PET", None), "angular_conditioning", None)
     if angular is not None:
         angular_weight = angular.projection.weight
@@ -6479,10 +6606,10 @@ def train_step(
     if conditioning is not None and conditioning.log_diagnostics:
         for name, value in conditioning.diagnostics.items():
             out[f"train/visible_conditioning/{name}"] = float(value)
-        for group in ("encoder", "modulations", "token_readout"):
+        for group in ("encoder", "modulations", "token_readout", "reward_probe"):
             parameters = [p for name, p in conditioning.named_parameters()
                           if (name.startswith(group + ".") if group != "encoder" else
-                              not name.startswith(("modulations.", "token_readout.")))]
+                              not name.startswith(("modulations.", "token_readout.", "reward_probe.")))]
             grads = [p.grad.detach().float().square().sum() for p in parameters if p.grad is not None]
             out[f"train/visible_conditioning/{group}_grad_norm_post_clip"] = float(torch.stack(grads).sum().sqrt()) if grads else 0.
     if theta_old_snap is not None and bool(
@@ -6497,7 +6624,7 @@ def train_step(
             extragradient_rebased_params
         )
     out["projection/active"] = 1.0 if projection_active else 0.0
-    out["projection/pure_dgpo_backward"] = 1.0
+    out["projection/pure_dgpo_backward"] = 0.0 if pathwise_active else 1.0
     _append_projection_summary_metrics(out)
     _append_projection_constraint_panel_metrics(out)
     _append_swd_panel_metrics(out)
@@ -7545,13 +7672,14 @@ def _wandb_critical_keep(key: str) -> bool:
     # Keep fit diagnostics searchable but hidden, not connected into a fake
     # training curve across independent folds/refits. Console progress remains.
     return (
-        key.startswith(("endpoint_kl/", "train/visible_conditioning/", "train/lr/scheduled/")) or key in _WANDB_CRITICAL_CHARTS or key in _WANDB_CLOCK_KEYS
+        key.startswith(("tau/", "trajectory/", "endpoint_kl/", "train/visible_conditioning/", "train/lr/scheduled/")) or key in _WANDB_CRITICAL_CHARTS or key in _WANDB_CLOCK_KEYS
         or key in _WANDB_CLASSIFIER_TRAINING_CHARTS
         or key.startswith("classifier_fit/")
         or key.startswith("gradient_conflict/")
         or key.startswith("gradient_direction/")
         or key.startswith("audit/")
         or key.startswith("gradient_transfer/")
+        or key.startswith("checkpoint_transfer/")
         or key.startswith("classifier_only/")
         or key.startswith("parameter_update_rms_calibration/")
         or key.startswith("reward_consensus/")
@@ -7735,7 +7863,7 @@ _WANDB_SIMPLIFIED_EXACT_KEYS = frozenset(
 def _wandb_simplified_keep(key: str, value: Any) -> bool:
     """Keep only non-redundant metrics used to judge training or acceptance."""
 
-    if key.startswith(("endpoint_kl/", "train/visible_conditioning/", "train/lr/scheduled/")):
+    if key.startswith(("tau/", "trajectory/", "endpoint_kl/", "train/visible_conditioning/", "train/lr/scheduled/")):
         return True
 
     if (
@@ -7758,6 +7886,7 @@ def _wandb_simplified_keep(key: str, value: Any) -> bool:
         "classifier_fit/",
         "gradient_conflict/",
         "gradient_transfer/",
+        "checkpoint_transfer/",
         "classifier_only/",
         "parameter_update_rms_calibration/",
     )):
@@ -7960,6 +8089,7 @@ def _wandb_train_payload(metrics: dict[str, Any]) -> dict[str, Any]:
             if k in _SWD_WANDB_SCALAR_KEYS:
                 out[k] = v
         elif k.startswith((
+            "trajectory/",
             "train/",
             "val/",
             "reward/",
@@ -7970,6 +8100,7 @@ def _wandb_train_payload(metrics: dict[str, Any]) -> dict[str, Any]:
             "reference_trust/",
             "gradient_conflict/",
             "gradient_transfer/",
+            "checkpoint_transfer/",
             "endpoint_kl/",
         )):
             out[k] = v
@@ -8510,6 +8641,19 @@ class _ClassifierTrainingPlotTracker:
 def _wandb_define_axes(wandb_mod: Any, *, critical: bool) -> None:
     """Never fall back to the classifier-inflated internal W&B Step axis."""
     wandb_mod.define_metric("*", step_metric="global_step", step_sync=False, hidden=critical)
+    wandb_mod.define_metric("tau/*", step_metric="global_step", step_sync=False, hidden=False)
+    # Read-only local-direction draws leave the physical policy clock fixed.
+    # Their compact replication curves need an explicit scientific draw axis,
+    # not overlapping points at step1920 or W&B's transport row counter.
+    wandb_mod.define_metric("tau/local_direction/*", step_metric="tau/local_direction/draw_index",
+                           step_sync=False, hidden=False)
+    wandb_mod.define_metric("tau/local_direction/draw_index", hidden=True)
+    for phase in ("audit_fit", "refit_fit", "transfer/audit_fit", "transfer/refit_fit"):
+        wandb_mod.define_metric(f"tau/{phase}/*", step_metric=f"tau/{phase}/log_index",
+                               step_sync=False, hidden=False)
+    for group in ("reward", "cij", "fresh_audit", "gradient", "marginal"):
+        wandb_mod.define_metric(f"tau/transfer/{group}/*", step_metric="tau/transfer/relative_step",
+                               step_sync=False, hidden=False)
     for key in _WANDB_CLOCK_KEYS:
         wandb_mod.define_metric(key, hidden=True)
     for prefix in _WANDB_EPOCH_PREFIXES:
@@ -8563,6 +8707,12 @@ def _wandb_define_axes(wandb_mod: Any, *, critical: bool) -> None:
         step_sync=False,
         hidden=True,
     )
+    wandb_mod.define_metric("checkpoint_transfer/*", step_metric="checkpoint_transfer/relative_step",
+                          step_sync=False, hidden=True)
+    for panel in ("heldout", "update_batch"):
+        for metric in ("delta_mean", "delta_lo95", "delta_hi95", "all_sample_mean"):
+            wandb_mod.define_metric(f"checkpoint_transfer/{panel}/{metric}",
+                step_metric="checkpoint_transfer/relative_step", step_sync=False, hidden=False)
     for key in ("omnifold_staleness/cosine", "omnifold_staleness/conflict",
                 "omnifold/norm", "staleness/norm", "trust/norm",
                 "omnifold_staleness/conclusive", "omnifold_trust/cosine",
@@ -11923,6 +12073,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             "dgpo_adaptive_omnifold_state",
             "dgpo_omnifold_reward_stack",
         }
+        if str(_dgpo_cfg_get(global_config.reward_config, "type", "")) == "conditional_tau":
+            required_recovery_keys.discard("dgpo_adaptive_omnifold_state")
+            required_recovery_keys.discard("dgpo_round_ref_state_dict")
+            required_recovery_keys.add("dgpo_ref_state_dict")
+            required_recovery_keys.add("dgpo_omnifold_reward_metadata")
         missing_recovery_keys = sorted(
             required_recovery_keys.difference(loaded_ckpt_dict or {})
         )
@@ -12034,6 +12189,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     # DDIM is the only rollout sampler.
     sampler = DDIMSampler(device=device)
     dg = global_config.dgpo
+    transfer_cfg = dg.get("checkpoint_transfer") or {}
+    transfer_enabled = bool(transfer_cfg.get("enabled", False))
     reward_agg = build_reward_aggregator(
         eve_net, device, normalization_dict=bundle.normalization_dict
     )
@@ -12152,6 +12309,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     adaptive_cfg.trust_extragradient_lookahead_scale,
                 )
     omnifold_source = reward_agg.omnifold_source
+    tau_source = reward_agg.conditional_tau_source
     if adaptive_cfg.enabled and omnifold_source is None:
         raise ValueError(
             "dgpo.adaptive_omnifold.enabled requires reward_config.type=omnifold"
@@ -12219,7 +12377,13 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         and bool(adaptive_cfg.refit_once_id)
         and not resume_refit_version_completed_at_load
     )
-    if saved_stack is not None:
+    if tau_source is not None:
+        if saved_stack is not None:
+            tau_source.load_stack_payload(saved_stack)
+        elif ckpt_dict is not None:
+            raise ValueError("Tau DGPO full resume requires its saved classifier state")
+        adaptive_state.reward_round_id = tau_source.round_id
+    elif saved_stack is not None:
         if omnifold_source is None:
             raise ValueError(
                 "DGPO checkpoint contains an OmniFold stack but the reward is disabled"
@@ -12403,6 +12567,18 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         except Exception as exc:
             _log.warning("[DGPO] W&B resume metadata could not be published: %s", exc)
     if ckpt_dict is not None and "dgpo_optimizer_state_dict" in ckpt_dict:
+        if dg.get("add_diffusion_attention", False) and not any(
+                k.removeprefix("model.").startswith("TruthGeneration.visible_conditioning.token_readout.")
+                for k in ckpt_dict["state_dict"]):
+            from RL.DGPO_neutrino.conditioning_probe import extend_optimizer_for_probe
+            ckpt_dict, added_count = extend_optimizer_for_probe(eve_net, optimizer, ckpt_dict, branch_name="token_readout")
+            _log.info("[DGPO/attention] Preserved saved optimizer; added %s fresh attention tensors", added_count)
+        if transfer_cfg.get("conditioning_ablation", False):
+            probe_branch = getattr(getattr(eve_net.TruthGeneration, "visible_conditioning", None), "reward_probe", None)
+            if probe_branch is not None:
+                from RL.DGPO_neutrino.conditioning_probe import extend_optimizer_for_probe
+                ckpt_dict, new_count = extend_optimizer_for_probe(eve_net, optimizer, ckpt_dict)
+                _log.info("[DGPO/conditioning] Preserved old AdamW moments/scheduler; added %s fresh parameter tensors.", new_count)
         try:
             use_config_lr_schedule = (dg.get("lr_schedule") or {}).get("resume_use_config", False)
             optimizer.load_state_dict(
@@ -12461,7 +12637,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             )
     K = int(_dgpo_cfg_get(dg, "K", 1))
     uses_omnifold_reward = any(
-        source.name == "omnifold" for source, _weight in reward_agg.sources
+        source.name in {"omnifold", "conditional_tau"} for source, _weight in reward_agg.sources
     )
     advantage_raw = dg.get("advantage_estimator", None)
     if advantage_raw is None:
@@ -13279,7 +13455,19 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     def _adaptive_state_payload() -> dict[str, Any] | None:
         return adaptive_state.to_dict() if adaptive_cfg.enabled else None
 
+    tau_mechanism_driver = None
+
     def _adaptive_stack_payload() -> dict[str, Any] | None:
+        if tau_source is not None:
+            payload = tau_source.stack_payload()
+            controller = getattr(tau_mechanism_driver, "trajectory_controller", None)
+            if controller is not None and controller.balance is not None:
+                payload["trajectory_reference_balance_state"] = controller.balance_state_dict()
+            if controller is not None and controller.classifier_kl is not None and controller.classifier_kl.source is not None:
+                payload["trajectory_classifier_kl_state"] = controller.classifier_kl.checkpoint_payload()
+            if controller is not None and getattr(controller, 'hard_trust', None) is not None:
+                payload['trajectory_classifier_trust_state'] = controller.hard_trust.checkpoint_payload()
+            return payload
         if not adaptive_cfg.enabled or omnifold_source is None:
             return None
         return omnifold_source.stack_payload()
@@ -13566,6 +13754,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         nonlocal global_step, reward_checkpoint_metadata
         nonlocal pending_resume_trust_diagnostics
         nonlocal last_gradient_conflict_snapshot
+        if transfer_enabled:
+            raise RuntimeError("Checkpoint-transfer diagnostic forbids all classifier fits/refits")
         if not adaptive_cfg.enabled or omnifold_source is None:
             return {}
         from RL.DGPO_neutrino.omnifold_ztautau.adaptive import (
@@ -16910,13 +17100,114 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 adaptive_state.trust_statistically_closed,
             )
 
+    tau_cycle = None
+    tau_transfer_probe = None
+    tau_mechanism_driver = None
+    policy_train_step = train_step
+    if tau_source is not None:
+        from RL.DGPO_neutrino.conditional_tau_cycle import ConditionalTauCycle
+        if adaptive_cfg.enabled or ema_save is not None or ema_rollout is not None:
+            raise ValueError("Conditional tau uses its own refit lifecycle and raw actor only")
+        def log_tau(payload, step):
+            if wandb_mod is not None:
+                _wandb_log_auxiliary(wandb_mod, payload, current_global_step=step)
+        tau_cycle = ConditionalTauCycle(dg["tau_ratio"], tau_source, eve_net, ref_model,
+                                        sampler, device, rank, world_size, log_tau)
+        tau_mechanism_cfg = dg["tau_ratio"].get("mechanism_probe") or {}
+        if tau_mechanism_cfg.get("enabled", False):
+            if transfer_enabled or checkpoint_load_mode != "resume" or ckpt_dict is None:
+                raise ValueError("Tau mechanisms require full resume and no other transfer protocol")
+            mode = tau_mechanism_cfg["mode"]
+            expected_cap = global_step + (int(tau_mechanism_cfg["updates"]) if mode == "trajectory" else 1 if mode in ("diagnose", "repeat_diagnose") else 0)
+            if max_steps != expected_cap:
+                raise ValueError("Mechanism update cap differs from the declared stage")
+            from RL.DGPO_neutrino.tau_reward_mechanisms import TauRewardMechanismDriver
+            tau_mechanism_driver = TauRewardMechanismDriver(tau_cycle, tau_mechanism_cfg,
+                native_step=train_step, optimizer=optimizer, checkpoint=ckpt_dict, source_step=global_step)
+            if tau_mechanism_driver.prepare(start_epoch - 1, train_shard=train_shard, loader_cfg=train_loader_cfg):
+                _barrier()
+                _finish_wandb_run(wandb_active)
+                return
+            policy_train_step = tau_mechanism_driver.native_step
+            tau_transfer_probe = tau_mechanism_driver.observer
+            reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+            adaptive_state.reward_round_id = tau_source.round_id
+        if dg["tau_ratio"].get("classifier_only", False):
+            if global_step <= 0:
+                raise ValueError("Current-policy classifier experiment requires a resumed DGPO checkpoint")
+            tau_cycle.classifier_only(global_step)
+            _barrier()
+            _finish_wandb_run(wandb_active)
+            return
+        tau_transfer_cfg = dg["tau_ratio"].get("transfer_probe") or {}
+        if tau_transfer_cfg.get("enabled", False):
+            if transfer_enabled or checkpoint_load_mode != "resume" or ckpt_dict is None:
+                raise ValueError("Tau transfer requires full resume and no adaptive-H4 transfer probe")
+            if global_step != int(tau_transfer_cfg["source_step"]):
+                raise ValueError("Tau transfer must start at its pinned source checkpoint")
+            if max_steps != global_step + int(tau_transfer_cfg["relative_steps"][-1]):
+                raise ValueError("Tau transfer requires the exact declared relative update cap")
+            saved_opt = ckpt_dict["dgpo_optimizer_state_dict"]
+            saved_groups, live_groups = saved_opt["optimizer"]["param_groups"], optimizer.param_groups
+            if len(saved_groups) != len(live_groups):
+                raise ValueError("Tau transfer changed the inherited optimizer groups")
+            for old, new in zip(saved_groups, live_groups, strict=True):
+                for key in ("lr", "weight_decay", "betas", "eps", "group_name"):
+                    if old.get(key) != new.get(key):
+                        raise ValueError(f"Tau transfer changed inherited optimizer {key}")
+            if optimizer.scheduler.last_epoch != saved_opt["scheduler"]["last_epoch"]:
+                raise ValueError("Tau transfer reset the inherited scheduler clock")
+            tau_cycle.prepare_reward_transfer(start_epoch - 1, global_step)
+            reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+            adaptive_state.reward_round_id = tau_source.round_id
+            if is_rank0:
+                _dgpo_save_last_ckpt(model, ema_save, optimizer, ref_model,
+                    last_completed_epoch=start_epoch-1, dgpo_next_epoch=start_epoch, global_step=global_step,
+                    reward_round_id=tau_source.round_id,
+                    dgpo_adaptive_omnifold_state=adaptive_state.to_dict(),
+                    dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                    dgpo_omnifold_reward_stack=_adaptive_stack_payload())
+            _barrier()
+            from RL.DGPO_neutrino.tau_reward_transfer import TauRewardTransferProbe
+            tau_transfer_probe = TauRewardTransferProbe(tau_cycle, tau_transfer_cfg,
+                source_step=global_step, reward_round=tau_source.round_id)
+            tau_transfer_probe.start()
+        if dg["tau_ratio"].get("production_cross_attention", False) and not tau_source.installed_head.get("cross_attention", False):
+            expected = dg["tau_ratio"].get("startup_refit_policy_step")
+            if expected != 1780 or global_step != expected:
+                raise ValueError("Attention migration requires the pinned step1780 checkpoint")
+            tau_cycle.refit(start_epoch - 1, global_step, force=True)
+            reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+            adaptive_state.reward_round_id = tau_source.round_id
+            if is_rank0:
+                _dgpo_save_last_ckpt(model, ema_save, optimizer, ref_model,
+                    last_completed_epoch=start_epoch-1, dgpo_next_epoch=start_epoch, global_step=global_step,
+                    reward_round_id=tau_source.round_id,
+                    dgpo_adaptive_omnifold_state=adaptive_state.to_dict(),
+                    dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                    dgpo_omnifold_reward_stack=_adaptive_stack_payload())
+            _barrier()
+        if global_step > 0 and dg["tau_ratio"].get("reward_cij_probe", False):
+            tau_cycle.reward_cij_probe(global_step)
+        if global_step == 0 and tau_source.last_evaluation_epoch < -1:
+            tau_cycle.verify_initial_policy()
+            tau_cycle.evaluate(-1, 0)
+            if is_rank0:
+                _dgpo_save_last_ckpt(model, ema_save, optimizer, ref_model,
+                    last_completed_epoch=-1, dgpo_next_epoch=0, global_step=0,
+                    dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                    dgpo_omnifold_reward_stack=_adaptive_stack_payload())
+            _barrier()
+
     # Following the EveNet ``train.py`` pattern: no rank-0-only synchronous setup
     # before the training loop.  All ranks proceed straight into ``fit``-style
     # iteration and hit the data pipeline simultaneously, avoiding NCCL barriers
     # that would otherwise busy-wait the GPU while rank 0 does cold-start work.
     ve_initial = int(val_events) if val_events is not None else 0
     if (
-        bool(dg.get("validation_initial_enabled", True))
+        not transfer_enabled
+        and tau_cycle is None
+        and bool(dg.get("validation_initial_enabled", True))
         and _should_log_pretraining_baseline(start_epoch, global_step)
         and ve_initial > 0
         and val_shard is not None
@@ -16983,7 +17274,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     wandb_step=_wandb_train_step(global_step),
                 )
         _barrier()
-    elif (start_epoch > 0 or global_step > 0) and ve_initial > 0 and is_rank0:
+    elif tau_cycle is None and (start_epoch > 0 or global_step > 0) and ve_initial > 0 and is_rank0:
         _log.warning(
             "[DGPO] Response matrices need the pre-DGPO validation baseline; "
             "this run is resuming at start_epoch=%s, so val/response/* will be skipped.",
@@ -17011,6 +17302,38 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     def constraint_ckpt_payload_for_save() -> dict[str, Any] | None:
         return _dgpo_constraint_checkpoint_payload(constraint_state)
 
+    transfer_probe = None
+    if transfer_enabled:
+        from RL.DGPO_neutrino.checkpoint_transfer import CheckpointTransferProbe
+
+        def score_transfer_panel(batch_cpu):
+            batch = batch_to_device(batch_cpu, device)
+            batch["_dgpo_reward_context"] = "policy_update"
+            candidates = generate_neutrino_candidates(
+                eve_net, batch, sampler, K=K, num_ddim_steps=num_ddim,
+                device=device, parallel_chains=rollout_parallel_chains,
+            )
+            rewards, _ = reward_agg.compute(candidates, batch)
+            return candidates, rewards
+
+        def log_transfer_panel(payload, step):
+            if wandb_mod is not None:
+                _wandb_log_step(wandb_mod, payload, step=step)
+
+        transfer_budget = int(transfer_cfg["relative_steps"][-1])
+        if max_steps != global_step + transfer_budget:
+            raise ValueError("Checkpoint-transfer requires --max-steps = saved global_step + declared probe budget")
+        if checkpoint_load_mode != "resume" or adaptive_cfg.refit_once_on_resume:
+            raise ValueError("Checkpoint-transfer requires full resume without startup refit")
+        if ema_save is not None or ema_rollout is not None:
+            raise ValueError("Checkpoint-transfer uses raw policy only, never EMA")
+        transfer_probe = CheckpointTransferProbe(
+            transfer_cfg, model=eve_net, score=score_transfer_panel,
+            validation_shard=val_shard, rank=rank, world_size=world_size,
+            source_step=global_step, reward_round=int(adaptive_state.reward_round_id),
+            optimizer=optimizer, checkpoint=ckpt_dict, log=log_transfer_panel,
+        )
+
     adaptive_early_stop = False
     trust_rejection_endpoint_requested = bool(
         adaptive_state.trust_rejection_stop_requested
@@ -17036,7 +17359,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
             if train_it is None:
                 # ``local_shuffle_buffer_size`` provides per-shard shuffling for
                 # every complete data pass.
-                train_it = iter(train_shard.iter_torch_batches(**train_loader_cfg))
+                train_it = (tau_mechanism_driver.training_iterator(train_shard, train_loader_cfg)
+                            if tau_mechanism_driver is not None else
+                            transfer_probe.training_iterator(train_shard, train_loader_cfg)
+                            if transfer_probe is not None else iter(train_shard.iter_torch_batches(**train_loader_cfg)))
             collect_train_dist_epoch = bool(
                 wandb_flag
                 and train_dist_enabled
@@ -17126,9 +17452,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         )
                     if logical_epoch_step_budget is None:
                         break
-                    train_it = iter(
-                        train_shard.iter_torch_batches(**train_loader_cfg)
-                    )
+                    train_it = (tau_mechanism_driver.training_iterator(train_shard, train_loader_cfg)
+                                if tau_mechanism_driver is not None else
+                                transfer_probe.training_iterator(train_shard, train_loader_cfg)
+                                if transfer_probe is not None else iter(train_shard.iter_torch_batches(**train_loader_cfg)))
                     batch_cpu, has_more = _next_batch_synced(
                         train_it, world_size=world_size, device=device
                     )
@@ -17139,6 +17466,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         )
 
                 batch_d = batch_to_device(batch_cpu, device)
+                if tau_cycle is not None:
+                    tau_cycle.verify_training_batch(batch_d, global_step)
+                if transfer_probe is not None:
+                    transfer_probe.before_update(batch_cpu)
+                if tau_transfer_probe is not None:
+                    tau_transfer_probe.before_update(batch_cpu)
                 reward_dist_step = wandb_active and (
                     not _wandb_simplified_enabled()
                     and global_step % log_reward_dist_every == 0
@@ -17167,7 +17500,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 round_warmup_metrics = policy_round_warmup_metrics(adaptive_state, cfg=adaptive_cfg)
                 round_warmup_scale = round_warmup_metrics.get("train/round_warmup/lr_scale", 1.0)
                 scheduled_lrs = [float(pg["lr"]) for pg in optimizer.param_groups]
-                metrics = train_step(
+                metrics = policy_train_step(
                     model,
                     round_ref_model if adaptive_cfg.enabled else ref_model,
                     ema_rollout,
@@ -17258,6 +17591,39 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         parameter_update_rms_max_scale_cfg
                     ),
                 )
+                if metrics.get("_tau_mechanism_read_only_pending", False):
+                    # Consume the next independent native batch at the SAME
+                    # checkpoint, before metric/state/warmup/clock updates.
+                    continue
+                if metrics.get("_tau_mechanism_diagnosis_complete", False):
+                    # Read-only stage: exit before native clock/scheduler/save.
+                    _barrier()
+                    _finish_wandb_run(wandb_active)
+                    return
+                if metrics.get('_tau_classifier_trust_stop', False):
+                    # No accepted update: retain the policy/update/scheduler
+                    # clocks and save the atomically restored incumbent. This
+                    # terminal audit is additional to the predeclared endpoint;
+                    # it must never be labeled a completed +50 experiment.
+                    if wandb_mod is not None:
+                        _wandb_log_auxiliary(wandb_mod, _wandb_train_payload(metrics),
+                                             current_global_step=global_step)
+                    tau_mechanism_driver.observer.stop_at_trust_boundary(global_step, metrics)
+                    if is_rank0:
+                        _dgpo_save_last_ckpt(
+                            model, ema_save, optimizer, ref_model,
+                            last_completed_epoch=epoch, dgpo_next_epoch=epoch,
+                            global_step=global_step, dgpo_epoch_step=steps_this_epoch,
+                            ema_rollout=ema_rollout, round_ref_model=round_ref_model,
+                            reward_round_id=int(tau_source.round_id),
+                            dgpo_projection_constraint_state=constraint_ckpt_payload_for_save(),
+                            dgpo_omnifold_reward_metadata=reward_checkpoint_metadata,
+                            dgpo_adaptive_omnifold_state=_adaptive_state_payload(),
+                            dgpo_omnifold_reward_stack=_adaptive_stack_payload())
+                        _log.info('[DGPO/classifier trust] boundary stop at accepted step=%s; incumbent and optimizer restored.', global_step)
+                    _barrier()
+                    _finish_wandb_run(wandb_active)
+                    return
                 metrics.update(trust_lr_diagnostics)
                 metrics.update(round_warmup_metrics)
                 metrics["train/lr/scheduled_max"] = max(scheduled_lrs)
@@ -17449,6 +17815,14 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                     )
                 global_step += 1
                 steps_this_epoch += 1
+                if transfer_probe is not None:
+                    transfer_probe.after_update(
+                        global_step, metrics, int(adaptive_state.reward_round_id),
+                    )
+                if tau_transfer_probe is not None:
+                    tau_transfer_probe.after_update(
+                        global_step, metrics, int(tau_source.round_id),
+                    )
 
                 if trust_rejection_this_step:
                     if is_rank0:
@@ -17465,6 +17839,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 # The last step is handled below, with the independent trust fit.
                 if (
                     adaptive_cfg.enabled
+                    and not transfer_enabled
                     and logical_epoch_step_budget is not None
                     and steps_this_epoch < logical_epoch_step_budget
                     and should_probe_training_boundary(
@@ -17678,7 +18053,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 full_every_n_epochs=validation_full_every_n_epochs,
             )
             run_epoch_val = (
-                ve > 0
+                not transfer_enabled
+                and tau_cycle is None
+                and ve > 0
                 and val_shard is not None
                 and validation_tier is not None
             )
@@ -17796,7 +18173,12 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
 
             adaptive_cycle_ran = False
             adaptive_stop_requested = False
-            if adaptive_cfg.enabled:
+            if tau_cycle is not None:
+                adaptive_cycle_ran = tau_cycle.epoch_end(epoch, global_step,
+                    final=(epochs is not None and epoch + 1 >= epochs))
+                reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+                adaptive_state.reward_round_id = tau_source.round_id
+            if adaptive_cfg.enabled and not transfer_enabled:
                 if trust_rejection_endpoint_requested or should_probe_training_boundary(
                     adaptive_state, cfg=adaptive_cfg, epoch=epoch,
                     global_step=global_step, epoch_end=True,
@@ -18044,7 +18426,7 @@ def main() -> None:
 
     runtime_env = {
         "env_vars": {
-            "PYTHONPATH": f"{_REPO_ROOT}:{os.environ.get('PYTHONPATH', '')}",
+            "PYTHONPATH": f"{_REPO_ROOT.parent}:{_REPO_ROOT.parent / 'scripts'}:{_REPO_ROOT}:{os.environ.get('PYTHONPATH', '')}",
             "TORCH_NCCL_TIMEOUT": "180",
         },
     }
@@ -18238,12 +18620,20 @@ def main() -> None:
         "fixed_omnifold_pool": fixed_omnifold_pool,
     }
 
+    data_config_kwargs = {}
+    launch_tau = _dgpo_cfg_get(global_config.dgpo, "tau_ratio", {})
+    launch_probe = _dgpo_cfg_get(launch_tau, "mechanism_probe", {})
+    if _dgpo_cfg_get(launch_probe, "full_trajectory", None):
+        from RL.DGPO_neutrino.tau_replay_data_config import CompleteReplayDataConfig
+        data_config_kwargs["dataset_config"] = CompleteReplayDataConfig()
+
     trainer = TorchTrainer(
         train_loop_per_worker=dgpo_train_loop,
         train_loop_config=trainer_config,
         scaling_config=scaling_config,
         run_config=run_config,
         datasets=datasets,
+        **data_config_kwargs,
     )
     trainer.fit()
 

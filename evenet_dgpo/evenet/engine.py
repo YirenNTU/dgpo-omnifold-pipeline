@@ -615,8 +615,12 @@ class EveNetEngine(L.LightningModule):
     @time_decorator()
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
 
-        optimizers = list(self.optimizers())
+        optimizers = self.optimizers()
+        if not isinstance(optimizers, (list, tuple)):
+            optimizers = [optimizers]
         schedulers = self.lr_schedulers()
+        if not isinstance(schedulers, (list, tuple)):
+            schedulers = [schedulers]
 
         self.current_step = int(schedulers[0].state_dict().get("last_epoch", self.current_step))
         step = self.current_step
@@ -834,7 +838,7 @@ class EveNetEngine(L.LightningModule):
             generated_distribution = self.sampler.sample(
                 data_shape=data_shape,
                 pred_fn=predict_for_neutrino,
-                normalize_fn=self.model.invisible_normalizer,
+                normalize_fn=self.model.invisible_coordinate_normalizer(inputs),
                 eta=1.0,
                 num_steps=self.neutrino_diffusion_steps,
                 use_tqdm=False,
@@ -866,6 +870,9 @@ class EveNetEngine(L.LightningModule):
             task_loss_dict (dict): Mapping from task name to loss tensor.
             shared_params (iterable): Parameters shared across tasks (e.g., backbone).
         """
+        shared_params = list(shared_params)
+        if not shared_params or not task_loss_dict:
+            return
         total_dim = sum(p.numel() for p in shared_params)
         grad_vectors = {}
 
@@ -1067,6 +1074,15 @@ class EveNetEngine(L.LightningModule):
     def on_train_epoch_start(self) -> None:
         self.eval_metrics = (self.current_epoch + 1) % self.eval_metrics_every_n_epochs == 0
 
+        # A train-only probe must keep the frozen source function deterministic.
+        # Lightning recursively enables train mode before this hook, so restore
+        # eval mode for the backbone and reopen only the selected new branches.
+        train_only = list(self.config.options.Training.get("train_only_modules", []) or [])
+        if train_only:
+            self.model.eval()
+            for module_name in train_only:
+                self.model.get_submodule(module_name).train()
+
         self.l.info(f"[Epoch {self.current_epoch:03d}] ▶️ Training Start | eval_metrics: {self.eval_metrics}")
         pass
 
@@ -1220,6 +1236,18 @@ class EveNetEngine(L.LightningModule):
                 num_training_steps=self.total_steps,
                 num_cycles=0.5
             )
+            floor = self.config.options.Training.get("cosine_min_lr_ratio", None)
+            if floor is not None:
+                floor = float(floor)
+                if not 0 <= floor <= 1:
+                    raise ValueError("cosine_min_lr_ratio must be in [0, 1]")
+                warmup = warmup_steps if warm_up else 0
+                def lr_multiplier(step):
+                    if step < warmup:
+                        return float(step) / max(1, warmup)
+                    progress = min(1., max(0., (step - warmup) / max(1, self.total_steps - warmup)))
+                    return floor + (1 - floor) * .5 * (1 + math.cos(math.pi * progress))
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
             return optimizer, scheduler
 
         optimizers, schedulers = [], []
@@ -1304,7 +1332,12 @@ class EveNetEngine(L.LightningModule):
                 self.l.warning(f"[Model] --> Loading pretrained weights from: {self.pretrain_ckpt_path}")
                 ckpt = torch.load(self.pretrain_ckpt_path, map_location=self.device)
 
-                if self.config.options.Training.get("strict_conditioning_ablation_source", False):
+                if self.config.options.Training.get("strict_relation_source", False):
+                    from evenet.network.body.relation_conditioning import load_relation_weights
+                    if ema_enable or ema_replace:
+                        raise ValueError("Relation screen requires raw weights without EMA")
+                    load_relation_weights(self.model, ckpt)
+                elif self.config.options.Training.get("strict_conditioning_ablation_source", False):
                     from evenet.utilities.fourier_integration import load_conditioning_ablation_weights
                     if ema_enable or ema_replace:
                         raise ValueError("Conditioning ablation requires raw weights with EMA disabled")
@@ -1317,6 +1350,14 @@ class EveNetEngine(L.LightningModule):
                     safe_load_state(self.model, ckpt['ema_state_dict'])
                 else:
                     safe_load_state(self.model, ckpt['state_dict'])
+
+                if self.model.conditional_preconditioning is not None:
+                    if not self.config.options.Training.get("strict_relation_source", False):
+                        raise ValueError("Fresh preconditioning experiment requires strict raw source loading")
+                    path = self.config.network.ConditionalPreconditioning.get("calibration_path")
+                    if not path:
+                        raise ValueError("Fit conditional preconditioning first and configure calibration_path")
+                    self.model.conditional_preconditioning.load_calibration(path, self.pretrain_ckpt_path)
 
             # EMA
             if ema_enable:
@@ -1333,6 +1374,19 @@ class EveNetEngine(L.LightningModule):
                 param.requires_grad = False
             if self.global_rank == 0:
                 self.l.warning(f"[Model] --> Froze module: {module_name}")
+
+        train_only = list(self.config.options.Training.get("train_only_modules", []) or [])
+        if train_only:
+            self.model.requires_grad_(False)
+            for module_name in train_only:
+                try:
+                    module = self.model.get_submodule(module_name)
+                except AttributeError as exc:
+                    raise ValueError(f"Unknown train-only module: {module_name}") from exc
+                module.requires_grad_(True)
+            if not any(parameter.requires_grad for parameter in self.model.parameters()):
+                raise ValueError("train_only_modules selected no parameters")
+            self.l.warning(f"[Model] --> Train-only modules: {train_only}")
 
         # Define Freezing
         if self.config.options.Training.get("strict_no_fourier_source", False):
@@ -1386,6 +1440,8 @@ class EveNetEngine(L.LightningModule):
             turn_on=self.include_famo,
             logits_bound=self.config.options.Training.FAMO.get("logits_bound", 1.0),
         ))
+        if train_only:
+            self.model.famo.requires_grad_(False)
         self.l.warning(f"FAMO Applied? --> {self.include_famo}")
 
         from evenet.utilities.diffusion_sampler import DDIMSampler

@@ -83,6 +83,10 @@ class EventGenerationHead(nn.Module):
         ])
         self.generator = nn.Linear(projection_dim, output_dim)
         self.visible_conditioning = VisibleConditioning(**visible_conditioning) if visible_conditioning else None
+        if (self.visible_conditioning is not None
+                and self.visible_conditioning.pair_attention is not None
+                and self.visible_conditioning.pair_attention.heads != num_heads):
+            raise ValueError("pair bias heads must match generation attention heads")
         if identity_init_from_layer is not None:
             if (isinstance(identity_init_from_layer, bool)
                     or not isinstance(identity_init_from_layer, int)
@@ -151,6 +155,7 @@ class EventGenerationHead(nn.Module):
 
         modulations = None
         token_memory = None
+        pair_biases = None
         if self.visible_conditioning is not None:
             if any(value is None for value in (visible_raw, visible_tokens, visible_mask, time_masking)):
                 raise ValueError("TruthGeneration visible conditioning requires observed context and invisible mask")
@@ -159,30 +164,73 @@ class EventGenerationHead(nn.Module):
             if self.visible_conditioning.token_readout is not None:
                 modulations, token_memory, token_mask = self.visible_conditioning(
                     visible_raw, visible_tokens, visible_mask, return_tokens=True, **extra)
+            elif self.visible_conditioning.pair_attention is not None:
+                modulations, pair_biases = self.visible_conditioning(
+                    visible_raw, visible_tokens, visible_mask, return_attention_bias=True, **extra)
             else:
                 modulations = self.visible_conditioning(visible_raw, visible_tokens, visible_mask, **extra)
         for index, transformer_block in enumerate(self.gen_transformer_blocks):
             concatenated = cond_token + x
             modulation = modulations[index] if modulations is not None else None
-            if token_memory is not None and index == len(self.gen_transformer_blocks) - 1:
+            direct_residual = None
+            readout = self.visible_conditioning.token_readout if token_memory is not None else None
+            if (readout is not None and readout.mode != "velocity"
+                    and (readout.block == "all" or index == len(self.gen_transformer_blocks) - 1)):
                 # Visible-first layout is the existing EveNet generation contract.
                 # Queries contain noisy state, time and slot information, never clean truth.
                 n_visible = token_memory.shape[1]
-                residual = self.visible_conditioning.token_readout(
+                residual = readout(
                     concatenated[:, n_visible:], token_memory,
                     (time_masking.bool() & x_mask.bool())[:, n_visible:], token_mask)
-                modulation = tuple(global_part[:, None, :] + F.pad(local, (0, 0, n_visible, 0))
-                                   for global_part, local in zip(modulation, residual))
+                if readout.mode == "film":
+                    modulation = tuple(global_part[:, None, :] + F.pad(local, (0, 0, n_visible, 0))
+                                       for global_part, local in zip(modulation, residual))
+                else:
+                    direct_residual = F.pad(residual, (0, 0, n_visible, 0))
                 if self.visible_conditioning.log_diagnostics:
-                    self.visible_conditioning.diagnostics.update(self.visible_conditioning.token_readout.diagnostics)
+                    if readout.mode == "film":
+                        self.visible_conditioning.diagnostics.update(readout.diagnostics)
+                    else:
+                        self.visible_conditioning.diagnostics.update(
+                            {f"block_{index}/{key}": value for key, value in readout.diagnostics.items()})
+            if modulation is not None:
+                # Also handles future combinations with token-specific FiLM.
+                modulation = self.visible_conditioning.apply_scale_policy(modulation)
+            pair_kwargs = (dict(attention_bias=pair_biases[index])
+                           if pair_biases is not None and index < len(pair_biases) else {})
             out_x, cond_token = transformer_block(
                 concatenated, cond_token, x_mask, attn_mask=attn_mask,
                 modulation=modulation,
                 modulation_mask=(time_masking.bool() & x_mask.bool()) if modulations is not None else None,
+                **pair_kwargs,
             )
-        x = cond_token + x
-        x = F.layer_norm(x, [x.size(-1)])
+            if direct_residual is not None:
+                # The legacy generator propagates cond_token, not out_x, between
+                # blocks. Write here after the existing FFN/LayerScale, without
+                # a second zero gate. Only valid invisible slots receive updates.
+                cond_token = cond_token + direct_residual
+        final_hidden = cond_token + x
+        x = F.layer_norm(final_hidden, [final_hidden.size(-1)])
         x = self.generator(x)
+        if token_memory is not None and self.visible_conditioning.token_readout.mode == "velocity":
+            readout = self.visible_conditioning.token_readout
+            n_visible = token_memory.shape[1]
+            valid = (time_masking.bool() & x_mask.bool())[:, n_visible:]
+            correction = readout(
+                final_hidden[:, n_visible:], token_memory,
+                valid, token_mask)
+            correction = F.pad(correction, (0, 0, n_visible, 0))
+            if correction.shape != x.shape:
+                raise ValueError("velocity conditioning output does not match generated velocity shape")
+            if self.visible_conditioning.log_diagnostics:
+                mask = (time_masking.bool() & x_mask.bool()).expand_as(x)
+                denom = mask.sum().clamp_min(1)
+                base_rms = (torch.where(mask, x.detach().float(), 0.).square().sum() / denom).sqrt()
+                diagnostics = dict(readout.diagnostics)
+                diagnostics["velocity_residual_to_base_rms"] = (
+                    diagnostics["velocity_residual_rms"] / base_rms.clamp_min(1e-8))
+                self.visible_conditioning.diagnostics.update(diagnostics)
+            x = x + correction
 
         return x * x_mask
 

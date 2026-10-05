@@ -1,0 +1,75 @@
+# 20-epoch coordinate fit, then 50-epoch diffusion adaptation; both use 16 GPUs.
+extends_overlay: train_diffusion_relation_context.yaml
+
+network:
+  ConditionalPreconditioning:
+    enabled: true
+    calibration_path: /pscratch/sd/y/yiren/Ztautau/diffusion_conditional_preconditioning_02/calibration/calibration.pt
+    width: 128
+    scale_floor: 0.01
+    max_diagonal: 5.0
+    off_diagonal_bound: 2.0
+    seed: 20261001
+
+preconditioning_fit:
+  epochs: 20
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gradient_clip: 5.0
+  seed: 42
+  wandb:
+    project: EveNet
+    entity: ytchou97-university-of-washington
+    id: condcoordfit02
+    name: "Learn event-specific coordinates | full covariance | filtered train"
+    group: Conditional preconditioning
+    tags: [GPU16, Calibration, FullCovariance, NoRL, Data10pct, FilteredData]
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_conditional_preconditioning_02/checkpoints
+    model_checkpoint_save_last: true
+    epochs: 50
+    total_epochs: 50
+    JointCoverage:
+      every_n_epochs: 50
+
+logger:
+  local:
+    name: diffusion-conditional-preconditioning
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_conditional_preconditioning_02/logs
+  wandb:
+    id: condpre02
+    run_name: "Recover joint physics with event coordinates? | full covariance | filtered data"
+    group: Conditional preconditioning
+    tags: [DiffusionOnly, NoRL, GPU16, PairedNoise, ConditionalPreconditioning, FullCovariance, FilteredData]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_conditional_preconditioning_02/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/run_conditional_preconditioning.py --stage all
+
+experiment:
+  question: Does frozen event-dependent full-covariance preconditioning recover narrow joint physics?
+  intervention: fit_observed_only_mean_and_full_covariance_then_freeze_target_coordinates
+  source_stage: pinned supervised epoch286 step22386 raw weights
+  checkpoint_protocol: identical_pinned_raw_weights_fresh_diffusion_optimizer_frozen_coordinate_fit
+  reference_wandb_run: relcontext02
+  primary_endpoint: epoch50_joint_radius_w1_preconditioning_minus_context
+  required_secondary_endpoint: joint_spike_probability_gaps_at_1e-6_1e-5_1e-4_radians
+  interpretation: >-
+    Same source, context adapter, FiLM scale and shift, data and 50 diffusion epochs
+    as the filtered-data control relcontext02. Historical relcontext01 used raw
+    train data. Additional20 epochs fit only a separate observed-input Gaussian
+    coordinate model; validation NLL selects its checkpoint, and the evaluation panel
+    is never used to fit/select coordinates. This is not total-compute matched.
+    Target chart is the existing normalized angular corrections, transformed by a
+    full4D Cholesky factor. Diffusion still models the full non-Gaussian distribution.
+    Coordinate fit is frozen and stored in diffusion checkpoints. Initial physical
+    function changes; compare absolute physics endpoints, not baseline-relative gains.
+    Whitened velocity MSE is not comparable to historical unwhitened velocity MSE.
+    Same exploratory1024-event panel,K32,DDIM20; paired noise is in different charts.
+    Require joint coverage and marginals to improve together before claiming progress.

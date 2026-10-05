@@ -112,6 +112,26 @@ def safe_load_state(model: nn.Module, state_dict: dict, prefix_to_strip: str = "
     # Strip prefix (e.g., "model.")
     clean_sd = {k.replace(prefix_to_strip, ""): v for k, v in state_dict.items()}
 
+    # A coordinate-trained velocity field is unusable with a dropped/mismatched
+    # transform. In this opt-in case all normalizers and weights are mandatory.
+    saved_coordinates = any(k.startswith("conditional_preconditioning.") for k in clean_sd)
+    configured_coordinates = getattr(model, "conditional_preconditioning", None) is not None
+    if saved_coordinates or configured_coordinates:
+        if saved_coordinates != configured_coordinates:
+            raise ValueError("Conditional preconditioning checkpoint requires its matching model configuration")
+        target = model.state_dict()
+        missing = set(target) - set(clean_sd)
+        unexpected = [k for k in clean_sd if k not in target and not k.startswith("famo.w.")]
+        if missing or unexpected:
+            raise ValueError(f"Incomplete preconditioned model: missing={sorted(missing)}, unexpected={unexpected}")
+        for k, v in target.items():
+            if clean_sd[k].shape != v.shape or clean_sd[k].dtype != v.dtype or not torch.isfinite(clean_sd[k]).all():
+                raise ValueError(f"Invalid preconditioned model tensor: {k}")
+        model.load_state_dict({k: clean_sd[k] for k in target}, strict=True)
+        if not bool(model.conditional_preconditioning.fitted):
+            raise ValueError("Conditional coordinates in this checkpoint are not fitted")
+        return
+
     for k, v in clean_sd.items():
         if "_normalizer" in k:
             if verbose:

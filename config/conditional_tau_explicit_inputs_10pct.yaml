@@ -1,0 +1,13 @@
+width_config: config/conditional_tau_condition_width_10pct.yaml
+wide_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_condition_width_1110/condition256-40e1f8b288
+wide_run: zrv2yfgt
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_explicit_inputs_1110
+workers: 16
+batch_size: 1024
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Can explicit inputs improve spin closure? | FiLM context256 | bound30
+  visible_name: Does explicit visible momentum help? | FiLM context256 | bound30 | raw1110
+  geometry_name: Does rest-frame geometry help? | FiLM context256 | bound30 | raw1110
+  group: Conditional tau ratio - explicit inputs

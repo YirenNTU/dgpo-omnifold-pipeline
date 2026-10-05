@@ -1,0 +1,36 @@
+# One weighted residual classifier; reuse the completed context256 baseline.
+width_config: config/conditional_tau_condition_width_10pct.yaml
+wide_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_condition_width_1110/condition256-40e1f8b288
+wide_run: zrv2yfgt
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_residual_ratio_1110
+workers: 16
+batch_size: 1024
+feature_batch_size: 256
+cap: 30
+seed: 42
+residual_split_seed: 100181
+audit_split_seed: 100182
+bootstrap: 2000
+bootstrap_seed: 100183
+audit_bootstrap: 500
+training:
+  epochs: 500
+  lr: 0.0002
+  min_lr: 0.00001
+  weight_decay: 0.001
+  grad_clip: null  # match existing AdamW fits; log/check gradients without clipping
+  patience: 25
+  min_delta: 0.0001
+  min_steps: 1000
+  selector: minimum_validation_weighted_bce
+# These are reported endpoint checks, never used to pick a classifier or hide a failure.
+guardrails:
+  ess_retention: 0.9
+  mass_tv_increase: 0.005
+  diagonal_error_increase: 0.02
+  total_error_increase: 0.01
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Can a residual classifier repair spin closure? | FiLM context256 | cumulative cap30
+  group: Conditional tau ratio - residual reweighting

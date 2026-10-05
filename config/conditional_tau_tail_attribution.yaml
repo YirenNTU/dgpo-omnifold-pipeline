@@ -1,0 +1,21 @@
+# Read-only replay of the completed 16-GPU K64 panel; no new inference/training.
+source: /pscratch/sd/y/yiren/Ztautau/conditional_tau_sampling_convergence/sampling-3c003b208f
+source_run: pt4n8f9t
+expected_events: 119002
+expected_candidates: 64
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_tail_attribution
+prefixes: [32, 64]
+ratio_caps: [10, 30, 100, 300, 1000]
+# Logit multipliers alpha, i.e. r**alpha (not conventional temperature T).
+temperatures: [0.9, 0.75, 0.5]
+top_count: 50
+remove_counts: [1, 10, 100, 1000]
+bootstrap: 500
+bootstrap_seed: 930481
+cpu_threads: 16
+minimum_truth_bin_count: 20
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Why do tails move Cij? | frozen FiLM | K32 and K64 | saved samples
+  group: Conditional tau ratio sampling convergence

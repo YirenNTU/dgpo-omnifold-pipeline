@@ -1,0 +1,21 @@
+# Only widen the condition encoder and FiLM context projections.
+upstream_config: config/conditional_tau_conditioning_10pct.yaml
+baseline_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_conditioning_1110/film-267e4db8e8
+baseline_run: pzq0nl1i
+panel_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cap_confirmation/confirm-fedfec09a0
+panel_run: fzekzrmr
+control_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_bounded_ratio_1110/bounded-3a83f9b24c
+control_run: a7mczoed
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_condition_width_1110
+workers: 16
+batch_size: 1024
+feature_batch_size: 256
+ratio_bound: 30
+condition_hidden: 256
+condition_width: 256
+bootstrap: 2000
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Does wider conditioning improve spin closure? | FiLM context256 | bound30 | raw1110
+  group: Conditional tau ratio - conditioning width

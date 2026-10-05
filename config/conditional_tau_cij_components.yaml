@@ -1,0 +1,18 @@
+# Read-only replay of the completed 16-GPU fresh-K64 panel; no inference or fitting.
+source: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cap_confirmation/confirm-fedfec09a0
+source_run: fzekzrmr
+events: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+expected_events: 119002
+expected_candidates: 64
+source_workers: 16
+cap: 30
+bootstrap: 2000
+bootstrap_seed: 930672
+cpu_threads: 16
+top_count: 50
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cij_components
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Why do Cij components disagree? | frozen FiLM | raw vs cap30 | saved K64
+  group: Conditional tau ratio sampling convergence

@@ -23,6 +23,7 @@ from ray.train import Checkpoint
 
 from evenet.control.global_config import global_config
 from evenet.dataset.preprocess import process_event_batch, unflatten_dict
+from evenet.dataset.filtered_data import validate_filtered_dataset
 import logging
 
 
@@ -164,6 +165,13 @@ def prepare_datasets(
     Returns:
         train_ds, val_ds, train_count, val_count
     """
+    if platform_info.get("require_filtered_data", False):
+        directories = {base_dir}
+        if not predict and base_val_dir is not None:
+            directories.add(base_val_dir)
+        for directory in sorted(directories):
+            record = validate_filtered_dataset(directory)
+            logging.info("Verified filtered input: %s", record)
     parquet_files: list[str] = sorted(map(str, base_dir.glob("*.parquet")))
     val_split = global_config.options.Dataset.val_split
     val_start_index = int(len(parquet_files) * val_split[0])

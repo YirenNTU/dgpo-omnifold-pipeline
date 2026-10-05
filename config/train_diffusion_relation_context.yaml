@@ -1,0 +1,52 @@
+extends_overlay: train_diffusion_token_film_global.yaml
+network:
+  VisibleConditioning:
+    diffusion_relation_adapter:
+      enabled: true
+      mode: context
+      width: 64
+      seed: 20260930
+options:
+  Training:
+    strict_relation_source: true
+    model_checkpoint_save_last: true
+    strict_conditioning_ablation_source: false
+    pretrain_model_load_path: /pscratch/sd/y/yiren/Ztautau/film_strength_real_01/raw_policy.pt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_context_01/checkpoints
+    JointCoverage:
+      enable: true
+      every_n_epochs: 50
+logger:
+  local:
+    name: diffusion-relation-context
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_context_01/logs
+  wandb:
+    id: relcontext01
+    run_name: Do visible relations improve joint physics? | context FiLM adapter |
+      matched 50 epochs
+    group: Visible relation FiLM
+    tags:
+    - DiffusionOnly
+    - NoRL
+    - GPU16
+    - PairedNoise
+    - RelationFiLM
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_context_01/ray_results
+  execution:
+    command: shifter python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml --overlay-config config/train_diffusion_relation_context.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_relation_context_01/ray_results
+experiment:
+  question: Do explicit observed pair relations improve joint generation beyond a
+    same-size context adapter?
+  source_wandb_run: '23522203'
+  source_stage: pinned supervised epoch286 step22386 raw weights
+  intervention: context_zero_output_film_adapter
+  primary_endpoint: epoch50 joint_radius_w1_relations_minus_context
+  interpretation: Same source function and nominal/active parameter count, 16 GPUs,
+    fixed 50 epochs. Source is the tested late checkpoint, not claimed best. Existing
+    scale and shift remain trainable. Reused panel is exploratory; primary is joint-radius
+    W1 at final epoch, velocity MSE and marginals/coverage are diagnostics. No fresh
+    H4 closure claim.

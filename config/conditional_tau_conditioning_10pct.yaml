@@ -1,0 +1,23 @@
+# New capacity-matched architecture controls, NOT a rerun of the old BCE head.
+baseline_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_relative_input_1110
+baseline_run: 443eg16h
+baseline_config: config/conditional_tau_relative_input_10pct.yaml
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_conditioning_1110
+workers: 16
+batch_size: 1024
+head_depth: 3
+diagnostic_every: 5
+early_stopping:
+  monitor: val_bce
+  patience: 25
+  min_delta: 0.0001
+  min_steps: 1000
+# Inherit verified BCE inputs/splits and 250-epoch cosine 2e-4 -> 1e-5.
+# Only fusion changes. No MMD/nnUKL penalty, no weight clipping or tempering.
+bootstrap: 500
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  group: Conditional tau fusion - matched depth and capacity
+  concat_name: Does conditioning fix tau ratios? | matched concat | 3 blocks | raw 1110
+  film_name: Does conditioning fix tau ratios? | matched FiLM | 3 blocks | raw 1110

@@ -1,0 +1,11 @@
+source: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/val-diffusion
+reference_samples: /pscratch/sd/y/yiren/Ztautau/tau_cij_sampling_bias/probe-c77f6b3e8c
+output: /pscratch/sd/y/yiren/Ztautau/tau_cij_fullval_response
+workers: 16
+batch_size: 1024
+seed: 421003
+wandb:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: "Does more validation MC help? | fixed raw models | remaining events | 16 GPUs"
+  group: Tau Cij unfolding

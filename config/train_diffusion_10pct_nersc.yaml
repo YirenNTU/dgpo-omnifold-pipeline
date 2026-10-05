@@ -1,7 +1,7 @@
 # NERSC Perlmutter Ztautau diffusion scaling-law run on a fixed 10% training set.
-# First materialize both config/subset_ztautau_diffusion_10pct.yaml and
-# config/subset_ztautau_validation_20pct.yaml. This run never overwrites the
-# full-data diffusion checkpoints.
+# Use the existing STIC-filtered train/validation datasets; do not regenerate
+# them using the raw subset materialization configs. This run never overwrites
+# the full-data diffusion checkpoints.
 
 nersc:
   submit: false
@@ -39,10 +39,11 @@ nersc:
       sample. Ray may reshuffle their order without changing subset membership.
 
 platform:
-  # Fixed 10% subset of the canonical train-diffusion population.
-  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_10pct_seed42/train
-  # Fixed seed-42 row-level 20% subset of the canonical validation population.
-  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42/val
+  require_filtered_data: true
+  # Existing filtered 10% subset: 416701 rows, seven anomalous events removed.
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  # Existing filtered seed-42 validation subset: 119002 rows.
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
   number_of_workers: 16
   resources_per_worker:
     CPU: 20

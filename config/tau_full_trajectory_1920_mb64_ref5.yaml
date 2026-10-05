@@ -1,0 +1,30 @@
+# Reference scale ablation against pathwise mb64/ref1 (fe1dc5a4).
+# Only the fixed velocity-reference coefficient changes: 1 -> 5.
+# Shared series/replay; every invocation gets a new output directory and W&B ID.
+checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/checkpoints/dgpo-epoch=191-next_ep=192-step=1920.ckpt
+source_runtime: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/runtime.yaml
+series_root: /pscratch/sd/y/yiren/Ztautau/tau_full_trajectory_1920_mb64
+source_step: 1920
+workers: 16
+trajectory_updates: [50, 200, 500]
+relative_steps: [0, 1, 5, 10, 20, 35, 50, 100, 150, 200, 300, 400, 500]
+audit_relative_steps: [0, 50, 200, 500]
+gradient_events_per_rank: 512
+condition_groups: 3
+condition_edges: [-1.0, -0.5, 0.5, 1.0]
+noise_edges: [0.0, 0.23333333333333334, 0.4666666666666667, 0.7]
+gradient_repeats: 2
+diagnostic_evaluation_events: 32768
+bootstrap_replicates: 300
+bootstrap_seed: 20261004
+reconstruction_tolerance: 0.0001
+direction_rms_fractions: [1.0]
+wandb_group: Tau full trajectory
+protocol: tau_full_trajectory
+full_trajectory:
+  reward_layout: k1_event_microbatch_v2
+  event_microbatch: 64
+  parity_atol: 5.0e-05
+  parity_rtol: 5.0e-05
+  reference_coefficient: 5.0
+native_training_directory: /pscratch/sd/y/yiren/Ztautau/tau_full_trajectory_1920/native_training_full_rows_v2

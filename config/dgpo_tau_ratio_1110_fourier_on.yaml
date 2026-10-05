@@ -1,0 +1,32 @@
+# Matched counterpart to a09283e1. New output; never resume the Fourier-off arm.
+extends_overlay: dgpo_tau_ratio_1110.yaml
+
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        fourier_enabled: true
+  VisibleConditioning:
+    diffusion_fourier_enabled: true
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_fourier_on/checkpoints
+
+dgpo:
+  tau_ratio:
+    output_root: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_fourier_on
+
+logger:
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_fourier_on/logs
+  wandb:
+    run_name: "Does Fourier help reward transfer? | diffusion Fourier on | FiLM retained | matched label0"
+    tags: [DGPO, ConditionalTau, Context256, FiLM3, PolicyFourier, Bound30, Raw1110, BestVal, Refit10, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_fourier_on/ray_results
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_dgpo_tau_ratio.py config/dgpo_tau_ratio_1110_fourier_on.yaml

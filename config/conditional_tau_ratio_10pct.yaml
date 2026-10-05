@@ -1,0 +1,40 @@
+# Fixed-sample conditional tau-pair density-ratio test on the same data as
+# c4a91e07 / the filtered 10% DGPO experiment. No DGPO policy updates.
+reference:
+  dgpo_10pct_config: config/dgpo_omnifold_ztautau_10pct_old_method_hard_ablation.yaml
+
+platform:
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+
+experiment:
+  representation: tau
+  test_source: /pscratch/sd/y/yiren/Ztautau/h4_film_step1110_cij/rescore-ca89b70725
+  train_sample_root: /pscratch/sd/y/yiren/Ztautau/h4_step1110_tau_train_20260930
+  output: /pscratch/sd/y/yiren/Ztautau/conditional_tau_ratio_1110_20260930_retry1
+
+sampling:
+  workers: 16
+  batch_size: 1024
+  seed: 42929
+
+classifier:
+  workers: 16
+  batch_size: 256
+  epochs: 250
+  patience: 30
+  min_delta: 0.0  # Save every new lowest validation BCE.
+  min_steps: 1000
+  lr: 0.0002
+  min_lr: 0.00001
+  weight_decay: 0.001
+  dropout: 0.05
+  hidden: 128
+  bootstrap: 500
+  seed: 42
+
+logger:
+  wandb:
+    group: Conditional ratio closure
+    sampling_run_name: Generate paired tau samples | 10 percent OmniFold train | step 1110
+    classifier_run_name: Can tau-pair ratios close the gap? | conditional MLP | step 1110

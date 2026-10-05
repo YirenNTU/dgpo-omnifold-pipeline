@@ -1,0 +1,47 @@
+# Repeat the SAME module in all three blocks; no new backbone depth or heads.
+extends_overlay: train_diffusion_residual_last.yaml
+
+network:
+  VisibleConditioning:
+    diffusion_token_readout:
+      block: all
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_residual_all/checkpoints
+
+logger:
+  local:
+    name: diffusion-residual-all
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_residual_all/logs
+  wandb:
+    id: diffresall1
+    run_name: "Can repeated conditioning help? | global FiLM plus shared residual | three blocks"
+    tags: [DiffusionOnly, NoRL, GlobalFiLM, ResidualCrossAttention, ThreeInjections, SharedReadout, RawWeights, Data10pct, GPU16, PairedNoise]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_residual_all/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_residual_all.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_residual_all/ray_results
+
+experiment:
+  question: Does repeating the same direct visible-token readout help velocity learning?
+  intervention: global_film_plus_shared_direct_residual_in_all_three_blocks
+  matched_configuration: config/train_diffusion_residual_last.yaml
+  interpretation: >-
+    Exactly the last-block residual model and parameter count, but call the same
+    shared attention/MLP/output module after each of the three generation blocks.
+    Queries use each block's input state/time/slot, and updates enter the carried
+    invisible-token representation after that block. No extra independent heads,
+    frequency bands, learned gates, LR changes or new backbone layers. This tests
+    repeated access at equal parameter count, not equal FLOPs or equal aggregate
+    path strength. Global FiLM remains active in all three blocks. Same raw start,
+    paired50-epoch supervised protocol,16 GPUs, FP32 and2048 events/GPU. No EMA,
+    DGPO, classifier training or physics loss; lower velocity MSE alone does not
+    establish high-order closure or improved reward transfer.

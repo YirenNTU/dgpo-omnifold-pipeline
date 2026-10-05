@@ -1,0 +1,18 @@
+# Read-only CPU replay of an existing 16-GPU panel. No Ray or model loading.
+source: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cap_confirmation/confirm-fedfec09a0
+source_run: fzekzrmr
+events: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+expected_events: 119002
+expected_candidates: 64
+source_workers: 16
+prefixes: [32, 64]
+cap: 30
+bootstrap: 2000
+bootstrap_seed: 930672
+cpu_threads: 16
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_normalization_diagnostic
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Is condition mass the problem? | frozen FiLM | disjoint normalization | K32-64
+  group: Conditional tau ratio sampling convergence

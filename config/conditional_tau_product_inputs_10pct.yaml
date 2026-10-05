@@ -1,0 +1,13 @@
+# Reuse completed Geometry (primary) and context256 (secondary); never refit controls.
+explicit_config: config/conditional_tau_explicit_inputs_10pct.yaml
+geometry_control: /pscratch/sd/y/yiren/Ztautau/conditional_tau_explicit_inputs_1110/geometry-edbdaf9e33
+geometry_run: n3jjqcn7
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_product_inputs_1110
+workers: 16
+batch_size: 1024
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Do explicit spin products help? | FiLM context256 | bound30 | raw1110
+  products_name: Do explicit spin products help? | FiLM context256 | bound30 | raw1110
+  group: Conditional tau ratio - analyzer products

@@ -1,0 +1,52 @@
+# Recovery branch: latest saved state is epoch13; continue 100 epochs to completed114.
+extends_overlay: train_diffusion_relation_relations.yaml
+options:
+  Training:
+    pretrain_model_load_path: null
+    model_checkpoint_load_path: null
+    resume_latest_checkpoint_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_relations_01/checkpoints
+    resume_expected_epoch: 13
+    strict_relation_source: false
+    epochs: 114
+    total_epochs: 114
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_resume_100/checkpoints
+    model_checkpoint_save_last: true
+    EarlyStopping:
+      patience: 115
+    JointCoverage:
+      enable: true
+      every_n_epochs: 50
+      final_completed_epoch: 114
+logger:
+  local:
+    name: diffusion-relation-resume-100
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_resume_100/logs
+  wandb:
+    id: relresume100
+    run_name: "Continue relation FiLM | epoch 13 recovery | 100 more epochs"
+    group: Visible relation FiLM
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_resume_100/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_relation_resume.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_relation_resume_100/ray_results
+experiment:
+  question: Does longer relation-FiLM finetuning improve joint physics?
+  source_wandb_run: relrelations01
+  source_stage: completed_epoch14_full_training_state
+  checkpoint_protocol: full_lightning_resume_with_cosine_horizon_extended_to114
+  intervention: additional100_epochs_same_relation_architecture
+  primary_endpoint: epoch114_joint_radius_w1_against_original_baseline
+  interpretation: >-
+    Recover epoch13/global_step1092, the latest full state actually saved; epoch49 is absent.
+    Restore trained adapter, raw model, optimizer moments, scheduler counters and callbacks.
+    Continue 100 additional epochs to completed114. Extend cosine horizon50 to114 with
+    original five-epoch warmup convention; future LR curve changes, without resetting
+    optimizer or schedule counters.16 GPUs. Coverage at completed50,100,114; restored
+    baseline remains the original pre-finetune model, not epoch13. This is a new branch
+    from epoch13, not an exact continuation of the completed50 endpoint. No H4 closure claim.

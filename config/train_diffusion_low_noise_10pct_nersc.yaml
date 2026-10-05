@@ -1,8 +1,9 @@
 # Dedicated raw step-1110 supervised fine-tuning pilot.
 # Actual peak learning rates, with GPU-count LR scaling disabled.
 platform:
-  # Fixed 10% subset of the canonical train-diffusion population.
-  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_10pct_seed42/train
+  require_filtered_data: true
+  # Existing filtered 10% subset: 416701 rows, seven anomalous events removed.
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
   # Same validation population, with the two known corrupted events removed.
   data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
   number_of_workers: 16

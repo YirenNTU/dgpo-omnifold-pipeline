@@ -1,0 +1,14 @@
+# Saved 16-GPU inference from vnk1rs3v; raw DGPO step890 and pretrain epoch214.
+# No new sampling from diffusion or training. User launches CPU analysis personally.
+reuse_samples: /pscratch/sd/y/yiren/Ztautau/tau_cij_sampling_bias/probe-c77f6b3e8c
+output: /pscratch/sd/y/yiren/Ztautau/tau_cij_sampling_bias_wide
+targets: [-0.5, -0.3, -0.1, 0.0, 0.1, 0.3, 0.5]
+repeats: 100
+seed: 421001
+# Warning threshold, not a physics acceptance criterion. No clipping or silent retargeting.
+min_ess_fraction: 0.1
+wandb:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: "Can spin moments track a wide scan? | pretrain vs DGPO | Cij -0.5 to 0.5 | resampling"
+  group: Tau Cij sampling bias

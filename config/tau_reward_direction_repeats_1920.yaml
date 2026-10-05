@@ -1,0 +1,24 @@
+# User-launched screening inside the existing sixteen-GPU allocation.
+# Four native update draws; all temporary perturbations are rolled back.
+protocol: tau_reward_direction_repeats
+checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/checkpoints/dgpo-epoch=191-next_ep=192-step=1920.ckpt
+source_runtime: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/runtime.yaml
+series_root: /pscratch/sd/y/yiren/Ztautau/tau_reward_direction_repeats_1920
+source_step: 1920
+workers: 16
+gradient_events_per_rank: 512
+diagnostic_evaluation_events: 32768
+draw_repeats: 4
+gradient_repeats: 2
+evaluation_seeds: [202610041, 202610042]
+direction_rms_fractions: [0.01, 0.03, 0.1]
+# Retained decomposition labels are instrumentation; this test does not test
+# condition/noise-specific update efficacy or conditioning capacity.
+condition_groups: 3
+condition_edges: [-1.0, -0.5, 0.5, 1.0]
+noise_edges: [0.0, 0.23333333333333334, 0.4666666666666667, 0.7]
+ensemble_directory: null
+bootstrap_replicates: 300
+bootstrap_seed: 20261004
+reconstruction_tolerance: 0.0001
+wandb_group: Tau local reward directions

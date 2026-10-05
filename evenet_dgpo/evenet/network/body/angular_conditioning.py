@@ -8,8 +8,11 @@ from torch import nn
 class VisibleAngularFourier(nn.Module):
     def __init__(self, feature_names, hidden_dim, theta_source="Part_eta", phi_source="Part_phi",
                  placement="input", projection_type="linear", mlp_dim=64,
-                 log_diagnostics=False, harmonics=None, attention_heads=4):
+                 log_diagnostics=False, harmonics=None, attention_heads=4, fourier_enabled=True):
         super().__init__()
+        if type(fourier_enabled) is not bool:
+            raise ValueError("fourier_enabled must be boolean")
+        self.fourier_enabled = fourier_enabled
         if placement not in ("input", "output"):
             raise ValueError("angular placement must be input or output")
         if projection_type not in ("linear", "mlp", "cross_attention") or mlp_dim < 1:
@@ -60,6 +63,8 @@ class VisibleAngularFourier(nn.Module):
         angles = torch.stack((theta, phi), dim=-1).unsqueeze(-1)
         phase = angles * self.harmonics.to(dtype=raw.dtype)
         features = torch.cat((phase.sin(), phase.cos()), dim=-1).flatten(-2)
+        if not self.fourier_enabled:
+            features = torch.zeros_like(features)
         return torch.where(mask, features, torch.zeros_like(features))
 
     def forward(self, visible_raw, visible_mask, query=None, time=None):

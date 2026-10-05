@@ -120,7 +120,7 @@ def train_func(cfg):
         mode="min",
         verbose=True,
         dirpath=global_config.options.Training.model_checkpoint_save_path,
-        save_last="link",
+        save_last=global_config.options.Training.get("model_checkpoint_save_last", "link"),
         auto_insert_metric_name=False,
         filename="epoch={epoch}_train={train/loss:.4f}_val={val/loss:.4f}",
     )

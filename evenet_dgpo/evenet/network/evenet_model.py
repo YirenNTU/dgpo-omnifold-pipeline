@@ -173,6 +173,7 @@ class EveNetModel(nn.Module):
                 log_diagnostics=angular_cfg.get("log_diagnostics", False),
                 harmonics=angular_cfg.get("harmonics"),
                 attention_heads=angular_cfg.get("attention_heads", 4),
+                fourier_enabled=angular_cfg.get("fourier_enabled", True),
             )
         self.PET = PETBody(
             num_feat=self.sequential_input_dim,
@@ -335,9 +336,25 @@ class EveNetModel(nn.Module):
                     self.network_cfg, target="diffusion", feature_names=self._raw_sequential_feature_names(),
                     token_dim=self.sequential_input_dim, hidden_dim=self.network_cfg.TruthGeneration.hidden_dim,
                     num_layers=self.network_cfg.TruthGeneration.num_layers, n_branches=2,
+                    output_dim=self.invisible_input_dim,
+                    attention_heads=self.network_cfg.TruthGeneration.num_heads,
                 ),
             )
             self.neutrino_position_encode = self.network_cfg.TruthGeneration.neutrino_position_encode
+
+        from evenet.network.body.conditional_preconditioning import ConditionalPreconditioner, preconditioning_spec
+        preconditioning = preconditioning_spec(self.network_cfg)
+        self.conditional_preconditioning = None
+        if preconditioning is not None:
+            if not self.include_neutrino_generation or self.invisible_input_dim != 2:
+                raise ValueError("Conditional preconditioning requires the two-angle TruthGeneration head")
+            if any((classification, regression, global_generation, point_cloud_generation, assignment, segmentation)):
+                raise ValueError("Conditional preconditioning experiment is diffusion-only")
+            if getattr(self.TruthGeneration.visible_conditioning, "reward_probe", None) is not None:
+                raise ValueError("Reward probe requires physical noisy coordinates; unsupported with preconditioning")
+            self.conditional_preconditioning = ConditionalPreconditioner(
+                self._raw_sequential_feature_names(), self.sequential_normalizer,
+                self.global_normalizer, self.invisible_normalizer, **preconditioning)
 
         # [7] Segmentation Head
         if self.include_segmentation:
@@ -488,7 +505,7 @@ class EveNetModel(nn.Module):
         )
 
         if self.include_neutrino_generation:
-            invisible_point_cloud = self.invisible_normalizer(
+            invisible_point_cloud = self.invisible_coordinate_normalizer(x)(
                 x=invisible_point_cloud,
                 mask=invisible_point_cloud_mask
             )
@@ -722,7 +739,10 @@ class EveNetModel(nn.Module):
                     visible_normalized=input_point_cloud_raw,
                 )
                 generations["neutrino"] = {
-                    "vector": pred_point_cloud_vector[:, is_invisible_query, :],
+                    "vector": self._apply_reward_conditioning_probe(
+                        pred_point_cloud_vector[:, is_invisible_query, :],
+                        invisible_point_cloud_noised[..., :self.invisible_input_dim], x, full_time,
+                        invisible_point_cloud_mask, input_point_cloud, input_point_cloud_mask),
                     "truth": truth_invisible_point_cloud_vector.detach(),
                     "mask": invisible_point_cloud_mask.contiguous(),
                     "time": full_time.detach(),
@@ -745,6 +765,31 @@ class EveNetModel(nn.Module):
             "event_token": outputs.get("deterministic", {}).get("event_token", None),
             "object_token": outputs.get("deterministic", {}).get("object_token", None),
         }
+
+    def invisible_coordinate_normalizer(self, batch):
+        """Use the same frozen target chart before perturbation and after DDIM."""
+        preconditioner = getattr(self, "conditional_preconditioning", None)
+        if preconditioner is None:
+            return self.invisible_normalizer
+        from evenet.network.body.conditional_preconditioning import ConditionalTargetNormalizer
+        return ConditionalTargetNormalizer(self.invisible_normalizer, preconditioner, batch)
+
+    def _apply_reward_conditioning_probe(self, vector, noisy, batch, time, inv_mask, tokens, vis_mask):
+        conditioning = getattr(self.TruthGeneration, "visible_conditioning", None)
+        probe = getattr(conditioning, "reward_probe", None)
+        if probe is None:
+            return vector
+        # Invert the actual trained normalizer (including inverse-CDF channels).
+        # This transforms x_t, never batch['x_invisible'], into a noisy angle chart.
+        pad = self.invisible_normalizer.mean.numel() - noisy.shape[-1]
+        if pad < 0:
+            raise ValueError("reward probe noisy coordinate width exceeds normalizer")
+        padded = torch.nn.functional.pad(noisy, (0, pad))
+        physical = self.invisible_normalizer.denormalize_grad(padded, mask=inv_mask)[..., :2]
+        residual = probe(tokens=tokens, visible_mask=vis_mask, noisy=noisy,
+                         physical_noisy_delta=physical, time=time, invisible_mask=inv_mask, batch=batch)
+        conditioning.diagnostics.update(probe.diagnostics)
+        return vector + residual
 
     def predict_diffusion_vector(
             self, noise_x: Tensor, cond_x: Dict[str, Tensor], time: Tensor, mode: str,
@@ -904,7 +949,9 @@ class EveNetModel(nn.Module):
                 visible_normalized=input_point_cloud_raw,
             )
 
-            return pred_point_cloud_vector[:, is_invisible_query, :]
+            return self._apply_reward_conditioning_probe(
+                pred_point_cloud_vector[:, is_invisible_query, :], noise_x, cond_x, time,
+                invisible_point_cloud_mask, input_point_cloud, input_point_cloud_mask)
         return None
 
     def shared_step(

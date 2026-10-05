@@ -1,0 +1,15 @@
+# User-launched within an existing 16-GPU Shifter/Ray allocation; no submission.
+# Exact path verified by 6d8bb6c2 W&B resume metadata. File availability and
+# contents are validated on NERSC at launch, never inferred from last.ckpt.
+checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/checkpoints/dgpo-epoch=191-next_ep=192-step=1920.ckpt
+source_runtime: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/runtime.yaml
+output_root: /pscratch/sd/y/yiren/Ztautau/tau_reward_transfer_1920
+source_step: 1920
+workers: 16
+relative_steps: [0, 1, 5, 10, 20, 35, 50]
+audit_relative_steps: [0, 50]
+bootstrap_replicates: 300
+bootstrap_seed: 20261004
+reconstruction_tolerance: 0.0001
+wandb_name: "Can refit reward be retained? | tau attention | frozen 50 updates | step 1920"
+wandb_group: Tau reward transfer

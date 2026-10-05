@@ -1,0 +1,12 @@
+# Frozen samples from vnk1rs3v: DGPO step890, original 10% pretrain epoch214.
+# Analysis only: no new inference, no Ray/GPU allocation needed.
+reuse_samples: /pscratch/sd/y/yiren/Ztautau/tau_cij_sampling_bias/probe-c77f6b3e8c
+output: /pscratch/sd/y/yiren/Ztautau/tau_cij_sampling_bias_small
+amplitude: 0.1
+repeats: 100
+seed: 421001
+wandb:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: "Does small spin shift track? | pretrain vs DGPO | 10% resampling | Cij and B moments"
+  group: Tau Cij sampling bias

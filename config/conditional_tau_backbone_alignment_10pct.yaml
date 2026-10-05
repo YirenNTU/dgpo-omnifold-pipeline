@@ -1,0 +1,47 @@
+# One matched loss ablation. Frozen raw step1110 full diffusion trunk;
+# fresh identical conditional heads. Reuse K=1 samples, no resampling.
+# Primary comparison: held-out joint tau MMD + conditional tau moments.
+# Require no worsening of condition-population drift or ratio concentration;
+# Cij is secondary, never a training feature/loss or checkpoint selector.
+# Neither finite moments nor this MMD certify full conditional closure.
+reference:
+  dgpo_10pct_config: config/dgpo_omnifold_ztautau_10pct_old_method_hard_ablation.yaml
+platform:
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+experiment:
+  representation: tau
+  test_source: /pscratch/sd/y/yiren/Ztautau/h4_film_step1110_cij/rescore-ca89b70725
+  train_sample_root: /pscratch/sd/y/yiren/Ztautau/h4_step1110_tau_train_20260930/sample-36e9d6c2a3
+  output: /pscratch/sd/y/yiren/Ztautau/conditional_tau_backbone_alignment_1110
+sampling:
+  workers: 16
+  batch_size: 1024
+  seed: 42929
+classifier:
+  condition_normalization: masked_feature
+  workers: 16
+  batch_size: 256
+  epochs: 250
+  # Equal training budget; select lowest internal validation BCE in both arms.
+  patience: 251
+  min_delta: 0.0
+  min_steps: 1000
+  lr: 0.0002
+  min_lr: 0.00001
+  weight_decay: 0.001
+  dropout: 0.05
+  hidden: 128
+  bootstrap: 500
+  seed: 42
+alignment:
+  cache: /pscratch/sd/y/yiren/Ztautau/conditional_tau_backbone_alignment_1110/features
+  feature_batch_size: 256
+  mmd_coefficient: 1.0
+  bce_run_name: Conditional tau alignment | frozen 1110 trunk | BCE
+  mmd_run_name: Conditional tau alignment | frozen 1110 trunk | BCE + joint MMD
+logger:
+  wandb:
+    group: Conditional tau alignment - frozen raw 1110
+    sampling_run_name: Shared tau samples | 10 percent train | raw step 1110
+    classifier_run_name: Conditional tau alignment | frozen 1110 trunk | loss ablation

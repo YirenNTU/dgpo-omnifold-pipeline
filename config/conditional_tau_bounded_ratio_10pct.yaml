@@ -1,0 +1,20 @@
+# Single intervention vs pzq0nl1i: smooth bounded output during paired BCE.
+upstream_config: config/conditional_tau_conditioning_10pct.yaml
+baseline_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_conditioning_1110/film-267e4db8e8
+baseline_run: pzq0nl1i
+panel_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cap_confirmation/confirm-fedfec09a0
+panel_run: fzekzrmr
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_bounded_ratio_1110
+workers: 16
+batch_size: 1024
+feature_batch_size: 256
+ratio_bound: 30
+bootstrap: 2000
+# Inherit exact fixed-negative FiLM: seed42, depth3, hidden128, dropout .05,
+# AdamW 2e-4 -> 1e-5 cosine250, weight_decay .001, patience25,
+# min_delta1e-4, min_steps1000. No fresh negatives, backbone fit or EMA.
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Does bounding ratios during training help? | FiLM BCE | cap30 | fixed negatives
+  group: Conditional tau ratio - bounded training

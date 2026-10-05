@@ -564,6 +564,13 @@ class RewardAggregator:
         return {"schema_version": 1, "sources": rows}
 
     @property
+    def conditional_tau_source(self) -> BaseReward | None:
+        for reward, _weight in self.sources:
+            if reward.name == "conditional_tau":
+                return reward
+        return None
+
+    @property
     def omnifold_source(self) -> BaseReward | None:
         for reward, _weight in self.sources:
             if reward.name == "omnifold":

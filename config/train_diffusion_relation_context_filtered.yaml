@@ -1,0 +1,37 @@
+# Fresh same-data control for conditional preconditioning run condpre02.
+extends_overlay: train_diffusion_relation_context.yaml
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_context_filtered_02/checkpoints
+
+logger:
+  local:
+    name: diffusion-relation-context-filtered
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_context_filtered_02/logs
+  wandb:
+    id: relcontext02
+    run_name: "Does preconditioning improve joint physics? | context control | filtered data"
+    group: Conditional preconditioning
+    tags: [DiffusionOnly, NoRL, GPU16, PairedNoise, ContextControl, FilteredData]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_relation_context_filtered_02/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_relation_context_filtered.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_relation_context_filtered_02/ray_results
+
+experiment:
+  question: Does conditional preconditioning improve physics over a context control on identical filtered data?
+  intervention: context_control_existing_filtered_train_and_validation
+  reference_wandb_run: condpre02
+  interpretation: >-
+    Fresh50-epoch context control from the identical pinned raw checkpoint,
+    16GPUs and existing filtered train416701/validation119002 events. Same
+    source normalization and evaluation panel. relcontext01 used unfiltered
+    training data and is a historical reference, not the matched data control.

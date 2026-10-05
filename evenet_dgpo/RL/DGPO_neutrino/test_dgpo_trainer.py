@@ -75,6 +75,12 @@ class _Policy(torch.nn.Module):
 
 
 class TestWandbClocks(unittest.TestCase):
+    def test_checkpoint_transfer_metrics_survive_compact_profiles(self):
+        key = "checkpoint_transfer/heldout/delta_mean"
+        self.assertTrue(dgpo_trainer._wandb_critical_keep(key))
+        self.assertTrue(dgpo_trainer._wandb_simplified_keep(key, .1))
+        self.assertEqual(dgpo_trainer._wandb_train_payload({key: .1})[key], .1)
+
     @staticmethod
     def _live_progress_logger(wb, *, is_rank0=True):
         # Execute the actual nested production callback without launching Ray,

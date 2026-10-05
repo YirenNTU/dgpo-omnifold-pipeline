@@ -1,0 +1,56 @@
+# Launch through scripts/diagnose_dgpo_checkpoint_transfer.py: it pins last.ckpt,
+# reads the actual counters, and gives every invocation an isolated output/run.
+extends_overlay: dgpo_global_film_diffusion_last.yaml
+
+dgpo:
+  auto_resume_from_last: false
+  checkpoint_load_mode: resume
+  lr_schedule:
+    resume_use_config: false
+  validation_initial_enabled: false
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 0
+  adaptive_omnifold:
+    baseline_probe_on_start: false
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: false
+      # Parent enables both flags; disabling the operation also disables its
+      # failure policy. Otherwise the native adaptive-config parser rejects it.
+      refit_once_fail_closed: false
+  checkpoint_transfer:
+    enabled: true
+    relative_steps: [0, 1, 5, 20]
+    events_per_rank: 2048
+    evaluation_batch_size: 128
+    noise_seed: 20260928
+    bootstrap_replicates: 2000
+    bootstrap_seed: 20260929
+    reconstruction_tolerance: 0.001
+  gradient_transfer_trace:
+    enabled: true
+    # The launcher replaces these with absolute saved_step + [1,5,20].
+    update_end_steps: [1, 5, 20]
+    counterfactual_trust_coefficients: [1.0]
+
+logger:
+  wandb:
+    id: null
+    resume: never
+    fresh_run: true
+    run_name: "Does late reward still transfer? | native DGPO | paired 20-update probe"
+    group: DGPO checkpoint reward transfer
+    tags: [DGPO, FixedReward, FullStateResume, RawWeights, PairedNoise, SixteenGPU]
+
+experiment:
+  protocol: native-checkpoint-reward-transfer
+  source_run: 99de15bc
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/99de15bc
+  intervention: fixed_reward_and_reference_native_20_update_diagnostic
+  single_question: Can native updates at the latest saved policy improve held-out all-sample reward?
+  primary_decision_rule: >-
+    Predeclared endpoint is paired held-out mean reward change at +20 updates,
+    with an event-bootstrap 95% interval. +1 and +5 diagnose the trajectory.
+    Positive interval supports local reward transfer, negative supports local
+    failure, overlap with zero is unresolved. This is not fresh-H4 closure.
+  cold_h4_audit_policy_steps: []

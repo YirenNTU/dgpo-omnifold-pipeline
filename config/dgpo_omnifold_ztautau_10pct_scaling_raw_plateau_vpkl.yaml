@@ -28,11 +28,12 @@ nersc:
       --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_rawplateau_vpkl_v18_scaling_seed42/ray_results
 
 platform:
+  require_filtered_data: true
   # This is already the complete materialized seed-42 10% training dataset. Do not
   # apply another fractional limit below.
-  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_10pct_seed42/train
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
   # Alias of the SAME pool: no external validation data are loaded.
-  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_train_10pct_seed42/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
   # DGPO expands each event by K candidates and eight policy-evaluation
   # timesteps.
   batch_size: 512

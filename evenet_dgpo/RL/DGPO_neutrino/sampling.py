@@ -87,7 +87,8 @@ def generate_neutrino_candidates(
             data_shape=data_shape_group,
             pred_fn=pred_partial,
             num_steps=int(num_ddim_steps),
-            normalize_fn=model.invisible_normalizer,
+            normalize_fn=(model.invisible_coordinate_normalizer(batch_group)
+                          if hasattr(model, "invisible_coordinate_normalizer") else model.invisible_normalizer),
             remove_padding=True,
             noise_mask=noise_mask_group,
             use_tqdm=use_tqdm_ddim,

@@ -1,0 +1,53 @@
+# Supervised only: preserve global FiLM and add a direct invisible-token residual.
+extends_overlay: train_diffusion_token_film_global.yaml
+
+network:
+  VisibleConditioning:
+    diffusion_token_readout:
+      enabled: true
+      mode: residual
+      block: last
+      width: 64
+      heads: 4
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_residual_last/checkpoints
+
+logger:
+  local:
+    name: diffusion-residual-last
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_residual_last/logs
+  wandb:
+    id: diffreslast1
+    run_name: "Can direct conditioning help? | global FiLM plus residual readout | last block"
+    tags: [DiffusionOnly, NoRL, GlobalFiLM, ResidualCrossAttention, LastBlock, RawWeights, Data10pct, GPU16, PairedNoise]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_residual_last/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_residual_last.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_residual_last/ray_results
+
+experiment:
+  question: Does a direct visible-token residual improve supervised velocity learning beyond global FiLM?
+  intervention: global_film_plus_last_block_direct_residual
+  matched_configuration: config/train_diffusion_token_film_global.yaml
+  injection_control: config/train_diffusion_token_film_last.yaml
+  interpretation: >-
+    Same raw step1110 policy before new RL updates, same three generation blocks,
+    PET Fourier and nonlinear visible encoder as the global-FiLM supervised arm.
+    A width64 four-head readout queries visible tokens using current noisy-state,
+    time and slot representations. A two-layer SiLU encoder plus LayerNorm and
+    zero-initialized output projects directly into the carried invisible-token
+    representation after the last block, bypassing its FFN/LayerScale path.
+    Global multiplicative FiLM is retained in all blocks. No new features or truth
+    conditioning. This compares routing/capacity packages, not parameter-matched
+    FiLM expressivity. All training settings and the fixed50-epoch endpoint are
+    inherited unchanged. No DGPO, classifier fits, reference penalty or EMA.
+

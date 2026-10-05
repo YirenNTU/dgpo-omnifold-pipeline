@@ -337,7 +337,37 @@ def load_weights_like_configure_model(
         weight_source = "ema_state_dict"
     else:
         weight_source = "state_dict"
-    safe_load_state(model, ckpt[weight_source])
+    if for_dgpo_training and (getattr(model, "conditional_preconditioning", None) is not None
+            or any(k.removeprefix("model.").startswith("conditional_preconditioning.")
+                   for k in ckpt[weight_source])):
+        raise ValueError("Conditional preconditioning currently supports supervised training/evaluation only; "
+                         "DGPO loss/reference coordinates must be adapted before transfer")
+    token_migration = bool((getattr(config, 'dgpo', None) or {}).get('add_diffusion_attention', False))
+    token_prefix = 'TruthGeneration.visible_conditioning.token_readout.'
+    has_token = any(k.removeprefix('model.').startswith(token_prefix) for k in ckpt[weight_source])
+    if token_migration and not has_token:
+        if not for_dgpo_training or not is_dgpo_ckpt or weight_source != 'state_dict':
+            raise ValueError('Diffusion attention migration requires full raw DGPO resume')
+        if any(key not in ckpt for key in ('dgpo_ref_state_dict', 'dgpo_optimizer_state_dict')):
+            raise ValueError('Attention migration requires saved reference and optimizer state')
+        from evenet.utilities.fourier_integration import load_conditioning_ablation_weights
+        load_conditioning_ablation_weights(model, ckpt)
+        branch = model.TruthGeneration.visible_conditioning.token_readout
+        if branch is None or branch.mode != 'residual' or branch.block != 'last':
+            raise ValueError('Expected last-block residual attention')
+        if torch.count_nonzero(branch.output.weight) or torch.count_nonzero(branch.output.bias):
+            raise ValueError('Attention migration must preserve the initial function')
+        # Keep each saved reference function, not recenter it. Add only the
+        # same zero-output branch so future tau refits can copy the full actor.
+        added = {k: v.detach().clone() for k,v in model.state_dict().items() if k.startswith(token_prefix)}
+        for key in ('dgpo_ref_state_dict', 'dgpo_round_ref_state_dict'):
+            if key in ckpt:
+                source_ref = {k.removeprefix('model.'):v for k,v in ckpt[key].items()}
+                if any(k.startswith(token_prefix) for k in source_ref):
+                    raise ValueError('Actor/reference attention architecture mismatch')
+                ckpt[key] = {**source_ref, **added}
+    else:
+        safe_load_state(model, ckpt[weight_source])
     _log.info("[DGPO/model] Loaded checkpoint weights from %s: %s", weight_source, ckpt_path)
     return ckpt
 
@@ -624,6 +654,10 @@ def _match_saved_reference_token_readout(model_ref: nn.Module, saved: dict[str, 
             and not any("TruthGeneration.visible_conditioning.token_readout." in key for key in saved)):
         conditioning.token_readout = None
         conditioning.spec.pop("token_readout", None)
+    if (conditioning is not None and getattr(conditioning, "reward_probe", None) is not None
+            and not any("TruthGeneration.visible_conditioning.reward_probe." in key for key in saved)):
+        conditioning.reward_probe = None
+        conditioning.spec.pop("reward_probe", None)
 
 
 def prepare_step_zero_architecture_bootstrap(checkpoint: dict[str, Any] | None) -> dict[str, Any]:

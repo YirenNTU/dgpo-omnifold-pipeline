@@ -1,0 +1,52 @@
+# Unlimited epoch budget; validation plateau determines stopping.
+extends_overlay: train_diffusion_velocity_residual_probe.yaml
+
+options:
+  Training:
+    epochs: -1
+    total_epochs: 1000
+    cosine_min_lr_ratio: 0.1
+    learning_rate_warm_up_factor: 5.0
+    train_only_modules: []
+    freeze_modules: []
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_velocity_residual_joint/checkpoints
+    EarlyStopping:
+      patience: 200
+      min_delta: 0.0
+    Components:
+      TruthGeneration.visible_conditioning:
+        learning_rate: 0.0001
+
+logger:
+  local:
+    name: diffusion-velocity-residual-joint
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_velocity_residual_joint/logs
+  wandb:
+    id: diffveljoint1
+    run_name: "Can output residual improve diffusion? | full finetuning | validation stopping"
+    tags: [DiffusionOnly, FullFinetuning, VelocityResidual, RawWeights, Data10pct, GPU16, PairedNoise]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_velocity_residual_joint/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_velocity_residual_joint.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_velocity_residual_joint/ray_results
+
+experiment:
+  question: Can joint finetuning with an output velocity residual improve held-out velocity MSE?
+  intervention: full_finetuning_with_output_velocity_residual
+  primary_endpoint: best_fixed_noise_validation_velocity_mse
+  stop_rule: validation_no_improvement_for_200_epochs_no_max_epoch
+  interpretation: >-
+    Start from the same raw step-zero source with fresh optimizer and a zero-output
+    new residual branch. All original parameters are trainable. Body and PET
+    Fourier LR2e-5, generation/projector/visible conditioning LR1e-4, five-epoch
+    warmup, cosine over1000 epochs to a10pct floor held thereafter. No maximum
+    epoch count; validation patience200 controls stopping. Same16 GPUs and2048
+    events per GPU. Prior50-epoch runs are historical references, not matched
+    architecture controls because the learning-rate schedule differs.

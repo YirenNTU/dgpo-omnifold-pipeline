@@ -1,0 +1,24 @@
+# Arithmetic only on completed 16-GPU inference; no new sampling or classifier fits.
+source: /pscratch/sd/y/yiren/Ztautau/conditional_tau_cap_confirmation/confirm-fedfec09a0
+source_run: fzekzrmr
+events: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+train_events: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+expected_events: 119002
+expected_candidates: 64
+source_workers: 16
+cap: 30
+A:
+  run: zrv2yfgt
+  directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_condition_width_1110/condition256-40e1f8b288
+B:
+  run: n3jjqcn7
+  directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_explicit_inputs_1110/geometry-edbdaf9e33
+bootstrap: 2000
+bootstrap_seed: 100164
+cpu_threads: 16
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_weight_factor_swap
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Where does spin closure change? | context256 vs geometry | mass x within | saved K64
+  group: Conditional tau ratio - weight factor swap

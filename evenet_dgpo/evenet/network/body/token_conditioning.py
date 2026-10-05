@@ -4,10 +4,20 @@ from torch import nn
 
 
 class TokenSpecificConditioning(nn.Module):
-    def __init__(self, hidden_dim, memory_dim, *, width=64, heads=4):
+    def __init__(self, hidden_dim, memory_dim, *, width=64, heads=4,
+                 mode="film", block="last", output_dim=None):
         super().__init__()
         if width < 2 or heads < 1 or width % heads:
             raise ValueError("token conditioning width must be divisible by positive heads")
+        if mode not in ("film", "residual", "velocity") or block not in ("last", "all", "output"):
+            raise ValueError("token conditioning requires a supported mode and injection site")
+        if mode == "film" and block != "last":
+            raise ValueError("legacy token FiLM supports only the last diffusion block")
+        if mode == "residual" and block not in ("last", "all"):
+            raise ValueError("hidden residual conditioning supports last/all blocks")
+        if mode == "velocity" and (block != "output" or not output_dim or int(output_dim) < 1):
+            raise ValueError("velocity conditioning requires block=output and a positive output_dim")
+        self.mode, self.block = mode, block
         self.query = nn.Sequential(nn.LayerNorm(hidden_dim, elementwise_affine=False),
                                    nn.Linear(hidden_dim, width))
         self.memory = nn.Linear(memory_dim, width)
@@ -16,7 +26,9 @@ class TokenSpecificConditioning(nn.Module):
                                      nn.Linear(width, width), nn.SiLU(),
                                      nn.LayerNorm(width, elementwise_affine=False))
         # One zero output gate; attention/MLP must remain normally initialized.
-        self.output = nn.Linear(width, 4 * hidden_dim)
+        output_width = (4 * hidden_dim if mode == "film" else
+                        int(output_dim) if mode == "velocity" else hidden_dim)
+        self.output = nn.Linear(width, output_width)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
         self.diagnostics = {}
@@ -35,6 +47,20 @@ class TokenSpecificConditioning(nn.Module):
         packed = self.output(self.encoder(torch.cat((q, readout), dim=-1)))
         valid = qvalid & present[:, None]
         packed = torch.where(valid[..., None], packed, 0.)
+        if self.mode in ("residual", "velocity"):
+            with torch.no_grad():
+                count = (valid.sum() * packed.shape[-1]).clamp_min(1)
+                residual_rms = (packed.detach().float().square().sum() / count).sqrt()
+                hidden = torch.where(valid[..., None], queries.detach().float(), 0.)
+                hidden_rms = (hidden.square().sum() / count).sqrt()
+                if self.mode == "residual":
+                    self.diagnostics = {
+                        "token_residual_rms": residual_rms,
+                        "token_residual_to_hidden_rms": residual_rms / hidden_rms.clamp_min(1e-8),
+                    }
+                else:
+                    self.diagnostics = {"velocity_residual_rms": residual_rms}
+            return packed
         with torch.no_grad():
             parts = packed.detach().float().reshape(*packed.shape[:2], 2, 2, -1)
             count = (valid.sum() * 2 * parts.shape[-1]).clamp_min(1)

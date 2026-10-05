@@ -1,0 +1,21 @@
+# Inference only. Frozen pzq0nl1i head + its raw step1110 generator/trunk.
+classifier_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_conditioning_1110/film-267e4db8e8
+classifier_run: pzq0nl1i
+events: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+expected_events: 119002
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_sampling_convergence
+workers: 16
+batch_size: 1024
+# Candidate hidden extraction is microbatched, not a change in population.
+feature_batch_size: 256
+prefixes: [1, 2, 4, 8, 16, 32, 64]
+# Reuse exact first eight draws from the completed ppoem0g9 analysis.
+extend_from: /pscratch/sd/y/yiren/Ztautau/conditional_tau_sampling_convergence/sampling-ee3acf9a12
+extend_run: ppoem0g9
+seed: 930481
+bootstrap: 500
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Does Cij converge with more draws? | frozen FiLM | K=8 to 64 | raw 1110
+  group: Conditional tau ratio sampling convergence

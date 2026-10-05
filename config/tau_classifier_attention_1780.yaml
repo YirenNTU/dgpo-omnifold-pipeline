@@ -1,0 +1,11 @@
+# No actor update; both heads see identical current-policy samples and splits.
+source_root: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_no_fourier
+source_runtime: /pscratch/sd/y/yiren/Ztautau/tau_classifier_current_dgpo_10pct/fresh-96fminsf/runtime.yaml
+checkpoint: /pscratch/sd/y/yiren/Ztautau/tau_classifier_current_dgpo_10pct/fresh-96fminsf/source.ckpt
+expected_policy_step: 1780
+output_root: /pscratch/sd/y/yiren/Ztautau/tau_classifier_attention_1780
+workers: 16
+batch_size: 1024
+classifier_depths: [3]
+classifier_attention_ablation: true
+wandb_name: "Can tau query visible particles? | FiLM vs cross-attention | frozen DGPO 1780"

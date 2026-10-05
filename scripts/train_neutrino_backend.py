@@ -97,6 +97,11 @@ def build_runtime_config(
     merged["compat"]["repo_root"] = str(REPO_ROOT)
     merged.setdefault("rl", {})
     merged["rl"]["enabled"] = backend == "dgpo-evenet"
+    training = merged.get("options", {}).get("Training", {})
+    resume_dir = training.get("resume_latest_checkpoint_dir")
+    if resume_dir:
+        training["model_checkpoint_load_path"] = str(latest_training_checkpoint(Path(resume_dir), expected_epoch=training.get("resume_expected_epoch")))
+        training["pretrain_model_load_path"] = None
     # Pure EveNet passes this filename to every Ray worker. Node-local /tmp
     # is not visible across NERSC nodes; use the shared experiment output.
     runtime_parent = None
@@ -111,6 +116,35 @@ def build_runtime_config(
     with runtime_path.open("w") as handle:
         yaml.safe_dump(merged, handle, sort_keys=False)
     return runtime_path
+
+
+def latest_training_checkpoint(directory: Path, expected_epoch: int | None = None) -> Path:
+    """Pin the newest readable training state; broken aliases are not checkpoints."""
+    import torch
+    records = []
+    for candidate in sorted(directory.expanduser().glob("*.ckpt")):
+        try:
+            path = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            print(f"Skipping broken checkpoint alias {candidate}: {exc}", flush=True)
+            continue
+        if any(record[2] == path for record in records):
+            continue
+        payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+        epoch, step = payload.get("epoch"), payload.get("global_step")
+        if type(epoch) is not int or type(step) is not int:
+            raise ValueError(f"Missing epoch/global_step: {path}")
+        if not payload.get("state_dict") or not payload.get("optimizer_states") or not payload.get("lr_schedulers"):
+            raise ValueError(f"Checkpoint cannot fully resume optimizer/scheduler: {path}")
+        records.append((epoch, step, path))
+        del payload
+    if not records:
+        raise FileNotFoundError(f"No recoverable training checkpoints in {directory}")
+    epoch, step, path = max(records)
+    if expected_epoch is not None and epoch != int(expected_epoch):
+        raise ValueError(f"Expected completed epoch {int(expected_epoch)+1}, but latest recoverable checkpoint is epoch index {epoch}: {path}")
+    print(f"Resume source: {path} (epoch={epoch}, global_step={step})", flush=True)
+    return path
 
 
 def command_for_backend(backend: str, runtime_config: Path) -> list[str]:

@@ -1,0 +1,123 @@
+# Full-state DGPO continuation, with a fresh W&B run on each launch.
+extends_overlay: dgpo_1110_step0_fixed_reward_lr5e5.yaml
+
+network:
+  VisibleConditioning:
+    diffusion_token_readout:
+      enabled: false
+
+platform:
+  number_of_workers: 16
+  resources_per_worker:
+    GPU: 1
+
+options:
+  Training:
+    pretrain_model_load_path: null
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_global_film_diffusion_one_iteration/checkpoints/last.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_global_film_diffusion_one_iteration/checkpoints
+
+reward_config:
+  omnifold:
+    bootstrap_in_dgpo: true
+    bundle_file: null
+
+dgpo:
+  checkpoint_load_mode: resume
+  auto_resume_from_last: false
+  step_zero_architecture_bootstrap: false
+  lr_schedule:
+    resume_use_config: false
+  adaptive_omnifold:
+    log_only: false
+    monitor_mode: raw_plateau_refit
+    baseline_probe_on_start: false
+    staleness_every_n_steps: null
+    staleness_every_n_epochs: 5
+    trigger:
+      raw_audit_enabled: true
+      warm_start_classifier: false
+      max_reward_age_epochs: 10
+      fixed_schedule_skip_staleness_audit: true
+      fixed_schedule_log_raw_audit: true
+    audit_fit:
+      training_population: omnifold_fold
+      training_fold: 1
+      disjoint_final_audit: true
+      min_steps: 850
+      steps: null
+      validation_patience_epochs: 25
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: true
+      refit_once_id: global-film-resume-refit10
+      refit_once_fail_closed: true
+      scheduled_refit_fail_closed: true
+      warm_start_iterations: []
+      warm_start_from_iteration_one: false
+      bootstrap_fail_closed: true
+      min_iterations: 1
+      max_iterations: 1
+      fixed_iteration_budget: true
+      iteration_one_only: false
+      fit:
+        min_steps: 850
+        min_steps_per_fold: 850
+        steps: null
+        max_steps_per_fold: null
+        validation_patience_epochs: 25
+
+logger:
+  local:
+    name: dgpo-global-film-diffusion-last
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_global_film_diffusion_one_iteration/logs
+  wandb:
+    id: null
+    resume: never
+    fresh_run: true
+    run_name: "Can refreshed reward improve samples? | global FiLM | refit every 10 epochs | cold audits"
+    group: DGPO after supervised diffusion
+    tags: [DGPO, GlobalFiLM, FullStateResume, PeriodicRefit, VelocityMSE, RawWeights, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_global_film_diffusion_one_iteration/ray_results
+  reproducibility:
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_global_film_diffusion_one_iteration/checkpoints/last.ckpt
+    note: >-
+      Continue the saved raw DGPO policy, AdamW, scheduler, policy counters,
+      installed two-fold one-iteration reward and paired reference from last.ckpt.
+      Refit fresh OmniFold once before resumed policy updates, then every10
+      policy epochs via the reward-age schedule. Recenter the paired reference
+      on accepted installs; retain policy AdamW and scheduler. New W&B run.
+      Checkpoint the one-shot marker so interruption recovery does not repeat it.
+      Cold audits retain at least850 updates, patience25 and best BCE selection.
+      Cold audits every5 policy epochs use
+      the same repeat1/fold1 training identities (about208k), fresh K1 samples,
+      and separate external early-stop/test halves. Validation every10 epochs.
+      Velocity-MSE reference coefficient1, policy LR5e-5 and conditioning LR1e-4,
+      cosine1500 policy epochs to10pct. No EMA or output velocity residual.
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend dgpo-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/dgpo_global_film_diffusion_last.yaml
+      -- --ray-dir /pscratch/sd/y/yiren/Ztautau/dgpo_global_film_diffusion_one_iteration/ray_results
+
+experiment:
+  protocol: dgpo-supervised-global-film-full-resume
+  source_run: 31bc2755
+  source_wandb_run: ytchou97-university-of-washington/nu2flow-RL/31bc2755
+  source_policy_step: null
+  upstream_raw_policy_step: null
+  retained_classifier_checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_global_film_diffusion_one_iteration/checkpoints/last.ckpt
+  residual_iterations_max: 1
+  cold_h4_audit_min_optimizer_updates: 850
+  startup_mode: full_dgpo_state_resume
+  intervention: resume_with_fresh_omnifold_then_refit_every10_epochs
+  single_question: Can periodic H4 refresh improve DGPO after supervised diffusion finetuning?
+  primary_decision_rule: >-
+    Track within-round held-out reward, ESS, reference velocity MSE and validation.
+    A separate fresh classifier is required to establish distribution improvement;
+    fixed-reward gains alone do not establish closure.

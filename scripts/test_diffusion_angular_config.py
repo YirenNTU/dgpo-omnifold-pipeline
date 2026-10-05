@@ -148,7 +148,8 @@ class AngularFineTuneConfigTest(unittest.TestCase):
         t = self.cfg['options']['Training']
         self.assertEqual(p['number_of_workers'], 16)
         self.assertEqual(p['batch_size'], 2048)
-        self.assertIn('diffusion_train_10pct_seed42/train', p['data_parquet_dir'])
+        self.assertIn('omnifold_attention_10pct_stic_filtered_test1/train', p['data_parquet_dir'])
+        self.assertTrue(p['require_filtered_data'])
         self.assertIn('stic_filtered', p['data_parquet_val_dir'])
         self.assertEqual(self.cfg['options']['Dataset']['dataset_limit'], 1)
         self.assertFalse(t['scale_lr_with_world_size'])

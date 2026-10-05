@@ -1,0 +1,26 @@
+# Pure CPU arithmetic on the completed 16-GPU K64 panel. No new inference/job.
+source_config: config/conditional_tau_weight_factor_swap.yaml
+output_root: /pscratch/sd/y/yiren/Ztautau/conditional_tau_moment_balance
+split_seed: 100167
+split_fractions: [0.4, 0.2, 0.4]  # calibration / selection / final evaluation
+minimum_split_events: 10000
+moment_strengths: [0.1, 1.0, 10.0]
+max_correction_factor: 2.0
+coefficient_limit: 5.0
+coefficient_ridge: 0.0001
+# Condition mass is a selection/test guardrail, NOT a second fitting objective.
+mass_strength: 0.0
+max_iterations: 300
+guardrails:
+  ess_retention: 0.9
+  mass_tv_increase: 0.005
+  diagonal_error_increase: 0.02
+  total_error_increase: 0.01
+bootstrap: 2000
+bootstrap_seed: 100168
+cpu_threads: 16
+logger:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: Can moment calibration repair cross terms? | frozen context256 | bound30 | held-out K64
+  group: Conditional tau ratio - moment calibration

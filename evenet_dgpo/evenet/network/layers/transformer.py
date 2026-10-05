@@ -332,7 +332,8 @@ class GeneratorTransformerBlockModule(nn.Module):
             nn.init.ones_(self.layer_scale1.gamma)
             nn.init.ones_(self.layer_scale2.gamma)
 
-    def forward(self, x, cond_token, mask=None, attn_mask=None, modulation=None, modulation_mask=None):
+    def forward(self, x, cond_token, mask=None, attn_mask=None, modulation=None, modulation_mask=None,
+                attention_bias=None):
         """
         :param x: point_cloud (batch_size, num_objects, projection_dim)
         :param cond_token: (batch_size, 1, projection_dim)
@@ -349,6 +350,25 @@ class GeneratorTransformerBlockModule(nn.Module):
             attn_mask = attn_mask.view(batch_size, 1, tgt_len, src_len)
             attn_mask = attn_mask.expand(batch_size, self.num_heads, tgt_len, src_len)
             attn_mask = attn_mask.reshape(batch_size * self.num_heads, tgt_len, src_len)
+
+        if attention_bias is not None:
+            batch_size, length, _ = x.shape
+            n_visible = attention_bias.shape[-1]
+            if (attention_bias.shape != (batch_size, self.num_heads, n_visible, n_visible)
+                    or n_visible > length):
+                raise ValueError("pair bias must be [batch, heads, visible, visible]")
+            # The original Boolean mask still blocks forbidden attention edges.
+            bias = torch.nn.functional.pad(attention_bias.to(x1),
+                                            (0, length - n_visible, 0, length - n_visible))
+            bias = bias.reshape(batch_size * self.num_heads, length, length)
+            if attn_mask is not None:
+                bias = (bias.masked_fill(attn_mask, -torch.inf) if attn_mask.dtype == torch.bool
+                        else bias + attn_mask.to(bias))
+            attn_mask = bias
+            # Match MHA mask dtypes and retain the padding-key exclusion.
+            if padding_mask is not None:
+                padding_mask = torch.zeros_like(padding_mask, dtype=x1.dtype).masked_fill(
+                    padding_mask, -torch.inf)
 
         updates, _ = self.attn(
             x1,

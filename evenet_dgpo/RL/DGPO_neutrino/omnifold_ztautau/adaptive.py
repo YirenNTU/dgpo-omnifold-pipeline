@@ -1246,7 +1246,12 @@ def resolve_adaptive_config(
     if audit_population not in ("probe_split", "omnifold_fold"):
         raise ValueError("audit_fit.training_population must be probe_split or omnifold_fold")
     if audit_population == "omnifold_fold":
-        if ((not config.fixed_schedule_log_raw_audit and not classifier_only)
+        cold_log_only_audit = (
+            config.monitor_mode == "raw_only" and config.log_only
+            and config.raw_audit_enabled
+        )
+        if ((not config.fixed_schedule_log_raw_audit and not classifier_only
+             and not cold_log_only_audit)
                 or config.raw_monitor_warm_start or not config.fixed_audit_panel
                 or config.single_pool_train_validation
                 or config.crossfit_partition != "identity" or config.pool_events is not None
@@ -1254,7 +1259,7 @@ def resolve_adaptive_config(
                 or not config.audit_fit.get("disjoint_final_audit", False)
                 or config.audit_fit.get("training_readiness") is not None):
             raise ValueError(
-                "omnifold_fold audit requires cold fixed-schedule or classifier-only diagnostics, cached full "
+                "omnifold_fold audit requires cold fixed-schedule, log-only raw-only, or classifier-only diagnostics, cached full "
                 "identity-crossfit training data, separate validation and disjoint final audit"
             )
         audit_fold = config.audit_fit.get("training_fold", 1)

@@ -1,0 +1,8 @@
+# Snapshot the latest trained actor/reward once, into a separate experiment.
+source_runtime: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/runtime.yaml
+checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/checkpoints/last.ckpt
+output_root: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_diffusion_attention_last
+add_diffusion_attention: true
+validation_every_epochs: 5
+validation_relative_to_install: true
+wandb_name: "Can diffusion absorb nn reward? | residual cross-attention | latest DGPO"

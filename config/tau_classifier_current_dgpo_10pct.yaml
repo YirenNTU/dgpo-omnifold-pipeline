@@ -1,0 +1,7 @@
+# Isolated classifier experiment. User launches in an existing 16-GPU allocation.
+source_root: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_no_fourier
+output_root: /pscratch/sd/y/yiren/Ztautau/tau_classifier_current_dgpo_10pct
+workers: 16
+batch_size: 1024
+classifier_depths: [3, 6]
+wandb_name: "Does deeper conditioning improve Cij? | FiLM 3 vs 6 | current DGPO | paired samples"

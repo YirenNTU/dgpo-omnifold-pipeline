@@ -63,7 +63,9 @@ class JointCoverageValidation(Callback):
                     last_epoch=self.last_epoch, config=self.cfg)
 
     def load_state_dict(self, state):
-        if state['config'] != self.cfg:
+        # Extending the endpoint changes evaluation timing, not panel/sampling.
+        protocol = lambda cfg: {k: v for k, v in cfg.items() if k != 'final_completed_epoch'}
+        if protocol(state['config']) != protocol(self.cfg):
             raise ValueError('Cannot resume paired coverage with a changed panel/protocol')
         self.baseline = state['baseline']
         self.baseline_metrics = state['baseline_metrics']
@@ -76,7 +78,8 @@ class JointCoverageValidation(Callback):
 
     def on_validation_epoch_end(self, trainer, pl_module):
         epoch = int(trainer.current_epoch)
-        if not trainer.sanity_checking and due(epoch, int(self.cfg['every_n_epochs'])) and epoch != self.last_epoch:
+        scheduled = due(epoch, int(self.cfg['every_n_epochs'])) or epoch + 1 == self.cfg.get('final_completed_epoch')
+        if not trainer.sanity_checking and scheduled and epoch != self.last_epoch:
             self.evaluate(trainer, pl_module, epoch + 1)
             self.last_epoch = epoch
 

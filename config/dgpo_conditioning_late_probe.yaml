@@ -1,0 +1,61 @@
+# Read over the EXACT completed transfer runtime, not today's production defaults.
+# scripts/diagnose_dgpo_conditioning.py pins the source once and builds A/B/C.
+dgpo:
+  auto_resume_from_last: false
+  checkpoint_load_mode: resume
+  step_zero_architecture_bootstrap: false
+  lr_schedule:
+    resume_use_config: false
+  validation_initial_enabled: false
+  checkpoint_every_n_steps: 0
+  checkpoint_every_n_epochs: 0
+  adaptive_omnifold:
+    baseline_probe_on_start: false
+    recalibration:
+      bootstrap_on_start: false
+      refit_once_on_resume: false
+      refit_once_fail_closed: false
+  checkpoint_transfer:
+    enabled: true
+    conditioning_ablation: true
+    relative_steps: [0, 1, 5, 20, 35, 50]
+    events_per_rank: 2048
+    evaluation_batch_size: 128
+    noise_seed: 20260928
+    update_seed: 20260930
+    bootstrap_replicates: 2000
+    bootstrap_seed: 20260929
+    reconstruction_tolerance: 0.001
+  gradient_transfer_trace:
+    enabled: true
+    update_end_steps: [1, 5, 20, 35, 50]
+    counterfactual_trust_coefficients: [1.0]
+
+logger:
+  wandb:
+    fresh_run: false
+    resume: never
+    group: Late reward conditioning screen
+    tags: [DGPO, ConditioningProbe, FixedReward, VelocityMSE1, PairedInputs, RawWeights, SixteenGPU]
+
+experiment:
+  protocol: late-reward-conditioning-50
+  source_run: 6704e92e
+  classifier_only: false
+  single_question: Does explicit noisy relational conditioning improve late fixed-reward gain and retention?
+  primary_endpoint: heldout_paired_C_minus_B_reward_gain_at_update50
+  primary_decision_rule: >-
+    C-minus-B paired mean gain must exceed 0.01 with a simultaneous 95 percent
+    lower bound above zero. Require positive C-minus-baseline gain as well.
+    B-minus-A measures the individual-angle residual package (capacity,
+    nonlinear readout and angle basis), not capacity alone.
+    Report +5-to+50 reward changes for retention, but do not select a best step.
+    Failure is unresolved for untested conditioning designs or longer budgets.
+    This is a fixed-reward screen, not fresh-classifier or physics closure.
+  policy_update_budget: 50
+  stop_rule: Exactly 50 additional native policy updates per arm, no refit or audit.
+  endpoint_selection: predeclared_relative_step50
+  cold_h4_audit_policy_steps: []
+  cold_h4_audit_min_optimizer_updates: null
+  startup_mode: late_full_state_resume_with_zero_output_branch
+  residual_iterations_max: null

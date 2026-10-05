@@ -1,0 +1,45 @@
+# Relative-input experiment vs completed BCE reference 5ugyt4h0.
+# User-requested batch 1024/GPU vs reference 256/GPU: not input-only causal control.
+# Reuse its exact frozen features and saved K=1 samples. No new backbone fit.
+# Primary: held-out conditional tau moments; corroborate with Cij and weight
+# support. AUC/ESS/MMD alone cannot certify conditional distribution closure.
+reference:
+  dgpo_10pct_config: config/dgpo_omnifold_ztautau_10pct_old_method_hard_ablation.yaml
+platform:
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+experiment:
+  representation: tau
+  test_source: /pscratch/sd/y/yiren/Ztautau/h4_film_step1110_cij/rescore-ca89b70725
+  train_sample_root: /pscratch/sd/y/yiren/Ztautau/h4_step1110_tau_train_20260930/sample-36e9d6c2a3
+  output: /pscratch/sd/y/yiren/Ztautau/conditional_tau_relative_input_1110
+  baseline_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_backbone_alignment_1110/bce
+  baseline_run: 5ugyt4h0
+  allow_baseline_batch_size_mismatch: true
+sampling:
+  workers: 16
+  batch_size: 1024
+  seed: 42929
+classifier:
+  backbone_cache: /pscratch/sd/y/yiren/Ztautau/conditional_tau_backbone_alignment_1110/features
+  relative_angle_input: true
+  mmd_coefficient: 0.0
+  condition_normalization: masked_feature
+  workers: 16
+  batch_size: 1024
+  epochs: 250
+  patience: 251
+  min_delta: 0.0
+  min_steps: 1000
+  lr: 0.0002
+  min_lr: 0.00001
+  weight_decay: 0.001
+  dropout: 0.05
+  hidden: 128
+  bootstrap: 500
+  seed: 42
+logger:
+  wandb:
+    group: Conditional tau alignment - frozen raw 1110
+    sampling_run_name: Shared tau samples | 10 percent train | raw step 1110
+    classifier_run_name: Do relative angles improve tau ratios? | frozen 1110 trunk | BCE

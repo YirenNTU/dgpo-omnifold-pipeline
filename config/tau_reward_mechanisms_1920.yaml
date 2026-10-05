@@ -1,0 +1,28 @@
+# User launches these stages inside an existing sixteen-GPU Shifter/Ray allocation.
+# This file selects one immutable series. No job submission or remote allocation.
+checkpoint: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/checkpoints/dgpo-epoch=191-next_ep=192-step=1920.ckpt
+source_runtime: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780/runtime.yaml
+series_root: /pscratch/sd/y/yiren/Ztautau/tau_reward_mechanisms_1920
+source_step: 1920
+workers: 16
+trajectory_updates: [50, 200, 500]
+relative_steps: [0, 1, 5, 10, 20, 35, 50, 100, 150, 200, 300, 400, 500]
+audit_relative_steps: [0, 50, 200, 500]
+gradient_events_per_rank: 512
+condition_groups: 3
+condition_edges: [-1.0, -0.5, 0.5, 1.0]
+noise_edges: [0.0, 0.23333333333333334, 0.4666666666666667, 0.7]
+gradient_repeats: 2
+diagnostic_evaluation_events: 32768
+ensemble_members: 4
+ensemble_fit_seeds: [202610051, 202610052, 202610053, 202610054]
+ensemble_judge_seed: 202610055
+ensemble_aggregation: mean_bounded_log_ratio
+# Populate this with the printed ensemble directory, or pass --ensemble-directory.
+# Every ensemble invocation writes its own artifacts under its fresh output folder.
+ensemble_directory: null
+bootstrap_replicates: 300
+bootstrap_seed: 20261004
+reconstruction_tolerance: 0.0001
+direction_rms_fractions: [1.0]
+wandb_group: Tau reward mechanisms

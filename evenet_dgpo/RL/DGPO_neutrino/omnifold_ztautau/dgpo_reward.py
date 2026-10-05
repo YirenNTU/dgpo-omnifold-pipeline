@@ -1197,6 +1197,19 @@ def validate_omnifold_reward_startup(
             )
         return
 
+    tau_metadata = [source["metadata"] for source in current_metadata.get("sources", [])
+                    if isinstance(source, Mapping) and isinstance(source.get("metadata"), Mapping)
+                    and source["metadata"].get("kind") == "conditional_tau_bound30"]
+    if tau_metadata:
+        if len(tau_metadata) != 1 or len(current_metadata["sources"]) != 1:
+            raise ValueError("Conditional tau requires exactly one unmixed ratio reward")
+        expected = tau_metadata[0]["source_checkpoint"]
+        if policy_checkpoint is None or Path(policy_checkpoint).resolve() != Path(expected).resolve():
+            raise ValueError("Conditional tau denominator must match the raw1110 cold-start policy")
+        if int(tau_metadata[0]["reward_round_id"]) != 0:
+            raise ValueError("Later tau rounds require full-state resume")
+        return
+
     omnifold_metadata = [
         source["metadata"]
         for source in current_metadata.get("sources", [])

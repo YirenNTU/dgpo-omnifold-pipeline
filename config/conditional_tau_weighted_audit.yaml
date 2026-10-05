@@ -1,0 +1,23 @@
+# No policy update, new samples, ratio refit, clipping or production correction.
+source_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_relative_input_1110
+source_run: 443eg16h
+output: /pscratch/sd/y/yiren/Ztautau/conditional_tau_relative_weighted_audit
+workers: 16
+batch_size: 1024
+epochs: 400
+min_steps: 1000
+patience: 50
+min_delta: 0.0001
+lr: 0.0002
+min_lr: 0.00001
+weight_decay: 0.001
+hidden: 128
+dropout: 0.05
+seed: 42
+bootstrap: 200
+arms: [unweighted_joint, weighted_joint, weighted_condition]
+wandb:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  group: Conditional tau ratio validation
+  name: Does reweighting remove the residual? | frozen tau inputs | fresh audit

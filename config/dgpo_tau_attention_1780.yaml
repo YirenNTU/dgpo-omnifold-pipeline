@@ -1,0 +1,8 @@
+source_runtime: /pscratch/sd/y/yiren/Ztautau/tau_classifier_current_dgpo_10pct/fresh-96fminsf/runtime.yaml
+checkpoint: /pscratch/sd/y/yiren/Ztautau/tau_classifier_current_dgpo_10pct/fresh-96fminsf/source.ckpt
+output_root: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_attention_1780
+require_existing_resume: true
+require_original_diffusion: true
+validation_every_epochs: 5
+validation_relative_to_install: true
+wandb_name: "Does attention reward improve spin? | DGPO 1780 | fresh refit every 5 epochs"

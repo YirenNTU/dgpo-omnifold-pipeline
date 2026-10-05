@@ -1,0 +1,34 @@
+# Matched label0 control; ablate ONLY added policy Fourier input channels.
+# Zero channels retain dimensions, FiLM/MLP capacity and optimizer groups.
+extends_overlay: dgpo_tau_ratio_1110.yaml
+
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        fourier_enabled: false
+  VisibleConditioning:
+    diffusion_fourier_enabled: false
+
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_no_fourier/checkpoints
+
+dgpo:
+  tau_ratio:
+    reward_cij_probe: true
+    output_root: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_no_fourier
+
+logger:
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_no_fourier/logs
+  wandb:
+    run_name: "Does Fourier help reward transfer? | diffusion Fourier off | FiLM retained | matched label0"
+    tags: [DGPO, ConditionalTau, Context256, FiLM3, NoPolicyFourier, Bound30, Raw1110, BestVal, Refit10, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_no_fourier/ray_results
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_dgpo_tau_ratio.py config/dgpo_tau_ratio_1110_no_fourier.yaml

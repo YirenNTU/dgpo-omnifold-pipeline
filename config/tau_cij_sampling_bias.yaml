@@ -1,0 +1,16 @@
+# Frozen-model comparison, not training; user launches on an existing 16-GPU Ray allocation.
+dgpo_root: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0_no_fourier
+pretrain_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/last.ckpt
+pretrain_runtime: /pscratch/sd/y/yiren/Ztautau/h4_spike_coverage_pretrain10pct_raw/runtime.yaml
+events: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+output: /pscratch/sd/y/yiren/Ztautau/tau_cij_sampling_bias
+workers: 16
+batch_size: 1024
+ddim_steps: 20
+seed: 421001
+repeats: 100
+wandb:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: "Does DGPO track spin changes? | 10% pretrain vs latest DGPO | sampling bias"
+  group: Tau Cij sampling bias

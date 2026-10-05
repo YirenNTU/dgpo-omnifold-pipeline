@@ -1,0 +1,45 @@
+# Matched against the fresh filtered-data relcontext02: disable only multiplicative FiLM.
+extends_overlay: train_diffusion_relation_context.yaml
+network:
+  VisibleConditioning:
+    diffusion_film_scale_enabled: false
+options:
+  Training:
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_context_shift_only_02/checkpoints
+    model_checkpoint_save_last: true
+logger:
+  local:
+    name: diffusion-context-shift-only
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_context_shift_only_02/logs
+  wandb:
+    id: ctxshift02
+    run_name: "Does shift alone improve physics? | context conditioning | filtered 50 epochs"
+    group: Conditioning physics followup
+    tags: [DiffusionOnly, NoRL, GPU16, PairedNoise, ShiftOnly, ContextControl, FilteredData]
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_context_shift_only_02/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_context_shift_only.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_context_shift_only_02/ray_results
+experiment:
+  question: Does shift-only context conditioning improve generated physics after adaptation?
+  matched_control_wandb_run: relcontext02
+  matched_configuration: config/train_diffusion_relation_context_filtered.yaml
+  checkpoint_protocol: identical_pinned_raw_epoch286_weights_fresh_optimizer_scheduler
+  intervention: zero_total_film_gamma_in_all_three_blocks_keep_beta_and_residual_layerscale
+  primary_endpoint: epoch50_joint_radius_w1_shift_only_minus_relcontext02
+  interpretation: >-
+    Same source weights and zero-initialized context adapter as relcontext02,
+    not a continuation from its trained endpoint. Gamma is disabled from the
+    first forward pass, including both existing FiLM and context-adapter gamma.
+    Beta and the full backbone train; residual LayerScale is unchanged.
+    Gamma rows remain in state_dict for exact checkpoint compatibility but are
+    inactive, so this is intentionally not active-parameter matched.
+    Same50 epochs,16 GPUs, data, learning rates, paired diffusion noise and DDIM20
+    evaluation. Compare absolute endpoint metrics, not changes from different
+    initial functions. Reused panel is exploratory; MSE alone is not physics closure.

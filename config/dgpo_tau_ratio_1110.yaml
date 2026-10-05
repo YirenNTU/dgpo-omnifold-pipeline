@@ -1,0 +1,65 @@
+# Native DGPO; reuse the selected zrv2yfgt head, no extra classifier adapter.
+# User launch only. Shared source/output paths are resolved by train_dgpo_tau_ratio.py.
+extends_overlay: dgpo_1110_step0_fixed_reward_lr5e5.yaml
+
+platform:
+  number_of_workers: 16
+  batch_size: 512
+
+options:
+  Training:
+    total_epochs: 1500
+    epochs: 1500
+    model_checkpoint_load_path: /pscratch/sd/y/yiren/Ztautau/dgpo_omnifold_10pct_old_method_hard_nc4shnpg_t075_trust1_nohardtrust_seed42/checkpoints/dgpo-epoch=110-next_ep=111-step=1110.ckpt
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0/checkpoints
+
+dgpo:
+  checkpoint_load_mode: weights_only
+  auto_resume_from_last: true
+  # Matches the saved sample/feature generation arithmetic; still float32.
+  float32_matmul_precision: highest
+  lr_schedule:
+    resume_use_config: false
+  # The launcher REPLACES the inherited H4 adaptive block, rather than merging it.
+  adaptive_omnifold:
+    enabled: false
+  tau_ratio:
+    policy_conditioning_contract: saved_tau_denominator_label0_v1
+    baseline_directory: /pscratch/sd/y/yiren/Ztautau/conditional_tau_condition_width_1110/condition256-40e1f8b288
+    output_root: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0
+    workers: 16
+    generation_batch_size: 1024
+    refit_every_epochs: 10
+    validation_every_epochs: 10
+    validation_candidates: 8
+    validation_seed: 20261001
+    audit_seed: 71
+    refit_seed: 42
+    fit:
+      batch_size: 1024
+      lr: 0.0002
+      min_lr: 0.00001
+      weight_decay: 0.001
+      epochs: 250
+      patience: 25
+      min_delta: 0.0001
+      min_steps: 1000
+
+logger:
+  local:
+    name: dgpo-conditional-tau
+    save_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0/logs
+  wandb:
+    id: null
+    resume: never
+    fresh_run: true
+    run_name: "Can DGPO absorb tau alignment? | context256 FiLM | bound30 | matched label0"
+    group: Conditional tau ratio - DGPO transfer
+    tags: [DGPO, ConditionalTau, Context256, FiLM3, Bound30, Raw1110, BestVal, Refit10, SixteenGPU]
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/dgpo_tau_context256_1110_label0/ray_results
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_dgpo_tau_ratio.py config/dgpo_tau_ratio_1110.yaml

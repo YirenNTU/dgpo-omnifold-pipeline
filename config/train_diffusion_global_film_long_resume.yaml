@@ -1,0 +1,37 @@
+# Full training-state resume with a separate W&B history.
+extends_overlay: train_diffusion_global_film_long.yaml
+
+options:
+  Training:
+    pretrain_model_load_path: null
+    model_checkpoint_load_path: null
+    resume_latest_checkpoint_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_global_film_long/checkpoints
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_global_film_long_resume/checkpoints
+    model_checkpoint_save_last: true
+
+logger:
+  local:
+    name: diffusion-global-film-long-resume
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_global_film_long_resume/logs
+  wandb:
+    id: diffgloblongr1
+    run_name: "Continue global FiLM diffusion | full-state resume | raw weights"
+
+nersc:
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_global_film_long_resume/ray_results
+  execution:
+    command: >-
+      shifter --image=registry.nersc.gov/m2616/avencast/evenet:1.3
+      python3 -u scripts/train_neutrino_backend.py --backend pure-evenet
+      --base-config config/train_diffusion_nersc.yaml
+      --overlay-config config/train_diffusion_global_film_long_resume.yaml
+      -- --ray_dir /pscratch/sd/y/yiren/Ztautau/diffusion_global_film_long_resume/ray_results
+
+experiment:
+  checkpoint_protocol: full_state_resume_from_global_film_last
+  source_wandb_run: ytchou97-university-of-washington/EveNet/diffgloblong1
+  interpretation: >-
+    Continue global FiLM from the newest recoverable checkpoint with optimizer, scheduler, epoch and
+    early-stopping history restored. Log into a new W&B run. Retain the existing
+    source checkpoints untouched; write real last checkpoint files in a separate resume directory.
