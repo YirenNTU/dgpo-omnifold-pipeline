@@ -11,6 +11,21 @@ import torch
 from torch import nn
 
 
+FILM_GAIN_KEYS = ('attention_gamma', 'attention_beta', 'ffn_gamma', 'ffn_beta')
+
+
+def diffusion_film_gains(options):
+    """Runtime controls, with no checkpoint tensors or changes to defaults."""
+    if options is None:
+        options = {}
+    if not isinstance(options, dict) or set(options)-set(FILM_GAIN_KEYS):
+        raise ValueError('diffusion_film_gains requires attention_gamma/beta and ffn_gamma/beta')
+    gains = {key: options.get(key, 1.) for key in FILM_GAIN_KEYS}
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in gains.values()):
+        raise ValueError('FiLM gains must be finite nonnegative numbers, not booleans')
+    return {key: float(value) for key, value in gains.items()}
+
+
 def visible_conditioning_spec(network_cfg, *, target, feature_names, token_dim,
                               hidden_dim, num_layers, n_branches, output_dim=None,
                               attention_heads=None):
@@ -47,6 +62,9 @@ def visible_conditioning_spec(network_cfg, *, target, feature_names, token_dim,
     if target == "diffusion" and relation_cfg.get("enabled", False):
         spec["relation_adapter"] = relation_cfg
     if target == "diffusion":
+        gains = diffusion_film_gains(cfg.get('diffusion_film_gains'))
+        if any(value != 1. for value in gains.values()):
+            spec['film_gains'] = gains
         fourier_enabled = cfg.get("diffusion_fourier_enabled", True)
         if type(fourier_enabled) is not bool:
             raise ValueError("diffusion_fourier_enabled must be boolean")
@@ -57,6 +75,11 @@ def visible_conditioning_spec(network_cfg, *, target, feature_names, token_dim,
             raise ValueError("diffusion_film_scale_enabled must be boolean")
         if not scale_enabled:
             spec["film_scale_enabled"] = False
+        ffn_enabled = cfg.get("diffusion_ffn_film_enabled", True)
+        if type(ffn_enabled) is not bool:
+            raise ValueError("diffusion_ffn_film_enabled must be boolean")
+        if not ffn_enabled:
+            spec["ffn_film_enabled"] = False
         pair_cfg = dict(cfg.get("diffusion_pair_attention", {}) or {})
         if pair_cfg.get("enabled", False):
             if attention_heads is None:
@@ -72,10 +95,16 @@ class VisibleConditioning(nn.Module):
                  log_diagnostics=True, feature_mode="angles", numerical_features=(),
                  numerical_frequencies=(.25, .5, 1., 2.), token_readout=None, reward_probe=None,
                  relation_adapter=None, film_scale_enabled=True, pair_attention=None,
-                 fourier_enabled=True):
+                 fourier_enabled=True, ffn_film_enabled=True, film_gains=None):
         super().__init__()
         if type(fourier_enabled) is not bool:
             raise ValueError("fourier_enabled must be boolean")
+        if type(ffn_film_enabled) is not bool or (not ffn_film_enabled and n_branches != 2):
+            raise ValueError("FFN FiLM switch requires a boolean and two diffusion branches")
+        self.ffn_film_enabled = ffn_film_enabled
+        self.film_gains = diffusion_film_gains(film_gains)
+        if n_branches != 2 and any(v != 1. for v in self.film_gains.values()):
+            raise ValueError('Runtime FiLM gains apply only to two-branch diffusion')
         self.fourier_enabled = fourier_enabled
         if min(token_dim, hidden_dim, num_layers, n_branches) < 1 or width < 2:
             raise ValueError("visible conditioning dimensions must be positive (width >= 2)")
@@ -90,6 +119,10 @@ class VisibleConditioning(nn.Module):
                          num_layers=int(num_layers), n_branches=int(n_branches), width=int(width),
                          harmonics=list(harmonics), theta_source=theta_source, phi_source=phi_source,
                          log_diagnostics=bool(log_diagnostics))
+        if any(value != 1. for value in self.film_gains.values()):
+            self.spec['film_gains'] = dict(self.film_gains)
+        if not ffn_film_enabled:
+            self.spec["ffn_film_enabled"] = False
         if type(film_scale_enabled) is not bool:
             raise ValueError("film_scale_enabled must be boolean")
         if not fourier_enabled:
@@ -270,11 +303,26 @@ class VisibleConditioning(nn.Module):
 
     def apply_scale_policy(self, modulation):
         """Disable only FiLM gamma; keep beta, LayerNorm and residual LayerScale."""
+        if not self.ffn_film_enabled:
+            # Keep the trained tensor layout and attention branch. Multiplication
+            # gives inactive FFN rows zero gradient while retaining the graph.
+            modulation = tuple(v if i < 2 else v * 0. for i, v in enumerate(modulation))
         if self.film_scale_enabled:
             return modulation
         # Keep checkpoint tensor shapes intact; gamma rows are inactive in this arm.
         return tuple(torch.zeros_like(value) if i % 2 == 0 else value
                      for i, value in enumerate(modulation))
+
+    def apply_runtime_gains(self, modulation):
+        """Call ONCE after global/local FiLM additions in the generation head.
+
+        Scaling the coefficients retains the identity in (1+gamma)*LN(x)+beta.
+        Legacy binary policies are applied separately and retain precedence.
+        """
+        if len(modulation) != 4:
+            raise ValueError('Diffusion FiLM requires attention gamma/beta, FFN gamma/beta')
+        return tuple(part if self.film_gains[key] == 1. else part*self.film_gains[key]
+                     for part, key in zip(modulation, FILM_GAIN_KEYS))
 
     def _numerical_fourier(self, values):
         phase = (values[..., None] * self.numerical_frequencies.to(values)).flatten(-2)

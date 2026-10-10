@@ -196,6 +196,9 @@ class EventGenerationHead(nn.Module):
             if modulation is not None:
                 # Also handles future combinations with token-specific FiLM.
                 modulation = self.visible_conditioning.apply_scale_policy(modulation)
+                # Apply numeric gains once; applying them in the encoder too
+                # would square nonbinary values.
+                modulation = self.visible_conditioning.apply_runtime_gains(modulation)
             pair_kwargs = (dict(attention_bias=pair_biases[index])
                            if pair_biases is not None and index < len(pair_biases) else {})
             out_x, cond_token = transformer_block(

@@ -1,0 +1,864 @@
+# Exact original pretrain epoch287 architecture; no MET/two-leg adapter migration.
+# Keep diffusion_enabled: true so every learned FiLM weight is loaded.
+# Edit network.VisibleConditioning.diffusion_film_gains below.
+nersc:
+  submit: false
+  system: perlmutter
+  account: m5019_g
+  qos: regular
+  constraint: gpu
+  time: '10:00:00'
+  nodes: 1
+  gpus_per_node: 4
+  ntasks_per_node: 1
+  cpus_per_task: 128
+  image: registry.nersc.gov/m2616/avencast/evenet:1.3
+  repo_root: /global/homes/y/yiren/ml_pipeline
+  ray:
+    start_script: /global/homes/y/yiren/ml_pipeline/NERSC/start_interactive_ray.sh
+    temp_dir: /tmp/r${UID}_${SLURM_JOB_ID}
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/film-on-run-02/ray_results
+    experimental_noset_cuda_visible_devices: null
+  execution:
+    mode: ray_train_ddp
+    workers: 4
+    gpus_per_worker: 1
+    command: shifter python3 -u scripts/check_tau_epoch287_film_control.py config/eval_diffusion_epoch287_film_control.yaml
+  reproducibility:
+    dataset_shuffle_seed: 42
+    note: Training identities are materialized once with a NumPy seed-42 row-level
+      sample. Ray may reshuffle their order without changing subset membership.
+    subset_config:
+      train: config/subset_ztautau_diffusion_10pct.yaml
+      validation: config/subset_ztautau_validation_20pct.yaml
+platform:
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+  number_of_workers: 4
+  resources_per_worker:
+    CPU: 20
+    GPU: 1
+  batch_size: 2048
+  prefetch_batches: 1
+  use_gpu: true
+  require_filtered_data: true
+  ordered_data: true
+logger:
+  wandb:
+    project: nu2flow-RL
+    run_name: Original epoch287 | FiLM config control | evaluation only
+    tags:
+    - DiffusionOnly
+    - NoRL
+    - Foundation
+    - GlobalFiLM
+    - NoFourier
+    - Depth1
+    - FilteredData
+    - Data10pct
+    - GPU16
+    - RawWeights
+    entity: ytchou97-university-of-washington
+    simplified: false
+    id: null
+    group: Diffusion foundation FiLM
+    mode: disabled
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/film-on-run-02/logs
+    name: diffusion-film-10pct-foundation
+    version: v1
+options:
+  Training:
+    total_epochs: 1500
+    epochs: 1500
+    model_checkpoint_save_top_k: 5
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/film-on-run-02/checkpoints
+    model_checkpoint_load_path: null
+    pretrain_model_load_path: null
+    learning_rate: 0.0002
+    learning_rate_factor: 1.0
+    learning_rate_warm_up_factor: 1.0
+    weight_decay: 0.001
+    decoupled_weight_decay: true
+    diffusion_every_n_epochs: 20
+    diffusion_every_n_steps: 1
+    eval_metrics_every_n_epochs: 1
+    apply_event_weight: false
+    log_gradient_step: 100
+    Components:
+      GlobalEmbedding:
+        learning_rate: 0.0002
+        optimizer_group: body
+        optimizer_type: adamW
+        warm_up: true
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+      PET:
+        learning_rate: 2.0e-05
+        optimizer_group: body
+        optimizer_type: adamW
+        warm_up: true
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+      ObjectEncoder:
+        learning_rate: 0.0002
+        optimizer_group: object_encoder
+        optimizer_type: adamW
+        warm_up: true
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+      Classification:
+        learning_rate: 0.0002
+        optimizer_group: classification
+        optimizer_type: adamW
+        warm_up: true
+        loss_scale: 1.0
+        include: false
+        include_cross_term: true
+        loss_scale_cross_term: 1.0
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+      Regression:
+        learning_rate: 5.0e-05
+        optimizer_group: regression
+        optimizer_type: lion
+        warm_up: true
+        loss_scale: 1.0
+        include: false
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+      Assignment:
+        learning_rate: 5.0e-05
+        optimizer_group: assignment
+        optimizer_type: lion
+        warm_up: true
+        assignment_loss_scale: 1.0
+        detection_loss_scale: 1.0
+        focal_gamma: 1.0
+        include: false
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+      Segmentation:
+        learning_rate: 5.0e-05
+        optimizer_group: segmentation
+        optimizer_type: lion
+        warm_up: true
+        include: false
+        mask_loss_scale: 1.0
+        dice_loss_scale: 1.0
+        cls_loss_scale: 1.0
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        use_full_mask: true
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+      GlobalGeneration:
+        learning_rate: 5.0e-05
+        optimizer_group: generation
+        optimizer_type: lion
+        warm_up: true
+        include: false
+        loss_scale: 1.0
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        diffusion_steps: 20
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+      ReconGeneration:
+        learning_rate: 5.0e-05
+        optimizer_group: generation
+        optimizer_type: lion
+        warm_up: true
+        include: false
+        loss_scale: 1.0
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        diffusion_steps: 100
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+        use_generation_result: false
+      TruthGeneration:
+        learning_rate: 0.0002
+        optimizer_group: generation
+        optimizer_type: adamW
+        warm_up: true
+        include: true
+        loss_scale: 1.0
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+        diffusion_steps: 50
+        freeze:
+          type: none
+          partial_freeze_components: []
+          random_freeze_fraction: 0.0
+        low_noise_cutoff: 0.0
+        low_noise_weight: 1.0
+      InvisibleInputProjector:
+        learning_rate: 0.0002
+        optimizer_group: projector
+        optimizer_type: adamW
+      GroupedSequentialEmbedding:
+        learning_rate: 0.0002
+        optimizer_group: projector
+        optimizer_type: adamW
+        warm_up: true
+        weight_decay: 0.01
+        decoupled_weight_decay: true
+      TruthGeneration.visible_conditioning:
+        optimizer_group: visible_conditioning
+        optimizer_type: adamW
+        learning_rate: 0.0002
+        warm_up: true
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+    ProgressiveTraining:
+      stages:
+      - name: neutrino_only
+        epoch_ratio: 1.0
+        transition_ratio: 0.0
+        loss_weights:
+          generation-truth:
+          - 1.0
+          - 1.0
+    EarlyStopping:
+      patience: 25
+      min_delta: 0.0
+      monitor: val/loss
+      mode: min
+      verbose: true
+    FAMO:
+      turn_on: false
+      detailed_loss: false
+      detailed_loss_list:
+      - classification
+      - classification-noised
+      - generation-global
+      - generation-event
+      - generation-invisible
+      - assignment
+      - detection
+      - regression
+      - segmentation
+      logits_bound: 1.0
+      lr: 0.025
+    EMA:
+      enable: false
+      decay: 0.999
+      start_epoch: 0
+      update_every_n_steps: 1
+      replace_model_after_load: false
+      replace_model_at_end: false
+      use_ema_during_training_eval: false
+      use_for_generation: false
+    freeze_modules: []
+    learning_rate_body: 2.0e-05
+    learning_rate_classification: 0.0002
+    learning_rate_median: 0.0002
+    precision: 32-true
+    seed: 42
+    paired_diffusion_seed: 20261006
+    model_checkpoint_save_last: true
+    scale_lr_with_world_size: true
+    JointCoverage:
+      enable: false
+    TauPhysics:
+      enable: true
+      events: 119002
+      every_n_epochs: 50
+      K: 8
+      batch_size: 512
+      ddim_steps: 20
+      seed: 20261006
+      bootstrap: 300
+      panel_path: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/film-on-run-02/validation_panel.npz
+      panel_metadata: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/film-on-run-02/validation_panel.json
+  Dataset:
+    dataset_limit: 1.0
+    normalization_file: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_spin_angles/within-event-reward-epoch287-refit10-val5-run-02/normalization.pt
+    balance_file: null
+    dataset_limit_apply_to_val_set: false
+    val_split:
+    - 0.8
+    - 1.0
+    val_dataset_limit: 1.0
+  Metrics:
+    Generation-Binning:
+      num_vectors:
+      - 21
+      - -1
+      - 20
+      point cloud-log_energy:
+      - 50
+      - -1
+      - 10
+      point cloud-log_pt:
+      - 50
+      - -1
+      - 10
+      point cloud-eta:
+      - 50
+      - -4
+      - 4
+      point cloud-phi:
+      - 50
+      - -4
+      - 4
+      point cloud-btag:
+      - 2
+      - 0
+      - 1
+      point cloud-isLepton:
+      - 2
+      - 0
+      - 1
+      point cloud-charge:
+      - 3
+      - -1
+      - 1
+      neutrino-log_mass:
+      - 10
+      - -1
+      - 1
+      neutrino-log_pt:
+      - 50
+      - 0
+      - 7
+      neutrino-eta:
+      - 121
+      - -0.15
+      - 0.15
+      neutrino-phi:
+      - 121
+      - -0.05
+      - 0.05
+      neutrino-btag:
+      - 2
+      - 0
+      - 1
+      neutrino-isLepton:
+      - 2
+      - 0
+      - 1
+      neutrino-charge:
+      - 3
+      - -1
+      - 1
+      neutrino-energy:
+      - 121
+      - 0
+      - 60
+      neutrino-pt:
+      - 121
+      - 0
+      - 60
+      neutrino-theta:
+      - 121
+      - -0.05
+      - 0.05
+    ObjectTag-Embedding:
+      enable: true
+      group_name: ObjectTag
+      label_feature: Part_pdgId
+      max_points: 10000
+      max_batches: 10
+      log_every_n_epochs: 20
+      alpha: 0.8
+      marker_size: 8.0
+      outlier_percentile_low: 0.5
+      outlier_percentile_high: 99.5
+      others_label: others
+      interested_labels:
+        '41': pi
+        '2': e
+        '6': mu
+        '21': gamma
+        '42': K
+        '47': pi0
+        '61': K_S0
+        '62': K_L0
+        '65': p
+        '66': n
+network:
+  Body:
+    GlobalEmbedding:
+      linear_block_type: GRU
+      transformer_dim_scale: 2.0
+      initial_embedding_dim: 16
+      hidden_dim: 256
+      normalization: LayerNorm
+      linear_activation: GELU
+      num_embedding_layers: 8
+      dropout: 0.1
+      skip_connection: true
+    PET:
+      num_feature_keep: 0
+      feature_drop: 0.0
+      hidden_dim: 256
+      enable_local_embedding: true
+      local_Krank: 3
+      local_point_index:
+      - 2
+      - 3
+      num_local_layer: 10
+      num_layers: 16
+      drop_probability: 0.1
+      talking_head: false
+      layer_scale: true
+      layer_scale_init: 1.0e-05
+      num_heads: 16
+      mode: all
+      dropout: 0.1
+      visible_angular_fourier:
+        enabled: false
+        theta_source: Part_eta
+        phi_source: Part_phi
+    ObjectEncoder:
+      hidden_dim: 256
+      position_embedding_dim: 32
+      num_attention_heads: 8
+      transformer_dim_scale: 2.0
+      num_embedding_layers: 2
+      num_encoder_layers: 2
+      dropout: 0.1
+      skip_connection: true
+      encoder_skip_connection: true
+    GroupedSequentialEmbedding:
+      hidden_dim_scale: 2.0
+      dropout: 0.0
+  Classification:
+    num_classification_layers: 1
+    hidden_dim: 256
+    dropout: 0.1
+    skip_connection: true
+    num_attention_heads: 8
+  Regression:
+    num_regression_layers: 1
+    hidden_dim: 256
+    dropout: 0.1
+    skip_connection: true
+  Assignment:
+    feature_drop: 0.1
+    num_feature_keep: 0
+    hidden_dim: 256
+    split_symmetric_attention: true
+    position_embedding_dim: 32
+    num_attention_heads: 4
+    transformer_dim_scale: 2.0
+    num_jet_embedding_layers: 0
+    num_jet_encoder_layers: 0
+    num_detection_layers: 1
+    dropout: 0.1
+    combinatorial_scale: 0.0
+    encode_event_token: false
+    activation: GELU
+    num_encoder_layers: 1
+    num_linear_layers: 1
+    skip_connection: true
+    encoder_skip_connection: true
+  Segmentation:
+    projection_dim: 256
+    num_heads: 8
+    dropout: 0.1
+    num_layers: 1
+    num_queries: 4
+    return_intermediate: true
+    mask_mlp_layers: 1
+    norm_before: false
+    encode_event_token: false
+  GlobalGeneration:
+    num_layers: 1
+    num_resnet_layers: 1
+    hidden_dim: 64
+    resnet_dim: 64
+    layer_scale_init: 1.0e-05
+    feature_drop_for_stochastic_depth: 0.0
+    activation: SILU
+    dropout: 0.0
+  ReconGeneration:
+    hidden_dim: 256
+    num_layers: 1
+    num_heads: 4
+    dropout: 0.1
+    layer_scale: true
+    layer_scale_init: 1.0e-05
+    drop_probability: 0.1
+    feature_drop: 0.1
+    extend_batch: true
+  TruthGeneration:
+    hidden_dim: 256
+    num_layers: 1
+    num_heads: 4
+    dropout: 0.1
+    layer_scale: true
+    layer_scale_init: 1.0e-05
+    drop_probability: 0.1
+    feature_drop: 0.0
+    extend_batch: true
+    neutrino_position_encode: true
+    max_position_length: 36
+  VisibleConditioning:
+    diffusion_enabled: true
+    classifier_enabled: false
+    diffusion_fourier_enabled: false
+    diffusion_film_scale_enabled: true
+    width: 64
+    harmonics:
+    - 1
+    - 2
+    - 3
+    - 4
+    theta_source: Part_eta
+    phi_source: Part_phi
+    feature_mode: kinematics
+    numerical_features:
+    - Part_energy
+    - Part_pt
+    numerical_frequencies:
+    - 0.25
+    - 0.5
+    - 1.0
+    - 2.0
+    log_diagnostics: true
+    diffusion_film_gains:
+      attention_gamma: 1.0
+      attention_beta: 1.0
+      ffn_gamma: 1.0
+      ffn_beta: 1.0
+event_info:
+  INPUTS:
+    SEQUENTIAL:
+      Source:
+        Part_energy: log_normalize
+        Part_pt: log_normalize
+        Part_eta: normalize
+        Part_phi: normalize_uniform
+        Part_pdgId: none
+        Part_hpcShowerEnergy: normalize
+        Part_hpcShowerTheta: normalize
+        Part_hpcShowerPhi: normalize
+        Part_hpcNumLayers: normalize
+        Part_hpcNumAssociatedShowers: normalize
+        Part_hpcTotalShowerEnergy: normalize
+        Part_hacShowerEnergy: normalize
+        Part_hacShowerTheta: normalize
+        Part_hacShowerPhi: normalize
+        Part_hacNumTowers: normalize
+        Part_hacNumAssociatedShowers: normalize
+        Part_hacTotalShowerEnergy: normalize
+        Part_sticShowerEnergy: normalize
+        Part_sticShowerTheta: normalize
+        Part_sticShowerPhi: normalize
+        Part_sticNumTowers: normalize
+        Part_sticChargedTag: none
+        Part_charge: none
+        Part_dR_to_lead_a: normalize
+        Part_dR_to_lead_b: normalize
+        Part_angle_to_lead_a: normalize
+        Part_angle_to_lead_b: normalize
+        Part_in_hemisphere_a: none
+        Part_in_hemisphere_b: none
+    GLOBAL:
+      Conditions:
+        thrust_Mag: normalize
+        missing_px: normalize
+        missing_py: normalize
+        missing_pz: normalize
+        lead_a_px: normalize
+        lead_a_py: normalize
+        lead_a_pz: normalize
+        lead_b_px: normalize
+        lead_b_py: normalize
+        lead_b_pz: normalize
+        isolation_angle: normalize
+        thrust_x: normalize
+        thrust_y: normalize
+        thrust_z: normalize
+  EVENT:
+    Ztautau_pipi:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_pirho:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_rhopi:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_pie:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_epi:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_pimu:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_mupi:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_rhoe:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_erho:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_murho:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_rhomu:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_rhorho:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_ee:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_mumu:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_emu:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_mue:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Ztautau_others:
+      tau-:
+      - vis-
+      tau+:
+      - vis+
+    Zll:
+      Z:
+      - l1
+      - l2
+    Zqq:
+      Z:
+      - q1
+      - q2
+  CLASSIFICATIONS:
+    EVENT:
+    - signal
+  CLASSLABEL:
+    EVENT:
+      signal:
+      - - Ztautau_pipi
+        - Ztautau_pirho
+        - Ztautau_rhopi
+        - Ztautau_pie
+        - Ztautau_epi
+        - Ztautau_pimu
+        - Ztautau_mupi
+        - Ztautau_rhoe
+        - Ztautau_erho
+        - Ztautau_murho
+        - Ztautau_rhomu
+        - Ztautau_rhorho
+        - Ztautau_ee
+        - Ztautau_mumu
+        - Ztautau_emu
+        - Ztautau_mue
+        - Ztautau_others
+        - Zll
+        - Zqq
+  GENERATIONS:
+    Conditions:
+    - thrust_Mag
+    - missing_px
+    - missing_py
+    - missing_pt
+    - isolation_angle
+    - thrust_x
+    - thrust_y
+    - thrust_z
+    GlobalTargets: []
+    Events:
+    - Part_energy
+    - Part_pt
+    - Part_eta
+    - Part_phi
+    Neutrinos:
+      theta: normalize
+      phi: normalize
+  GROUPED_INPUTS:
+    SEQUENTIAL:
+      Source:
+        projected_feature_names:
+        - Part_energy
+        - Part_pt
+        - Part_eta
+        - Part_phi
+        - ObjectTag_0
+        - ObjectTag_1
+        - Charge
+        groups:
+          Momentum:
+            output_dim: 4
+            input:
+            - Part_energy
+            - Part_pt
+            - Part_eta
+            - Part_phi
+            index:
+            - 0
+            - 1
+            - 2
+            - 3
+          ObjectTag:
+            output_dim: 2
+            input:
+            - Part_pdgId
+            - hpc:
+                name: hpc
+                output_dim: 2
+                input:
+                - Part_hpcShowerEnergy
+                - Part_hpcShowerTheta
+                - Part_hpcShowerPhi
+                - Part_hpcNumLayers
+                - Part_hpcNumAssociatedShowers
+                - Part_hpcTotalShowerEnergy
+            - hac:
+                name: hac
+                output_dim: 2
+                input:
+                - Part_hacShowerEnergy
+                - Part_hacShowerTheta
+                - Part_hacShowerPhi
+                - Part_hacNumTowers
+                - Part_hacNumAssociatedShowers
+                - Part_hacTotalShowerEnergy
+            - stic:
+                name: stic
+                output_dim: 2
+                input:
+                - Part_sticShowerEnergy
+                - Part_sticShowerTheta
+                - Part_sticShowerPhi
+                - Part_sticNumTowers
+                - Part_sticChargedTag
+            index:
+            - 4
+            - 5
+          Charge:
+            output_dim: 1
+            input:
+            - Part_charge
+            - Part_dR_to_lead_a
+            - Part_dR_to_lead_b
+            - Part_angle_to_lead_a
+            - Part_angle_to_lead_b
+            - Part_in_hemisphere_a
+            - Part_in_hemisphere_b
+            index:
+            - 6
+resonance:
+  TauVisibleDecay:
+    tau-/vis-: {}
+    tau+/vis+: {}
+  DiObjectDecay:
+    Z/qq: {}
+    Z/ll: {}
+rl:
+  enabled: false
+experiment:
+  question: Does visible FiLM improve supervised tau spin closure on filtered 10%
+    training data?
+  intervention: global_visible_film_only_at_original_generation_depth
+  source_stage: original_20M_a4_foundation_before_ztautau_diffusion
+  checkpoint_protocol: foundation_weights_only_fresh_optimizer_scheduler_epoch_zero
+  primary_endpoint: generated_Cij_Frobenius_error_at_fixed_completed_epoch_200
+  physics_guardrail: nn_absolute_error_at_the_same_epoch
+  secondary: validation_velocity_loss_and_all_Cij_components
+  evaluation_epochs:
+  - 0
+  - 50
+  - 100
+  - 150
+  - 200
+  interpretation: FiLM-on pilot only; no matched off-arm training is launched. Retain
+    original one-block depth, filtered populations, normalization file, supervised
+    loss, batch2048 per GPU and historical optimizer/schedule. Added FiLM starts with
+    zero scale/shift and uses visible inputs only. Fourier channels are disabled.
+    Ordered batches and paired training/validation RNG support a future matched control;
+    the historical off run is descriptive, not a matched causal control. Training
+    may continue to1500 epochs or stop on inherited val/loss patience25. If it stops
+    before200, the declared endpoint is incomplete. Cij uses the existing fixed-energy
+    tau reconstruction and analyzing-power convention; this is not complete tau-rest-frame
+    or entanglement closure.
+  film: 'on'
+  source_checkpoint: /pscratch/sd/y/yiren/checkpoints.20M.a4.last.ckpt
+  source_epoch: 29
+  source_global_step: 109650
+  source_normalization_file: /global/cfs/cdirs/m5019/tihsu/Ztautau/evenet-input/normalization.pt
+compat:
+  backend: pure-evenet
+  repo_root: /global/u2/y/yiren/ml_pipeline
+evaluation:
+  checkpoint: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_spin_angles/within-event-reward-epoch287-refit10-val5-run-02/source.ckpt
+  expected_checkpoint:
+    epoch: 286
+    global_step: 18655
+  weights: raw
+  purpose: Original pretrain epoch287 FiLM runtime control; CPU check/evaluation only

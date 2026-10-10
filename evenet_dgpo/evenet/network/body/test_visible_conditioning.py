@@ -194,7 +194,7 @@ def test_production_context_wiring_is_visible_pre_pet_not_truth():
         source = inspect.getsource(method)
         assert f"visible_raw={raw_source}, visible_tokens=input_point_cloud, visible_mask=input_point_cloud_mask" in source
     signature = inspect.signature(VisibleConditioning.forward)
-    assert list(signature.parameters) == ["self", "raw", "tokens", "mask", "normalized_raw", "return_tokens"]
+    assert list(signature.parameters) == ["self", "raw", "tokens", "mask", "normalized_raw", "return_tokens", "return_attention_bias"]
     assert signature.parameters["return_tokens"].default is False  # optional visible-only memory, never truth
 
 

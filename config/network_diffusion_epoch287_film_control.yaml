@@ -1,0 +1,145 @@
+Body:
+  GlobalEmbedding:
+    linear_block_type: GRU
+    transformer_dim_scale: 2.0
+    initial_embedding_dim: 16
+    hidden_dim: 256
+    normalization: LayerNorm
+    linear_activation: GELU
+    num_embedding_layers: 8
+    dropout: 0.1
+    skip_connection: true
+  PET:
+    num_feature_keep: 0
+    feature_drop: 0.0
+    hidden_dim: 256
+    enable_local_embedding: true
+    local_Krank: 3
+    local_point_index:
+    - 2
+    - 3
+    num_local_layer: 10
+    num_layers: 16
+    drop_probability: 0.1
+    talking_head: false
+    layer_scale: true
+    layer_scale_init: 1.0e-05
+    num_heads: 16
+    mode: all
+    dropout: 0.1
+    visible_angular_fourier:
+      enabled: false
+      theta_source: Part_eta
+      phi_source: Part_phi
+  ObjectEncoder:
+    hidden_dim: 256
+    position_embedding_dim: 32
+    num_attention_heads: 8
+    transformer_dim_scale: 2.0
+    num_embedding_layers: 2
+    num_encoder_layers: 2
+    dropout: 0.1
+    skip_connection: true
+    encoder_skip_connection: true
+  GroupedSequentialEmbedding:
+    hidden_dim_scale: 2.0
+    dropout: 0.0
+Classification:
+  num_classification_layers: 1
+  hidden_dim: 256
+  dropout: 0.1
+  skip_connection: true
+  num_attention_heads: 8
+Regression:
+  num_regression_layers: 1
+  hidden_dim: 256
+  dropout: 0.1
+  skip_connection: true
+Assignment:
+  feature_drop: 0.1
+  num_feature_keep: 0
+  hidden_dim: 256
+  split_symmetric_attention: true
+  position_embedding_dim: 32
+  num_attention_heads: 4
+  transformer_dim_scale: 2.0
+  num_jet_embedding_layers: 0
+  num_jet_encoder_layers: 0
+  num_detection_layers: 1
+  dropout: 0.1
+  combinatorial_scale: 0.0
+  encode_event_token: false
+  activation: GELU
+  num_encoder_layers: 1
+  num_linear_layers: 1
+  skip_connection: true
+  encoder_skip_connection: true
+Segmentation:
+  projection_dim: 256
+  num_heads: 8
+  dropout: 0.1
+  num_layers: 1
+  num_queries: 4
+  return_intermediate: true
+  mask_mlp_layers: 1
+  norm_before: false
+  encode_event_token: false
+GlobalGeneration:
+  num_layers: 1
+  num_resnet_layers: 1
+  hidden_dim: 64
+  resnet_dim: 64
+  layer_scale_init: 1.0e-05
+  feature_drop_for_stochastic_depth: 0.0
+  activation: SILU
+  dropout: 0.0
+ReconGeneration:
+  hidden_dim: 256
+  num_layers: 1
+  num_heads: 4
+  dropout: 0.1
+  layer_scale: true
+  layer_scale_init: 1.0e-05
+  drop_probability: 0.1
+  feature_drop: 0.1
+  extend_batch: true
+TruthGeneration:
+  hidden_dim: 256
+  num_layers: 1
+  num_heads: 4
+  dropout: 0.1
+  layer_scale: true
+  layer_scale_init: 1.0e-05
+  drop_probability: 0.1
+  feature_drop: 0.0
+  extend_batch: true
+  neutrino_position_encode: true
+  max_position_length: 36
+VisibleConditioning:
+  diffusion_enabled: true
+  classifier_enabled: false
+  diffusion_fourier_enabled: false
+  diffusion_film_scale_enabled: true
+  width: 64
+  harmonics:
+  - 1
+  - 2
+  - 3
+  - 4
+  theta_source: Part_eta
+  phi_source: Part_phi
+  feature_mode: kinematics
+  numerical_features:
+  - Part_energy
+  - Part_pt
+  numerical_frequencies:
+  - 0.25
+  - 0.5
+  - 1.0
+  - 2.0
+  log_diagnostics: true
+  diffusion_film_gains:
+    attention_gamma: 1.0
+    attention_beta: 1.0
+    ffn_gamma: 1.0
+    ffn_beta: 1.0
