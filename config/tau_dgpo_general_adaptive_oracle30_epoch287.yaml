@@ -1,0 +1,40 @@
+# User launch only: matched 16-GPU arm; oracle strength recalibrated after refits.
+source_directory: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_process_labels_film/run-01
+classifier_directory: /pscratch/sd/y/yiren/Ztautau/tau_leg_pair_classifiers/epoch287-10pct-run-01
+output: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_general_adaptive_oracle30/epoch287-10pct-run-01
+workers: 16
+seed: 42
+epochs: 1500
+refit_every_epochs: 50
+refit_relative_to_install: true
+validation_every_epochs: 5
+oracle_fraction: 0.3
+classifier_fit:
+  epochs: 3000
+  scheduler: cosine
+  lr: 0.0001
+  min_lr: 1.0e-05
+  lr_decay_epochs: 1500
+  batch_size: 1024
+  patience: 25
+  min_delta: 0.0001
+  checkpoint_fit: true
+  allow_best_warm_start: true
+  require_plateau: true
+  weight_decay: 0.005
+  dropout: 0.1
+wandb_id: tau-dgpo-general-adaptive-oracle30-epoch287-10pct-run-01
+run_name: Adaptive oracle | General + up to 30pct | Epoch287 10pct | Run 01
+unfolding:
+  method: RooUnfoldSvd
+  bins: 8
+  kreg: 5
+  response_bootstraps: 300
+  seed: 4203
+adaptive_oracle:
+  method: heldout_paired_auc_lcb
+  max_alpha: 0.3
+  calibration_events: 11903
+  calibration_seed: 4203
+  generation_seed: 8642
+  noise_z: 1.96

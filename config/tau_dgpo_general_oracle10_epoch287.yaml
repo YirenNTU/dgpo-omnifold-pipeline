@@ -1,0 +1,25 @@
+# User launch only: 4 nodes x 4 GPUs; one seed. No new generator architecture.
+source_directory: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_process_labels_film/run-01
+classifier_directory: /pscratch/sd/y/yiren/Ztautau/tau_leg_pair_classifiers/epoch287-10pct-run-01
+output: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_general_oracle10/epoch287-10pct-run-01
+workers: 16
+seed: 42
+epochs: 1500
+refit_every_epochs: 30
+refit_relative_to_install: true
+validation_every_epochs: 5
+oracle_fraction: 0.1
+classifier_fit:
+  epochs: 1000
+  lr_decay_epochs: 250
+  require_plateau: true
+  weight_decay: 0.005
+  dropout: 0.1
+wandb_id: tau-dgpo-general-oracle10-epoch287-10pct-run-01
+run_name: "Tau DGPO | General + 10pct oracle | Epoch287 10pct | Run 01"
+unfolding:
+  method: RooUnfoldSvd
+  bins: 8
+  kreg: 5
+  response_bootstraps: 300
+  seed: 4203

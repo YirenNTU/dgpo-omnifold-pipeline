@@ -1,0 +1,55 @@
+# User launch only. Full MG5; fresh start from the tested supervised epoch115.
+evenet_root: /global/homes/y/yiren/EveNet-private
+classifier_directory: /pscratch/sd/y/yiren/Preference_Optimization/ttbar-general-reco-truthnu-oracle30-full-mg5-run-02
+output: /pscratch/sd/y/yiren/Preference_Optimization/ttbar-dgpo-general70-top-oracle30-full-mg5-run-01
+seed: 42
+workers: 16
+cpus_per_worker: 8
+batch_size: 512
+candidates: 8
+generation_batch_size: 1024
+feature_batch_size: 1024
+rollout_chunk_k: 2
+max_steps: 15000
+epochs: 200
+validation_every_epochs: 1
+checkpoint_every_steps: 10
+learning_rate: 0.00001
+backbone_learning_rate: 0.000001
+weight_decay: 0.01
+beta: 1.0
+reference_coefficient: 1.0
+policy_timesteps: 8
+policy_t_min: 0.0
+policy_t_max: 0.7
+ddim_steps: 20
+mixture:
+  oracle: reco_top_truthnu_p4
+  alpha: 0.3
+  temperature: 1.0
+refit:
+  every_steps: 500
+  batch_size: 2048
+  lr: 0.0001
+  min_lr: 0.00001
+  weight_decay: 0.005
+  cosine_epochs: 1500
+  max_epochs: 3000
+  patience: 50
+  min_delta: 0.0001
+  minimum_steps: 1000
+  require_plateau: true
+wandb:
+  id: ttbar-dgpo-general70-top-oracle30-full-mg5-run-01
+  run_name: 'Does the mixture transfer? | TTbar DGPO | General70 + top oracle30 | Full MG5'
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  group: TTbar General oracle transfer
+  tags: [ttbar, DGPO, full-mg5, oracle30, GPU16, batch512, seed42, refit500]
+evaluation:
+  method: RooUnfoldSvd
+  native_joint_kreg: 7
+  neutrino_kreg: 5
+  response_bootstraps: 300
+  native_source: EveNet-private/downstreams/nu2flow/unfolding/unfold.py
+  compare: raw pretrained vs raw DGPO; General and oracle reweighting are separate diagnostics

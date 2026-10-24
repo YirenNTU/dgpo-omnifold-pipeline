@@ -109,7 +109,8 @@ class EventGenerationHead(nn.Module):
                 visible_raw=None,
                 visible_tokens=None,
                 visible_mask=None,
-                visible_normalized=None):
+                visible_normalized=None,
+                global_normalized=None):
         """
         x: [B, T, D] <- Noised Input
         global_cond: [B, 1, D] <- Global Condition
@@ -154,6 +155,7 @@ class EventGenerationHead(nn.Module):
             print("ERROR: In Generation Head, Label is None, skipping label embedding")
 
         modulations = None
+        leg_modulations = None
         token_memory = None
         pair_biases = None
         if self.visible_conditioning is not None:
@@ -161,7 +163,13 @@ class EventGenerationHead(nn.Module):
                 raise ValueError("TruthGeneration visible conditioning requires observed context and invisible mask")
             extra = (dict(normalized_raw=visible_normalized)
                      if self.visible_conditioning.feature_mode == "kinematics" else {})
-            if self.visible_conditioning.token_readout is not None:
+            if (self.visible_conditioning.met_conditioning is not None
+                    or self.visible_conditioning.leg_attention_conditioning is not None):
+                extra.update(global_normalized=global_normalized, global_mask=global_cond_mask)
+            if self.visible_conditioning.leg_attention_conditioning is not None:
+                modulations, leg_modulations = self.visible_conditioning(
+                    visible_raw, visible_tokens, visible_mask, return_leg_modulations=True, **extra)
+            elif self.visible_conditioning.token_readout is not None:
                 modulations, token_memory, token_mask = self.visible_conditioning(
                     visible_raw, visible_tokens, visible_mask, return_tokens=True, **extra)
             elif self.visible_conditioning.pair_attention is not None:
@@ -172,6 +180,22 @@ class EventGenerationHead(nn.Module):
         for index, transformer_block in enumerate(self.gen_transformer_blocks):
             concatenated = cond_token + x
             modulation = modulations[index] if modulations is not None else None
+            value_modulation = None
+            if leg_modulations is not None:
+                n_visible = visible_tokens.shape[1]
+                selected = time_masking.bool() & x_mask.bool()
+                if (x.shape[1] != n_visible + 2 or selected[:, :n_visible].any()
+                        or not selected[:, n_visible:].all()):
+                    raise ValueError('Leg modulation requires ordered final leg_a/leg_b invisible slots')
+                ga, ba = leg_modulations[index]
+                if self.visible_conditioning.leg_attention_conditioning.spec.get('attention_route') == 'qk':
+                    # Only the NEW leg correction is excluded from V. Retain
+                    # the original global attention FiLM on its value input.
+                    value_modulation = modulation
+                # Add only to attention; original FFN coefficients retain shape/value.
+                modulation = (modulation[0][:, None] + F.pad(ga, (0, 0, n_visible, 0)),
+                              modulation[1][:, None] + F.pad(ba, (0, 0, n_visible, 0)),
+                              modulation[2], modulation[3])
             direct_residual = None
             readout = self.visible_conditioning.token_readout if token_memory is not None else None
             if (readout is not None and readout.mode != "velocity"
@@ -196,11 +220,15 @@ class EventGenerationHead(nn.Module):
             if modulation is not None:
                 # Also handles future combinations with token-specific FiLM.
                 modulation = self.visible_conditioning.apply_scale_policy(modulation)
-                # Apply numeric gains once; applying them in the encoder too
-                # would square nonbinary values.
+                # Numeric runtime gains must not be applied in both the visible
+                # encoder and here: nonbinary gains would otherwise be squared.
                 modulation = self.visible_conditioning.apply_runtime_gains(modulation)
+            if value_modulation is not None:
+                value_modulation = self.visible_conditioning.apply_runtime_gains(value_modulation)
             pair_kwargs = (dict(attention_bias=pair_biases[index])
                            if pair_biases is not None and index < len(pair_biases) else {})
+            if value_modulation is not None:
+                pair_kwargs['value_modulation'] = value_modulation
             out_x, cond_token = transformer_block(
                 concatenated, cond_token, x_mask, attn_mask=attn_mask,
                 modulation=modulation,

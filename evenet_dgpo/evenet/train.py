@@ -103,7 +103,12 @@ def train_func(cfg):
     val_ds = ray.train.get_dataset_shard("validation")
 
     train_ds_loader = train_ds.iter_torch_batches(**dataset_configs)
-    val_ds_loader = val_ds.iter_torch_batches(**dataset_configs)
+    validation_configs = dict(dataset_configs)
+    if training.get('EnergyScore', {}).get('enabled', False):
+        # Keep the original 8 x 64 events/rank monitor and paired noise when
+        # resuming EnergyScore with a larger training batch.
+        validation_configs['batch_size'] = 64
+    val_ds_loader = val_ds.iter_torch_batches(**validation_configs)
 
     # Model
     model = EveNetEngine(
@@ -133,6 +138,11 @@ def train_func(cfg):
         from evenet.utilities.joint_coverage import JointCoverageValidation
         coverage_callbacks.append(JointCoverageValidation(
             coverage_cfg, global_config.options.Training.model_checkpoint_save_path))
+    tau_physics_cfg = global_config.options.Training.get('TauPhysics', {})
+    if tau_physics_cfg.get('enable', False):
+        from evenet.utilities.tau_physics_validation import TauPhysicsValidation
+        coverage_callbacks.append(TauPhysicsValidation(
+            tau_physics_cfg, global_config.options.Training.model_checkpoint_save_path))
 
     accelerator_config = {
         "accelerator": "auto",
@@ -192,6 +202,8 @@ def build_parser() -> argparse.ArgumentParser:
     # argument for loading all dataset files into RAM
     parser.add_argument("--load_all", action="store_true", help="Load all dataset files into RAM")
     parser.add_argument("--ray_dir", type=str, default="~/ray_results")
+    parser.add_argument("--startup_marker", type=str, default=None,
+                        help="Optional launcher marker: trainer entered after credential validation.")
     parser.add_argument("--resume_checkpoint", type=str, default=None,
                         help="Full Lightning resume: raw model, optimizers, schedulers and epoch.")
     parser.add_argument("--low_noise_cutoff", type=float, default=None)
@@ -210,10 +222,14 @@ def main(args: argparse.Namespace) -> None:
             "WANDB_API_KEY" in os.environ
     ), 'Please set WANDB_API_KEY="abcde" when running this script.'
 
+    if getattr(args, "startup_marker", None):
+        Path(args.startup_marker).write_text('\n{"trainer_entered": true}\n')
+
     runtime_env = {
         "env_vars": {
             "PYTHONPATH": f"{Path(__file__).resolve().parent.parent}:{os.environ.get('PYTHONPATH', '')}",
             "WANDB_API_KEY": os.environ["WANDB_API_KEY"],
+            **({"WANDB_BASE_URL": os.environ["WANDB_BASE_URL"]} if os.environ.get("WANDB_BASE_URL") else {}),
             # "TORCH_NCCL_BLOCKING_WAIT": "1",
             # "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
             "TORCH_NCCL_TIMEOUT": "180",
@@ -263,6 +279,7 @@ def main(args: argparse.Namespace) -> None:
 
     # Use the configured DDP worker count (the conditioning ablations request 16).
     scaling_config = ScalingConfig(
+        placement_strategy=platform_info.get("placement_strategy", "PACK"),
         num_workers=platform_info.number_of_workers,
         resources_per_worker=platform_info.resources_per_worker,
         use_gpu=platform_info.get("use_gpu", True),

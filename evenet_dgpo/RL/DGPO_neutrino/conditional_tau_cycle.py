@@ -7,8 +7,10 @@ head install recenters the velocity reference. Actor AdamW/clock are untouched.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +18,10 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 
-from RL.DGPO_neutrino.conditional_tau_reward import feature_precision, canonical_policy_batch
+from RL.DGPO_neutrino.conditional_tau_reward import (
+    feature_precision, canonical_policy_batch, POLICY_CONDITIONING_CONTRACT,
+    SUPERVISED_POLICY_CONDITIONING_CONTRACT, condition_inputs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -39,10 +44,15 @@ def panel_batch(panel, idx, spec, device):
     for leg in ('a', 'b'):
         for j, key in enumerate(('E', 'px', 'py', 'pz')):
             batch[f'lead_{leg}_visible_{key}'] = torch.as_tensor(panel['visible_'+leg][idx, j], device=device)
-    return canonical_policy_batch(batch)
+    return canonical_policy_batch(batch, contract=SUPERVISED_POLICY_CONDITIONING_CONTRACT
+        if 'classification' in spec.shapes else POLICY_CONDITIONING_CONTRACT,
+        num_classes=int(panel.get('num_process_classes',19)))
 
 
 def cij_terms(panel, idx, delta):
+    # Historical uncalibrated event-moment diagnostic. Do not change this map
+    # in place: saved baselines and predeclared ablations use these exact terms.
+    # The channel-binned tihsu reconstruction is logged separately below.
     from scripts.diagnose_ztautau_cij import tau_from_deltas, angles
     va, vb = panel['visible_a'][idx], panel['visible_b'][idx]
     a, b = angles(tau_from_deltas(va, delta[:, 0]), tau_from_deltas(vb, delta[:, 1]), va, vb)
@@ -77,11 +87,74 @@ def fit_head(cfg, arrays, path, device, rank, world, emit):
     model = torch.nn.parallel.DistributedDataParallel(bare, device_ids=[device.index]
         if device.type == 'cuda' else None) if world > 1 else bare
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg['epochs'], eta_min=cfg['min_lr'])
+    decay_epochs = int(cfg.get('lr_decay_epochs', cfg['epochs']))
+    if decay_epochs < 1:raise ValueError('lr_decay_epochs must be positive')
+    plateau_lr = cfg.get('scheduler') == 'validation_plateau'
+    scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
+        factor=cfg['lr_factor'], patience=cfg['lr_patience'], threshold=cfg['min_delta'],
+        threshold_mode='abs', min_lr=cfg['min_lr']) if plateau_lr else
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, decay_epochs, eta_min=cfg['min_lr']))
     selector = BestValidation(cfg['patience'], cfg['min_delta'], cfg['min_steps'])
     status = torch.zeros(6, device=device, dtype=torch.float64)
-    steps, best = 0, None
-    for epoch in range(cfg['epochs']):
+    steps, best, start_epoch, resume_mode = 0, None, 0, 'fresh'
+    state_path = path.with_name('fit_last.pt')
+    checkpoint_fit = cfg.get('checkpoint_fit', False)
+    # Bind optimizer continuation to the exact paired data, split and fit configuration.
+    # A replayed policy may have different candidates even at the same policy step.
+    digest = hashlib.sha256()
+    if checkpoint_fit:
+        for key in sorted(arrays):
+            a = np.ascontiguousarray(arrays[key])
+            digest.update(key.encode()); digest.update(str((a.shape, a.dtype)).encode())
+            digest.update(memoryview(a).cast('B'))
+    signature = digest.hexdigest()
+    contract = {k: v for k, v in cfg.items() if k not in ('epochs', 'allow_best_warm_start')}
+    if checkpoint_fit and state_path.exists():
+        saved_fit = torch.load(state_path, map_location='cpu', weights_only=False)
+        if saved_fit['contract'] != contract or saved_fit['world'] != world:
+            raise ValueError('Classifier continuation configuration/world differs; explicit migration required')
+        if saved_fit['data_signature'] == signature:
+            bare.load_state_dict(saved_fit['model'], strict=True)
+            optimizer.load_state_dict(saved_fit['optimizer'])
+            scheduler.load_state_dict(saved_fit['scheduler'])
+            selector.__dict__.update(saved_fit['selector'])
+            steps, start_epoch, best = saved_fit['steps'], saved_fit['epoch'], saved_fit['best']
+            rng = saved_fit['rng'][rank]
+            torch.set_rng_state(rng['cpu'])
+            if device.type == 'cuda': torch.cuda.set_rng_state(rng['cuda'], device)
+            resume_mode = 'full_state'
+        elif not cfg.get('allow_best_warm_start'):
+            raise ValueError('Classifier continuation candidates/data differ')
+        else:
+            resume_mode = 'best_weights_new_candidates'
+    if checkpoint_fit and resume_mode != 'full_state' and path.exists():
+        if not cfg.get('allow_best_warm_start'):
+            raise ValueError('Only classifier weights exist; explicitly enable best-weight warm start')
+        previous = torch.load(path, map_location='cpu', weights_only=True)
+        if previous.get('source_policy_step') != cfg.get('source_policy_step'):
+            raise ValueError('Warm-start classifier belongs to a different policy step')
+        bare.load_state_dict(previous['state_dict'], strict=True)
+        start_epoch, steps = previous['epoch'], previous['optimizer_steps']
+        if resume_mode == 'fresh': resume_mode = 'legacy_best_weights_new_optimizer'
+        # Re-evaluate the initial weights on THIS validation split; never retain
+        # a best BCE from older candidates. Dropout is disabled by score_pair.
+        if rank == 0:
+            p, q = score_pair(bare, arrays['condition'][vi], arrays['candidate_truth'][vi],
+                arrays['candidate_generated'][vi], device, cfg['batch_size'])
+            m = pair_metrics(p, q, arrays['event_weight'][vi])
+            selector.update(m['bce'], steps)
+            best = dict(cfg, state_dict=copy.deepcopy(previous['state_dict']), epoch=start_epoch,
+                optimizer_steps=steps, val_bce=m['bce'])
+        barrier(world)
+    if start_epoch >= cfg['epochs'] and not (resume_mode == 'full_state' and saved_fit['stopped']):
+        raise ValueError('Classifier continuation needs a larger epoch safety limit')
+    if rank == 0:
+        log.info('[DGPO/tau fit] mode=%s start_epoch=%s steps=%s batch_per_gpu=%s scheduler=%s',
+            resume_mode, start_epoch, steps, cfg['batch_size'], cfg.get('scheduler', 'cosine'))
+    already_stopped = resume_mode == 'full_state' and saved_fit['stopped']
+    if already_stopped: status[3] = 1
+    epoch = start_epoch-1
+    for epoch in range(start_epoch, start_epoch if already_stopped else cfg['epochs']):
         model.train()
         total = torch.zeros(2, device=device, dtype=torch.float64)
         lr = optimizer.param_groups[0]['lr']
@@ -131,18 +204,44 @@ def fit_head(cfg, arrays, path, device, rank, world, emit):
             emit(dict(epoch=epoch+1, optimizer_steps=steps, train_bce=float(total[0]/total[1]),
                 val_bce=float(status[0]), val_auc=float(status[1]), best_val_bce=float(status[2]),
                 lr=lr, grad_norm=float(grad), early_stopped=int(status[3])))
-        scheduler.step()
+        # Do not let cosine LR rise again when fitting beyond its decay horizon.
+        if plateau_lr:
+            scheduler.step(float(status[0]))
+        elif scheduler.last_epoch < decay_epochs:
+            scheduler.step()
+        if checkpoint_fit:
+            rng = dict(cpu=torch.get_rng_state(), cuda=torch.cuda.get_rng_state(device)
+                       if device.type == 'cuda' else None)
+            states = [None]*world if rank == 0 else None
+            if world > 1: dist.gather_object(rng, states, dst=0)
+            else: states = [rng]
+            if rank == 0:
+                payload = dict(version=1, contract=contract, data_signature=signature, world=world,
+                    model=bare.state_dict(), optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
+                    selector=dict(selector.__dict__), epoch=epoch+1, steps=steps, best=best,
+                    rng=states, stopped=bool(status[3]), resume_mode=resume_mode)
+                temporary = state_path.with_suffix('.pending.pt')
+                torch.save(payload, temporary); temporary.replace(state_path)
         if bool(status[3]):
             break
     barrier(world)
-    best = torch.load(path, map_location='cpu', weights_only=True)
+    if checkpoint_fit:
+        # fit_last is the atomic source of truth, including the selected head.
+        best = torch.load(state_path, map_location='cpu', weights_only=False)['best']
+        if rank == 0:
+            temporary = path.with_suffix('.pending.pt')
+            torch.save(best, temporary); temporary.replace(path)
+    else:
+        best = torch.load(path, map_location='cpu', weights_only=True)
     bare.load_state_dict(best['state_dict'], strict=True)
     bare.eval().requires_grad_(False)
     info = dict(total_steps=steps, epochs=epoch+1, best_epoch=best['epoch'], best_steps=best['optimizer_steps'],
                 best_val_bce=best['val_bce'], minimum_fit_steps_met=steps >= cfg['min_steps'],
-                early_stopped=bool(status[3]))
+                early_stopped=bool(status[3]), resume_mode=resume_mode)
     if rank == 0:
         path.with_suffix('.json').write_text(json.dumps(info, indent=2)+'\n')
+    if cfg.get('require_plateau', False) and not info['early_stopped']:
+        raise RuntimeError('Classifier hit its epoch safety limit without validation plateau; best.pt preserved, reward not installed')
     return bare, best, info
 
 
@@ -150,21 +249,31 @@ class ConditionalTauCycle:
     def __init__(self, cfg, reward, actor, reference, sampler, device, rank, world, log_metrics):
         self.cfg, self.reward, self.actor, self.reference, self.sampler = cfg, reward, actor, reference, sampler
         self.device, self.rank, self.world, self.emit = device, rank, world, log_metrics
+        self.fixed_round = None
+        combined = bool(reward.installed_head.get('general_spin_angles'))
+        if combined != bool(cfg.get('combined_reward', False)):
+            raise ValueError('Combined reward requires its explicit lifecycle')
+        if cfg.get('fixed_general_round', False):
+            from .tau_fixed_round import FixedGeneralRound
+            self.fixed_round = FixedGeneralRound(reward, reference)
         if world != int(cfg['workers']):
             raise ValueError('Conditional tau cycle requires the configured 16-GPU group')
         self.output = Path(cfg['output']); self.output.mkdir(parents=True, exist_ok=True)
         self.validation = self.read_panel(cfg['validation_panel'])
+        if combined:
+            from scripts.tau_general_spin_angles import validate_truth_cache
+            validate_truth_cache(self.validation, reward.installed_head['general_spin_angles'])
         self.train = None
         self._training_path_verified = False
         self._verify_replay()
 
     @torch.no_grad()
     def verify_training_batch(self, batch, step):
-        """Paired real-batch probe: original label vs fixed0, then panel replay.
+        """Paired real-batch probe: incoming labels, canonical labels, panel replay.
 
         Read-only, once per launch. Restore RNG and actor mode. No policy update
-        or classifier fit. This isolates the label intervention on identical
-        events/noise, rather than attributing a train/val population gap to it.
+        or classifier fit. Supervised labels must give identical live/panel
+        samples on identical events/noise.
         """
         if self._training_path_verified:
             return
@@ -174,7 +283,7 @@ class ConditionalTauCycle:
         n = min(32, len(batch['x']))
         raw = {k: v[:n] if torch.is_tensor(v) and v.ndim and len(v) == len(batch['x']) else v
                for k, v in batch.items()}
-        fixed = canonical_policy_batch(raw)
+        fixed = canonical_policy_batch(raw, contract=self.reward.policy_conditioning_contract)
         packed, _ = pack_event_inputs(raw, self.reward.spec)
         panel = dict(raw_condition=packed.cpu().numpy(), category=raw['event_category'].cpu().numpy())
         for leg in ('a', 'b'):
@@ -203,10 +312,11 @@ class ConditionalTauCycle:
         sums = torch.stack([*values, incoming.ne(0).double().sum(), values[0].new_tensor(n)])
         reduce_sum(sums, self.world)
         if self.rank == 0:
-            self.emit({'tau/startup/process_label': 0,
+            supervised = self.reward.policy_conditioning_contract == SUPERVISED_POLICY_CONDITIONING_CONTRACT
+            self.emit({'tau/startup/supervised_process_labels': int(supervised),
                 'tau/startup/incoming_label_nonzero_fraction': float(sums[3]/sums[4]),
                 'tau/startup/paired_original_label_reward': float(sums[0]/sums[4]),
-                'tau/startup/paired_fixed0_reward': float(sums[1]/sums[4]),
+                'tau/startup/paired_canonical_reward': float(sums[1]/sums[4]),
                 'tau/startup/paired_panel_reward': float(sums[2]/sums[4]),
                 'tau/startup/live_panel_max_sample_error': float(error)}, step)
         self._training_path_verified = True
@@ -233,8 +343,9 @@ class ConditionalTauCycle:
         if self.world > 1:
             dist.all_reduce(error, op=dist.ReduceOp.MAX)
         if self.rank == 0:
-            self.emit({'tau/startup/raw1110_max_sample_error': float(error),
-                       'tau/startup/baseline_head_reused': 1}, 0)
+            self.emit({'tau/startup/source_policy_max_sample_error': float(error),
+                       'tau/startup/baseline_head_reused': int(
+                           self.reward.policy_conditioning_contract == POLICY_CONDITIONING_CONTRACT)}, 0)
 
     @staticmethod
     def read_panel(path):
@@ -242,6 +353,13 @@ class ConditionalTauCycle:
             return {k: f[k] for k in f.files}
 
     def _verify_replay(self):
+        if self.reward.policy_conditioning_contract == SUPERVISED_POLICY_CONDITIONING_CONTRACT:
+            for start in range(0, len(self.validation['source_ids']), 2048):
+                idx = np.arange(start, min(start+2048, len(self.validation['source_ids'])))
+                b = panel_batch(self.validation, idx, self.reward.spec, self.device)
+                c = self.reward.prepare_inputs(b)['condition']
+                np.testing.assert_allclose(c, self.validation['condition'][idx], rtol=1e-6, atol=1e-6)
+            return
         with np.load(self.reward.bundle['replay'], allow_pickle=False) as replay:
             idx = np.arange(self.rank, len(replay['deltas']), self.world)
             b = panel_batch(self.validation, idx, self.reward.spec, self.device)
@@ -266,6 +384,75 @@ class ConditionalTauCycle:
             if not np.allclose(score, replay['logits'][idx], atol=1e-3, rtol=1e-4):
                 raise ValueError('Saved best-val tau head logit replay failed')
         barrier(self.world)
+
+    @torch.no_grad()
+    def _prepare_truth_features(self, panel, label):
+        """Cache paired truth through the SAME frozen, label-aware FiLM trunk."""
+        spec = self.reward.installed_head.get('general_spin_angles')
+        if spec:
+            from scripts.tau_general_spin_angles import validate_truth_cache
+            validate_truth_cache(panel, spec)
+        if bool(panel.get('truth_features_ready', False)):
+            if panel['candidate_truth'].shape[1] != self.reward.installed_head['candidate_dim']:
+                raise ValueError('Cached truth features do not match reward architecture')
+            return
+        folder = self.output/f'initial-{label}-truth-features'
+        folder.mkdir(parents=True, exist_ok=True)
+        idx = np.arange(self.rank, len(panel['source_ids']), self.world)
+        features = []
+        for start in range(0, len(idx), self.cfg['generation_batch_size']):
+            take = idx[start:start+self.cfg['generation_batch_size']]
+            b = panel_batch(panel, take, self.reward.spec, self.device)
+            _, f = self.reward.features(b, torch.as_tensor(panel['truth_deltas'][take], device=self.device))
+            if spec:
+                from scripts.tau_general_spin_angles import truth_features
+                f[:, spec['base_candidate_dim']:] = truth_features(panel, take)
+            features.append(f)
+        np.savez(folder/f'rank-{self.rank:02d}.npz', positions=idx, features=np.concatenate(features))
+        barrier(self.world)
+        merged = np.empty((len(panel['source_ids']), self.reward.installed_head['candidate_dim']), np.float32)
+        seen = np.zeros(len(merged), int)
+        for rank in range(self.world):
+            with np.load(folder/f'rank-{rank:02d}.npz', allow_pickle=False) as data:
+                pos = data['positions']; np.add.at(seen, pos, 1)
+                merged[pos] = data['features']
+        if not np.all(seen == 1) or not np.isfinite(merged).all():
+            raise ValueError('Incomplete/nonfinite supervised truth feature cache')
+        panel.update(candidate_truth=merged, truth_features_ready=np.array(True))
+        if self.rank == 0:
+            path = Path(self.cfg[label+'_panel'])
+            temporary = path.with_suffix('.pending.npz')
+            np.savez(temporary, **panel); temporary.replace(path)
+        barrier(self.world)
+
+    def bootstrap_supervised_reward(self, epoch, step):
+        """Fresh paired classifier fit before any actor update; resume keeps it."""
+        if self.reward.policy_conditioning_contract != SUPERVISED_POLICY_CONDITIONING_CONTRACT:
+            return False
+        if self.cfg.get('policy_conditioning_contract') != self.reward.policy_conditioning_contract:
+            raise ValueError('Actor/classifier process-label contracts differ')
+        if self.cfg.get('combined_reward', False):
+            from .tau_combined_reward import verify_saved_scores
+            if (not bool(self.validation.get('truth_features_ready', False))
+                    or self.validation['candidate_truth'].shape[1] != self.reward.installed_head['candidate_dim']):
+                raise ValueError('Combined validation truth feature cache is incomplete')
+            verify_saved_scores(self, step)
+            conditioning = getattr(getattr(self.actor,'TruthGeneration',None),'visible_conditioning',None)
+            if step == 0 and getattr(conditioning,'met_conditioning',None) is not None:
+                self.verify_initial_policy()
+            return False
+        self.train = self.read_panel(self.cfg['train_panel'])
+        self._prepare_truth_features(self.train, 'train')
+        self._prepare_truth_features(self.validation, 'validation')
+        if self.reward.installed_head.get('fitting_current_policy', False):
+            return False
+        if step != 0 or self.reward.round_id != 0:
+            raise ValueError('Unfitted initial classifier cannot resume after actor updates')
+        self.verify_initial_policy()
+        self.refit(epoch, step, force=True)
+        if self.reward.installed_head['optimizer_steps'] < self.cfg['fit']['min_steps']:
+            raise ValueError('Initial process-conditioned classifier is undertrained')
+        return True
 
     @torch.no_grad()
     def generate(self, panel, output, candidates, seed, physics, *, retain_features=True):
@@ -295,7 +482,8 @@ class ConditionalTauCycle:
                     draws.append(delta.permute(1, 0, 2, 3).cpu().numpy())
                     if physics:
                         rewards.append(self.reward.compute(delta, b).T.cpu().numpy())
-                        terms.append(np.mean([cij_terms(panel, ii, d.cpu().numpy()) for d in delta], axis=0))
+                        if not self.cfg.get('direct_oracle_monitor', False):
+                            terms.append(np.mean([cij_terms(panel, ii, d.cpu().numpy()) for d in delta], axis=0))
                     log.info('[DGPO/tau generation] %s rank=%s events=%s/%s K=%s', output.name, self.rank, start+len(ii), len(idx), candidates)
         finally:
             self.actor.train(old_mode)
@@ -303,12 +491,15 @@ class ConditionalTauCycle:
         if retain_features:
             data['features'] = np.concatenate(feature)
         if physics:
-            data.update(rewards=np.concatenate(rewards), cij=np.concatenate(terms))
+            data.update(rewards=np.concatenate(rewards))
+            if terms:
+                data['cij'] = np.concatenate(terms)
         np.savez(output/f'rank-{self.rank:02d}.npz', **data)
         barrier(self.world)
         # All ranks need head inputs; only rank0 collects K-sample physics arrays.
         merged, seen = {}, np.zeros(len(panel['source_ids']), int)
-        keys = (['features'] if retain_features else []) + (['rewards', 'cij', 'deltas'] if physics and self.rank == 0 else [])
+        physics_keys = ['rewards', 'deltas'] + ([] if self.cfg.get('direct_oracle_monitor', False) else ['cij'])
+        keys = (['features'] if retain_features else []) + (physics_keys if physics and self.rank == 0 else [])
         for rank in range(self.world):
             with np.load(output/f'rank-{rank:02d}.npz', allow_pickle=False) as f:
                 pos = f['positions']; np.add.at(seen, pos, 1)
@@ -332,6 +523,9 @@ class ConditionalTauCycle:
             data['split'] = split_events(data['source_ids'], self.cfg['audit_seed'], (.6, .2, .2))
         cfg = copy.deepcopy(self.reward.bundle['head'])
         cfg.pop('state_dict')
+        if self.cfg.get('combined_reward', False) and audit:
+            from .tau_combined_reward import general_audit_inputs
+            cfg, data = general_audit_inputs(cfg, data)
         cfg.update(self.cfg['fit'])
         if self.cfg.get('production_cross_attention', False):
             cfg.update(cross_attention=True, attention_heads=4, head_depth=3)
@@ -343,7 +537,7 @@ class ConditionalTauCycle:
                    ratio_bound=None if audit else reward_ratio_bound, source_policy_step=step, fitting_current_policy=True)
         if type(min_selected_steps) is not int or min_selected_steps < 0:
             raise ValueError('min_selected_steps must be a nonnegative integer')
-        cfg['min_selected_steps'] = min_selected_steps
+        cfg['min_selected_steps'] = max(min_selected_steps, int(self.cfg.get('minimum_selected_steps', 0)))
         folder.mkdir(parents=True, exist_ok=True)
         phase = log_phase or ('audit_fit' if audit else 'refit_fit')
         def emit(row):
@@ -619,7 +813,27 @@ class ConditionalTauCycle:
     def evaluate(self, epoch, step):
         if epoch <= self.reward.last_evaluation_epoch:
             return
+        evaluation_started = time.perf_counter()
         folder = self.output/f'eval-step-{step:08d}'
+        if self.cfg.get('direct_oracle_monitor', False):
+            g = self.generate(self.validation, folder/'candidates', self.cfg['validation_candidates'],
+                              self.cfg['validation_seed'], True, retain_features=False)
+            if self.rank == 0:
+                from scripts.tau_oracle_dgpo_monitor import export_monitor
+                metrics = export_monitor(self.validation, g['deltas'], folder, self.output, step)
+                if self.cfg.get('joint_oracle_monitor'):
+                    from scripts.tau_joint_oracle_monitor import export_joint_monitor
+                    metrics.update(export_joint_monitor(self.validation, g['deltas'], folder, self.output, step,
+                                                        self.cfg['joint_oracle_monitor']))
+                self.emit(metrics, step)
+                # The logger accepts W&B media as well as numeric metrics.
+                import wandb
+                self.emit({'tau/direct/distributions': wandb.Image(str(folder/'direct_distributions.png'))}, step)
+                if self.cfg.get('joint_oracle_monitor'):
+                    self.emit({'tau/joint/distributions': wandb.Image(str(folder/'joint_distributions.png'))}, step)
+            self.reward.last_evaluation_epoch = epoch
+            barrier(self.world)
+            return
         g = self.generate(self.validation, folder/'candidates', self.cfg['validation_candidates'], self.cfg['validation_seed'], True)
         if self.cfg.get('reward_cij_probe', False):
             self.reward_cij_probe(step, g, phase='validation')
@@ -643,6 +857,22 @@ class ConditionalTauCycle:
                     f.close()
             truth = cij_terms(self.validation, np.arange(len(a['source_ids'])), self.validation['truth_deltas'])
             report = summarize_cij(truth, g['cij'], a['event_weight'])
+            from scripts.tau_tihsu_cij import panel_report, monitoring_metrics
+            if self.cfg.get('combined_reward', False):
+                from .tau_combined_reward import native_cij_monitor
+                baseline = g['deltas']
+                if step:
+                    with np.load(self.output/'eval-step-00000000'/'measurements.npz', allow_pickle=False) as saved:
+                        np.testing.assert_array_equal(saved['source_ids'], self.validation['source_ids'])
+                        baseline = saved['deltas']
+                tihsu_report = native_cij_monitor(self.validation, g['deltas'], baseline,
+                    bootstrap=self.cfg['cij_bootstrap'], seed=42)
+            else:
+                tihsu_report = panel_report(self.validation, g['deltas'])
+            (folder/'tihsu_reconstruction_cij.json').write_text(
+                json.dumps(tihsu_report, indent=2, allow_nan=False)+'\n')
+            report['legacy_cij_protocol'] = 'uncalibrated-event-moments-krn'
+            report['tihsu_reconstruction'] = tihsu_report
             report.update(policy_step=step, epoch=epoch, reward_round=self.reward.round_id,
                 events=len(truth), candidates=self.cfg['validation_candidates'],
                 audit=m, audit_fit=status, audit_test_events=len(indices),
@@ -651,11 +881,20 @@ class ConditionalTauCycle:
             (folder/'report.json').write_text(json.dumps(report, indent=2)+'\n')
             np.savez(folder/'measurements.npz', source_ids=a['source_ids'], truth_cij=truth, generated_cij=g['cij'],
                      weight=a['event_weight'], deltas=g['deltas'], reward=g['rewards'])
-            out = {f'tau/cij/{key}': report[key] for key in ('error', 'diagonal_error', 'offdiagonal_error')}
-            for i, left in enumerate('krn'):
-                for j, right in enumerate('krn'):
-                    out[f'tau/cij/generated/{left}{right}'] = report['generated'][i][j]
-                    out[f'tau/cij/truth/{left}{right}'] = report['truth'][i][j]
+            # Retain legacy moments in local reports for historical replay, but
+            # publish only the explicitly versioned reconstruction Cij to W&B.
+            if self.cfg.get('wandb_profile') == 'tau_spin':
+                import wandb
+                from .tau_spin_logging import compact_cij_metrics
+                out = compact_cij_metrics(tihsu_report, self.validation, wandb)
+            else:
+                out = monitoring_metrics(tihsu_report, 'tau/tihsu_reconstruction/cij')
+            if 'native_change' in tihsu_report:
+                change = tihsu_report['native_change']
+                out.update({f'tau/tihsu_reconstruction/cij/{k}': change[k] for k in ('baseline', 'current', 'delta')})
+                out.update({'tau/tihsu_reconstruction/cij/change_ci_low': change['ci95'][0],
+                            'tau/tihsu_reconstruction/cij/change_ci_high': change['ci95'][1],
+                            'tau/fresh_audit/general_only': 1})
             r, w = g['rewards'], a['event_weight']
             soft = np.exp(r-r.max(axis=1, keepdims=True)); soft /= soft.sum(axis=1, keepdims=True)
             out.update({f'tau/fresh_audit/{k}': v for k, v in m.items()})
@@ -676,31 +915,118 @@ class ConditionalTauCycle:
             else:
                 import wandb
                 out.update({f'tau/marginal/plots/{name}': wandb.Image(str(path)) for name, path in plots.items()})
+            if self.cfg.get('wandb_profile') == 'tau_spin':
+                out['tau/fresh_audit/auc_gap'] = abs(m['auc']-.5)
+                cap = self.reward.installed_head['ratio_bound']
+                if cap is not None:
+                    out['tau/reward/near_cap_fraction'] = float(np.average(
+                        (np.exp(r) >= .9*cap).mean(1), weights=w))
+                out['tau/validation/seconds'] = time.perf_counter() - evaluation_started
             self.emit(out, step)
         del model, g
         self.reward.last_evaluation_epoch = epoch
         barrier(self.world)
 
+    def initialize_adaptive_oracle(self, step):
+        cfg = self.cfg.get('adaptive_oracle')
+        state = getattr(self.reward, 'adaptive_oracle_state', None)
+        if cfg is None:
+            if state is not None:
+                raise ValueError('Adaptive checkpoint cannot resume into fixed oracle experiment')
+            return
+        from .tau_adaptive_oracle import live_alpha
+        if state is not None:
+            live_alpha(dict(alpha=cfg['max_alpha'], adaptive=cfg), self.reward)
+            return
+        if step != 0 or self.reward.round_id != 0:
+            raise ValueError('Cannot recalibrate missing adaptive state after policy updates')
+        self.reward.adaptive_oracle_state = self.calibrate_adaptive_oracle(
+            self.reward.head, step, self.reward.round_id)
+
+    def calibrate_adaptive_oracle(self, model, step, round_id):
+        """Independent fixed external-validation subset; no fit or head selection.
+
+        Generates only K1 for 11,903 calibration events once per accepted refit.
+        Full raw-monitor plots remain exploratory; export reserved IDs so final
+        physics/unfolding comparisons can exclude these feedback events.
+        """
+        cfg = self.cfg.get('adaptive_oracle')
+        if cfg is None:
+            return None
+        from .tau_adaptive_oracle import validate_gate, paired_auc, next_state
+        from scripts.train_conditional_spin_ratio import score_pair
+        validate_gate(cfg)
+        count = len(self.validation['source_ids'])
+        selected = np.sort(np.random.default_rng(cfg['calibration_seed']).permutation(count)[:cfg['calibration_events']])
+        if len(selected) != cfg['calibration_events']:
+            raise ValueError('Incomplete adaptive calibration panel')
+        panel = {k: (v[selected] if isinstance(v, np.ndarray) and v.ndim and len(v)==count else v)
+                 for k,v in self.validation.items()}
+        folder = self.output/f'oracle-calibration-step-{step:08d}'
+        generated = self.generate(panel, folder/'candidates', 1, cfg['generation_seed'], False)
+        idx = np.arange(self.rank, len(selected), self.world)
+        with feature_precision():
+            p,q = score_pair(model, panel['condition'][idx], panel['candidate_truth'][idx],
+                            generated['features'][idx], self.device, self.cfg['fit']['batch_size'])
+        gathered = [None]*self.world if self.rank==0 else None
+        if self.world>1: dist.gather_object((idx,p,q),gathered,dst=0)
+        else: gathered=[(idx,p,q)]
+        payload=[None]
+        if self.rank==0:
+            # Broadcast failures too: never strand other workers at a collective.
+            try:
+                positions=np.concatenate([v[0] for v in gathered])
+                if sorted(positions.tolist()) != list(range(len(selected))):
+                    raise ValueError('Missing/repeated gate calibration events')
+                p=np.concatenate([v[1] for v in gathered]);q=np.concatenate([v[2] for v in gathered])
+                state=next_state(cfg,getattr(self.reward,'adaptive_oracle_state',None),paired_auc(p,q),round_id=round_id,step=step)
+                np.savez(folder/'scores.npz',source_ids=panel['source_ids'][positions],truth_logits=p,generated_logits=q)
+                np.savez(self.output/'oracle_calibration_ids.npz',source_ids=panel['source_ids'],positions=selected)
+                temporary=folder/'gate.pending.json';temporary.write_text(json.dumps(state,indent=2));temporary.replace(folder/'gate.json')
+                self.emit({**{'oracle/adaptive/'+k:state[k] for k in ('auc','auc_se','resolved_gap','baseline_gap','alpha','round_id','policy_step','events')},
+                           'oracle/adaptive/refit_calibration':int(round_id>0)},step)
+                payload[0]=dict(state=state)
+            except Exception as exc:
+                payload[0]=dict(error=str(exc))
+        if self.world>1: dist.broadcast_object_list(payload,src=0)
+        if 'error' in payload[0]:raise ValueError(payload[0]['error'])
+        return payload[0]['state']
+
     def refit(self, epoch, step, *, force=False):
+        if self.cfg.get('fixed_general_round', False):
+            raise ValueError('Fixed General round forbids classifier refit and reference recentering')
         if not force and epoch <= self.reward.last_refit_epoch:
             return
+        refit_started = time.perf_counter()
         if self.train is None:
             self.train = self.read_panel(self.cfg['train_panel'])
+            if self.cfg.get('combined_reward', False):
+                from scripts.tau_general_spin_angles import validate_truth_cache
+                validate_truth_cache(self.train, self.reward.installed_head['general_spin_angles'])
         if len(self.train['source_ids']) != 416701 or np.intersect1d(
                 self.train['source_ids'], self.validation['source_ids']).size:
             raise ValueError('Refit requires filtered 10% training population disjoint from external validation')
         folder = self.output/f'refit-step-{step:08d}'
         g = self.generate(self.train, folder/'candidates', 1, self.cfg['refit_seed']+step, False)
         model, best, status, _ = self.fit(self.train, g, folder, audit=False, step=step)
+        if self.reward.policy_conditioning_contract == SUPERVISED_POLICY_CONDITIONING_CONTRACT:
+            if (best['optimizer_steps'] < self.cfg['minimum_selected_steps']
+                    or not status['minimum_fit_steps_met']):
+                raise ValueError('Do not install an undertrained process-conditioned classifier')
         # Complete best-head + denominator transaction on EVERY rank. No actor
         # update happens here; no mixing old ratios or resetting actor AdamW.
+        adaptive_state = self.calibrate_adaptive_oracle(model, step, self.reward.round_id+1)
         self.reward.install(best, policy_step=step, epoch=epoch)
+        if adaptive_state is not None:
+            self.reward.adaptive_oracle_state = adaptive_state
         self.reference.load_state_dict(self.actor.state_dict(), strict=True)
         self.reference.eval().requires_grad_(False)
         if self.rank == 0:
             self.emit({**{f'tau/refit/{k}': v for k, v in status.items()},
                 'tau/refit/policy_step': step, 'tau/refit/reward_round': self.reward.round_id,
                 'tau/refit/reference_recentered': 1, 'tau/refit/actor_optimizer_reset': 0}, step)
+        if self.rank == 0 and self.cfg.get('wandb_profile') == 'tau_spin':
+            self.emit({'tau/refit/seconds': time.perf_counter()-refit_started}, step)
         del model, g
         barrier(self.world)
 
@@ -716,7 +1042,17 @@ class ConditionalTauCycle:
         if self.cfg.get('validation_relative_to_install', False):
             validation_due = epoch-self.reward.last_refit_epoch >= self.cfg['validation_every_epochs']
         if validation_due:
+            if getattr(self, 'fixed_round', None) is not None:
+                self.fixed_round.verify()
             self.evaluate(epoch, step)
+            if getattr(self, 'fixed_round', None) is not None:
+                self.fixed_round.verify()
+                if self.rank == 0:
+                    self.emit({'tau/fixed_round/integrity_verified': 1,
+                               'tau/fixed_round/anchor_step': 500,
+                               'tau/fixed_round/updates_since_anchor': step-500}, step)
+        if self.cfg.get('fixed_general_round', False):
+            return False
         refit = not final and (epoch+1) % self.cfg['refit_every_epochs'] == 0
         if self.cfg.get('refit_relative_to_install', False):
             refit = not final and epoch-self.reward.last_refit_epoch >= self.cfg['refit_every_epochs']

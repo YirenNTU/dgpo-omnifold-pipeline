@@ -74,6 +74,9 @@ class Config:
     def __init__(self):
         self._global_config = DotDict()
         self._defaults = DotDict()
+        # EventInfo is a constructed object, not a mergeable YAML section.
+        # Retain its raw schema for repeated driver/worker loads and overlays.
+        self._event_info_config = DotDict()
         self.loaded = False
         self.skip_keys = ["event_info", "resonance"]
 
@@ -93,7 +96,10 @@ class Config:
                 self._global_config[section] = deepcopy(self._defaults[section])
                 self._global_config[section].merge(content)
             else:
-                self._global_config[section] = self._global_config.get(section, DotDict())
+                previous = self._global_config.get(section, DotDict())
+                if section == "event_info" and isinstance(previous, EventInfo):
+                    previous = deepcopy(self._event_info_config)
+                self._global_config[section] = previous
                 if isinstance(content, dict):
                     self._global_config[section].merge(content)
                 else:
@@ -106,10 +112,16 @@ class Config:
 
         self._defaults.pop("event_info", None)
         self._defaults.pop("resonance", None)
+        event_info_config = self._global_config["event_info"]
+        if isinstance(event_info_config, EventInfo):
+            # An overlay may omit event_info while changing other sections.
+            event_info_config = self._event_info_config
+        event_info_config = deepcopy(event_info_config)
         self._global_config["event_info"] = EventInfo.construct(
-            config=self._global_config.pop("event_info"),
+            config=deepcopy(event_info_config),
             resonance_info=self._global_config["resonance"],
         )
+        self._event_info_config = event_info_config
 
         if 'process_info' in self._global_config:
             self._global_config['process_info'].pop('EXCLUDE', None)

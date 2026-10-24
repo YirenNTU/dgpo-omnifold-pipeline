@@ -28,7 +28,7 @@ def diffusion_film_gains(options):
 
 def visible_conditioning_spec(network_cfg, *, target, feature_names, token_dim,
                               hidden_dim, num_layers, n_branches, output_dim=None,
-                              attention_heads=None):
+                              attention_heads=None, global_feature_names=None):
     cfg = dict(getattr(network_cfg, "VisibleConditioning", {}) or {})
     if not cfg.get(f"{target}_enabled", False):
         return None
@@ -65,6 +65,14 @@ def visible_conditioning_spec(network_cfg, *, target, feature_names, token_dim,
         gains = diffusion_film_gains(cfg.get('diffusion_film_gains'))
         if any(value != 1. for value in gains.values()):
             spec['film_gains'] = gains
+        from .met_conditioning import met_spec
+        met = met_spec(cfg.get("diffusion_met_conditioning"), global_feature_names)
+        if met is not None:
+            spec["met_conditioning"] = met
+        from .leg_attention_conditioning import leg_spec
+        leg = leg_spec(cfg.get("diffusion_leg_attention_conditioning"), global_feature_names)
+        if leg is not None:
+            spec["leg_attention_conditioning"] = leg
         fourier_enabled = cfg.get("diffusion_fourier_enabled", True)
         if type(fourier_enabled) is not bool:
             raise ValueError("diffusion_fourier_enabled must be boolean")
@@ -95,7 +103,8 @@ class VisibleConditioning(nn.Module):
                  log_diagnostics=True, feature_mode="angles", numerical_features=(),
                  numerical_frequencies=(.25, .5, 1., 2.), token_readout=None, reward_probe=None,
                  relation_adapter=None, film_scale_enabled=True, pair_attention=None,
-                 fourier_enabled=True, ffn_film_enabled=True, film_gains=None):
+                 fourier_enabled=True, met_conditioning=None, ffn_film_enabled=True,
+                 leg_attention_conditioning=None, film_gains=None):
         super().__init__()
         if type(fourier_enabled) is not bool:
             raise ValueError("fourier_enabled must be boolean")
@@ -222,8 +231,30 @@ class VisibleConditioning(nn.Module):
                 width=int(pair_attention.get("width", 32)),
                 seed=int(pair_attention.get("seed", 20260930)))
 
+        self.met_conditioning = None
+        if met_conditioning is not None:
+            from .met_conditioning import METConditioning
+            if n_branches != 2 or any(x is not None for x in
+                    (self.token_readout, self.reward_probe, self.relation_adapter, self.pair_attention)):
+                raise ValueError("MET experiment requires the original visible FiLM diffusion")
+            self.spec["met_conditioning"] = dict(met_conditioning)
+            self.met_conditioning = METConditioning(width, 2*n_branches*hidden_dim, num_layers, met_conditioning)
+
+        self.leg_attention_conditioning = None
+        if leg_attention_conditioning is not None:
+            from .leg_attention_conditioning import LegAttentionConditioning
+            if n_branches != 2 or any(x is not None for x in
+                    (self.token_readout, self.reward_probe, self.relation_adapter,
+                     self.pair_attention, self.met_conditioning)):
+                raise ValueError("Leg attention requires the original global FiLM architecture")
+            self.spec["leg_attention_conditioning"] = dict(leg_attention_conditioning)
+            self.leg_attention_conditioning = LegAttentionConditioning(width, hidden_dim, num_layers, leg_attention_conditioning)
+
     def forward(self, raw, tokens, mask, *, normalized_raw=None, return_tokens=False,
-                return_attention_bias=False):
+                return_attention_bias=False, global_normalized=None, global_mask=None,
+                return_leg_modulations=False):
+        if return_leg_modulations and (self.leg_attention_conditioning is None or return_tokens or return_attention_bias):
+            raise ValueError('Leg modulation requires its own enabled branch')
         if return_attention_bias and (self.pair_attention is None or return_tokens):
             raise ValueError("attention bias requires an enabled pair branch and no token readout")
         if raw.ndim != 3 or tokens.ndim != 3 or raw.shape[:2] != tokens.shape[:2]:
@@ -264,6 +295,10 @@ class VisibleConditioning(nn.Module):
         context = self.event_encoder(torch.cat((pooled, count.to(pooled).log1p()), dim=-1))
         present = (count > 0).to(context)
         outputs = [head(context) * present for head in self.modulations]
+        met_outputs = None
+        if self.met_conditioning is not None:
+            met_outputs = self.met_conditioning(context, global_normalized, global_mask)
+            outputs = [base+delta*present for base,delta in zip(outputs, met_outputs)]
         if self.relation_adapter is not None:
             from .relation_conditioning import pair_summary
             relations, pair_present = pair_summary(theta, phi, raw[...,self.relation_indices[0]],
@@ -277,6 +312,11 @@ class VisibleConditioning(nn.Module):
                 self.diagnostics = {"context_rms": (context.detach().float() * present).square().mean().sqrt(),
                                     "scale_rms": packed[..., 0, :].square().mean().sqrt(),
                                     "shift_rms": packed[..., 1, :].square().mean().sqrt()}
+                if met_outputs is not None:
+                    met_packed = torch.stack([d*present for d in met_outputs]).detach().float().reshape(
+                        len(outputs), raw.shape[0], self.spec["n_branches"], 2, self.spec["hidden_dim"])
+                    self.diagnostics.update(met_scale_rms=met_packed[...,0,:].square().mean().sqrt(),
+                                            met_shift_rms=met_packed[...,1,:].square().mean().sqrt())
                 if self.relation_adapter is not None:
                     delta = torch.stack(additions).detach().float().reshape(
                         len(outputs), raw.shape[0], self.spec["n_branches"], 2, self.spec["hidden_dim"])
@@ -287,6 +327,10 @@ class VisibleConditioning(nn.Module):
                         (valid.sum() * max(1, len(self.numerical_indices))).clamp_min(1)).sqrt()
         modulations = [output.chunk(2 * self.spec["n_branches"], dim=-1) for output in outputs]
         modulations = [self.apply_scale_policy(parts) for parts in modulations]
+        if return_leg_modulations:
+            legs = self.leg_attention_conditioning(context, global_normalized, global_mask)
+            legs = [tuple(x * present[:, None] for x in parts) for parts in legs]
+            return modulations, legs
         if self.log_diagnostics:
             self.diagnostics["effective_scale_rms"] = (
                 self.diagnostics["scale_rms"] if self.film_scale_enabled

@@ -20,8 +20,9 @@ def layout(spec):
 
 def particle_view(condition, spec):
     spans, width = layout(spec)
-    if condition.shape[1] != width + 16:
-        raise ValueError('Expected packed condition followed by 16 decay indicators')
+    extra = condition.shape[1]-width
+    if (extra <= 16 if 'classification' in spec['shapes'] else extra != 16):
+        raise ValueError('Expected packed condition followed by decay/process indicators')
     xs, shape = spans['x']
     ms, _ = spans['x_mask']
     if len(shape) != 2 or ms.stop - ms.start != shape[0]:
@@ -57,7 +58,7 @@ def fit_masked_feature(condition, fit, spec):
     m, s = _stats(x[fit][mask[fit]])
     mean[xs], scale[xs] = np.tile(m, x.shape[1]), np.tile(s, x.shape[1])
     for key, (span, _) in spans.items():
-        if key in ('x', 'x_mask') or key.endswith('_mask'):
+        if key in ('x', 'x_mask', 'classification') or key.endswith('_mask'):
             continue
         valid = fit.copy()
         if key == 'conditions' and 'conditions_mask' in spans:

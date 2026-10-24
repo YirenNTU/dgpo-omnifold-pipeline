@@ -1,0 +1,45 @@
+# User launch only; fresh epoch287,16 GPUs,one seed. No back-to-back calibration.
+source_directory: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_process_labels_film/run-01
+classifier_directory: /pscratch/sd/y/yiren/Ztautau/tau_leg_pair_classifiers/epoch287-10pct-run-01
+output: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_general_reconstructed_tau_oracle30/epoch287-10pct-run-01
+workers: 16
+seed: 42
+epochs: 1500
+refit_every_epochs: 50
+refit_relative_to_install: true
+validation_every_epochs: 5
+oracle_fraction: 0.3
+classifier_fit:
+  epochs: 3000
+  scheduler: cosine
+  lr: 0.0001
+  min_lr: 1.0e-05
+  lr_decay_epochs: 1500
+  batch_size: 1024
+  patience: 25
+  min_delta: 0.0001
+  checkpoint_fit: true
+  allow_best_warm_start: true
+  require_plateau: true
+  weight_decay: 0.005
+  dropout: 0.1
+wandb_id: tau-dgpo-general-reconstructed-tau-oracle30-epoch287-10pct-run-01
+run_name: Reconstructed tau anchor | General70 + oracle30 | Actual MC momentum | Epoch287
+unfolding:
+  method: RooUnfoldSvd
+  bins: 8
+  kreg: 5
+  response_bootstraps: 300
+  seed: 4203
+command_config: tau_dgpo_general_reconstructed_tau_oracle30_epoch287.yaml
+joint_monitor: config/tau_joint_oracle_monitor.json
+joint_oracle:
+  geometry: normalized_reconstructed_mc_tau_p4_v1
+  fixed_energy_GeV: 45.6
+  tau_mass_GeV: 1.777
+  reconstruction: raw_directions_no_post_calibration
+  scale_source: 'export_evenet_qi_inputs.py: CM_ENERGY_GEV/2=45.6 and TAU_MASS_GEV=1.777,
+    before post_calibrate_tau_tau; common p0 squared. Actual parquet truth_tau_{a,b}_{E,px,py,pz}
+    unchanged.'
+  term_order:
+  - mean_two_leg_euclidean_p4_error_squared_over_p0_squared

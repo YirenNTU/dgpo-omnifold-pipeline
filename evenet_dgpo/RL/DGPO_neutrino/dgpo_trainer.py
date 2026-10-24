@@ -4567,6 +4567,22 @@ def _dgpo_projection_repair_after_adamw(
         diag_last.update(off_diag_old)
 
 
+def _require_finite_accumulation_chunk(model, losses):
+    """Fail all ranks before backward; restart, do not reuse an incomplete DDP reducer."""
+    finite = torch.stack([torch.isfinite(loss.detach()) for loss in losses]).all().to(torch.int32)
+    if isinstance(model, DDP):
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=model.process_group)
+    elif dist.is_available() and dist.is_initialized():
+        # Tau also has paths with explicit gradient reductions through core.
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not bool(finite.item()):
+        model.zero_grad(set_to_none=True)
+        raise FloatingPointError(
+            "Nonfinite DGPO accumulation chunk on at least one rank; "
+            "aborting before optimizer.step; restart from checkpoint"
+        )
+
+
 def train_step(
     model: torch.nn.Module,
     ref_model: torch.nn.Module,
@@ -4638,9 +4654,10 @@ def train_step(
     shared_noise = True
     if getattr(reward_agg, "conditional_tau_source", None) is not None:
         from RL.DGPO_neutrino.conditional_tau_reward import canonical_policy_batch
-        # Canonicalize BEFORE rollout AND gradient/reference forwards, not just
-        # the reward call. Historical tau-ratio negatives were generated at0.
-        batch = canonical_policy_batch(batch)
+        # One shared process-label contract for rollout, actor, reference and
+        # classifier; new experiments retain supervised parquet labels.
+        batch = canonical_policy_batch(batch,
+            contract=reward_agg.conditional_tau_source.policy_conditioning_contract)
     endpoint_controller = getattr(_unwrap_core_evenet(model), "_endpoint_kl_controller", None)
     endpoint_active = endpoint_controller is not None and endpoint_controller.config.enabled
     if endpoint_active and extragradient_optimizer_base_params is not None:
@@ -4888,6 +4905,25 @@ def train_step(
         rewards, reward_breakdown = trajectory_controller.score_rollout(reward_agg, candidates_phys, reward_batch)
     else:
         rewards, reward_breakdown = reward_agg.compute(candidates_phys, reward_batch)
+    oracle_cfg = _dgpo_cfg_get(global_config.dgpo, "oracle_mixture", {}) or {}
+    if oracle_cfg.get("enabled", False):
+        if (trajectory_controller is not None or cand_frac > 0
+                or getattr(reward_agg, "conditional_tau_source", None) is None
+                or advantage_estimator != "leave_one_out_unscaled"):
+            raise ValueError("Oracle mixture requires finite General-only LOO DGPO rollouts")
+        from RL.DGPO_neutrino.tau_oracle_mixture import training_reward, geometry_options
+        from RL.DGPO_neutrino.tau_adaptive_oracle import live_alpha
+        rewards, oracle_metrics = training_reward(rewards, candidates_phys, batch,
+            alpha=live_alpha(oracle_cfg, reward_agg.conditional_tau_source), **geometry_options(oracle_cfg))
+        # Read the live installed head each update. Refit/resume replace this
+        # source in place; never cache the step-zero General or oracle picks.
+        live_general = reward_agg.conditional_tau_source
+        oracle_metrics.update({
+            "oracle/general_reward_round": int(live_general.round_id),
+            "oracle/general_denominator_step": int(live_general.denominator_step),
+        })
+        nonfinite_diag.update(oracle_metrics)
+        reward_breakdown = dict(reward_breakdown, general_oracle_mixture=rewards)
     rewards, reward_breakdown, rew_nonfinite_diag = _dgpo_sanitize_rollout_rewards(
         rewards,
         reward_breakdown,
@@ -5861,6 +5897,9 @@ def train_step(
                             )
                         ),
                     )
+                    _require_finite_accumulation_chunk(
+                        model, [outcome[0] for outcome in chunk_outcomes]
+                    )
                     finite_losses: list[Tensor] = []
                     finite_h4_losses: list[Tensor] = []
                     finite_ref_losses: list[Tensor] = []
@@ -5873,19 +5912,6 @@ def train_step(
                         sub = completed_substeps + chunk_offset + 1
                         diags.append(dlast)
                         diag_weights.append(event_weight)
-                        if not torch.isfinite(loss):
-                            skipped_substeps += 1
-                            _log.warning(
-                                "[DGPO] non-finite substep loss (%s); skipping backward "
-                                "(step=%s events=%s:%s sub=%s/%s).",
-                                float(loss.detach().float().cpu()),
-                                global_step,
-                                event_start,
-                                event_stop,
-                                sub,
-                                acc_steps,
-                            )
-                            continue
                         finite_losses.append(loss)
                         finite_h4_losses.append(h4_component)
                         finite_ref_losses.append(ref_component)
@@ -6529,6 +6555,11 @@ def train_step(
         valid_b,
         advantages=advantages,
     )
+    if _wandb_tau_spin_enabled():
+        selected_advantage = advantages.detach()[:, valid_b.reshape(-1) > 0].float()
+        if selected_advantage.numel():
+            out["reward/advantage/std"] = float(selected_advantage.std(unbiased=False).cpu())
+            out["reward/advantage/positive_fraction"] = float((selected_advantage > 0).float().mean().cpu())
     out["train/policy_eval/parallel_timesteps"] = float(parallel_eval_steps)
     out.update(endpoint_metrics)
     out["train/policy_eval/event_microbatch_size"] = float(
@@ -6606,10 +6637,13 @@ def train_step(
     if conditioning is not None and conditioning.log_diagnostics:
         for name, value in conditioning.diagnostics.items():
             out[f"train/visible_conditioning/{name}"] = float(value)
-        for group in ("encoder", "modulations", "token_readout", "reward_probe"):
+        groups = ["encoder", "modulations", "token_readout", "reward_probe"]
+        if getattr(conditioning, "met_conditioning", None) is not None:
+            groups.append("met_conditioning")
+        for group in groups:
             parameters = [p for name, p in conditioning.named_parameters()
                           if (name.startswith(group + ".") if group != "encoder" else
-                              not name.startswith(("modulations.", "token_readout.", "reward_probe.")))]
+                              not name.startswith(("modulations.", "token_readout.", "reward_probe.", "met_conditioning.")))]
             grads = [p.grad.detach().float().square().sum() for p in parameters if p.grad is not None]
             out[f"train/visible_conditioning/{group}_grad_norm_post_clip"] = float(torch.stack(grads).sum().sqrt()) if grads else 0.
     if theta_old_snap is not None and bool(
@@ -7460,7 +7494,11 @@ def _dgpo_wandb_publish_metric_docs() -> None:
         # The compact profile deliberately keeps W&B Config and Artifacts free
         # of a second, very large copy of documentation already tracked in git.
         try:
-            run.summary["dgpo_logging_profile"] = "critical" if _wandb_critical_enabled() else "simplified"
+            if _wandb_tau_spin_enabled():
+                from RL.DGPO_neutrino.tau_spin_logging import summary_metadata
+                run.summary.update(summary_metadata())
+            else:
+                run.summary["dgpo_logging_profile"] = "critical" if _wandb_critical_enabled() else "simplified"
             run.summary["dgpo_clock_schema"] = "completed-policy-steps-v2"
         except Exception as e:
             _log.warning("[DGPO] wandb simplified-profile summary failed: %s", e)
@@ -7522,6 +7560,7 @@ def _wandb_is_media_value(v: Any) -> bool:
     return mod.startswith("wandb") and name in (
         "CustomChart",
         "Histogram",
+        "Table",
         "Image",
         "Plotly",
         "Video",
@@ -7536,9 +7575,14 @@ def _wandb_simplified_enabled() -> bool:
     return bool(_dgpo_cfg_get(section, "simplified", False)) or _wandb_critical_enabled()
 
 
+def _wandb_tau_spin_enabled() -> bool:
+    section, _ = _dgpo_wandb_yaml_section()
+    return str(_dgpo_cfg_get(section, "profile", "")) == "tau_spin"
+
+
 def _wandb_critical_enabled() -> bool:
     section, _ = _dgpo_wandb_yaml_section()
-    return str(_dgpo_cfg_get(section, "profile", "")) == "critical"
+    return str(_dgpo_cfg_get(section, "profile", "")) in ("critical", "tau_spin")
 
 
 # An explicit allowlist avoids hundreds of automatic panels from dormant
@@ -8028,6 +8072,9 @@ def _wandb_simplified_keep(key: str, value: Any) -> bool:
 def _wandb_apply_simplified_profile(data: Mapping[str, Any]) -> dict[str, Any]:
     """Apply the compact W&B allowlist when ``logger.wandb.simplified`` is true."""
 
+    if _wandb_tau_spin_enabled():
+        from RL.DGPO_neutrino.tau_spin_logging import filter_payload
+        return filter_payload(data)
     if _wandb_critical_enabled():
         return {str(key): value for key, value in data.items() if _wandb_critical_keep(str(key))}
     if not _wandb_simplified_enabled():
@@ -8640,8 +8687,14 @@ class _ClassifierTrainingPlotTracker:
 
 def _wandb_define_axes(wandb_mod: Any, *, critical: bool) -> None:
     """Never fall back to the classifier-inflated internal W&B Step axis."""
+    if _wandb_tau_spin_enabled():
+        from RL.DGPO_neutrino.tau_spin_logging import define_axes
+        define_axes(wandb_mod)
+        return
     wandb_mod.define_metric("*", step_metric="global_step", step_sync=False, hidden=critical)
     wandb_mod.define_metric("tau/*", step_metric="global_step", step_sync=False, hidden=False)
+    # Historical raw-moment Cij remains in local reports, not active charts.
+    wandb_mod.define_metric("tau/cij/*", step_metric="global_step", step_sync=False, hidden=True)
     # Read-only local-direction draws leave the physical policy clock fixed.
     # Their compact replication curves need an explicit scientific draw axis,
     # not overlapping points at step1920 or W&B's transport row counter.
@@ -12064,6 +12117,8 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
         loaded_ckpt_dict = torch.load(
             str(bundle.checkpoint_path), map_location=device, weights_only=False
         )
+    from RL.DGPO_neutrino.tau_oracle_mixture import validate_resume_contract
+    validate_resume_contract(_dgpo_cfg_get(global_config.dgpo, 'oracle_mixture', {}) or {}, loaded_ckpt_dict or {})
     if auto_resume_checkpoint is not None:
         required_recovery_keys = {
             "dgpo_checkpoint_version",
@@ -13460,6 +13515,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     def _adaptive_stack_payload() -> dict[str, Any] | None:
         if tau_source is not None:
             payload = tau_source.stack_payload()
+            from RL.DGPO_neutrino.tau_oracle_mixture import joint_contract
+            contract = joint_contract(_dgpo_cfg_get(global_config.dgpo, 'oracle_mixture', {}) or {})
+            if contract is not None:
+                payload['joint_oracle_contract'] = contract
             controller = getattr(tau_mechanism_driver, "trajectory_controller", None)
             if controller is not None and controller.balance is not None:
                 payload["trajectory_reference_balance_state"] = controller.balance_state_dict()
@@ -17106,6 +17165,9 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
     policy_train_step = train_step
     if tau_source is not None:
         from RL.DGPO_neutrino.conditional_tau_cycle import ConditionalTauCycle
+        from RL.DGPO_neutrino.conditional_tau_reward import SUPERVISED_POLICY_CONDITIONING_CONTRACT
+        if tau_source.policy_conditioning_contract != SUPERVISED_POLICY_CONDITIONING_CONTRACT:
+            raise ValueError("Tau-DGPO training now requires supervised process labels; use train_dgpo_tau_process_labels.py with a freshly fitted classifier")
         if adaptive_cfg.enabled or ema_save is not None or ema_rollout is not None:
             raise ValueError("Conditional tau uses its own refit lifecycle and raw actor only")
         def log_tau(payload, step):
@@ -17113,6 +17175,10 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 _wandb_log_auxiliary(wandb_mod, payload, current_global_step=step)
         tau_cycle = ConditionalTauCycle(dg["tau_ratio"], tau_source, eve_net, ref_model,
                                         sampler, device, rank, world_size, log_tau)
+        if tau_cycle.bootstrap_supervised_reward(start_epoch-1, global_step):
+            reward_checkpoint_metadata = reward_agg.checkpoint_metadata()
+            adaptive_state.reward_round_id = tau_source.round_id
+        tau_cycle.initialize_adaptive_oracle(global_step)
         tau_mechanism_cfg = dg["tau_ratio"].get("mechanism_probe") or {}
         if tau_mechanism_cfg.get("enabled", False):
             if transfer_enabled or checkpoint_load_mode != "resume" or ckpt_dict is None:
@@ -17500,6 +17566,7 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                 round_warmup_metrics = policy_round_warmup_metrics(adaptive_state, cfg=adaptive_cfg)
                 round_warmup_scale = round_warmup_metrics.get("train/round_warmup/lr_scale", 1.0)
                 scheduled_lrs = [float(pg["lr"]) for pg in optimizer.param_groups]
+                policy_step_started = time.perf_counter()
                 metrics = policy_train_step(
                     model,
                     round_ref_model if adaptive_cfg.enabled else ref_model,
@@ -17591,6 +17658,11 @@ def dgpo_train_loop(cfg: dict[str, Any]) -> None:
                         parameter_update_rms_max_scale_cfg
                     ),
                 )
+                if _wandb_tau_spin_enabled():
+                    metrics["train/time/policy_step_seconds"] = time.perf_counter() - policy_step_started
+                    if tau_source is not None:
+                        metrics["train/reward_round"] = int(tau_source.round_id)
+                        metrics["train/reward_age_updates"] = global_step + 1 - int(tau_source.denominator_step)
                 if metrics.get("_tau_mechanism_read_only_pending", False):
                     # Consume the next independent native batch at the SAME
                     # checkpoint, before metric/state/warmup/clock updates.

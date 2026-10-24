@@ -367,7 +367,12 @@ def load_weights_like_configure_model(
                     raise ValueError('Actor/reference attention architecture mismatch')
                 ckpt[key] = {**source_ref, **added}
     else:
-        safe_load_state(model, ckpt[weight_source])
+        from evenet.network.body.met_conditioning import PREFIX as met_prefix, load_met_weights
+        if (any(k.startswith(met_prefix) for k in model.state_dict())
+                or any(k.removeprefix('model.').startswith(met_prefix) for k in ckpt[weight_source])):
+            load_met_weights(model, {'state_dict':ckpt[weight_source]})
+        else:
+            safe_load_state(model, ckpt[weight_source])
     _log.info("[DGPO/model] Loaded checkpoint weights from %s: %s", weight_source, ckpt_path)
     return ckpt
 

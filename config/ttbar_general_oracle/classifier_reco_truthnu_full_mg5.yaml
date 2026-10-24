@@ -1,0 +1,62 @@
+seed: 42
+evenet_root: /global/homes/y/yiren/EveNet-private
+output: /pscratch/sd/y/yiren/Preference_Optimization/ttbar-general-reco-truthnu-oracle30-full-mg5-run-01
+workers: 4
+cpus_per_worker: 8
+policy:
+  config: /global/homes/y/yiren/EveNet-private/reasoning_module/train_TT2L_visible_film_full.yaml
+  checkpoint_dir: /pscratch/sd/y/yiren/Preference_Optimization/ttbar-visible-film-full-mg5-run-01/checkpoints
+  checkpoint: /pscratch/sd/y/yiren/Preference_Optimization/ttbar-visible-film-full-mg5-run-01/checkpoints/epoch=115_train=0.5625_val=0.5342.ckpt
+  ema: false
+cache:
+  batch_size: 128
+  train_candidates: 1
+  evaluation_candidates: 8
+  ddim_steps: 20
+head:
+  dropout: 0.1
+  ratio_bound: 30.0
+  classes: 1
+fit:
+  batch_size: 1024
+  lr: 0.0001
+  min_lr: 0.00001
+  weight_decay: 0.005
+  cosine_epochs: 1500
+  max_epochs: 3000
+  patience: 50
+  min_delta: 0.0001
+  minimum_steps: 1000
+mixture:
+  oracle: reco_top_truthnu_p4
+  alpha: 0.3
+  temperature: 1.0
+evaluation:
+  response_bootstraps: 300
+wandb:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  id: ttbar-general-reco-truthnu-oracle30-full-mg5-run-01
+  name: 'Does General transfer to ttbar? | Frozen diffusion | Full MG5 | Reco top truth-nu30'
+  group: TTbar General oracle transfer
+  tags: [ttbar, classifier, frozen-diffusion, reco-top-truthnu-oracle30, seed-42]
+
+protocol:
+  general_reference: scripts/tau_conditioning_heads.py::ConditionedTauMLP
+  feature_source: frozen diffusion clean t0 pre-velocity tokens plus ordered neutrino geometry
+  oracle_candidate: reconstructed b plus reconstructed lepton plus predicted neutrino, both ordered legs
+  oracle_target: same reconstructed b plus same reconstructed lepton plus MC neutrino, both ordered legs
+  oracle_normalization: full training valid-assignment reconstructed-visible-plus-MC-neutrino reference RMS; one energy scale and one shared xyz scale; fixed before evaluation
+  oracle_distance: mean squared normalized difference over both legs and all E_px_py_pz components
+  inference_limit: top oracle requires MC truth and source b/lepton assignments; not a deployable selection
+  cache_source: best concrete supervised checkpoint pinned once, never stale last.ckpt
+  splits: full MG5 train for head; MG5 test hashed 20pct head selection, 40pct response, 20pct measurement, 20pct independent truth reference
+  validation_limit: MG5 test was already used to select diffusion; developmental comparison, not blind final physics test
+  nu2flow_reference: EveNet-private/downstreams/nu2flow/unfolding/unfold.py
+  nu2flow_bins: mtt 4 bins times variable 4 bins, flattened X+4*mtt, RooUnfoldSvd kreg7
+  nu2flow_delta_phi: absolute dilepton delta_phi/pi; explicit change from distributions.ipynb signed expression to match nonnegative bins
+  neutrino_reference: EveNet-private/reasoning_analysis/RL/Scoring_method/test_result_analysis/scoring_head_unfolding_separated.py
+  neutrino_bins: pt 30 bins 0..150, eta 20 bins -4..4, phi 16 bins -pi..pi; edge bins explicitly include tails; kreg5
+  top_mass_bins: 28 bins 100..240 GeV, edge bins include tails; kreg5
+  covariance: whole-event K8 contributions, full offdiagonal data covariance, paired response-event bootstrap separately reported
+  decision: assess distribution, closure, data and total uncertainty, ESS and conditional spread together; manual DGPO decision
