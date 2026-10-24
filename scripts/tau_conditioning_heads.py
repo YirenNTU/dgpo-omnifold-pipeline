@@ -41,7 +41,7 @@ class ConditioningBlock(nn.Module):
 class ConditionedTauMLP(ConditionalSpinMLP):
     def __init__(self, condition_dim, hidden=128, dropout=.05, candidate_dim=15,
                  relative_dim=0, kind='concat', depth=3, ratio_bound=None,
-                 condition_hidden=None, condition_width=64):
+                 condition_hidden=None, condition_width=64, process_label_index=None,num_process_classes=19):
         if depth < 1:
             raise ValueError('Head depth must be positive')
         super().__init__(condition_dim, hidden, dropout, candidate_dim, relative_dim)
@@ -56,13 +56,36 @@ class ConditionedTauMLP(ConditionalSpinMLP):
             with torch.random.fork_rng(devices=[]):
                 self.condition_encoder = nn.Sequential(nn.Linear(condition_dim, condition_hidden), nn.SiLU(),
                     nn.Linear(condition_hidden, condition_width), nn.SiLU())
+        self.process_label_index = process_label_index
+        self.num_process_classes = num_process_classes
+        if process_label_index is not None:
+            if not 0 <= process_label_index < condition_dim-num_process_classes:
+                raise ValueError('Process label must be a packed scalar before the appended one-hot')
+            # Match generator.label_dense: learned one-hot projection ADDED
+            # to the condition vector before FiLM. Numeric IDs are not treated
+            # as ordered continuous features; the duplicate one-hot is excluded
+            # from the continuous encoder as well.
+            columns = [i for i in range(condition_dim-num_process_classes) if i != process_label_index]
+            self.register_buffer('continuous_condition_columns',torch.tensor(columns),persistent=False)
+            self.condition_encoder = nn.Sequential(nn.Linear(len(columns),condition_hidden),nn.SiLU(),
+                nn.Linear(condition_hidden,condition_width),nn.SiLU())
+            self.process_label_dense = nn.Linear(num_process_classes,condition_width,bias=False)
         self.residual_scale = 1/math.sqrt(depth)
         if ratio_bound is not None and (not math.isfinite(ratio_bound) or ratio_bound <= 1):
             raise ValueError('Invalid ratio bound')
         self.ratio_bound = ratio_bound
 
     def forward(self, condition, candidate):
-        c, h = self.condition_encoder(condition), self.spin_encoder(candidate)
+        if self.process_label_index is None:
+            c = self.condition_encoder(condition)
+        else:
+            labels = condition[:,self.process_label_index]
+            if (not torch.isfinite(labels).all() or not torch.equal(labels,labels.long().to(labels.dtype))
+                    or (labels < 0).any() or (labels >= self.num_process_classes).any()):
+                raise ValueError('Classifier process labels exceed the pinned embedding vocabulary')
+            c = self.condition_encoder(condition[:,self.continuous_condition_columns])
+            c = c + self.process_label_dense(F.one_hot(labels.long(),num_classes=self.num_process_classes).to(c.dtype))
+        h = self.spin_encoder(candidate)
         h = self.condition_candidate(h, condition)
         for block in self.blocks:
             h = h + self.residual_scale*block(h, c)
@@ -90,7 +113,10 @@ class AttentionConditionedTauMLP(ConditionedTauMLP):
         self.mask_span, mask_shape = spans['x_mask']
         if len(shape) != 2 or mask_shape != (shape[0],):
             raise ValueError('Attention requires particle x and aligned x_mask')
-        if self.condition_encoder[0].in_features != packed_width + 16:
+        # With process labels, the continuous encoder excludes both the scalar
+        # process ID and its appended one-hot. Decay indicators still add 16.
+        continuous_width = packed_width + 16 - (self.process_label_index is not None)
+        if self.condition_encoder[0].in_features != continuous_width:
             raise ValueError('Attention condition packing mismatch')
         if attention_heads != 4 or len(self.blocks) != 3:
             raise ValueError('This ablation fixes three FiLM blocks and four attention heads')

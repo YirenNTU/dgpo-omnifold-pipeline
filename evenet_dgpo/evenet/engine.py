@@ -615,6 +615,10 @@ class EveNetEngine(L.LightningModule):
     @time_decorator()
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
 
+        if self.config.options.Training.get('EnergyScore', {}).get('enabled', False):
+            from evenet.utilities.tau_energy_score import engine_step
+            return engine_step(self, batch, batch_idx, training=True)
+
         optimizers = self.optimizers()
         if not isinstance(optimizers, (list, tuple)):
             optimizers = [optimizers]
@@ -739,6 +743,9 @@ class EveNetEngine(L.LightningModule):
 
     # @time_decorator
     def validation_step(self, batch, batch_idx) -> STEP_OUTPUT:
+        if self.config.options.Training.get('EnergyScore', {}).get('enabled', False):
+            from evenet.utilities.tau_energy_score import engine_step
+            return engine_step(self, batch, batch_idx, training=False)
         step = self.current_step
         epoch = self.current_epoch
 
@@ -1248,6 +1255,20 @@ class EveNetEngine(L.LightningModule):
                     progress = min(1., max(0., (step - warmup) / max(1, self.total_steps - warmup)))
                     return floor + (1 - floor) * .5 * (1 + math.cos(math.pi * progress))
                 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
+            energy_resume = self.config.options.Training.get("EnergyBatchResume", None)
+            if energy_resume is not None:
+                from functools import partial
+                from evenet.utilities.tau_energy_score import resumed_lr_multiplier
+                if not self.config.options.Training.get('EnergyScore', {}).get('enabled', False):
+                    raise ValueError('EnergyBatchResume requires EnergyScore')
+                if batch_size != energy_resume['batch_size']:
+                    raise ValueError('Energy resume batch size disagrees with optimizer config')
+                reference_steps = math.ceil(dataset_size/(energy_resume['original_batch_size']*world_size))
+                multiplier = partial(resumed_lr_multiplier,
+                    pivot=energy_resume['pivot_step'], reference_steps=reference_steps,
+                    new_steps=self.steps_per_epoch, epochs=epochs, warmup_epochs=warm_up_factor,
+                    warm_up=warm_up, floor=0. if floor is None else floor)
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
             return optimizer, scheduler
 
         optimizers, schedulers = [], []
@@ -1330,9 +1351,25 @@ class EveNetEngine(L.LightningModule):
 
             if self.pretrain_ckpt_path is not None:
                 self.l.warning(f"[Model] --> Loading pretrained weights from: {self.pretrain_ckpt_path}")
-                ckpt = torch.load(self.pretrain_ckpt_path, map_location=self.device)
+                # Exact supervised continuation uses a user-owned Lightning
+                # checkpoint already pinned/validated by preparation. Its saved
+                # callback state may contain NumPy arrays, not just tensors.
+                load_options = ({"weights_only": False}
+                                if self.config.options.Training.get("strict_pretrained_model", False)
+                                else {})
+                ckpt = torch.load(self.pretrain_ckpt_path, map_location=self.device, **load_options)
 
-                if self.config.options.Training.get("strict_relation_source", False):
+                if self.config.options.Training.get("strict_pretrained_model", False):
+                    from evenet.utilities.strict_pretrained import load_exact_pretrained
+                    if ema_enable or ema_replace:
+                        raise ValueError("Exact supervised continuation requires raw weights without EMA")
+                    conditioning = getattr(getattr(self.model, 'TruthGeneration', None), 'visible_conditioning', None)
+                    if getattr(conditioning, 'leg_attention_conditioning', None) is not None:
+                        from evenet.network.body.leg_attention_conditioning import load_leg_weights
+                        load_leg_weights(self.model, ckpt)
+                    else:
+                        load_exact_pretrained(self.model, ckpt)
+                elif self.config.options.Training.get("strict_relation_source", False):
                     from evenet.network.body.relation_conditioning import load_relation_weights
                     if ema_enable or ema_replace:
                         raise ValueError("Relation screen requires raw weights without EMA")
@@ -1346,10 +1383,20 @@ class EveNetEngine(L.LightningModule):
                     if ema_enable or ema_replace:
                         raise ValueError("Fourier integration requires raw weights with EMA disabled")
                     load_no_fourier_weights(self.model, ckpt)
-                elif ema_enable and 'ema_state_dict' in ckpt and ema_replace:
-                    safe_load_state(self.model, ckpt['ema_state_dict'])
                 else:
-                    safe_load_state(self.model, ckpt['state_dict'])
+                    state = ckpt['ema_state_dict'] if ema_enable and 'ema_state_dict' in ckpt and ema_replace else ckpt['state_dict']
+                    from evenet.network.body.met_conditioning import PREFIX as met_prefix, load_met_weights
+                    from evenet.network.body.leg_attention_conditioning import PREFIX as leg_prefix, load_leg_weights
+                    if (any(k.startswith(leg_prefix) for k in self.model.state_dict())
+                            or any(k.removeprefix('model.').startswith(leg_prefix) for k in state)):
+                        if self.model.TruthGeneration.visible_conditioning.leg_attention_conditioning is None:
+                            raise ValueError('Checkpoint requires leg attention runtime; weights cannot be ignored')
+                        load_leg_weights(self.model, {'state_dict':state})
+                    elif (any(k.startswith(met_prefix) for k in self.model.state_dict())
+                            or any(k.removeprefix('model.').startswith(met_prefix) for k in state)):
+                        load_met_weights(self.model, {'state_dict':state})
+                    else:
+                        safe_load_state(self.model, state)
 
                 if self.model.conditional_preconditioning is not None:
                     if not self.config.options.Training.get("strict_relation_source", False):

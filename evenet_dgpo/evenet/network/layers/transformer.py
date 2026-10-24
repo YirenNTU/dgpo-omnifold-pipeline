@@ -333,16 +333,23 @@ class GeneratorTransformerBlockModule(nn.Module):
             nn.init.ones_(self.layer_scale2.gamma)
 
     def forward(self, x, cond_token, mask=None, attn_mask=None, modulation=None, modulation_mask=None,
-                attention_bias=None):
+                attention_bias=None, value_modulation=None):
         """
         :param x: point_cloud (batch_size, num_objects, projection_dim)
         :param cond_token: (batch_size, 1, projection_dim)
         :param mask: (batch_size, num_objects, 1)
         """
         x1 = self.norm1(x)
+        value_input = x1
         if modulation is not None:
             from evenet.network.body.visible_conditioning import modulate_visible_condition
             x1 = modulate_visible_condition(x1, modulation[0], modulation[1], modulation_mask)
+        if value_modulation is None:
+            value_input = x1  # Preserve legacy shared Q/K/V execution exactly.
+        else:
+            if modulation is None or modulation_mask is None or len(value_modulation) != 4:
+                raise ValueError('Separate value routing requires valid original FiLM')
+            value_input = modulate_visible_condition(value_input, value_modulation[0], value_modulation[1], modulation_mask)
         padding_mask = ~(mask.squeeze(2).bool()) if mask is not None else None
 
         if (attn_mask is not None) and (attn_mask.dim() == 3):
@@ -373,7 +380,7 @@ class GeneratorTransformerBlockModule(nn.Module):
         updates, _ = self.attn(
             x1,
             x1,
-            x1,
+            value_input,
             key_padding_mask=padding_mask,
             attn_mask=attn_mask,
             # EventGenerationHead never consumes attention weights.

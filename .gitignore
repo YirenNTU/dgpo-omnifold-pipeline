@@ -8,6 +8,7 @@ ray_results/
 
 # Generated experiment outputs stay local.
 /artifacts/
+/.runtime/
 checkpoints/
 *.pt
 *.pth

@@ -116,23 +116,8 @@ def make_noise_bank(n, k, batch_size, device, seed):
 
 
 def make_replay_sampler(noise, mode, progress=None):
-    from evenet.utilities.diffusion_sampler import DDIMSampler
-
-    class ReplayDDIMSampler(DDIMSampler):
-        def __init__(self):
-            super().__init__(noise.device, x0_mode=mode)
-            self.draws_used = 0
-
-        def prior_sde(self, dimensions):
-            if self.draws_used >= len(noise) or tuple(dimensions) != tuple(noise.shape[1:]):
-                raise ValueError("Replay noise exhausted or chain/batch shape changed")
-            if progress is not None and self.draws_used % 16 == 0:
-                progress(self.draws_used)
-            x = noise[self.draws_used].clone()
-            self.draws_used += 1
-            return x
-
-    return ReplayDDIMSampler()
+    from evenet.utilities.diffusion_sampler import make_replay_sampler as replay
+    return replay(noise, mode, progress)
 
 
 def merge_parts(parts, events, k, value_key):

@@ -1,0 +1,28 @@
+# User launches once inside an existing 16-GPU Ray allocation; inference only.
+output_root: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_no_film_cij
+reference_run: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/film-on-run-02
+source_runtime: /pscratch/sd/y/yiren/Ztautau/tau_cij_sampling_bias/probe-c77f6b3e8c/pretrain_runtime.yaml
+checkpoints:
+  pretrain-no-film-epoch214:
+    path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/epoch=214_train=0.1519_val=0.1278.ckpt
+    epoch: 214
+    global_step: 13975
+    role: primary_historical_last
+  pretrain-no-film-epoch190:
+    path: /pscratch/sd/y/yiren/Ztautau/diffusion_pretrain_10pct_seed42/checkpoints/epoch=190_train=0.1381_val=0.1263.ckpt
+    epoch: 190
+    global_step: 12415
+    role: secondary_lowest_saved_validation_loss
+workers: 16
+events: 119002
+K: 8
+ddim_steps: 20
+batch_size: 512
+seed: 20261006
+bootstrap: 300
+wandb:
+  entity: ytchou97-university-of-washington
+  project: nu2flow-RL
+  name: "Does FiLM improve spin closure? | pretrain epochs190 and214 | paired Cij"
+  group: Diffusion foundation FiLM
+  tags: [InferenceOnly, FiLMOff, FilteredData, GPU16, RawWeights, PairedNoise]

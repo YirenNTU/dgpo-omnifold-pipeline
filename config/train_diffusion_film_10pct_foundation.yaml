@@ -1,0 +1,120 @@
+# Standard diffusion training from the original foundation, not an RL policy.
+# Resolve with scripts/train_diffusion_film_10pct.py. User launches compute.
+extends_overlay: train_diffusion_10pct_nersc.yaml
+
+rl:
+  enabled: false
+
+network:
+  Body:
+    PET:
+      visible_angular_fourier:
+        enabled: false
+  # Retain the original depth to make FiLM the architecture intervention.
+  TruthGeneration:
+    num_layers: 1
+  VisibleConditioning:
+    diffusion_enabled: true
+    classifier_enabled: false
+    diffusion_fourier_enabled: false
+    diffusion_film_scale_enabled: true
+    width: 64
+    harmonics: [1, 2, 3, 4]
+    theta_source: Part_eta
+    phi_source: Part_phi
+    feature_mode: kinematics
+    numerical_features: [Part_energy, Part_pt]
+    numerical_frequencies: [0.25, 0.5, 1.0, 2.0]
+    log_diagnostics: true
+
+platform:
+  ordered_data: true
+
+options:
+  Training:
+    precision: 32-true
+    seed: 42
+    paired_diffusion_seed: 20261006
+    pretrain_model_load_path: /pscratch/sd/y/yiren/checkpoints.20M.a4.last.ckpt
+    model_checkpoint_load_path: null
+    model_checkpoint_save_path: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/checkpoints
+    model_checkpoint_save_top_k: 5
+    model_checkpoint_save_last: true
+    # Preserve the historical 10% training budget, optimizer and LR scaling.
+    epochs: 1500
+    total_epochs: 1500
+    scale_lr_with_world_size: true
+    learning_rate_factor: 1.0
+    learning_rate_warm_up_factor: 1.0
+    freeze_modules: []
+    JointCoverage:
+      enable: false
+    EMA:
+      enable: false
+      replace_model_after_load: false
+      replace_model_at_end: false
+      use_for_generation: false
+    Components:
+      TruthGeneration:
+        low_noise_cutoff: 0.0
+        low_noise_weight: 1.0
+      # Child owns these parameters; the parent generation group excludes them.
+      TruthGeneration.visible_conditioning:
+        optimizer_group: visible_conditioning
+        optimizer_type: adamW
+        learning_rate: 0.0002
+        warm_up: true
+        weight_decay: 0.001
+        decoupled_weight_decay: true
+    TauPhysics:
+      enable: true
+      events: 119002
+      every_n_epochs: 50
+      K: 8
+      batch_size: 512
+      ddim_steps: 20
+      seed: 20261006
+      bootstrap: 300
+      panel_path: null  # Filled by CPU-only preparation from filtered validation.
+      panel_metadata: null
+
+logger:
+  wandb:
+    project: nu2flow-RL
+    id: null
+    run_name: "Does FiLM improve spin closure? | diffusion 10% | foundation training"
+    group: Diffusion foundation FiLM
+    tags: [DiffusionOnly, NoRL, Foundation, GlobalFiLM, NoFourier, Depth1, FilteredData, Data10pct, GPU16, RawWeights]
+  local:
+    save_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/logs
+    name: diffusion-film-10pct-foundation
+    version: v1
+
+nersc:
+  submit: false
+  ray:
+    results_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/ray_results
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_diffusion_film_10pct.py run
+
+experiment:
+  question: Does visible FiLM improve supervised tau spin closure on filtered 10% training data?
+  intervention: global_visible_film_only_at_original_generation_depth
+  source_stage: original_20M_a4_foundation_before_ztautau_diffusion
+  checkpoint_protocol: foundation_weights_only_fresh_optimizer_scheduler_epoch_zero
+  primary_endpoint: generated_Cij_Frobenius_error_at_fixed_completed_epoch_200
+  physics_guardrail: nn_absolute_error_at_the_same_epoch
+  secondary: validation_velocity_loss_and_all_Cij_components
+  evaluation_epochs: [0, 50, 100, 150, 200]
+  interpretation: >-
+    FiLM-on pilot only; no matched off-arm training is launched. Retain original
+    one-block depth, filtered populations, normalization file, supervised loss,
+    batch2048 per GPU and historical optimizer/schedule. Added FiLM starts with
+    zero scale/shift and uses visible inputs only. Fourier channels are disabled.
+    Ordered batches and paired training/validation RNG support a future matched
+    control; the historical off run is descriptive, not a matched causal control.
+    Training may continue to1500 epochs or stop on inherited val/loss patience25.
+    If it stops before200, the declared endpoint is incomplete. Cij uses the
+    existing fixed-energy tau reconstruction and analyzing-power convention;
+    this is not complete tau-rest-frame or entanglement closure.

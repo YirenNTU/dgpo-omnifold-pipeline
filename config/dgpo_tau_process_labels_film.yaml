@@ -1,0 +1,34 @@
+# User-launched native tau-DGPO from the completed supervised FiLM policy.
+extends_overlay: dgpo_tau_ratio_1110.yaml
+
+platform:
+  require_filtered_data: true
+  data_parquet_dir: /pscratch/sd/y/yiren/Ztautau/omnifold_attention_10pct_stic_filtered_test1/train
+  data_parquet_val_dir: /pscratch/sd/y/yiren/Ztautau/diffusion_val_20pct_seed42_stic_filtered_test1/val
+
+dgpo:
+  tau_ratio:
+    policy_conditioning_contract: supervised_process_labels_v2
+    source_run: xgp6ls8b
+    source_runtime: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/film-on-run-02/runtime.yaml
+    source_checkpoint: /pscratch/sd/y/yiren/Ztautau/diffusion_film_10pct_foundation/film-on-run-02/checkpoints/last.ckpt
+    source_completed_epochs: 287
+    source_global_step: 18655
+    output_root: /pscratch/sd/y/yiren/Ztautau/tau_dgpo_process_labels_film/run-01
+    minimum_selected_steps: 1000
+    bootstrap_fresh_classifier: true
+    validation_seed: 20261006
+    refit_every_epochs: 10
+    validation_every_epochs: 10
+
+logger:
+  wandb:
+    run_name: "Does tau DGPO improve spin closure? | process labels and FiLM | diffusion epoch287"
+    group: Tau DGPO supervised conditioning
+    tags: [DGPO, ConditionalTau, ProcessLabels, FiLM, Depth1, DiffusionEpoch287, FreshClassifier, FilteredData, GPU16]
+
+nersc:
+  submit: false
+  execution:
+    command: >-
+      shifter python3 -u scripts/train_dgpo_tau_process_labels.py config/dgpo_tau_process_labels_film.yaml train

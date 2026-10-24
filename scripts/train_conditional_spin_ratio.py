@@ -294,6 +294,15 @@ class ConditionalSpinMLP(nn.Module):
 
 
 def build_classifier(cfg, condition_dim=None, candidate_dim=None):
+    if cfg.get('general_spin_angles'):
+        from scripts.tau_general_spin_angles import build
+        return build(cfg, condition_dim, candidate_dim)
+    if cfg.get('topology_branch'):
+        from scripts.tau_topology_branch import build_topology_classifier
+        return build_topology_classifier(cfg, condition_dim, candidate_dim)
+    if cfg.get('physics_branch'):
+        from scripts.tau_physics_branch import build_physics_classifier
+        return build_physics_classifier(cfg, condition_dim, candidate_dim)
     if cfg.get('explicit_input'):
         from scripts.tau_explicit_inputs import build_explicit_classifier
         return build_explicit_classifier(cfg, condition_dim, candidate_dim)
@@ -308,12 +317,20 @@ def build_classifier(cfg, condition_dim=None, candidate_dim=None):
         return ConditionalSpinMLP(*args)
     from scripts.tau_conditioning_heads import ConditionedTauMLP
     cls, extra = ConditionedTauMLP, {}
+    if cfg.get('process_label_conditioning', False):
+        from scripts.conditional_tau_preprocessing import layout
+        spans,_ = layout(cfg['packing_spec'])
+        span,shape = spans['classification']
+        if span.stop-span.start != 1:
+            raise ValueError('Classifier process label must be one scalar per event')
+        extra['process_label_index'] = span.start
+        extra['num_process_classes'] = cfg['num_process_classes']
     if cfg.get('cross_attention', False):
         from scripts.tau_conditioning_heads import AttentionConditionedTauMLP
         if kind != 'film':
             raise ValueError('Cross-attention ablation requires FiLM')
         cls = AttentionConditionedTauMLP
-        extra = dict(packing_spec=cfg['packing_spec'], attention_heads=cfg.get('attention_heads', 4))
+        extra.update(packing_spec=cfg['packing_spec'], attention_heads=cfg.get('attention_heads', 4))
     return cls(*args, **extra, kind=kind, depth=cfg.get('head_depth', 3),ratio_bound=bound,
         condition_hidden=cfg.get('condition_hidden'),condition_width=cfg.get('condition_width',64))
 

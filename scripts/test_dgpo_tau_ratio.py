@@ -13,7 +13,7 @@ from scripts.train_dgpo_tau_ratio import ROOT, assemble_runtime, validate_settin
 from scripts.train_conditional_spin_ratio import build_classifier, score_pair
 from RL.DGPO_neutrino.conditional_tau_reward import (
     KIND, ConditionalTauReward, candidate_coordinates, feature_precision, canonical_policy_batch,
-    POLICY_CONDITIONING_CONTRACT,
+    POLICY_CONDITIONING_CONTRACT, SUPERVISED_POLICY_CONDITIONING_CONTRACT,
 )
 from RL.DGPO_neutrino.conditional_tau_cycle import fit_head, summarize_cij, ConditionalTauCycle
 from RL.DGPO_neutrino.rewards import RewardAggregator
@@ -247,7 +247,9 @@ def test_refit_recenters_reference_without_changing_actor_optimizer(tmp_path):
     cycle=object.__new__(ConditionalTauCycle)
     cycle.reward,cycle.actor,cycle.reference=r,actor,reference
     cycle.rank,cycle.world=0,1
-    cycle.train={}; cycle.cfg={'refit_seed':42}; cycle.output=tmp_path
+    cycle.train={'source_ids':np.arange(416701)}
+    cycle.validation={'source_ids':np.array([-1,-2])}
+    cycle.cfg={'refit_seed':42}; cycle.output=tmp_path
     cycle.generate=lambda *args,**kwargs: {}
     head=copy.deepcopy(r.bundle['head']); head['state_dict']['readout.bias']+=1
     cycle.fit=lambda *args,**kwargs:(None,head,{},None)
@@ -300,7 +302,7 @@ def test_canonical_process_label_preserves_observables_and_input():
     b=live_batch(); b['classification']=torch.arange(5)
     result=canonical_policy_batch(b)
     assert result['classification'].dtype==torch.long
-    assert result['classification'].tolist()==[0]*5
+    assert result['classification'].tolist()==list(range(5))
     assert b['classification'].tolist()==list(range(5))
     for key in b:
         if key!='classification': assert result[key] is b[key]
@@ -315,12 +317,12 @@ def test_native_train_step_canonicalizes_before_any_policy_forward():
         seen.append(inspect.currentframe().f_back.f_locals['batch'])
         raise ReachedPolicy()
     b=live_batch(); b['classification']=torch.ones(5,dtype=torch.long)
-    for tau in (object(),None):
+    for tau in (SimpleNamespace(policy_conditioning_contract=SUPERVISED_POLICY_CONDITIONING_CONTRACT),None):
         with patch.object(trainer,'_unwrap_core_evenet',new=intercept),pytest.raises(ReachedPolicy):
             trainer.train_step(None,None,None,None,b,None,None,
                 SimpleNamespace(conditional_tau_source=tau),beta=1,K=8,num_ddim_steps=20,
                 global_step=0,epoch=0,device=torch.device('cpu'),dtype=torch.float32)
-    assert seen[0]['classification'].tolist()==[0]*5
+    assert seen[0]['classification'].tolist()==[1]*5
     assert seen[1] is b  # Old H4 / other reward behavior untouched.
 
 
@@ -330,6 +332,7 @@ def test_live_panel_probe_is_paired_read_only_and_measures_label_effect():
     cycle.device=torch.device('cpu'); cycle.rank=0; cycle.world=1
     cycle.actor=torch.nn.Linear(1,1).train(); cycle.sampler=None
     cycle.reward=SimpleNamespace(spec=EventPackingSpec.from_dict(example_bundle()['head']['packing_spec']),
+        policy_conditioning_contract=POLICY_CONDITIONING_CONTRACT,
         compute=lambda d,b:d.mean((-1,-2)))
     records=[]; cycle.emit=lambda row,step:records.append(row)
     b=live_batch(); b['classification']=torch.full((5,),2,dtype=torch.long)
@@ -348,5 +351,5 @@ def test_live_panel_probe_is_paired_read_only_and_measures_label_effect():
     row=records[0]
     assert row['tau/startup/incoming_label_nonzero_fraction']==1
     assert row['tau/startup/live_panel_max_sample_error']==0
-    assert row['tau/startup/paired_original_label_reward']-row['tau/startup/paired_fixed0_reward']==pytest.approx(2)
-    assert row['tau/startup/paired_fixed0_reward']==row['tau/startup/paired_panel_reward']
+    assert row['tau/startup/paired_original_label_reward']-row['tau/startup/paired_canonical_reward']==pytest.approx(2)
+    assert row['tau/startup/paired_canonical_reward']==row['tau/startup/paired_panel_reward']

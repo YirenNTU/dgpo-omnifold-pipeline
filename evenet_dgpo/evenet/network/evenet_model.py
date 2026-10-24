@@ -338,9 +338,13 @@ class EveNetModel(nn.Module):
                     num_layers=self.network_cfg.TruthGeneration.num_layers, n_branches=2,
                     output_dim=self.invisible_input_dim,
                     attention_heads=self.network_cfg.TruthGeneration.num_heads,
+                    global_feature_names=self._raw_global_feature_names(),
                 ),
             )
             self.neutrino_position_encode = self.network_cfg.TruthGeneration.neutrino_position_encode
+            conditioning = self.TruthGeneration.visible_conditioning
+            if conditioning is not None and conditioning.leg_attention_conditioning is not None:
+                conditioning.leg_attention_conditioning.bind_normalizer(self.global_normalizer)
 
         from evenet.network.body.conditional_preconditioning import ConditionalPreconditioner, preconditioning_spec
         preconditioning = preconditioning_spec(self.network_cfg)
@@ -390,6 +394,10 @@ class EveNetModel(nn.Module):
             for feature_info in self.event_info.input_features[input_name]:
                 feature_names.append(feature_info.name)
         return feature_names
+
+    def _raw_global_feature_names(self) -> list[str]:
+        return [feature.name for name, kind in self.event_info.input_types.items()
+                if str(kind).upper() == "GLOBAL" for feature in self.event_info.input_features[name]]
 
     def project_sequential_inputs(self, x: Tensor, mask: Tensor) -> Tensor:
         """
@@ -737,6 +745,7 @@ class EveNetModel(nn.Module):
                     position_encode=(self.neutrino_position_encode and schedule_name == "neutrino_generation"),
                     visible_raw=x['x'], visible_tokens=input_point_cloud, visible_mask=input_point_cloud_mask,
                     visible_normalized=input_point_cloud_raw,
+                    global_normalized=global_conditions,
                 )
                 generations["neutrino"] = {
                     "vector": self._apply_reward_conditioning_probe(
@@ -947,6 +956,7 @@ class EveNetModel(nn.Module):
                 position_encode=self.neutrino_position_encode,
                 visible_raw=cond_x['x'], visible_tokens=input_point_cloud, visible_mask=input_point_cloud_mask,
                 visible_normalized=input_point_cloud_raw,
+                global_normalized=global_conditions,
             )
 
             return self._apply_reward_conditioning_probe(

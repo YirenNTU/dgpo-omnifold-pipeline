@@ -123,3 +123,22 @@ class DDIMSampler:
             denormalize = normalize_fn.denormalize_grad if differentiable else normalize_fn.denormalize
             x = denormalize(x, noise_mask, remove_padding=remove_padding)
         return x
+
+
+def make_replay_sampler(noise, mode, progress=None):
+    """Replay fixed candidate noise without importing diagnostic entrypoints."""
+    class ReplayDDIMSampler(DDIMSampler):
+        def __init__(self):
+            super().__init__(noise.device, x0_mode=mode)
+            self.draws_used = 0
+
+        def prior_sde(self, dimensions):
+            if self.draws_used >= len(noise) or tuple(dimensions) != tuple(noise.shape[1:]):
+                raise ValueError('Replay noise exhausted or chain/batch shape changed')
+            if progress is not None and self.draws_used % 16 == 0:
+                progress(self.draws_used)
+            x = noise[self.draws_used].clone()
+            self.draws_used += 1
+            return x
+
+    return ReplayDDIMSampler()

@@ -46,7 +46,9 @@ def load_policy(cfg, device):
 def make_batch(raw, spec, device):
     from RL.DGPO_neutrino.omnifold_ztautau.evenet_ratio import unpack_event_inputs
     batch = unpack_event_inputs(torch.as_tensor(raw, device=device), spec)
-    batch.pop('classification', None)
+    if 'classification' in spec.shapes:
+        from RL.DGPO_neutrino.tau_process_labels import canonical_policy_batch
+        batch = canonical_policy_batch(batch)
     batch['x_invisible'] = torch.zeros(len(raw), 2, 2, device=device)
     batch['x_invisible_mask'] = torch.ones(len(raw), 2, dtype=torch.bool, device=device)
     return batch

@@ -212,6 +212,8 @@ def main():
     p.add_argument('config', type=Path)
     p.add_argument('phase', choices=('prepare', 'train'), nargs='?', default='train')
     args = p.parse_args()
+    if args.phase == 'train':
+        raise ValueError('This label0 launcher is archived. Use scripts/train_dgpo_tau_process_labels.py config/dgpo_tau_process_labels_film.yaml train')
     runtime, output = prepare(args.config)
     if args.phase == 'train':
         env = dict(os.environ)

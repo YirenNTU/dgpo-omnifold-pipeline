@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "method": "RooUnfoldSvd",
+  "kreg": 5,
+  "response_bootstraps": 300,
+  "seed": 4203,
+  "edges": {
+    "leg_a_delta_theta": [
+      -3.141592653589793,
+      -0.03499993681907654,
+      -0.019552767276763916,
+      -0.009552478790283203,
+      -0.00023376941680908203,
+      0.009049952030181885,
+      0.019336163997650146,
+      0.03473305702209473,
+      3.141592653589793
+    ],
+    "leg_a_delta_phi": [
+      -3.141592653589793,
+      -0.04126192629337311,
+      -0.02300542499870062,
+      -0.01088143140077591,
+      -0.0003981590270996094,
+      0.01038205623626709,
+      0.022489371709525585,
+      0.04132961109280586,
+      3.141592653589793
+    ],
+    "leg_b_delta_theta": [
+      -3.141592653589793,
+      -0.035423070192337036,
+      -0.01970517635345459,
+      -0.009561657905578613,
+      -0.0001499652862548828,
+      0.009214669466018677,
+      0.019613802433013916,
+      0.035098254680633545,
+      3.141592653589793
+    ],
+    "leg_b_delta_phi": [
+      -3.141592653589793,
+      -0.0411320487037301,
+      -0.022335290908813477,
+      -0.010073423385620117,
+      0.00041556358337402344,
+      0.011142530711367726,
+      0.023066073656082153,
+      0.04121790733188391,
+      3.141592653589793
+    ],
+    "cos_opening": [
+      -1.0,
+      -0.9999980000006666,
+      -0.9999875000260416,
+      -0.9999500004166653,
+      -0.9998000066665778,
+      -0.9992001066609779,
+      -0.9968017063026194,
+      -0.9872272833756269,
+      1.0
+    ],
+    "acoplanarity": [
+      0.0,
+      0.002,
+      0.005,
+      0.01,
+      0.02,
+      0.04,
+      0.08,
+      0.16,
+      3.141592653589793
+    ],
+    "polar_sum": [
+      0.0,
+      0.002,
+      0.005,
+      0.01,
+      0.02,
+      0.04,
+      0.08,
+      0.16,
+      3.141592653589793
+    ],
+    "axis_x": [
+      -1.0,
+      -0.75,
+      -0.5,
+      -0.25,
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "axis_y": [
+      -1.0,
+      -0.75,
+      -0.5,
+      -0.25,
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "axis_z": [
+      -1.0,
+      -0.75,
+      -0.5,
+      -0.25,
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ]
+  },
+  "edges_source": "artifacts/tau_dgpo_general_oracle10/step1300-axis-polar-oracle-all-targets-svd-run-01/report.json",
+  "truth": "Physical MC angular offsets plus reconstructed-visible directions; ordered lab pair axis. No fixed-energy/back-to-back calibration.",
+  "weighting": "Raw uniform K8; total one contribution per event",
+  "selection": "Common physical-theta and defined-axis mask across epoch287/current. Report removal fractions, never clip theta.",
+  "uncertainty": "Data H.T@H; separate paired whole-event response-MC covariance; nominal/tilted closure and localized truth-bin bias.",
+  "limitations": "Reused development validation; fixed kreg is not validated for every truth deformation; no full systematics or spin closure.",
+  "historical_targets": [
+    "leg_a_delta_theta",
+    "leg_a_delta_phi",
+    "leg_b_delta_theta",
+    "leg_b_delta_phi",
+    "cos_opening",
+    "acoplanarity",
+    "polar_sum"
+  ],
+  "supplementary_axis_targets": [
+    "axis_x",
+    "axis_y",
+    "axis_z"
+  ],
+  "axis_binning_note": "Additional predeclared 8 equal physical bins in [-1,1], kreg5 for both policies; not a historical validated axis protocol. Fail on missing support rather than retune."
+}
